@@ -728,8 +728,17 @@ export async function startServer(): Promise<StartedServer> {
       void heartbeat
         .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
         .then(() => heartbeat.resumeQueuedRuns())
-        .then(async () => {
-          const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
+        .catch((err) => {
+          logger.error({ err }, "periodic heartbeat reap/resume failed");
+        });
+    }, config.heartbeatSchedulerIntervalMs);
+
+    // Reconcile stranded/blocked issues on a much longer interval (default 10 min)
+    // to prevent wake storms from aggressive re-firing. AUR-989 hot fix.
+    setInterval(() => {
+      void heartbeat
+        .reconcileStrandedAssignedIssues()
+        .then(async (reconciled) => {
           if (
             reconciled.dispatchRequeued > 0 ||
             reconciled.continuationRequeued > 0 ||
@@ -745,9 +754,9 @@ export async function startServer(): Promise<StartedServer> {
           }
         })
         .catch((err) => {
-          logger.error({ err }, "periodic heartbeat recovery failed");
+          logger.error({ err }, "periodic heartbeat reconciliation failed");
         });
-    }, config.heartbeatSchedulerIntervalMs);
+    }, config.heartbeatReconcileIntervalMs);
   }
   
   if (config.databaseBackupEnabled) {
@@ -809,6 +818,7 @@ export async function startServer(): Promise<StartedServer> {
         migrationSummary,
         heartbeatSchedulerEnabled: config.heartbeatSchedulerEnabled,
         heartbeatSchedulerIntervalMs: config.heartbeatSchedulerIntervalMs,
+        heartbeatReconcileIntervalMs: config.heartbeatReconcileIntervalMs,
         databaseBackupEnabled: config.databaseBackupEnabled,
         databaseBackupIntervalMinutes: config.databaseBackupIntervalMinutes,
         databaseBackupRetentionDays: config.databaseBackupRetentionDays,

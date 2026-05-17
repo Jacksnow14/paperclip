@@ -98,6 +98,7 @@ vi.mock("../config.js", () => ({
     feedbackExportBackendToken: "telemetry-token",
     heartbeatSchedulerEnabled: false,
     heartbeatSchedulerIntervalMs: 30000,
+    heartbeatReconcileIntervalMs: 600000,
     companyDeletionEnabled: false,
   })),
 }));

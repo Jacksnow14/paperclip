@@ -3773,6 +3773,16 @@ export function heartbeatService(
         continue;
       }
 
+      // AUR-833 fix: a successful latest run is positive evidence the agent
+      // intentionally exited (e.g. sleeve in scheduled stand-by waiting for a
+      // routine trigger). The continuation-recovery loop should only re-fire
+      // when the last run actually failed/crashed, not after every successful
+      // silent-exit. Mirrors the todo branch's `succeeded` skip above.
+      if (latestRun && latestRun.status === "succeeded") {
+        result.skipped += 1;
+        continue;
+      }
+
       if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
         const failureSummary = summarizeRunFailureForIssueComment(latestRun);
         const updated = await escalateStrandedAssignedIssue({

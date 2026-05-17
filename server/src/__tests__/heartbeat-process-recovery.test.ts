@@ -878,7 +878,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("Latest retry failure: `process_lost` - run failed before issue advanced.");
   });
 
-  it("re-enqueues continuation when the latest automatic continuation succeeded without closing the issue", async () => {
+  it("does NOT re-enqueue continuation when the latest run succeeded — treats success as intentional stand-by (AUR-833 wake-storm fix)", async () => {
+    // Prior behavior: re-fired continuation indefinitely while in_progress + no active run,
+    // producing infinite wake storms on legitimately-paused sleeves (e.g. agent waiting
+    // on a scheduled routine trigger). New behavior: a successful latest run is positive
+    // evidence the agent intentionally exited; only retry when the last run actually
+    // failed/crashed. Mirrors the `todo` branch's symmetric `succeeded` skip.
     const { agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "succeeded",
@@ -887,9 +892,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
-    expect(result.continuationRequeued).toBe(1);
+    expect(result.continuationRequeued).toBe(0);
     expect(result.escalated).toBe(0);
-    expect(result.issueIds).toEqual([issueId]);
+    expect(result.skipped).toBe(1);
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
     expect(issue?.status).toBe("in_progress");
@@ -897,18 +902,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(0);
 
+    // No retry run should have been spawned.
     const runs = await db
       .select()
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, agentId));
-    expect(runs).toHaveLength(2);
-
-    const retryRun = runs.find((row) => row.id !== runId);
-    expect(retryRun?.id).toBeTruthy();
-    expect((retryRun?.contextSnapshot as Record<string, unknown>)?.retryReason).toBe("issue_continuation_needed");
-    if (retryRun) {
-      await waitForRunToSettle(heartbeat, retryRun.id);
-    }
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.id).toBe(runId);
   });
 
   it("does not reconcile user-assigned work through the agent stranded-work recovery path", async () => {

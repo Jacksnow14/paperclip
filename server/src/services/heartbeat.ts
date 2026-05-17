@@ -5962,6 +5962,45 @@ export function heartbeatService(
       });
     },
 
+    listWakeupRequests: async (
+      agentId: string,
+      opts?: { limit?: number; statuses?: string[] },
+    ) => {
+      const limit = opts?.limit ? Math.max(1, Math.min(500, opts.limit)) : 50;
+      const statusFilter = opts?.statuses?.length
+        ? inArray(agentWakeupRequests.status, opts.statuses)
+        : undefined;
+      const whereClause = statusFilter
+        ? and(eq(agentWakeupRequests.agentId, agentId), statusFilter)
+        : eq(agentWakeupRequests.agentId, agentId);
+      return db
+        .select({
+          id: agentWakeupRequests.id,
+          companyId: agentWakeupRequests.companyId,
+          agentId: agentWakeupRequests.agentId,
+          source: agentWakeupRequests.source,
+          triggerDetail: agentWakeupRequests.triggerDetail,
+          reason: agentWakeupRequests.reason,
+          payload: agentWakeupRequests.payload,
+          status: agentWakeupRequests.status,
+          coalescedCount: agentWakeupRequests.coalescedCount,
+          requestedByActorType: agentWakeupRequests.requestedByActorType,
+          requestedByActorId: agentWakeupRequests.requestedByActorId,
+          idempotencyKey: agentWakeupRequests.idempotencyKey,
+          runId: agentWakeupRequests.runId,
+          requestedAt: agentWakeupRequests.requestedAt,
+          claimedAt: agentWakeupRequests.claimedAt,
+          finishedAt: agentWakeupRequests.finishedAt,
+          error: agentWakeupRequests.error,
+          createdAt: agentWakeupRequests.createdAt,
+          updatedAt: agentWakeupRequests.updatedAt,
+        })
+        .from(agentWakeupRequests)
+        .where(whereClause)
+        .orderBy(desc(agentWakeupRequests.requestedAt))
+        .limit(limit);
+    },
+
     getRun,
 
     getRunLogAccess,

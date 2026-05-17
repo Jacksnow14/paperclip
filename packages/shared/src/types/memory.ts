@@ -300,6 +300,31 @@ export interface MemoryRefreshJobResult {
   recordCount: number;
 }
 
+export interface MemorySynthesisQualityGateCounts {
+  minSupport: number;
+  minDistinctAgents: number;
+  minObservationAge: number;
+  maxSensitivity: number;
+  recentlyRejected: number;
+}
+
+export interface MemorySynthesisRunSummary {
+  lookbackWindow: { since: string; until: string };
+  sourceRecordCount: number;
+  clusterCount: number;
+  candidateCount: number;
+  skipped: MemorySynthesisQualityGateCounts;
+}
+
+export interface MemorySynthesisJobResult {
+  job: BackgroundJob;
+  run: BackgroundJobRun;
+  dryRun: boolean;
+  bindingId: string;
+  summary: MemorySynthesisRunSummary;
+  candidateRecordIds: string[];
+}
+
 export interface MemoryQueryResult {
   operation: MemoryOperation;
   records: MemoryRecord[];
@@ -391,6 +416,12 @@ export interface MemoryCorrectResult {
   operation: MemoryOperation;
   originalRecord: MemoryRecord;
   correctedRecord: MemoryRecord;
+}
+
+export interface MemoryPromoteResult {
+  operation: MemoryOperation;
+  originalRecord: MemoryRecord;
+  promotedRecord: MemoryRecord;
 }
 
 export interface MemoryReview {

@@ -275,6 +275,33 @@ export const memoryReviewSchema = z
   })
   .strict();
 
+export const MEMORY_PROMOTION_SCOPE_TYPES = ["agent", "workspace", "project", "team", "org"] as const;
+
+export const memoryPromoteTargetScopeSchema = z
+  .object({
+    scopeType: z.enum(MEMORY_PROMOTION_SCOPE_TYPES),
+    scopeId: z.string().trim().min(1).max(200).nullable().optional(),
+  })
+  .strict();
+
+export const memoryPromoteSchema = z
+  .object({
+    targetScope: memoryPromoteTargetScopeSchema,
+    reason: z.string().trim().min(1).max(1000),
+    // Promotion invariant: sensitivityLabel MUST NOT lower the origin record's
+    // sensitivity. Equal or strictly raised labels are accepted; lowering is
+    // rejected as 422 by the server to prevent declassification while widening
+    // audience. See AUR-964 / AUR-947 for the canonical contract.
+    sensitivityLabel: z.enum(MEMORY_SENSITIVITY_LABELS).optional(),
+    retentionPolicy: z.record(z.unknown()).nullable().optional(),
+    expiresAt: z.coerce.date().nullable().optional(),
+    title: z.string().trim().max(200).nullable().optional(),
+    summary: z.string().trim().max(2000).nullable().optional(),
+    content: z.string().trim().min(1).max(20000).optional(),
+    citation: memoryCitationSchema.nullable().optional(),
+  })
+  .strict();
+
 export const memoryRetentionSweepSchema = z
   .object({
     now: z.coerce.date().optional(),
@@ -353,6 +380,26 @@ export const memoryRefreshJobSchema = z
   })
   .strict();
 
+export const memorySynthesisJobSchema = z
+  .object({
+    bindingId: z.string().uuid().optional(),
+    bindingKey: z.string().trim().min(1).max(64).optional(),
+    lookbackDays: z.number().int().positive().max(180).optional().default(14),
+    similarityThreshold: z.number().min(0.1).max(1).optional().default(0.5),
+    minSupport: z.number().int().min(2).max(50).optional().default(3),
+    minDistinctAgents: z.number().int().min(1).max(50).optional().default(2),
+    minObservationAgeDays: z.number().int().min(0).max(60).optional().default(3),
+    maxSensitivityLabel: z
+      .enum(["public", "internal", "confidential", "restricted"])
+      .optional()
+      .default("internal"),
+    rejectionLookbackDays: z.number().int().min(0).max(365).optional().default(60),
+    sourceLimit: z.number().int().positive().max(5000).optional().default(2000),
+    dryRun: z.boolean().optional().default(false),
+    trigger: z.enum(["manual", "schedule"]).optional().default("manual"),
+  })
+  .strict();
+
 export const memoryBindingTargetTypeSchema = z.enum(MEMORY_BINDING_TARGET_TYPES);
 
 export type MemoryScopeInput = z.infer<typeof memoryScopeSchema>;
@@ -373,8 +420,12 @@ export type MemoryForget = z.infer<typeof memoryForgetSchema>;
 export type MemoryRevoke = z.infer<typeof memoryRevokeSchema>;
 export type MemoryCorrect = z.infer<typeof memoryCorrectSchema>;
 export type MemoryReview = z.infer<typeof memoryReviewSchema>;
+export type MemoryPromoteTargetScope = z.infer<typeof memoryPromoteTargetScopeSchema>;
+export type MemoryPromote = z.infer<typeof memoryPromoteSchema>;
+export type MemoryPromotionScopeType = (typeof MEMORY_PROMOTION_SCOPE_TYPES)[number];
 export type MemoryRetentionSweep = z.infer<typeof memoryRetentionSweepSchema>;
 export type MemoryListRecordsQuery = z.infer<typeof memoryListRecordsQuerySchema>;
 export type MemoryListOperationsQuery = z.infer<typeof memoryListOperationsQuerySchema>;
 export type MemoryListExtractionJobsQuery = z.infer<typeof memoryListExtractionJobsQuerySchema>;
 export type MemoryRefreshJob = z.infer<typeof memoryRefreshJobSchema>;
+export type MemorySynthesisJob = z.infer<typeof memorySynthesisJobSchema>;

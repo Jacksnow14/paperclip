@@ -24,6 +24,7 @@ const mockMemoryService = vi.hoisted(() => ({
   forget: vi.fn(),
   revoke: vi.fn(),
   correct: vi.fn(),
+  promote: vi.fn(),
   review: vi.fn(),
   sweepRetention: vi.fn(),
   listRecords: vi.fn(),
@@ -331,6 +332,92 @@ describe("memory routes", () => {
 
     expect(res.status).toBe(403);
     expect(mockMemoryService.setProjectOverride).not.toHaveBeenCalled();
+  });
+
+  it("blocks promote for agent callers", async () => {
+    const recordId = "44444444-4444-4444-8444-444444444444";
+    const app = createApp({
+      type: "agent",
+      agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: companyA,
+    });
+
+    const res = await request(app)
+      .post(`/api/companies/${companyA}/memory/records/${recordId}/promote`)
+      .send({ targetScope: { scopeType: "org" }, reason: "Promote to org" });
+
+    expect(res.status).toBe(403);
+    expect(mockMemoryService.promote).not.toHaveBeenCalled();
+  });
+
+  it("blocks promote for board users outside the record's company", async () => {
+    const recordId = "44444444-4444-4444-8444-444444444444";
+    const app = createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      companyIds: [companyB],
+      isInstanceAdmin: false,
+    });
+
+    const res = await request(app)
+      .post(`/api/companies/${companyA}/memory/records/${recordId}/promote`)
+      .set("Origin", "http://localhost:3100")
+      .send({ targetScope: { scopeType: "org" }, reason: "Promote to org" });
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: "User does not have access to this company" });
+    expect(mockMemoryService.promote).not.toHaveBeenCalled();
+  });
+
+  it("routes board promote through memory service and logs activity", async () => {
+    const recordId = "44444444-4444-4444-8444-444444444444";
+    const promotedId = "66666666-6666-4666-8666-666666666666";
+    mockMemoryService.promote.mockResolvedValue({
+      operation: { id: "op-promote-1" },
+      originalRecord: {
+        id: recordId,
+        scope: { scopeType: "run", scopeId: "run-scope-id" },
+      },
+      promotedRecord: {
+        id: promotedId,
+        scope: { scopeType: "org", scopeId: companyA },
+      },
+    });
+    const app = createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      companyIds: [companyA],
+      isInstanceAdmin: false,
+    });
+
+    const res = await request(app)
+      .post(`/api/companies/${companyA}/memory/records/${recordId}/promote`)
+      .set("Origin", "http://localhost:3100")
+      .send({ targetScope: { scopeType: "org" }, reason: "Widen run memory to org" });
+
+    expect(res.status).toBe(201);
+    expect(mockMemoryService.promote).toHaveBeenCalledWith(
+      companyA,
+      recordId,
+      { targetScope: { scopeType: "org" }, reason: "Widen run memory to org" },
+      expect.objectContaining({ actorType: "user", userId: "board-user" }),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        companyId: companyA,
+        action: "memory.promoted",
+        entityType: "memory_record",
+        entityId: promotedId,
+        details: expect.objectContaining({
+          originalRecordId: recordId,
+          promotedRecordId: promotedId,
+          reason: "Widen run memory to org",
+        }),
+      }),
+    );
   });
 
   it("starts memory refresh jobs through the memory service and logs activity", async () => {

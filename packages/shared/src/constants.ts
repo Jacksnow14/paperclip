@@ -451,6 +451,7 @@ export const MEMORY_OPERATION_TYPES = [
   "correct",
   "review",
   "retention_sweep",
+  "promote",
 ] as const;
 export type MemoryOperationType = (typeof MEMORY_OPERATION_TYPES)[number];
 

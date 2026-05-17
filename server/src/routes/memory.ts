@@ -4,6 +4,7 @@ import {
   memoryCaptureSchema,
   memoryCorrectSchema,
   memoryForgetSchema,
+  memoryPromoteSchema,
   memoryListExtractionJobsQuerySchema,
   memoryListOperationsQuerySchema,
   memoryListRecordsQuerySchema,
@@ -328,6 +329,46 @@ export function memoryRoutes(
     });
     res.status(201).json(result);
   });
+
+  router.post(
+    "/companies/:companyId/memory/records/:recordId/promote",
+    validate(memoryPromoteSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertCompanyAccess(req, companyId);
+      assertBoard(req);
+      const result = await memory.promote(
+        companyId,
+        req.params.recordId as string,
+        req.body,
+        actorInfoFromReq(req),
+      );
+      const actor = getActorInfo(req);
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        action: "memory.promoted",
+        entityType: "memory_record",
+        entityId: result.promotedRecord.id,
+        details: {
+          originalRecordId: result.originalRecord.id,
+          promotedRecordId: result.promotedRecord.id,
+          fromScope: {
+            scopeType: result.originalRecord.scope.scopeType,
+            scopeId: result.originalRecord.scope.scopeId,
+          },
+          toScope: {
+            scopeType: result.promotedRecord.scope.scopeType,
+            scopeId: result.promotedRecord.scope.scopeId,
+          },
+          reason: req.body.reason,
+        },
+      });
+      res.status(201).json(result);
+    },
+  );
 
   router.patch("/companies/:companyId/memory/records/:recordId/review", validate(memoryReviewSchema), async (req, res) => {
     const companyId = req.params.companyId as string;

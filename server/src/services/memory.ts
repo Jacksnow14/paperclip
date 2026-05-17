@@ -36,6 +36,8 @@ import type {
   MemoryListRecordsQuery,
   MemoryOperation,
   MemoryPrincipalRef,
+  MemoryPromote,
+  MemoryPromoteResult,
   MemoryProviderDescriptor,
   MemoryQuery,
   MemoryQueryResult,
@@ -44,6 +46,10 @@ import type {
   MemoryRefreshJob,
   MemoryRefreshJobResult,
   MemoryRefreshJobSourceCounts,
+  MemorySynthesisJob,
+  MemorySynthesisJobResult,
+  MemorySynthesisRunSummary,
+  MemorySynthesisQualityGateCounts,
   MemoryRetentionSweep,
   MemoryRetentionSweepResult,
   MemoryRevoke,
@@ -57,7 +63,7 @@ import type {
   MemorySourceRef,
   MemoryUsage,
 } from "@paperclipai/shared";
-import { createMemoryBindingSchema, memoryCorrectSchema, memoryHookPoliciesSchema, memoryRefreshJobSchema, memoryRetentionSweepSchema, memoryReviewSchema, memoryRevokeSchema, updateMemoryBindingSchema } from "@paperclipai/shared";
+import { createMemoryBindingSchema, memoryCorrectSchema, memoryHookPoliciesSchema, memoryPromoteSchema, memoryRefreshJobSchema, memoryRetentionSweepSchema, memoryReviewSchema, memoryRevokeSchema, memorySynthesisJobSchema, updateMemoryBindingSchema } from "@paperclipai/shared";
 import { z } from "zod";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { costService } from "./costs.js";
@@ -275,6 +281,82 @@ const SENSITIVITY_RANK: Record<MemorySensitivityLabel, number> = {
   confidential: 2,
   restricted: 3,
 };
+
+const SCOPE_PROMOTION_RANK: Record<MemoryScopeType, number> = {
+  run: 1,
+  agent: 2,
+  workspace: 3,
+  project: 4,
+  team: 5,
+  org: 6,
+};
+
+function applyTargetScope(input: {
+  base: {
+    scopeAgentId: string | null;
+    scopeProjectId: string | null;
+    scopeRunId: string | null;
+    scopeWorkspaceId: string | null;
+    scopeTeamId: string | null;
+  };
+  companyId: string;
+  target: { scopeType: MemoryScopeType; scopeId?: string | null };
+  resolvedTargetScopeId: string;
+}): {
+  scopeId: string;
+  scopeAgentId: string | null;
+  scopeProjectId: string | null;
+  scopeRunId: string | null;
+  scopeWorkspaceId: string | null;
+  scopeTeamId: string | null;
+} {
+  const { base, target, resolvedTargetScopeId, companyId } = input;
+  // Default: keep all narrow scope columns from the original. Override only the
+  // column matching the target scope. The `run` column is dropped when widening
+  // past run because a wider memory should not be tied to a specific run.
+  let scopeAgentId = base.scopeAgentId;
+  let scopeProjectId = base.scopeProjectId;
+  let scopeRunId = base.scopeRunId;
+  let scopeWorkspaceId = base.scopeWorkspaceId;
+  let scopeTeamId = base.scopeTeamId;
+
+  if (target.scopeType !== "run") {
+    scopeRunId = null;
+  }
+
+  switch (target.scopeType) {
+    case "agent":
+      scopeAgentId = resolvedTargetScopeId;
+      break;
+    case "workspace":
+      scopeWorkspaceId = resolvedTargetScopeId;
+      break;
+    case "project":
+      scopeProjectId = resolvedTargetScopeId;
+      // Project-wide memories should not be tied to one contributing agent.
+      scopeAgentId = null;
+      break;
+    case "team":
+      scopeTeamId = resolvedTargetScopeId;
+      scopeAgentId = null;
+      scopeProjectId = null;
+      break;
+    case "org":
+      scopeAgentId = null;
+      scopeProjectId = null;
+      scopeWorkspaceId = null;
+      scopeTeamId = null;
+      break;
+    case "run":
+      // Unreachable — schema rejects "run" as a promotion target.
+      throw new Error("run is not a valid promotion target");
+  }
+
+  const scopeId =
+    target.scopeType === "org" ? companyId : resolvedTargetScopeId;
+
+  return { scopeId, scopeAgentId, scopeProjectId, scopeRunId, scopeWorkspaceId, scopeTeamId };
+}
 
 const DEFAULT_AGENT_MAX_SENSITIVITY: MemorySensitivityLabel = "confidential";
 
@@ -2605,6 +2687,241 @@ export function memoryService(
       } satisfies MemoryCorrectResult;
     },
 
+    promote: async (
+      companyId: string,
+      recordId: string,
+      data: MemoryPromote,
+      actor: ActorInfo,
+    ): Promise<MemoryPromoteResult> => {
+      const parsed = memoryPromoteSchema.parse(data);
+      const target = parsed.targetScope;
+
+      const targetRank = SCOPE_PROMOTION_RANK[target.scopeType];
+
+      // Resolve & validate target scope ids early (before opening the tx).
+      let resolvedTargetScopeId: string | null = null;
+      if (target.scopeType === "org") {
+        resolvedTargetScopeId = companyId;
+      } else {
+        const id = (target.scopeId ?? "").trim();
+        if (!id) throw unprocessable(`targetScope.scopeId is required for scopeType '${target.scopeType}'`);
+        resolvedTargetScopeId = id;
+        if (target.scopeType === "agent") {
+          const agentRow = await db
+            .select({ id: agents.id, companyId: agents.companyId })
+            .from(agents)
+            .where(eq(agents.id, id))
+            .then((rows) => rows[0] ?? null);
+          if (!agentRow || agentRow.companyId !== companyId) {
+            throw unprocessable("targetScope.scopeId references an agent outside this company");
+          }
+        } else if (target.scopeType === "project") {
+          const projectRow = await db
+            .select({ id: projects.id, companyId: projects.companyId })
+            .from(projects)
+            .where(eq(projects.id, id))
+            .then((rows) => rows[0] ?? null);
+          if (!projectRow || projectRow.companyId !== companyId) {
+            throw unprocessable("targetScope.scopeId references a project outside this company");
+          }
+        }
+      }
+
+      // Single atomic transaction with row-level lock + race-safe supersedence update.
+      const promotionResult = await db.transaction(async (tx) => {
+        const originalRow = await tx
+          .select()
+          .from(memoryLocalRecords)
+          .where(and(eq(memoryLocalRecords.companyId, companyId), eq(memoryLocalRecords.id, recordId)))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!originalRow) throw notFound("Memory record not found");
+        if (originalRow.deletedAt || originalRow.revokedAt || originalRow.retentionState === "revoked") {
+          throw conflict("Revoked memory records cannot be promoted");
+        }
+        if (originalRow.supersededByRecordId) {
+          throw conflict("Memory record was already superseded");
+        }
+        if (originalRow.expiresAt && originalRow.expiresAt <= new Date()) {
+          throw conflict("Expired memory records cannot be promoted");
+        }
+
+        const originScopeType = originalRow.scopeType ?? "org";
+        const originRank = SCOPE_PROMOTION_RANK[originScopeType];
+        if (originRank === undefined) {
+          throw unprocessable(`Origin scopeType '${originScopeType}' is not eligible for promotion`);
+        }
+        if (targetRank <= originRank) {
+          throw unprocessable(
+            `Promotion target '${target.scopeType}' must strictly widen origin scope '${originScopeType}'`,
+          );
+        }
+
+        // Promotion invariant (AUR-964): sensitivityLabel MUST NOT lower the
+        // origin record's sensitivity. Equal or strictly higher labels are
+        // accepted; lowering is rejected as 422 to prevent declassification
+        // while widening audience.
+        if (
+          parsed.sensitivityLabel
+          && SENSITIVITY_RANK[parsed.sensitivityLabel] < SENSITIVITY_RANK[originalRow.sensitivityLabel ?? "internal"]
+        ) {
+          throw unprocessable("Promotion cannot lower sensitivityLabel below the original record");
+        }
+
+        const binding = await getBindingOrThrow(originalRow.bindingId);
+        const promotedAt = new Date();
+        const principal = actorPrincipal(actor);
+        const promotedRecordId = randomUUID();
+
+        // Compute widened scope columns. Carry forward existing scope hints where they
+        // make sense (e.g., agent → project keeps scopeAgentId so we still know which
+        // agent contributed the memory), but always overwrite the canonical
+        // scopeType + scopeId pair, and set the dedicated widened column.
+        const widened = applyTargetScope({
+          base: originalRow,
+          companyId,
+          target,
+          resolvedTargetScopeId: resolvedTargetScopeId!,
+        });
+
+        const fromScope = {
+          scopeType: originScopeType,
+          scopeId: originalRow.scopeId ?? null,
+        };
+        const toScope = {
+          scopeType: target.scopeType,
+          scopeId: widened.scopeId,
+        };
+
+        const [promotedRow] = await tx
+          .insert(memoryLocalRecords)
+          .values({
+            id: promotedRecordId,
+            companyId,
+            bindingId: originalRow.bindingId,
+            providerKey: originalRow.providerKey,
+            scopeAgentId: widened.scopeAgentId,
+            scopeProjectId: widened.scopeProjectId,
+            scopeIssueId: originalRow.scopeIssueId,
+            scopeRunId: widened.scopeRunId,
+            scopeSubjectId: originalRow.scopeSubjectId,
+            scopeType: target.scopeType,
+            scopeId: widened.scopeId,
+            scopeWorkspaceId: widened.scopeWorkspaceId,
+            scopeTeamId: widened.scopeTeamId,
+            sourceKind: originalRow.sourceKind,
+            sourceIssueId: originalRow.sourceIssueId,
+            sourceCommentId: originalRow.sourceCommentId,
+            sourceDocumentKey: originalRow.sourceDocumentKey,
+            sourceRunId: originalRow.sourceRunId,
+            sourceActivityId: originalRow.sourceActivityId,
+            sourceExternalRef: originalRow.sourceExternalRef,
+            title: parsed.title === undefined ? originalRow.title : parsed.title ?? null,
+            content: parsed.content ?? originalRow.content,
+            summary: parsed.summary === undefined ? originalRow.summary : parsed.summary ?? null,
+            metadata: {
+              ...(originalRow.metadata ?? {}),
+              promotedFromRecordId: originalRow.id,
+              promotionReason: parsed.reason,
+              promotionFromScope: fromScope,
+              promotionToScope: toScope,
+            },
+            ownerType: originalRow.ownerType,
+            ownerId: originalRow.ownerId,
+            createdByActorType: principal.type,
+            createdByActorId: principal.id,
+            sensitivityLabel: parsed.sensitivityLabel ?? originalRow.sensitivityLabel ?? "internal",
+            retentionPolicy:
+              parsed.retentionPolicy === undefined ? originalRow.retentionPolicy : parsed.retentionPolicy,
+            expiresAt: parsed.expiresAt === undefined ? originalRow.expiresAt : parsed.expiresAt,
+            retentionState: "active",
+            reviewState: "accepted",
+            reviewedAt: promotedAt,
+            reviewedByActorType: principal.type,
+            reviewedByActorId: principal.id,
+            reviewNote: parsed.reason,
+            citationJson:
+              parsed.citation === undefined ? originalRow.citationJson : normalizeCitation(parsed.citation),
+            supersedesRecordId: originalRow.id,
+            createdByOperationId: null,
+            createdAt: promotedAt,
+            updatedAt: promotedAt,
+          })
+          .returning();
+
+        // Race-safe update: only mark the original as superseded if nothing else
+        // has claimed it. If a concurrent promote/correct already did, this returns
+        // 0 rows and we abort with conflict — the inserted row above is rolled back
+        // by the surrounding transaction.
+        const updatedOriginals = await tx
+          .update(memoryLocalRecords)
+          .set({ supersededByRecordId: promotedRecordId, updatedAt: promotedAt })
+          .where(
+            and(
+              eq(memoryLocalRecords.companyId, companyId),
+              eq(memoryLocalRecords.id, originalRow.id),
+              isNull(memoryLocalRecords.supersededByRecordId),
+            ),
+          )
+          .returning({ id: memoryLocalRecords.id });
+        if (updatedOriginals.length === 0) {
+          throw conflict("Memory record was already superseded");
+        }
+
+        const operation = await logOperation({
+          companyId,
+          binding,
+          actor,
+          operationType: "promote",
+          triggerKind: "manual",
+          scope: scopeFromRow({
+            ...originalRow,
+            scopeType: target.scopeType,
+            scopeId: widened.scopeId,
+            scopeAgentId: widened.scopeAgentId,
+            scopeProjectId: widened.scopeProjectId,
+            scopeWorkspaceId: widened.scopeWorkspaceId,
+            scopeTeamId: widened.scopeTeamId,
+            scopeRunId: widened.scopeRunId,
+          }),
+          source: sourceFromRow(originalRow),
+          requestJson: {
+            recordId,
+            targetScope: { scopeType: target.scopeType, scopeId: widened.scopeId },
+            fromScope,
+            reason: parsed.reason,
+            sensitivityLabel: parsed.sensitivityLabel ?? null,
+            expiresAt: parsed.expiresAt ? parsed.expiresAt.toISOString() : null,
+          },
+          resultJson: {
+            originalRecordId: originalRow.id,
+            promotedRecordId,
+            fromScope,
+            toScope,
+          },
+          recordCount: 1,
+        });
+
+        const [attachedPromotedRow] = await tx
+          .update(memoryLocalRecords)
+          .set({ createdByOperationId: operation.id, updatedAt: promotedAt })
+          .where(and(eq(memoryLocalRecords.companyId, companyId), eq(memoryLocalRecords.id, promotedRecordId)))
+          .returning();
+
+        return {
+          operation,
+          originalRow: { ...originalRow, supersededByRecordId: promotedRecordId, updatedAt: promotedAt },
+          promotedRow: attachedPromotedRow ?? { ...promotedRow, createdByOperationId: operation.id },
+        };
+      });
+
+      return {
+        operation: promotionResult.operation,
+        originalRecord: mapRecord(promotionResult.originalRow),
+        promotedRecord: mapRecord(promotionResult.promotedRow),
+      } satisfies MemoryPromoteResult;
+    },
+
     review: async (
       companyId: string,
       recordId: string,
@@ -2864,6 +3181,21 @@ export function memoryService(
         sourceCounts,
         recordCount: 0,
       };
+    },
+
+    startSynthesisJob: async (
+      _companyId: string,
+      data: MemorySynthesisJob,
+      _actor: ActorInfo,
+      _options?: { runInline?: boolean },
+    ): Promise<MemorySynthesisJobResult> => {
+      memorySynthesisJobSchema.parse(data);
+      // Synthesis job orchestration is owned by a sibling phase (AUR-948).
+      // The executor (resolveSynthesisBinding / executeSynthesisJob /
+      // emptySynthesisSummary) lands with that work. This stub keeps the
+      // method signature wired so callers can be typechecked, and fails
+      // fast at runtime until the synthesis pipeline ships.
+      throw new Error("memory.startSynthesisJob not implemented yet (owned by AUR-948)");
     },
 
     preRunHydrate: async (input: {

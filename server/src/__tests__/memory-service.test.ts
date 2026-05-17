@@ -452,6 +452,111 @@ describe("memoryService hook policies", () => {
   });
 });
 
+describe("memoryService supersedence protection", () => {
+  const companyId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const actor = {
+    actorType: "user" as const,
+    actorId: "board-user",
+    agentId: null,
+    userId: "board-user",
+    runId: null,
+  };
+
+  it("correct throws 409 when the record has already been superseded", async () => {
+    const row = makeMemoryRecordRow({
+      supersededByRecordId: "99999999-9999-4999-8999-999999999999",
+    });
+    const db = {
+      select: vi.fn(() => ({
+        from: vi.fn().mockReturnThis(),
+        where: vi.fn().mockReturnValue({
+          then: vi.fn((resolve: (rows: unknown[]) => unknown) => Promise.resolve(resolve([row]))),
+        }),
+      })),
+    } as any;
+
+    await expect(
+      memoryService(db).correct(
+        companyId,
+        row.id,
+        { content: "corrected content", reason: "outdated" },
+        actor,
+      ),
+    ).rejects.toMatchObject({ status: 409, message: "Memory record has already been corrected" });
+  });
+
+  it("promote throws 409 when the record is already superseded inside the transaction", async () => {
+    const row = makeMemoryRecordRow({
+      supersededByRecordId: "99999999-9999-4999-8999-999999999999",
+    });
+    const tx = {
+      select: vi.fn(() => ({
+        from: vi.fn().mockReturnThis(),
+        where: vi.fn().mockReturnThis(),
+        for: vi.fn().mockReturnThis(),
+        then: vi.fn((resolve: (rows: unknown[]) => unknown) => Promise.resolve(resolve([row]))),
+      })),
+    };
+    const db = {
+      transaction: vi.fn(async (fn: (tx: typeof tx) => Promise<unknown>) => fn(tx)),
+      select: vi.fn(),
+    } as any;
+
+    await expect(
+      memoryService(db).promote(
+        companyId,
+        row.id,
+        { targetScope: { scopeType: "org" }, reason: "widen scope" },
+        actor,
+      ),
+    ).rejects.toMatchObject({ status: 409, message: "Memory record was already superseded" });
+  });
+
+  it("promote throws 409 when a concurrent operation claims supersedence first (race-safe update returns 0 rows)", async () => {
+    const originalRow = makeMemoryRecordRow({ scopeType: "run", scopeId: "run-scope-id", supersededByRecordId: null });
+    const promotedRow = makeMemoryRecordRow({ id: "promoted-row-id", supersedesRecordId: originalRow.id });
+    const bindingRow = makeBinding(originalRow.bindingId, "company");
+
+    const tx = {
+      select: vi.fn(() => ({
+        from: vi.fn().mockReturnThis(),
+        where: vi.fn().mockReturnThis(),
+        for: vi.fn().mockReturnThis(),
+        then: vi.fn((resolve: (rows: unknown[]) => unknown) => Promise.resolve(resolve([originalRow]))),
+      })),
+      insert: vi.fn(() => ({
+        values: vi.fn(() => ({
+          returning: vi.fn().mockResolvedValue([promotedRow]),
+        })),
+      })),
+      update: vi.fn(() => ({
+        set: vi.fn(() => ({
+          where: vi.fn(() => ({
+            returning: vi.fn().mockResolvedValue([]),
+          })),
+        })),
+      })),
+    };
+    const db = {
+      select: vi.fn(() => ({
+        from: vi.fn().mockReturnThis(),
+        where: vi.fn().mockReturnThis(),
+        then: vi.fn((resolve: (rows: unknown[]) => unknown) => Promise.resolve(resolve([bindingRow]))),
+      })),
+      transaction: vi.fn(async (fn: (tx: typeof tx) => Promise<unknown>) => fn(tx)),
+    } as any;
+
+    await expect(
+      memoryService(db).promote(
+        companyId,
+        originalRow.id,
+        { targetScope: { scopeType: "org" }, reason: "widen scope" },
+        actor,
+      ),
+    ).rejects.toMatchObject({ status: 409, message: "Memory record was already superseded" });
+  });
+});
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -538,5 +643,117 @@ describeEmbeddedPostgres("memoryService local basic persistence", () => {
 
     const revokedRecords = await service.listRecords(companyId, revokedFilters, actor);
     expect(revokedRecords.map((record) => record.id)).toEqual([captured.records[0].id]);
+  });
+
+  // AUR-964: canonical promotion-sensitivity invariant. Promotion may keep
+  // sensitivity equal or strictly raise it; lowering is rejected as 422 to
+  // prevent declassification while widening audience.
+  it("rejects sensitivity-lowering promotion and accepts equal/raise", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip Promote Sensitivity Test",
+      issuePrefix: `P${companyId.replace(/-/g, "").slice(0, 5).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const service = memoryService(db);
+    const actor = {
+      actorType: "user" as const,
+      actorId: "board-user",
+      agentId: null,
+      userId: "board-user",
+      runId: null,
+    };
+
+    const binding = await service.createBinding(companyId, {
+      key: "local-promote-sensitivity",
+      name: "Local promote sensitivity",
+      providerKey: "local_basic",
+      config: {},
+      enabled: true,
+    });
+    await service.setCompanyDefault(companyId, binding.id);
+
+    const agentScopeId = randomUUID();
+
+    const captureConfidential = async () =>
+      service.capture(
+        companyId,
+        {
+          bindingKey: "local-promote-sensitivity",
+          scope: { scopeType: "agent", scopeId: agentScopeId },
+          scopeType: "agent",
+          scopeId: agentScopeId,
+          source: { kind: "manual_note", externalRef: "promote-sensitivity-test" },
+          title: "Sensitive fact",
+          content: "Agent-scope confidential fact used for promotion sensitivity tests.",
+          sensitivityLabel: "confidential",
+          reviewState: "accepted",
+        },
+        actor,
+      );
+
+    // Case 1: lowering sensitivity on promotion (confidential -> internal) must 422.
+    const lowering = await captureConfidential();
+    await expect(
+      service.promote(
+        companyId,
+        lowering.records[0].id,
+        {
+          targetScope: { scopeType: "org" },
+          reason: "Attempt to declassify while widening audience",
+          sensitivityLabel: "internal",
+        },
+        actor,
+      ),
+    ).rejects.toMatchObject({
+      status: 422,
+      message: "Promotion cannot lower sensitivityLabel below the original record",
+    });
+
+    // Case 2: equal sensitivity (confidential -> confidential) accepted.
+    const equal = await captureConfidential();
+    const equalResult = await service.promote(
+      companyId,
+      equal.records[0].id,
+      {
+        targetScope: { scopeType: "org" },
+        reason: "Promote agent fact to org without changing sensitivity",
+        sensitivityLabel: "confidential",
+      },
+      actor,
+    );
+    expect(equalResult.promotedRecord.sensitivityLabel).toBe("confidential");
+    expect(equalResult.promotedRecord.scope.scopeType).toBe("org");
+    expect(equalResult.originalRecord.supersededByRecordId).toBe(equalResult.promotedRecord.id);
+
+    // Case 3: raising sensitivity (confidential -> restricted) accepted.
+    const raising = await captureConfidential();
+    const raisingResult = await service.promote(
+      companyId,
+      raising.records[0].id,
+      {
+        targetScope: { scopeType: "org" },
+        reason: "Promote and tighten governance for wider audience",
+        sensitivityLabel: "restricted",
+      },
+      actor,
+    );
+    expect(raisingResult.promotedRecord.sensitivityLabel).toBe("restricted");
+    expect(raisingResult.promotedRecord.scope.scopeType).toBe("org");
+
+    // Case 4: omitting sensitivityLabel keeps the origin label.
+    const omitted = await captureConfidential();
+    const omittedResult = await service.promote(
+      companyId,
+      omitted.records[0].id,
+      {
+        targetScope: { scopeType: "org" },
+        reason: "Promote and inherit origin sensitivity",
+      },
+      actor,
+    );
+    expect(omittedResult.promotedRecord.sensitivityLabel).toBe("confidential");
   });
 });

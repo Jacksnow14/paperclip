@@ -504,7 +504,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
+    // executionRunId stays pointing to the failed run until the retry is claimed
+    // (lazy locking — AUR-977 fix)
+    expect(issue?.executionRunId).toBe(runId);
     expect(issue?.checkoutRunId).toBe(runId);
   });
 
@@ -544,7 +546,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
+    // executionRunId stays pointing to the failed run until the retry is claimed
+    // (lazy locking — AUR-977 fix)
+    expect(issue?.executionRunId).toBe(runId);
   });
 
   it("does not queue a second retry after the first process-loss retry was already used", async () => {

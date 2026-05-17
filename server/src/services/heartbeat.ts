@@ -2959,17 +2959,10 @@ export function heartbeatService(
         })
         .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
-      if (issueId) {
-        await tx
-          .update(issues)
-          .set({
-            executionRunId: retryRun.id,
-            executionAgentNameKey: normalizeAgentNameKey(agent.name),
-            executionLockedAt: now,
-            updatedAt: now,
-          })
-          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)));
-      }
+      // Do NOT stamp executionRunId here. The lock is stamped lazily in
+      // claimQueuedRun() when the retry actually transitions to "running".
+      // Stamping at queue time caused stuck locks when the retry was never
+      // claimed (AUR-977).
 
       return retryRun;
     });
@@ -3091,6 +3084,7 @@ export function heartbeatService(
     const claimedIssueId = readNonEmptyString(parseObject(claimed.contextSnapshot).issueId);
     if (claimedIssueId) {
       const claimedAgent = await getAgent(claimed.agentId);
+      const retryOfRunId = readNonEmptyString(parseObject(claimed.contextSnapshot).retryOfRunId);
       await db
         .update(issues)
         .set({
@@ -3103,7 +3097,11 @@ export function heartbeatService(
           and(
             eq(issues.id, claimedIssueId),
             eq(issues.companyId, claimed.companyId),
-            or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id)),
+            or(
+              isNull(issues.executionRunId),
+              eq(issues.executionRunId, claimed.id),
+              ...(retryOfRunId ? [eq(issues.executionRunId, retryOfRunId)] : []),
+            ),
           ),
         );
     }
@@ -5037,8 +5035,23 @@ export function heartbeatService(
         const deferredContextSeed = parseObject(deferredPayload[DEFERRED_WAKE_CONTEXT_KEY]);
         const promotedContextSeed: Record<string, unknown> = { ...deferredContextSeed };
         const deferredCommentIds = extractWakeCommentIds(deferredContextSeed);
+        const isTerminalIssue = issue.status === "done" || issue.status === "cancelled";
         const shouldReopenDeferredCommentWake =
-          deferredCommentIds.length > 0 && (issue.status === "done" || issue.status === "cancelled");
+          deferredCommentIds.length > 0 && isTerminalIssue;
+
+        if (isTerminalIssue && !shouldReopenDeferredCommentWake) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "failed",
+              finishedAt: new Date(),
+              error: `Deferred wake not promoted: issue is ${issue.status}`,
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          continue;
+        }
+
         let reopenedActivity: LogActivityInput | null = null;
 
         if (shouldReopenDeferredCommentWake) {
@@ -5172,7 +5185,12 @@ export function heartbeatService(
       },
     });
 
-    await startNextQueuedRunForAgent(promotedRun.agentId);
+    // Use void to avoid re-entrant deadlock: releaseIssueExecutionAndPromote can be
+    // called from cancelRunInternal inside withAgentStartLock (via claimQueuedRun).
+    // Awaiting here would chain onto the held lock and deadlock the agent's queue.
+    void startNextQueuedRunForAgent(promotedRun.agentId).catch((err) => {
+      logger.error({ err, agentId: promotedRun.agentId }, "startNextQueuedRunForAgent failed after promotion");
+    });
   }
 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}) {

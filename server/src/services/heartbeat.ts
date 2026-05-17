@@ -3041,6 +3041,19 @@ export function heartbeatService(
       return null;
     }
 
+    const issueId = readNonEmptyString(context.issueId);
+    if (issueId) {
+      const issueRow = await db
+        .select({ status: issues.status })
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+        .then((rows) => rows[0] ?? null);
+      if (issueRow && (issueRow.status === "cancelled" || issueRow.status === "done")) {
+        await cancelRunInternal(run.id, `Cancelled because the issue is ${issueRow.status}`);
+        return null;
+      }
+    }
+
     const claimedAt = new Date();
     const claimed = await db
       .update(heartbeatRuns)
@@ -5276,6 +5289,7 @@ export function heartbeatService(
           .select({
             id: issues.id,
             companyId: issues.companyId,
+            status: issues.status,
             executionRunId: issues.executionRunId,
             executionAgentNameKey: issues.executionAgentNameKey,
           })
@@ -5290,6 +5304,23 @@ export function heartbeatService(
             source,
             triggerDetail,
             reason: "issue_execution_issue_not_found",
+            payload,
+            status: "skipped",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            finishedAt: new Date(),
+          });
+          return { kind: "skipped" as const };
+        }
+
+        if (issue.status === "cancelled" || issue.status === "done") {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason: "issue_terminal_status",
             payload,
             status: "skipped",
             requestedByActorType: opts.requestedByActorType ?? null,

@@ -526,7 +526,7 @@ const SYNTHESIS_STOPWORDS = new Set<string>([
   "had","because",
 ]);
 
-function synthesisTokenize(text: string | null | undefined): Set<string> {
+export function synthesisTokenize(text: string | null | undefined): Set<string> {
   if (!text) return new Set();
   const tokens: string[] = [];
   const seen = new Set<string>();
@@ -544,7 +544,7 @@ function synthesisTokenize(text: string | null | undefined): Set<string> {
   return new Set(tokens);
 }
 
-function jaccardSim(a: Set<string>, b: Set<string>): number {
+export function jaccardSim(a: Set<string>, b: Set<string>): number {
   if (a.size === 0 || b.size === 0) return 0;
   let intersect = 0;
   const [small, large] = a.size <= b.size ? [a, b] : [b, a];
@@ -553,12 +553,12 @@ function jaccardSim(a: Set<string>, b: Set<string>): number {
   return union === 0 ? 0 : intersect / union;
 }
 
-function computeClusterId(recordIds: string[]): string {
+export function computeClusterId(recordIds: string[]): string {
   const sorted = [...recordIds].sort();
   return createHash("sha256").update(sorted.join("|")).digest("hex").slice(0, 16);
 }
 
-class UnionFind {
+export class UnionFind {
   private parent: number[];
   constructor(size: number) {
     this.parent = Array.from({ length: size }, (_, i) => i);

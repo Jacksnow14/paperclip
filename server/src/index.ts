@@ -671,6 +671,21 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn({ ...reconciled }, "startup stranded-issue reconciliation changed assigned issue state");
         }
       })
+      .then(async () => {
+        const backfilled = await heartbeat.backfillStuckRateLimitedIssues();
+        if (backfilled.scheduled > 0) {
+          logger.warn(
+            { ...backfilled },
+            "startup backfill scheduled retry windows for stuck rate-limited blocked issues",
+          );
+        }
+      })
+      .then(async () => {
+        const resumed = await heartbeat.reconcileBlockedRetryableIssues();
+        if (resumed.resumed > 0) {
+          logger.warn({ ...resumed }, "startup blocked-retry reconciliation resumed rate-limited issues");
+        }
+      })
       .catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
       });
@@ -721,6 +736,12 @@ export async function startServer(): Promise<StartedServer> {
             reconciled.escalated > 0
           ) {
             logger.warn({ ...reconciled }, "periodic stranded-issue reconciliation changed assigned issue state");
+          }
+        })
+        .then(async () => {
+          const resumed = await heartbeat.reconcileBlockedRetryableIssues();
+          if (resumed.resumed > 0) {
+            logger.warn({ ...resumed }, "periodic blocked-retry reconciliation resumed rate-limited issues");
           }
         })
         .catch((err) => {

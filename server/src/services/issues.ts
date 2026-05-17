@@ -626,6 +626,8 @@ const issueListSelect = {
   completedAt: issues.completedAt,
   cancelledAt: issues.cancelledAt,
   hiddenAt: issues.hiddenAt,
+  retryAfter: issues.retryAfter,
+  rateLimitRetryCount: issues.rateLimitRetryCount,
   createdAt: issues.createdAt,
   updatedAt: issues.updatedAt,
 };

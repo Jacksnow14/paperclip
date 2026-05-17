@@ -3049,6 +3049,7 @@ export function heartbeatService(
         .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
         .then((rows) => rows[0] ?? null);
       if (issueRow && (issueRow.status === "cancelled" || issueRow.status === "done")) {
+        logger.info({ issueId, issueStatus: issueRow.status, runId: run.id }, "runs.cancelled_terminal_issue");
         await cancelRunInternal(run.id, `Cancelled because the issue is ${issueRow.status}`);
         return null;
       }
@@ -5315,6 +5316,7 @@ export function heartbeatService(
         }
 
         if (issue.status === "cancelled" || issue.status === "done") {
+          logger.info({ issueId: issue.id, issueStatus: issue.status, agentId }, "runs.skipped_terminal_issue");
           await tx.insert(agentWakeupRequests).values({
             companyId: agent.companyId,
             agentId,

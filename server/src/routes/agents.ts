@@ -2516,6 +2516,56 @@ export function agentRoutes(db: Db) {
     res.json(run);
   });
 
+  router.post("/companies/:companyId/runs/reap-terminal", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+
+    const runsToReap = await db
+      .select({
+        runId: heartbeatRuns.id,
+        issueId: sql<string>`(${heartbeatRuns.contextSnapshot} ->> 'issueId')`,
+        issueStatus: issuesTable.status,
+        previousRunStatus: heartbeatRuns.status,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(
+        issuesTable,
+        sql`${issuesTable.id} = (${heartbeatRuns.contextSnapshot} ->> 'issueId')`,
+      )
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          inArray(heartbeatRuns.status, ["queued", "running"]),
+          inArray(issuesTable.status, ["cancelled", "done"]),
+        ),
+      );
+
+    const reaped: Array<{ runId: string; issueId: string; issueStatus: string; previousRunStatus: string }> = [];
+    for (const row of runsToReap) {
+      const cancelled = await heartbeat.cancelRun(row.runId, `Reaped: issue is ${row.issueStatus}`);
+      if (cancelled) {
+        await logActivity(db, {
+          companyId,
+          actorType: "user",
+          actorId: req.actor.userId ?? "board",
+          action: "heartbeat.reaped",
+          entityType: "heartbeat_run",
+          entityId: row.runId,
+          details: { issueId: row.issueId, issueStatus: row.issueStatus },
+        });
+        reaped.push({
+          runId: row.runId,
+          issueId: row.issueId,
+          issueStatus: row.issueStatus,
+          previousRunStatus: row.previousRunStatus,
+        });
+      }
+    }
+
+    res.json({ reapedCount: reaped.length, runs: reaped });
+  });
+
   router.get("/heartbeat-runs/:runId/events", async (req, res) => {
     const runId = req.params.runId as string;
     const run = await heartbeat.getRun(runId);

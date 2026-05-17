@@ -5,6 +5,7 @@ import type {
   MemoryHookExtractionMode,
   MemoryHookKind,
   MemoryHookRunMode,
+  MemoryInjectionMode,
   MemoryOperationStatus,
   MemoryOperationType,
   MemoryPrincipalType,
@@ -91,6 +92,7 @@ export interface MemoryProviderDescriptor {
 
 export interface MemoryHookPolicy {
   enabled: boolean;
+  injectionMode?: MemoryInjectionMode;
   extractionMode: MemoryHookExtractionMode;
   runMode: MemoryHookRunMode;
   harness: MemoryExtractionHarness;

@@ -5,6 +5,7 @@ import {
   MEMORY_HOOK_EXTRACTION_MODES,
   MEMORY_HOOK_KINDS,
   MEMORY_HOOK_RUN_MODES,
+  MEMORY_INJECTION_MODES,
   MEMORY_OPERATION_STATUSES,
   MEMORY_OPERATION_TYPES,
   MEMORY_PRINCIPAL_TYPES,
@@ -141,6 +142,7 @@ const queryBooleanSchema = z.preprocess((value) => {
 export const memoryHookPolicySchema = z
   .object({
     enabled: z.boolean().optional(),
+    injectionMode: z.enum(MEMORY_INJECTION_MODES).optional(),
     extractionMode: z.enum(MEMORY_HOOK_EXTRACTION_MODES).optional(),
     runMode: z.enum(MEMORY_HOOK_RUN_MODES).optional(),
     harness: z.enum(MEMORY_EXTRACTION_HARNESSES).optional(),

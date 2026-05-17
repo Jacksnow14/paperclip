@@ -57,13 +57,14 @@ import type {
   MemoryReview,
   MemoryReviewResult,
   MemoryResolvedBinding,
+  MemoryInjectionMode,
   MemoryScope,
   MemoryScopeType,
   MemorySensitivityLabel,
   MemorySourceRef,
   MemoryUsage,
 } from "@paperclipai/shared";
-import { createMemoryBindingSchema, memoryCorrectSchema, memoryHookPoliciesSchema, memoryPromoteSchema, memoryRefreshJobSchema, memoryRetentionSweepSchema, memoryReviewSchema, memoryRevokeSchema, memorySynthesisJobSchema, updateMemoryBindingSchema } from "@paperclipai/shared";
+import { MEMORY_INJECTION_MODES, createMemoryBindingSchema, memoryCorrectSchema, memoryHookPoliciesSchema, memoryPromoteSchema, memoryRefreshJobSchema, memoryRetentionSweepSchema, memoryReviewSchema, memoryRevokeSchema, memorySynthesisJobSchema, updateMemoryBindingSchema } from "@paperclipai/shared";
 import { z } from "zod";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { costService } from "./costs.js";
@@ -77,6 +78,7 @@ import {
   buildPostRunCaptureTrace,
   buildPreRunHydrateTrace,
   buildSkippedMemoryHookTrace,
+  buildThinIndexHydrateTrace,
   type MemoryHookTrace,
 } from "./memory-hook-trace.js";
 
@@ -157,6 +159,7 @@ const localBasicConfigSchema = z
     enableIssueCommentCapture: z.boolean().optional().default(false),
     enableIssueDocumentCapture: z.boolean().optional().default(true),
     maxHydrateSnippets: z.number().int().positive().max(10).optional().default(5),
+    injectionMode: z.enum(MEMORY_INJECTION_MODES).optional().default("thin_index"),
   })
   .strict();
 
@@ -196,6 +199,7 @@ const LOCAL_BASIC_PROVIDER: MemoryProviderDescriptor = {
       enableIssueCommentCapture: { type: "boolean", default: false },
       enableIssueDocumentCapture: { type: "boolean", default: true },
       maxHydrateSnippets: { type: "integer", minimum: 1, maximum: 10, default: 5 },
+      injectionMode: { type: "string", enum: ["thin_index", "top_k_facts"], default: "thin_index" },
       hookPolicies: {
         type: "object",
         description: "Optional per-hook extraction policy overrides.",
@@ -209,6 +213,7 @@ const LOCAL_BASIC_PROVIDER: MemoryProviderDescriptor = {
       enableIssueCommentCapture: false,
       enableIssueDocumentCapture: true,
       maxHydrateSnippets: 5,
+      injectionMode: "thin_index",
       hookPolicies: {
         issue_comment_capture: {
           enabled: false,
@@ -256,12 +261,24 @@ const LOCAL_BASIC_PROVIDER: MemoryProviderDescriptor = {
       {
         key: "maxHydrateSnippets",
         label: "Hydration snippets",
-        description: "Maximum snippets to include when hydrating prompts.",
+        description: "Maximum snippets to include when hydrating prompts (top_k_facts mode only).",
         input: "number",
         defaultValue: 5,
         suggestedValue: 5,
         min: 1,
         max: 10,
+      },
+      {
+        key: "injectionMode",
+        label: "Injection mode",
+        description: "thin_index: emit a lightweight scope pointer (saves tokens). top_k_facts: inject full memory snippets.",
+        input: "select",
+        defaultValue: "thin_index",
+        suggestedValue: "thin_index",
+        options: [
+          { value: "thin_index", label: "Thin index (default)" },
+          { value: "top_k_facts", label: "Top-K facts" },
+        ],
       },
     ],
     healthChecks: [
@@ -1576,6 +1593,14 @@ export function memoryService(
     return typeof raw === "number" && Number.isFinite(raw) && raw > 0
       ? Math.min(Math.max(Math.floor(raw), 1), 25)
       : 5;
+  }
+
+  function getInjectionMode(binding: BindingRow): MemoryInjectionMode {
+    if (binding.providerKey === LOCAL_BASIC_PROVIDER_KEY) {
+      return parseLocalBasicConfig(binding.config).injectionMode;
+    }
+    const policy = parseMemoryHookPolicies(binding.config)["pre_run_hydrate"];
+    return policy?.injectionMode ?? "thin_index";
   }
 
   async function captureWithHookPolicy(input: {
@@ -3253,6 +3278,47 @@ export function memoryService(
           }),
         };
       }
+
+      const injectionMode = getInjectionMode(resolved.binding);
+
+      if (injectionMode === "thin_index") {
+        const actor: ActorInfo = {
+          actorType: "agent",
+          actorId: input.agentId,
+          agentId: input.agentId,
+          userId: null,
+          runId: input.runId,
+        };
+        let count = 0;
+        if (!isPluginProvider(resolved.binding.providerKey)) {
+          const result = await countLocalBasic(
+            input.companyId,
+            {
+              bindingId: resolved.binding.id,
+              limit: 1,
+              includeDeleted: false,
+              includeRevoked: false,
+              includeExpired: false,
+              includeSuperseded: false,
+            },
+            actor,
+          );
+          count = result.count;
+        }
+        const countLabel = isPluginProvider(resolved.binding.providerKey)
+          ? "available"
+          : String(count);
+        const preamble = [
+          `<memory-index binding="${resolved.binding.key}" records="${countLabel}" mode="thin_index">`,
+          `Memory is available for this agent via explicit search.${!isPluginProvider(resolved.binding.providerKey) ? ` ${count} record${count === 1 ? "" : "s"} in scope.` : ""}`,
+          `</memory-index>`,
+        ].join("\n");
+        return {
+          preamble,
+          trace: buildThinIndexHydrateTrace(mapBinding(resolved.binding), preamble, count),
+        };
+      }
+
       const result = await service.query(
         input.companyId,
         {

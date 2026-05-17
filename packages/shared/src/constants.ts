@@ -469,6 +469,9 @@ export const MEMORY_HOOK_KINDS = [
 ] as const;
 export type MemoryHookKind = (typeof MEMORY_HOOK_KINDS)[number];
 
+export const MEMORY_INJECTION_MODES = ["thin_index", "top_k_facts"] as const;
+export type MemoryInjectionMode = (typeof MEMORY_INJECTION_MODES)[number];
+
 export const MEMORY_HOOK_EXTRACTION_MODES = [
   "raw_capture",
   "provider_managed",

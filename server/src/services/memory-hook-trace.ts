@@ -135,6 +135,25 @@ export function buildPreRunHydrateTrace(
   };
 }
 
+export function buildThinIndexHydrateTrace(
+  binding: Pick<MemoryBinding, "id" | "key" | "providerKey">,
+  preamble: string,
+  scopeRecordCount: number,
+): MemoryHookTrace {
+  return {
+    hookKind: "pre_run_hydrate",
+    action: "hydrate",
+    status: "hydrated",
+    reason: "thin_index",
+    binding: bindingTrace(binding),
+    operation: null,
+    recordCount: scopeRecordCount,
+    records: [],
+    preambleLength: preamble.length,
+    error: null,
+  };
+}
+
 export function buildPostRunCaptureTrace(
   binding: Pick<MemoryBinding, "id" | "key" | "providerKey">,
   result: MemoryCaptureResult,

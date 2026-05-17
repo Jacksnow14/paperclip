@@ -3,6 +3,7 @@ import { and, asc, desc, eq, gte, ilike, inArray, isNull, isNotNull, lte, or, sq
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  backgroundJobRuns,
   documents,
   heartbeatRuns,
   issueComments,
@@ -3756,6 +3757,102 @@ export function memoryService(
         summary: emptySynthesisSummary({ since, until }),
         candidateRecordIds: [],
       };
+    },
+
+    tickSynthesisSchedules: async (
+      now: Date,
+      options?: { maxAgeDays?: number },
+    ): Promise<{
+      scanned: number;
+      triggered: number;
+      skippedFresh: number;
+      skippedBusy: number;
+      errors: number;
+    }> => {
+      const maxAgeDays = options?.maxAgeDays ?? 7;
+      const staleBefore = new Date(now.getTime() - maxAgeDays * 24 * 60 * 60 * 1000);
+
+      const enabledBindings = await db
+        .select()
+        .from(memoryBindings)
+        .where(eq(memoryBindings.enabled, true));
+
+      let scanned = 0;
+      let triggered = 0;
+      let skippedFresh = 0;
+      let skippedBusy = 0;
+      let errors = 0;
+
+      for (const binding of enabledBindings) {
+        scanned += 1;
+        try {
+          const busy = await db
+            .select({ id: backgroundJobRuns.id })
+            .from(backgroundJobRuns)
+            .where(
+              and(
+                eq(backgroundJobRuns.companyId, binding.companyId),
+                eq(backgroundJobRuns.jobType, "memory_synthesis"),
+                inArray(backgroundJobRuns.status, ["queued", "running"]),
+              ),
+            )
+            .limit(1);
+          if (busy.length > 0) {
+            skippedBusy += 1;
+            continue;
+          }
+
+          const lastSucceededRows = await db
+            .select({ finishedAt: backgroundJobRuns.finishedAt })
+            .from(backgroundJobRuns)
+            .where(
+              and(
+                eq(backgroundJobRuns.companyId, binding.companyId),
+                eq(backgroundJobRuns.jobType, "memory_synthesis"),
+                eq(backgroundJobRuns.status, "succeeded"),
+                isNotNull(backgroundJobRuns.finishedAt),
+              ),
+            )
+            .orderBy(desc(backgroundJobRuns.finishedAt))
+            .limit(1);
+          const lastFinishedAt = lastSucceededRows[0]?.finishedAt ?? null;
+
+          if (lastFinishedAt && lastFinishedAt > staleBefore) {
+            skippedFresh += 1;
+            continue;
+          }
+
+          const synthesisRequest = memorySynthesisJobSchema.parse({
+            bindingId: binding.id,
+            trigger: "schedule",
+          });
+          await service.startSynthesisJob(
+            binding.companyId,
+            synthesisRequest,
+            {
+              actorType: "system",
+              actorId: "system:memory-synthesis-scheduler",
+              agentId: null,
+              userId: null,
+              runId: null,
+            },
+          );
+          triggered += 1;
+        } catch (err) {
+          errors += 1;
+          // Errors are surfaced via the caller's logger; per-binding failures
+          // must not stop the tick from scanning the rest.
+          if (typeof console !== "undefined" && typeof console.error === "function") {
+            console.error("memory synthesis tick failed for binding", {
+              bindingId: binding.id,
+              companyId: binding.companyId,
+              err: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+      }
+
+      return { scanned, triggered, skippedFresh, skippedBusy, errors };
     },
 
     preRunHydrate: async (input: {

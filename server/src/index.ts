@@ -32,6 +32,7 @@ import {
   feedbackService,
   heartbeatService,
   instanceSettingsService,
+  memoryService,
   reconcilePersistedRuntimeServicesOnStartup,
   routineService,
 } from "./services/index.js";
@@ -653,6 +654,7 @@ export async function startServer(): Promise<StartedServer> {
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any);
     const routines = routineService(db as any);
+    const memory = memoryService(db as any);
   
     // Reap orphaned running runs at startup while in-memory execution state is empty,
     // then resume any persisted queued runs that were waiting on the previous process.
@@ -693,6 +695,17 @@ export async function startServer(): Promise<StartedServer> {
         })
         .catch((err) => {
           logger.error({ err }, "routine scheduler tick failed");
+        });
+
+      void memory
+        .tickSynthesisSchedules(new Date())
+        .then((result) => {
+          if (result.triggered > 0 || result.errors > 0) {
+            logger.info({ ...result }, "memory synthesis tick enqueued runs");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "memory synthesis tick failed");
         });
   
       // Periodically reap orphaned runs (5-min staleness threshold) and make sure

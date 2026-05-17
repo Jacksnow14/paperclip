@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, type KeyboardEvent } from "react";
 import { Link, useSearchParams } from "@/lib/router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  MEMORY_PROMOTION_SCOPE_TYPES,
   MEMORY_RETENTION_STATES,
   MEMORY_REVIEW_STATES,
   MEMORY_SCOPE_TYPES,
@@ -11,6 +12,7 @@ import {
   type Issue,
   type MemoryListOperationsQuery,
   type MemoryListRecordsQuery,
+  type MemoryPromotionScopeType,
   type MemoryRecord,
   type MemoryRetentionState,
   type MemoryReviewState,
@@ -19,7 +21,7 @@ import {
   type MemorySourceKind,
   type Project,
 } from "@paperclipai/shared";
-import { AlertTriangle, Check, ChevronDown, Clipboard, Database, RotateCcw, SlidersHorizontal, Trash2, X } from "lucide-react";
+import { AlertTriangle, ArrowUpCircle, Check, ChevronDown, Clipboard, Database, RotateCcw, SlidersHorizontal, Trash2, X } from "lucide-react";
 import { agentsApi } from "../api/agents";
 import { issuesApi } from "../api/issues";
 import { memoryApi } from "../api/memory";
@@ -59,6 +61,15 @@ import { useCompany } from "../context/CompanyContext";
 import { useToast } from "../context/ToastContext";
 import { queryKeys } from "../lib/queryKeys";
 import { agentUrl, cn, formatDateTime, projectUrl, relativeTime } from "../lib/utils";
+
+const SCOPE_RANK: Record<MemoryScopeType, number> = {
+  run: 1, agent: 2, workspace: 3, project: 4, team: 5, org: 6,
+};
+
+function promotionTargets(scopeType: MemoryScopeType | null | undefined): MemoryPromotionScopeType[] {
+  const rank = SCOPE_RANK[scopeType ?? "org"] ?? 6;
+  return MEMORY_PROMOTION_SCOPE_TYPES.filter((t) => SCOPE_RANK[t as MemoryScopeType] > rank);
+}
 
 type MemoryFilters = {
   q: string;
@@ -225,12 +236,18 @@ function MemoryDetailSheet({
   const [revokeReason, setRevokeReason] = useState("");
   const [correctionContent, setCorrectionContent] = useState("");
   const [correctionReason, setCorrectionReason] = useState("");
+  const [promotionTargetScopeType, setPromotionTargetScopeType] = useState<MemoryPromotionScopeType | "">("");
+  const [promotionTargetScopeId, setPromotionTargetScopeId] = useState("");
+  const [promotionReason, setPromotionReason] = useState("");
 
   useEffect(() => {
     setReviewNote(record?.reviewNote ?? "");
     setRevokeReason("");
     setCorrectionContent(record?.content ?? "");
     setCorrectionReason("");
+    setPromotionTargetScopeType("");
+    setPromotionTargetScopeId("");
+    setPromotionReason("");
   }, [record]);
 
   const operationFilters = useMemo(() => detailOperationFilters(record), [record]);
@@ -309,6 +326,36 @@ function MemoryDetailSheet({
     },
   });
 
+  const promoteRecord = useMutation({
+    mutationFn: () => {
+      if (!record) throw new Error("No memory record selected");
+      if (!promotionTargetScopeType) throw new Error("Select a target scope");
+      if (!promotionReason.trim()) throw new Error("Promotion reason is required");
+      return memoryApi.promoteRecord(companyId, record.id, {
+        targetScope: {
+          scopeType: promotionTargetScopeType,
+          scopeId: promotionTargetScopeId.trim() || null,
+        },
+        reason: promotionReason.trim(),
+      });
+    },
+    onSuccess: async () => {
+      setPromotionTargetScopeType("");
+      setPromotionTargetScopeId("");
+      setPromotionReason("");
+      await invalidateMemory();
+      pushToast({ title: "Memory promoted", tone: "success" });
+      onClose();
+    },
+    onError: (error) => {
+      pushToast({
+        title: "Failed to promote memory",
+        body: error instanceof Error ? error.message : "Unknown error",
+        tone: "error",
+      });
+    },
+  });
+
   if (!record) {
     return (
       <Sheet open={false} onOpenChange={onClose}>
@@ -321,6 +368,15 @@ function MemoryDetailSheet({
   const agent = record.scope.agentId ? agentsById.get(record.scope.agentId) : null;
   const project = record.scope.projectId ? projectsById.get(record.scope.projectId) : null;
   const canMutate = record.retentionState === "active" && !record.revokedAt && !record.supersededByRecordId;
+  const validPromotionTargets = promotionTargets(record.scopeType);
+  const canPromote = canMutate && validPromotionTargets.length > 0;
+  const scopeIdRequired = promotionTargetScopeType && !["org"].includes(promotionTargetScopeType);
+  const canSubmitPromotion =
+    canPromote &&
+    Boolean(promotionTargetScopeType) &&
+    Boolean(promotionReason.trim()) &&
+    (!scopeIdRequired || Boolean(promotionTargetScopeId.trim())) &&
+    !promoteRecord.isPending;
   const sourceReference = [
     record.source?.kind ?? "memory",
     record.source?.issueId ? `issue:${record.source.issueId}` : null,
@@ -536,6 +592,58 @@ function MemoryDetailSheet({
               </Button>
             </div>
           </div>
+
+          {canPromote ? (
+            <div className="rounded-md border border-border px-4 py-4">
+              <div className="mb-1 text-sm font-medium">Promote</div>
+              <div className="mb-3 text-xs text-muted-foreground">
+                Widen this record to a broader scope. The original record is superseded.
+              </div>
+              <div className="space-y-2">
+                <Select
+                  value={promotionTargetScopeType}
+                  onValueChange={(v) => {
+                    setPromotionTargetScopeType(v as MemoryPromotionScopeType);
+                    setPromotionTargetScopeId("");
+                  }}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue placeholder="Select target scope…" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {validPromotionTargets.map((t) => (
+                      <SelectItem key={t} value={t}>
+                        {labelize(t)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {scopeIdRequired ? (
+                  <Input
+                    value={promotionTargetScopeId}
+                    onChange={(e) => setPromotionTargetScopeId(e.target.value)}
+                    placeholder={`${labelize(promotionTargetScopeType)} ID`}
+                  />
+                ) : null}
+                <div className="flex gap-2">
+                  <Input
+                    value={promotionReason}
+                    onChange={(e) => setPromotionReason(e.target.value)}
+                    placeholder="Promotion reason"
+                    className="flex-1"
+                  />
+                  <Button
+                    size="sm"
+                    disabled={!canSubmitPromotion}
+                    onClick={() => promoteRecord.mutate()}
+                  >
+                    <ArrowUpCircle className="mr-2 h-4 w-4" />
+                    Promote
+                  </Button>
+                </div>
+              </div>
+            </div>
+          ) : null}
 
           <div className="rounded-md border border-border px-4 py-4">
             <div className="mb-3 text-sm font-medium">Operations</div>

@@ -265,6 +265,7 @@ export {
   memoryForgetSchema,
   memoryRevokeSchema,
   memoryCorrectSchema,
+  MEMORY_PROMOTION_SCOPE_TYPES,
   memoryPromoteSchema,
   memoryPromoteTargetScopeSchema,
   memoryReviewSchema,

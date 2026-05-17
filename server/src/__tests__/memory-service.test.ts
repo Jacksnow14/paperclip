@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { companies, createDb } from "@paperclipai/db";
+import { agents, companies, createDb, memoryLocalRecords, memoryOperations, projects } from "@paperclipai/db";
 import type { MemoryListRecordsQuery } from "@paperclipai/shared";
 import { memoryService } from "../services/memory.js";
 import {
@@ -570,6 +570,12 @@ describeEmbeddedPostgres("memoryService local basic persistence", () => {
   }, 20_000);
 
   afterEach(async () => {
+    // Clear FK leaves first so companies/projects/agents can be deleted without constraint violations.
+    // memory_local_records and memory_operations reference projects/agents with ON DELETE NO ACTION.
+    await db.delete(memoryLocalRecords);
+    await db.delete(memoryOperations);
+    await db.delete(projects);
+    await db.delete(agents);
     await db.delete(companies);
   });
 
@@ -913,5 +919,184 @@ describeEmbeddedPostgres("memoryService local basic persistence", () => {
     const winner = records.find((r) => r.supersedesRecordId === originId);
     expect(winner).toBeDefined();
     expect(origin!.supersededByRecordId).toBe(winner!.id);
+  });
+
+  // AUR-949 Phase 1.6: project binding override takes precedence over company default.
+  it("resolves project binding override ahead of company default", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip Binding Override Test",
+      issuePrefix: `B${companyId.replace(/-/g, "").slice(0, 5).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({ id: projectId, companyId, name: "Override Test Project" });
+
+    const service = memoryService(db);
+
+    const companyBinding = await service.createBinding(companyId, {
+      key: "company-default-override",
+      name: "Company Default",
+      providerKey: "local_basic",
+      config: {},
+      enabled: true,
+    });
+    await service.setCompanyDefault(companyId, companyBinding.id);
+
+    const projectBinding = await service.createBinding(companyId, {
+      key: "project-override-binding",
+      name: "Project Override",
+      providerKey: "local_basic",
+      config: {},
+      enabled: true,
+    });
+    await service.setProjectOverride(projectId, projectBinding.id);
+
+    const resolved = await service.resolveBinding(companyId, { projectId });
+
+    expect(resolved.binding?.id).toBe(projectBinding.id);
+    expect(resolved.source).toBe("project_override");
+  });
+
+  // AUR-949 Phase 1.6: thin-index pre-run hydrate emits compact preamble, not full record content.
+  it("thin-index preRunHydrate preamble omits record content and includes mode tag", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip Thin Index Test",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 5).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Thin Index Test Agent" });
+
+    const service = memoryService(db);
+    const actor = {
+      actorType: "user" as const,
+      actorId: "board-user",
+      agentId: null,
+      userId: "board-user",
+      runId: null,
+    };
+
+    const binding = await service.createBinding(companyId, {
+      key: "local-thin-index",
+      name: "Local thin-index",
+      providerKey: "local_basic",
+      config: { injectionMode: "thin_index" },
+      enabled: true,
+    });
+    await service.setCompanyDefault(companyId, binding.id);
+
+    const secretContent = "ULTRA_SECRET_FACT_MUST_NOT_APPEAR_IN_THIN_INDEX_PREAMBLE";
+    await service.capture(
+      companyId,
+      {
+        bindingKey: "local-thin-index",
+        scope: { scopeType: "org", scopeId: companyId },
+        scopeType: "org",
+        scopeId: companyId,
+        source: { kind: "manual_note", externalRef: "thin-index-test" },
+        title: "Thin index test record",
+        content: secretContent,
+        reviewState: "accepted",
+      },
+      actor,
+    );
+
+    const result = await service.preRunHydrate({
+      companyId,
+      agentId,
+      runId,
+      query: "thin index test",
+    });
+
+    expect(result.preamble).not.toBeNull();
+    // Thin-index preamble must NOT contain the full record content.
+    expect(result.preamble).not.toContain(secretContent);
+    // Must include the thin_index mode tag so agents know to query explicitly.
+    expect(result.preamble).toContain('mode="thin_index"');
+  });
+
+  // AUR-949 Phase 1.6: agent→project→org promotion chain creates correct supersedence.
+  it("promotion chain agent→project→org supersedes each origin and widens scope", async () => {
+    const companyId = randomUUID();
+    const agentScopeId = randomUUID();
+    const projectScopeId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip Promotion Chain Test",
+      issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 5).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({ id: projectScopeId, companyId, name: "Promotion Target Project" });
+
+    const service = memoryService(db);
+    const actor = {
+      actorType: "user" as const,
+      actorId: "board-user",
+      agentId: null,
+      userId: "board-user",
+      runId: null,
+    };
+
+    const binding = await service.createBinding(companyId, {
+      key: "local-promote-chain",
+      name: "Local promote chain",
+      providerKey: "local_basic",
+      config: {},
+      enabled: true,
+    });
+    await service.setCompanyDefault(companyId, binding.id);
+
+    // Capture agent-scoped record.
+    const agentCapture = await service.capture(
+      companyId,
+      {
+        bindingKey: "local-promote-chain",
+        scope: { scopeType: "agent", scopeId: agentScopeId },
+        scopeType: "agent",
+        scopeId: agentScopeId,
+        source: { kind: "manual_note", externalRef: "promote-chain-test" },
+        title: "Agent fact",
+        content: "Fact captured at agent scope to be promoted twice.",
+        reviewState: "accepted",
+      },
+      actor,
+    );
+    const agentRecord = agentCapture.records[0];
+
+    // Step 1: promote agent → project (projectScopeId must exist in DB — inserted above).
+    const step1 = await service.promote(
+      companyId,
+      agentRecord.id,
+      { targetScope: { scopeType: "project", scopeId: projectScopeId }, reason: "Widen to project" },
+      actor,
+    );
+    expect(step1.promotedRecord.scope.scopeType).toBe("project");
+    expect(step1.promotedRecord.scope.scopeId).toBe(projectScopeId);
+    expect(step1.originalRecord.supersededByRecordId).toBe(step1.promotedRecord.id);
+
+    // Step 2: promote project record → org.
+    const step2 = await service.promote(
+      companyId,
+      step1.promotedRecord.id,
+      { targetScope: { scopeType: "org" }, reason: "Widen to org" },
+      actor,
+    );
+    expect(step2.promotedRecord.scope.scopeType).toBe("org");
+    expect(step2.originalRecord.supersededByRecordId).toBe(step2.promotedRecord.id);
+
+    // Verify the full chain via listRecords (includeSuperseded).
+    const all = await service.listRecords(companyId, { includeSuperseded: true, limit: 100 }, actor);
+    const chainIds = [agentRecord.id, step1.promotedRecord.id, step2.promotedRecord.id];
+    const chainRecords = chainIds.map((id) => all.find((r) => r.id === id));
+    expect(chainRecords.every(Boolean)).toBe(true);
+    expect(chainRecords[0]!.supersededByRecordId).toBe(step1.promotedRecord.id);
+    expect(chainRecords[1]!.supersededByRecordId).toBe(step2.promotedRecord.id);
+    expect(chainRecords[2]!.supersededByRecordId).toBeNull();
+    expect(chainRecords[2]!.scope.scopeType).toBe("org");
   });
 });

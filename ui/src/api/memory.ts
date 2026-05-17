@@ -7,6 +7,8 @@ import type {
   MemoryListOperationsQuery,
   MemoryListRecordsQuery,
   MemoryOperation,
+  MemoryPromote,
+  MemoryPromoteResult,
   MemoryProviderDescriptor,
   MemoryRecord,
   MemoryRecordCountResult,
@@ -74,6 +76,11 @@ export const memoryApi = {
   correctRecord: (companyId: string, recordId: string, data: MemoryCorrect) =>
     api.post<MemoryCorrectResult>(
       `/companies/${encodeURIComponent(companyId)}/memory/records/${encodeURIComponent(recordId)}/correct`,
+      data,
+    ),
+  promoteRecord: (companyId: string, recordId: string, data: MemoryPromote) =>
+    api.post<MemoryPromoteResult>(
+      `/companies/${encodeURIComponent(companyId)}/memory/records/${encodeURIComponent(recordId)}/promote`,
       data,
     ),
   reviewRecord: (companyId: string, recordId: string, data: MemoryReview) =>

@@ -1,10 +1,17 @@
-import { describe, expect, it } from "vitest";
+import { randomUUID } from "node:crypto";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { companies, createDb, memoryLocalRecords } from "@paperclipai/db";
 import {
   UnionFind,
   computeClusterId,
   jaccardSim,
+  memoryService,
   synthesisTokenize,
 } from "../services/memory.js";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
 
 describe("synthesisTokenize", () => {
   it("lowercases, strips punctuation, drops stopwords and 1-char tokens, dedupes", () => {
@@ -270,4 +277,271 @@ describe("deterministic clustering + quality gates (integration of pure helpers)
     expect(maxRank).toBe(2);
     expect(maxRank).toBeGreaterThan(1);
   });
+});
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+describeEmbeddedPostgres("memorySynthesis recentlyRejected anti-bounce gate (AUR-974)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase(
+      "paperclip-memory-synthesis-recently-rejected-",
+    );
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it(
+    "skips clusters whose clusterId matches an in-window rejected candidate and increments summary.skipped.recentlyRejected",
+    async () => {
+      const companyId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip Memory Synthesis Recently-Rejected",
+        issuePrefix: `R${companyId.replace(/-/g, "").slice(0, 5).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+
+      const service = memoryService(db);
+      const actor = {
+        actorType: "user" as const,
+        actorId: "board-user",
+        agentId: null,
+        userId: "board-user",
+        runId: null,
+      };
+
+      const binding = await service.createBinding(companyId, {
+        key: "synthesis-rr",
+        name: "Synthesis recently-rejected",
+        providerKey: "local_basic",
+        config: {},
+        enabled: true,
+      });
+      await service.setCompanyDefault(companyId, binding.id);
+
+      // Three agent-scope source records that share enough tokens to cluster
+      // together under the default similarity threshold (0.5) and that pass
+      // the support / distinct-agents / sensitivity / observation-age gates.
+      const sourceCreatedAt = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000);
+      const sources = [
+        {
+          id: randomUUID(),
+          actorId: "agent-a",
+          content: "Launch checklist lives in the issue document.",
+        },
+        {
+          id: randomUUID(),
+          actorId: "agent-b",
+          content: "Issue document contains the launch checklist.",
+        },
+        {
+          id: randomUUID(),
+          actorId: "agent-c",
+          content: "Launch checklist sits in the issue document.",
+        },
+      ];
+
+      for (const src of sources) {
+        await db.insert(memoryLocalRecords).values({
+          id: src.id,
+          companyId,
+          bindingId: binding.id,
+          providerKey: binding.providerKey,
+          scopeType: "agent",
+          scopeId: src.actorId,
+          sourceKind: "manual_note",
+          sourceExternalRef: `synthesis-rr-source-${src.actorId}`,
+          title: null,
+          content: src.content,
+          metadata: {},
+          ownerType: "agent",
+          ownerId: src.actorId,
+          createdByActorType: "agent",
+          createdByActorId: src.actorId,
+          sensitivityLabel: "internal",
+          retentionState: "active",
+          reviewState: "accepted",
+          createdAt: sourceCreatedAt,
+          updatedAt: sourceCreatedAt,
+        });
+      }
+
+      const clusterId = computeClusterId(sources.map((s) => s.id));
+
+      // A previously-rejected synthesis candidate sharing the same clusterId,
+      // created 7 days ago — comfortably inside the default 60-day window.
+      const rejectedAt = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      await db.insert(memoryLocalRecords).values({
+        id: randomUUID(),
+        companyId,
+        bindingId: binding.id,
+        providerKey: binding.providerKey,
+        scopeType: "org",
+        scopeId: companyId,
+        sourceKind: "manual_note",
+        sourceExternalRef: "synthesis-rr-prior-rejection",
+        title: "Previously rejected synthesis",
+        content: "Reviewer rejected this candidate; the gate must remember.",
+        metadata: {
+          kind: "synthesis_candidate",
+          synthesis: { clusterId, supportCount: 3 },
+        },
+        ownerType: "system",
+        ownerId: "memory.synthesis",
+        createdByActorType: "user",
+        createdByActorId: "board-user",
+        sensitivityLabel: "internal",
+        retentionState: "active",
+        reviewState: "rejected",
+        reviewedAt: rejectedAt,
+        reviewedByActorType: "user",
+        reviewedByActorId: "board-user",
+        reviewNote: "Not promoted; superseded by other guidance.",
+        createdAt: rejectedAt,
+        updatedAt: rejectedAt,
+      });
+
+      const result = await service.startSynthesisJob(
+        companyId,
+        {
+          bindingId: binding.id,
+          lookbackDays: 30,
+          minObservationAgeDays: 1,
+          rejectionLookbackDays: 60,
+        },
+        actor,
+        { runInline: true },
+      );
+
+      expect(result.summary.clusterCount).toBe(1);
+      expect(result.summary.candidateCount).toBe(0);
+      expect(result.summary.skipped.recentlyRejected).toBe(1);
+      expect(result.candidateRecordIds).toEqual([]);
+    },
+  );
+
+  it(
+    "still promotes the cluster when the rejection is older than rejectionLookbackDays",
+    async () => {
+      const companyId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip Memory Synthesis Stale Rejection",
+        issuePrefix: `S${companyId.replace(/-/g, "").slice(0, 5).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+
+      const service = memoryService(db);
+      const actor = {
+        actorType: "user" as const,
+        actorId: "board-user",
+        agentId: null,
+        userId: "board-user",
+        runId: null,
+      };
+
+      const binding = await service.createBinding(companyId, {
+        key: "synthesis-rr-stale",
+        name: "Synthesis stale rejection",
+        providerKey: "local_basic",
+        config: {},
+        enabled: true,
+      });
+      await service.setCompanyDefault(companyId, binding.id);
+
+      const sourceCreatedAt = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000);
+      const sources = [
+        { id: randomUUID(), actorId: "agent-a", content: "Launch checklist lives in the issue document." },
+        { id: randomUUID(), actorId: "agent-b", content: "Issue document contains the launch checklist." },
+        { id: randomUUID(), actorId: "agent-c", content: "Launch checklist sits in the issue document." },
+      ];
+
+      for (const src of sources) {
+        await db.insert(memoryLocalRecords).values({
+          id: src.id,
+          companyId,
+          bindingId: binding.id,
+          providerKey: binding.providerKey,
+          scopeType: "agent",
+          scopeId: src.actorId,
+          sourceKind: "manual_note",
+          sourceExternalRef: `synthesis-rr-stale-${src.actorId}`,
+          title: null,
+          content: src.content,
+          metadata: {},
+          ownerType: "agent",
+          ownerId: src.actorId,
+          createdByActorType: "agent",
+          createdByActorId: src.actorId,
+          sensitivityLabel: "internal",
+          retentionState: "active",
+          reviewState: "accepted",
+          createdAt: sourceCreatedAt,
+          updatedAt: sourceCreatedAt,
+        });
+      }
+
+      const clusterId = computeClusterId(sources.map((s) => s.id));
+
+      // Stale rejection: 120 days old, lookback 60 days — must NOT block.
+      const staleAt = new Date(Date.now() - 120 * 24 * 60 * 60 * 1000);
+      await db.insert(memoryLocalRecords).values({
+        id: randomUUID(),
+        companyId,
+        bindingId: binding.id,
+        providerKey: binding.providerKey,
+        scopeType: "org",
+        scopeId: companyId,
+        sourceKind: "manual_note",
+        sourceExternalRef: "synthesis-rr-stale-prior-rejection",
+        title: "Stale rejected synthesis",
+        content: "Old rejection that should no longer suppress promotion.",
+        metadata: {
+          kind: "synthesis_candidate",
+          synthesis: { clusterId, supportCount: 3 },
+        },
+        ownerType: "system",
+        ownerId: "memory.synthesis",
+        createdByActorType: "user",
+        createdByActorId: "board-user",
+        sensitivityLabel: "internal",
+        retentionState: "active",
+        reviewState: "rejected",
+        reviewedAt: staleAt,
+        reviewedByActorType: "user",
+        reviewedByActorId: "board-user",
+        reviewNote: "Old, out-of-window rejection.",
+        createdAt: staleAt,
+        updatedAt: staleAt,
+      });
+
+      const result = await service.startSynthesisJob(
+        companyId,
+        {
+          bindingId: binding.id,
+          lookbackDays: 30,
+          minObservationAgeDays: 1,
+          rejectionLookbackDays: 60,
+        },
+        actor,
+        { runInline: true },
+      );
+
+      expect(result.summary.clusterCount).toBe(1);
+      expect(result.summary.candidateCount).toBe(1);
+      expect(result.summary.skipped.recentlyRejected).toBe(0);
+      expect(result.candidateRecordIds).toHaveLength(1);
+    },
+  );
 });

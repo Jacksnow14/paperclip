@@ -2338,6 +2338,29 @@ export function memoryService(
       const memberIds = members.map((m) => m.id);
       const clusterId = computeClusterId(memberIds);
 
+      if (request.rejectionLookbackDays > 0) {
+        const rejectionCutoff = new Date(
+          promotedAt.getTime() - request.rejectionLookbackDays * 24 * 60 * 60 * 1000,
+        );
+        const recentRejection = await db
+          .select({ id: memoryLocalRecords.id })
+          .from(memoryLocalRecords)
+          .where(
+            and(
+              eq(memoryLocalRecords.companyId, companyId),
+              eq(memoryLocalRecords.bindingId, binding.id),
+              eq(memoryLocalRecords.reviewState, "rejected"),
+              gte(memoryLocalRecords.createdAt, rejectionCutoff),
+              sql`${memoryLocalRecords.metadata}->'synthesis'->>'clusterId' = ${clusterId}`,
+            ),
+          )
+          .limit(1);
+        if (recentRejection.length > 0) {
+          summary.skipped.recentlyRejected += 1;
+          continue;
+        }
+      }
+
       const tokenFrequency = new Map<string, number>();
       for (const set of memberTokens) {
         for (const t of set) tokenFrequency.set(t, (tokenFrequency.get(t) ?? 0) + 1);
@@ -3675,6 +3698,7 @@ export function memoryService(
             minDistinctAgents: parsed.minDistinctAgents,
             minObservationAgeDays: parsed.minObservationAgeDays,
             maxSensitivityLabel: parsed.maxSensitivityLabel,
+            rejectionLookbackDays: parsed.rejectionLookbackDays,
             sourceLimit: parsed.sourceLimit,
           },
           sourceIssueId: null,
@@ -3707,6 +3731,7 @@ export function memoryService(
             minDistinctAgents: parsed.minDistinctAgents,
             minObservationAgeDays: parsed.minObservationAgeDays,
             maxSensitivityLabel: parsed.maxSensitivityLabel,
+            rejectionLookbackDays: parsed.rejectionLookbackDays,
             sourceLimit: parsed.sourceLimit,
             dryRun: parsed.dryRun,
           },

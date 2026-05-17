@@ -2648,10 +2648,27 @@ export function memoryService(
           updatedAt: correctedAt,
         })
         .returning();
-      await db
+      // Race-safe: only mark the original as superseded if nothing else has
+      // claimed it. If a concurrent correct/promote already did, this returns
+      // 0 rows and we abort with 409 — matching the supersedence contract
+      // exercised by the AUR-965 correct-vs-promote race test.
+      const claimed = await db
         .update(memoryLocalRecords)
         .set({ supersededByRecordId: correctedRecordId, updatedAt: correctedAt })
-        .where(and(eq(memoryLocalRecords.companyId, companyId), eq(memoryLocalRecords.id, originalRow.id)));
+        .where(
+          and(
+            eq(memoryLocalRecords.companyId, companyId),
+            eq(memoryLocalRecords.id, originalRow.id),
+            isNull(memoryLocalRecords.supersededByRecordId),
+          ),
+        )
+        .returning({ id: memoryLocalRecords.id });
+      if (claimed.length === 0) {
+        await db
+          .delete(memoryLocalRecords)
+          .where(and(eq(memoryLocalRecords.companyId, companyId), eq(memoryLocalRecords.id, correctedRecordId)));
+        throw conflict("Memory record has already been corrected");
+      }
 
       const operation = await logOperation({
         id: operationId,

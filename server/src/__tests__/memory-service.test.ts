@@ -756,4 +756,162 @@ describeEmbeddedPostgres("memoryService local basic persistence", () => {
     );
     expect(omittedResult.promotedRecord.sensitivityLabel).toBe("confidential");
   });
+
+  // AUR-965: pinned error-code matrix for promote (404 / 409 / 422) and
+  // race coverage for correct vs promote on the same origin record.
+  it("pins promote error codes for missing, narrowing, cross-company, and race-against-correct cases", async () => {
+    const companyId = randomUUID();
+    const otherCompanyId = randomUUID();
+    await db.insert(companies).values([
+      {
+        id: companyId,
+        name: "Paperclip Promote Errors",
+        issuePrefix: `Q${companyId.replace(/-/g, "").slice(0, 5).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      },
+      {
+        id: otherCompanyId,
+        name: "Paperclip Promote Errors Other",
+        issuePrefix: `R${otherCompanyId.replace(/-/g, "").slice(0, 5).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      },
+    ]);
+
+    const service = memoryService(db);
+    const actor = {
+      actorType: "user" as const,
+      actorId: "board-user",
+      agentId: null,
+      userId: "board-user",
+      runId: null,
+    };
+    const binding = await service.createBinding(companyId, {
+      key: "local-promote-errors",
+      name: "Local promote errors",
+      providerKey: "local_basic",
+      config: {},
+      enabled: true,
+    });
+    await service.setCompanyDefault(companyId, binding.id);
+
+    // 404: promote a record id that does not exist
+    await expect(
+      service.promote(
+        companyId,
+        randomUUID(),
+        { targetScope: { scopeType: "org" }, reason: "missing" },
+        actor,
+      ),
+    ).rejects.toMatchObject({ status: 404, message: "Memory record not found" });
+
+    // 422: same-rank / narrowing — promote an org record to org
+    const orgRecord = await service.capture(
+      companyId,
+      {
+        bindingKey: "local-promote-errors",
+        scope: { scopeType: "org", scopeId: companyId },
+        scopeType: "org",
+        scopeId: companyId,
+        source: { kind: "manual_note", externalRef: "promote-rank-test" },
+        title: "Already org-wide",
+        content: "Already at the org scope; promotion target must strictly widen.",
+        reviewState: "accepted",
+      },
+      actor,
+    );
+    await expect(
+      service.promote(
+        companyId,
+        orgRecord.records[0].id,
+        { targetScope: { scopeType: "org" }, reason: "narrowing" },
+        actor,
+      ),
+    ).rejects.toMatchObject({
+      status: 422,
+      message: expect.stringContaining("must strictly widen"),
+    });
+
+    // 422: cross-company project scopeId — target a project that does not belong here
+    const agentScopeId = randomUUID();
+    const agentRecord = await service.capture(
+      companyId,
+      {
+        bindingKey: "local-promote-errors",
+        scope: { scopeType: "agent", scopeId: agentScopeId },
+        scopeType: "agent",
+        scopeId: agentScopeId,
+        source: { kind: "manual_note", externalRef: "promote-xcompany-test" },
+        title: "Cross-company target test",
+        content: "Record used for cross-company target validation.",
+        reviewState: "accepted",
+      },
+      actor,
+    );
+    await expect(
+      service.promote(
+        companyId,
+        agentRecord.records[0].id,
+        {
+          targetScope: { scopeType: "project", scopeId: randomUUID() },
+          reason: "cross-company target",
+        },
+        actor,
+      ),
+    ).rejects.toMatchObject({
+      status: 422,
+      message: expect.stringContaining("references a project outside this company"),
+    });
+
+    // Race coverage: correct + promote against the same origin record run
+    // concurrently — exactly one must succeed; the other must fail with 409
+    // and not corrupt the supersedence chain.
+    const raceRecord = await service.capture(
+      companyId,
+      {
+        bindingKey: "local-promote-errors",
+        scope: { scopeType: "agent", scopeId: agentScopeId },
+        scopeType: "agent",
+        scopeId: agentScopeId,
+        source: { kind: "manual_note", externalRef: "promote-race-test" },
+        title: "Race target",
+        content: "Origin record for the correct-vs-promote race assertion.",
+        reviewState: "accepted",
+      },
+      actor,
+    );
+    const originId = raceRecord.records[0].id;
+
+    const results = await Promise.allSettled([
+      service.promote(
+        companyId,
+        originId,
+        { targetScope: { scopeType: "org" }, reason: "race-promote" },
+        actor,
+      ),
+      service.correct(
+        companyId,
+        originId,
+        { content: "corrected content during race", reason: "race-correct" },
+        actor,
+      ),
+    ]);
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect((rejected[0] as PromiseRejectedResult).reason).toMatchObject({ status: 409 });
+
+    // Reload origin and ensure it points to exactly one successor — the winner's new record id.
+    const records = await service.listRecords(
+      companyId,
+      { includeSuperseded: true, limit: 100 },
+      actor,
+    );
+    const origin = records.find((r) => r.id === originId);
+    expect(origin).toBeDefined();
+    expect(origin!.supersededByRecordId).toBeTruthy();
+    const winner = records.find((r) => r.supersedesRecordId === originId);
+    expect(winner).toBeDefined();
+    expect(origin!.supersededByRecordId).toBe(winner!.id);
+  });
 });

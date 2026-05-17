@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gte, ilike, inArray, isNull, isNotNull, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -514,6 +514,81 @@ function buildMemoryPreamble(records: MemoryRecord[]) {
       return `${index + 1}. [${sourceLabel}] ${body}`;
     }),
   ].join("\n");
+}
+
+const SYNTHESIS_STOPWORDS = new Set<string>([
+  "a","an","and","are","as","at","be","by","for","from","has","have","he","her","his",
+  "i","in","is","it","its","of","on","or","she","that","the","their","then","there",
+  "these","they","this","to","was","we","were","will","with","you","your","but","not",
+  "if","into","do","does","did","also","than","such","just","can","could","should",
+  "would","may","might","our","us","one","two","more","most","other","some","any","all",
+  "over","when","what","which","who","whom","whose","how","why","where","been","being",
+  "had","because",
+]);
+
+function synthesisTokenize(text: string | null | undefined): Set<string> {
+  if (!text) return new Set();
+  const tokens: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of String(text)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]+/g, " ")
+    .split(/\s+/)) {
+    if (raw.length <= 1) continue;
+    if (SYNTHESIS_STOPWORDS.has(raw)) continue;
+    if (seen.has(raw)) continue;
+    seen.add(raw);
+    tokens.push(raw);
+    if (tokens.length >= 200) break;
+  }
+  return new Set(tokens);
+}
+
+function jaccardSim(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let intersect = 0;
+  const [small, large] = a.size <= b.size ? [a, b] : [b, a];
+  for (const t of small) if (large.has(t)) intersect += 1;
+  const union = a.size + b.size - intersect;
+  return union === 0 ? 0 : intersect / union;
+}
+
+function computeClusterId(recordIds: string[]): string {
+  const sorted = [...recordIds].sort();
+  return createHash("sha256").update(sorted.join("|")).digest("hex").slice(0, 16);
+}
+
+class UnionFind {
+  private parent: number[];
+  constructor(size: number) {
+    this.parent = Array.from({ length: size }, (_, i) => i);
+  }
+  find(x: number): number {
+    let root = x;
+    while (this.parent[root] !== root) root = this.parent[root];
+    let cur = x;
+    while (this.parent[cur] !== root) {
+      const next = this.parent[cur];
+      this.parent[cur] = root;
+      cur = next;
+    }
+    return root;
+  }
+  union(a: number, b: number) {
+    const ra = this.find(a);
+    const rb = this.find(b);
+    if (ra !== rb) this.parent[Math.max(ra, rb)] = Math.min(ra, rb);
+  }
+  groups(): Map<number, number[]> {
+    const out = new Map<number, number[]>();
+    for (let i = 0; i < this.parent.length; i++) {
+      const root = this.find(i);
+      const list = out.get(root) ?? [];
+      list.push(i);
+      out.set(root, list);
+    }
+    return out;
+  }
 }
 
 function scopeFromRow(row: {
@@ -2096,6 +2171,353 @@ export function memoryService(
     return { run, recordCount };
   }
 
+  function emptySynthesisSummary(window: { since: Date; until: Date }): MemorySynthesisRunSummary {
+    return {
+      lookbackWindow: { since: window.since.toISOString(), until: window.until.toISOString() },
+      sourceRecordCount: 0,
+      clusterCount: 0,
+      candidateCount: 0,
+      skipped: {
+        minSupport: 0,
+        minDistinctAgents: 0,
+        minObservationAge: 0,
+        maxSensitivity: 0,
+        recentlyRejected: 0,
+      },
+    };
+  }
+
+  async function resolveSynthesisBinding(
+    companyId: string,
+    request: MemorySynthesisJob,
+  ): Promise<BindingRow> {
+    if (request.bindingId) {
+      const row = await db
+        .select()
+        .from(memoryBindings)
+        .where(and(eq(memoryBindings.companyId, companyId), eq(memoryBindings.id, request.bindingId)))
+        .then((rows) => rows[0] ?? null);
+      if (!row) throw notFound("Memory binding not found");
+      return row;
+    }
+    if (request.bindingKey) {
+      const row = await db
+        .select()
+        .from(memoryBindings)
+        .where(and(eq(memoryBindings.companyId, companyId), eq(memoryBindings.key, request.bindingKey)))
+        .then((rows) => rows[0] ?? null);
+      if (!row) throw notFound(`Memory binding with key '${request.bindingKey}' not found`);
+      return row;
+    }
+    const rows = await db
+      .select()
+      .from(memoryBindings)
+      .where(and(eq(memoryBindings.companyId, companyId), eq(memoryBindings.enabled, true)))
+      .orderBy(desc(memoryBindings.createdAt))
+      .limit(1);
+    const row = rows[0] ?? null;
+    if (!row) throw notFound("No enabled memory binding configured for this company");
+    return row;
+  }
+
+  async function executeSynthesisJob(input: {
+    companyId: string;
+    runId: string;
+    binding: BindingRow;
+    request: MemorySynthesisJob;
+    window: { since: Date; until: Date };
+    actor: ActorInfo;
+  }): Promise<{
+    run: Awaited<ReturnType<typeof backgroundJobsSvc.getRun>>;
+    summary: MemorySynthesisRunSummary;
+    candidateRecordIds: string[];
+  }> {
+    await backgroundJobsSvc.startRun(input.runId);
+
+    const { companyId, runId, binding, request, window, actor } = input;
+    const maxSensitivityRank = SENSITIVITY_RANK[request.maxSensitivityLabel];
+
+    const sourceRows: RecordRow[] = await db
+      .select()
+      .from(memoryLocalRecords)
+      .where(
+        and(
+          eq(memoryLocalRecords.companyId, companyId),
+          eq(memoryLocalRecords.bindingId, binding.id),
+          inArray(memoryLocalRecords.scopeType, ["agent", "project"]),
+          eq(memoryLocalRecords.reviewState, "accepted"),
+          eq(memoryLocalRecords.retentionState, "active"),
+          isNull(memoryLocalRecords.deletedAt),
+          isNull(memoryLocalRecords.revokedAt),
+          isNull(memoryLocalRecords.supersededByRecordId),
+          gte(memoryLocalRecords.createdAt, window.since),
+        ),
+      )
+      .orderBy(asc(memoryLocalRecords.createdAt), asc(memoryLocalRecords.id))
+      .limit(request.sourceLimit);
+
+    const summary: MemorySynthesisRunSummary = {
+      lookbackWindow: { since: window.since.toISOString(), until: window.until.toISOString() },
+      sourceRecordCount: sourceRows.length,
+      clusterCount: 0,
+      candidateCount: 0,
+      skipped: {
+        minSupport: 0,
+        minDistinctAgents: 0,
+        minObservationAge: 0,
+        maxSensitivity: 0,
+        recentlyRejected: 0,
+      },
+    };
+    const candidateRecordIds: string[] = [];
+
+    if (sourceRows.length === 0) {
+      const run = await backgroundJobsSvc.completeRun(runId, {
+        status: "succeeded",
+        result: { dryRun: request.dryRun, summary, candidateRecordIds },
+      });
+      return { run, summary, candidateRecordIds };
+    }
+
+    const tokenSets = sourceRows.map((row) =>
+      synthesisTokenize(`${row.title ?? ""} ${row.content ?? ""}`),
+    );
+
+    const uf = new UnionFind(sourceRows.length);
+    for (let i = 0; i < sourceRows.length; i++) {
+      for (let j = i + 1; j < sourceRows.length; j++) {
+        if (jaccardSim(tokenSets[i], tokenSets[j]) >= request.similarityThreshold) {
+          uf.union(i, j);
+        }
+      }
+    }
+
+    const groups = [...uf.groups().values()];
+    summary.clusterCount = groups.length;
+
+    const minAgeMs = request.minObservationAgeDays * 24 * 60 * 60 * 1000;
+    const promotedAt = new Date();
+
+    for (const memberIndices of groups) {
+      const members = memberIndices.map((idx) => sourceRows[idx]);
+      const memberTokens = memberIndices.map((idx) => tokenSets[idx]);
+
+      if (members.length < request.minSupport) {
+        summary.skipped.minSupport += 1;
+        continue;
+      }
+
+      const distinctAgentIds = new Set(
+        members
+          .map((m) => m.scopeAgentId ?? m.createdByActorId)
+          .filter((v): v is string => Boolean(v)),
+      );
+      if (distinctAgentIds.size < request.minDistinctAgents) {
+        summary.skipped.minDistinctAgents += 1;
+        continue;
+      }
+
+      const oldestObservedAt = members.reduce(
+        (min, m) => (m.createdAt < min ? m.createdAt : min),
+        members[0].createdAt,
+      );
+      if (promotedAt.getTime() - oldestObservedAt.getTime() < minAgeMs) {
+        summary.skipped.minObservationAge += 1;
+        continue;
+      }
+
+      const maxRank = members.reduce(
+        (max, m) => Math.max(max, SENSITIVITY_RANK[m.sensitivityLabel ?? "internal"]),
+        0,
+      );
+      if (maxRank > maxSensitivityRank) {
+        summary.skipped.maxSensitivity += 1;
+        continue;
+      }
+
+      const memberIds = members.map((m) => m.id);
+      const clusterId = computeClusterId(memberIds);
+
+      const tokenFrequency = new Map<string, number>();
+      for (const set of memberTokens) {
+        for (const t of set) tokenFrequency.set(t, (tokenFrequency.get(t) ?? 0) + 1);
+      }
+      const sharedTokens = [...tokenFrequency.entries()]
+        .filter(([, count]) => count >= Math.max(2, Math.ceil(members.length / 2)))
+        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+        .slice(0, 12)
+        .map(([token]) => token);
+
+      const seed = members.reduce((best, m, idx) => {
+        const size = memberTokens[idx].size;
+        return size > best.size ? { size, row: m } : best;
+      }, { size: -1, row: members[0] });
+      const seedRow = seed.row;
+
+      const distinctProjectIds = new Set(
+        members.map((m) => m.scopeProjectId).filter((v): v is string => Boolean(v)),
+      );
+      const sensitivityLabel: MemorySensitivityLabel =
+        members.reduce(
+          (label, m) =>
+            SENSITIVITY_RANK[m.sensitivityLabel ?? "internal"] > SENSITIVITY_RANK[label]
+              ? (m.sensitivityLabel ?? "internal")
+              : label,
+          "public" as MemorySensitivityLabel,
+        );
+
+      await backgroundJobsSvc.appendEvent(runId, {
+        eventType: "checkpoint",
+        level: "info",
+        message: `Cluster ${clusterId} accepted (${members.length} records, ${distinctAgentIds.size} agents)`,
+        currentItem: clusterId,
+        details: {
+          clusterId,
+          supportCount: members.length,
+          distinctAgentIds: [...distinctAgentIds],
+          sharedTokens,
+        },
+      });
+
+      if (request.dryRun) {
+        summary.candidateCount += 1;
+        continue;
+      }
+
+      const synthesisMetadata = {
+        kind: "synthesis_candidate" as const,
+        synthesis: {
+          clusterId,
+          supportCount: members.length,
+          distinctAgentIds: [...distinctAgentIds],
+          distinctProjectIds: [...distinctProjectIds],
+          sharedTokens,
+          lookbackWindow: {
+            since: window.since.toISOString(),
+            until: window.until.toISOString(),
+          },
+          backgroundJobRunId: runId,
+        },
+      };
+
+      const candidateId = randomUUID();
+      const titleSnippet = sharedTokens.slice(0, 5).join(" ");
+      const title = titleSnippet
+        ? `Synthesis: ${titleSnippet}`
+        : seedRow.title ?? "Synthesis candidate";
+      const content =
+        `Synthesized from ${members.length} observations across ` +
+        `${distinctAgentIds.size} agent(s).\n\n${seedRow.content ?? ""}`;
+
+      const [insertedRow] = await db
+        .insert(memoryLocalRecords)
+        .values({
+          id: candidateId,
+          companyId,
+          bindingId: binding.id,
+          providerKey: binding.providerKey,
+          scopeAgentId: null,
+          scopeProjectId: null,
+          scopeIssueId: null,
+          scopeRunId: null,
+          scopeSubjectId: null,
+          scopeType: "org",
+          scopeId: companyId,
+          scopeWorkspaceId: null,
+          scopeTeamId: null,
+          sourceKind: seedRow.sourceKind,
+          sourceIssueId: seedRow.sourceIssueId,
+          sourceCommentId: seedRow.sourceCommentId,
+          sourceDocumentKey: seedRow.sourceDocumentKey,
+          sourceRunId: seedRow.sourceRunId,
+          sourceActivityId: seedRow.sourceActivityId,
+          sourceExternalRef: seedRow.sourceExternalRef,
+          title,
+          content,
+          summary: sharedTokens.slice(0, 8).join(" "),
+          metadata: synthesisMetadata,
+          ownerType: "system",
+          ownerId: "memory.synthesis",
+          createdByActorType: actor.actorType,
+          createdByActorId: actor.actorId,
+          sensitivityLabel,
+          retentionPolicy: null,
+          expiresAt: null,
+          retentionState: "active",
+          reviewState: "pending",
+          reviewedAt: null,
+          reviewedByActorType: null,
+          reviewedByActorId: null,
+          reviewNote: null,
+          citationJson: {
+            label: "Memory synthesis",
+            sourceTitle: title,
+            synthesisRunId: runId,
+            clusterId,
+            supportingRecordIds: memberIds,
+          },
+          createdByOperationId: null,
+          createdAt: promotedAt,
+          updatedAt: promotedAt,
+        })
+        .returning();
+
+      const operation = await logOperation({
+        companyId,
+        binding,
+        actor,
+        operationType: "review",
+        triggerKind: "manual",
+        scope: {
+          scopeType: "org",
+          scopeId: companyId,
+          agentId: null,
+          workspaceId: null,
+          projectId: null,
+          issueId: null,
+          runId: actor.runId ?? null,
+          teamId: null,
+          subjectId: null,
+          maxSensitivityLabel: sensitivityLabel,
+        },
+        source: null,
+        requestJson: {
+          backgroundJobRunId: runId,
+          clusterId,
+          supportingRecordIds: memberIds,
+        },
+        resultJson: {
+          candidateRecordId: candidateId,
+          clusterId,
+          supportCount: members.length,
+          distinctAgentIds: [...distinctAgentIds],
+          sharedTokens,
+        },
+        recordCount: 1,
+      });
+
+      await db
+        .update(memoryLocalRecords)
+        .set({ createdByOperationId: operation.id, updatedAt: promotedAt })
+        .where(
+          and(
+            eq(memoryLocalRecords.companyId, companyId),
+            eq(memoryLocalRecords.id, candidateId),
+          ),
+        );
+
+      candidateRecordIds.push(insertedRow?.id ?? candidateId);
+      summary.candidateCount += 1;
+    }
+
+    const run = await backgroundJobsSvc.completeRun(runId, {
+      status: "succeeded",
+      result: { dryRun: request.dryRun, summary, candidateRecordIds },
+    });
+
+    return { run, summary, candidateRecordIds };
+  }
+
   const service = {
     providers: async () => {
       const pluginProviders = pluginMemoryProviders?.listProviders() ?? [];
@@ -3226,18 +3648,114 @@ export function memoryService(
     },
 
     startSynthesisJob: async (
-      _companyId: string,
+      companyId: string,
       data: MemorySynthesisJob,
-      _actor: ActorInfo,
-      _options?: { runInline?: boolean },
+      actor: ActorInfo,
+      options?: { runInline?: boolean },
     ): Promise<MemorySynthesisJobResult> => {
-      memorySynthesisJobSchema.parse(data);
-      // Synthesis job orchestration is owned by a sibling phase (AUR-948).
-      // The executor (resolveSynthesisBinding / executeSynthesisJob /
-      // emptySynthesisSummary) lands with that work. This stub keeps the
-      // method signature wired so callers can be typechecked, and fails
-      // fast at runtime until the synthesis pipeline ships.
-      throw new Error("memory.startSynthesisJob not implemented yet (owned by AUR-948)");
+      const parsed = memorySynthesisJobSchema.parse(data);
+      const binding = await resolveSynthesisBinding(companyId, parsed);
+      const since = new Date(Date.now() - parsed.lookbackDays * 24 * 60 * 60 * 1000);
+      const until = new Date();
+
+      const job = await backgroundJobsSvc.createOrUpdateJob(
+        companyId,
+        {
+          key: "memory.synthesis",
+          jobType: "memory_synthesis",
+          displayName: "Memory synthesis",
+          description:
+            "Cluster agent/project-scope memory records into org-scope promotion candidates for human review.",
+          backendKind: "server_worker",
+          status: "active",
+          config: {
+            lookbackDays: parsed.lookbackDays,
+            similarityThreshold: parsed.similarityThreshold,
+            minSupport: parsed.minSupport,
+            minDistinctAgents: parsed.minDistinctAgents,
+            minObservationAgeDays: parsed.minObservationAgeDays,
+            maxSensitivityLabel: parsed.maxSensitivityLabel,
+            sourceLimit: parsed.sourceLimit,
+          },
+          sourceIssueId: null,
+          sourceProjectId: null,
+        },
+        {
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          userId: actor.userId,
+        },
+      );
+
+      const run = await backgroundJobsSvc.createRun(
+        companyId,
+        {
+          jobId: job.id,
+          trigger: parsed.trigger,
+          sourceIssueId: null,
+          sourceProjectId: null,
+          sourceAgentId: null,
+          heartbeatRunId: actor.runId ?? null,
+          totalItems: 0,
+          config: {
+            bindingId: binding.id,
+            bindingKey: binding.key,
+            lookbackWindow: { since: since.toISOString(), until: until.toISOString() },
+            similarityThreshold: parsed.similarityThreshold,
+            minSupport: parsed.minSupport,
+            minDistinctAgents: parsed.minDistinctAgents,
+            minObservationAgeDays: parsed.minObservationAgeDays,
+            maxSensitivityLabel: parsed.maxSensitivityLabel,
+            sourceLimit: parsed.sourceLimit,
+            dryRun: parsed.dryRun,
+          },
+        },
+        {
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          userId: actor.userId,
+        },
+      );
+
+      const execute = () =>
+        executeSynthesisJob({
+          companyId,
+          runId: run.id,
+          binding,
+          request: parsed,
+          window: { since, until },
+          actor,
+        });
+
+      if (options?.runInline || parsed.dryRun) {
+        const completed = await execute();
+        return {
+          job,
+          run: completed.run,
+          dryRun: parsed.dryRun,
+          bindingId: binding.id,
+          summary: completed.summary,
+          candidateRecordIds: completed.candidateRecordIds,
+        };
+      }
+
+      void execute().catch(async (error) => {
+        await backgroundJobsSvc.completeRun(run.id, {
+          status: "failed",
+          error: error instanceof Error ? error.message : String(error),
+        }).catch(() => undefined);
+      });
+
+      return {
+        job,
+        run,
+        dryRun: parsed.dryRun,
+        bindingId: binding.id,
+        summary: emptySynthesisSummary({ since, until }),
+        candidateRecordIds: [],
+      };
     },
 
     preRunHydrate: async (input: {

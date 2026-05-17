@@ -10,6 +10,7 @@ import {
   memoryListRecordsQuerySchema,
   memoryQuerySchema,
   memoryRefreshJobSchema,
+  memorySynthesisJobSchema,
   memoryRetentionSweepSchema,
   memoryReviewSchema,
   memoryRevokeSchema,
@@ -451,6 +452,34 @@ export function memoryRoutes(
     });
     res.status(202).json(result);
   });
+
+  router.post(
+    "/companies/:companyId/memory/synthesis-jobs",
+    validate(memorySynthesisJobSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertCompanyAccess(req, companyId);
+      assertBoard(req);
+      const result = await memory.startSynthesisJob(companyId, req.body, actorInfoFromReq(req));
+      const actor = getActorInfo(req);
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        action: "memory.synthesis_job_started",
+        entityType: "background_job_run",
+        entityId: result.run.id,
+        details: {
+          jobId: result.job.id,
+          bindingId: result.bindingId,
+          dryRun: result.dryRun,
+          summary: result.summary,
+        },
+      });
+      res.status(202).json(result);
+    },
+  );
 
   return router;
 }

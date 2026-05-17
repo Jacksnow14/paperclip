@@ -5836,7 +5836,11 @@ export function heartbeatService(
 
     runningProcesses.delete(run.id);
     await finalizeAgentStatus(run.agentId, "cancelled");
-    await startNextQueuedRunForAgent(run.agentId);
+    // Schedule outside the current call stack so that callers inside
+    // withAgentStartLock (e.g. claimQueuedRun guards) don't re-enter the lock.
+    void startNextQueuedRunForAgent(run.agentId).catch((err) => {
+      logger.error({ err, agentId: run.agentId }, "startNextQueuedRunForAgent failed after cancel");
+    });
     return cancelled;
   }
 
@@ -6204,7 +6208,7 @@ export function heartbeatService(
       return { checked, enqueued, skipped };
     },
 
-    cancelRun: (runId: string) => cancelRunInternal(runId),
+    cancelRun: (runId: string, reason?: string) => cancelRunInternal(runId, reason),
 
     cancelActiveForAgent: (agentId: string) => cancelActiveForAgentInternal(agentId),
 

@@ -2903,6 +2903,36 @@ export function agentRoutes(
     res.json({ ok: true });
   });
 
+  router.get("/agents/:id/wakeup-requests", async (req, res) => {
+    const id = req.params.id as string;
+    const agent = await svc.getById(id);
+    if (!agent) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    assertCompanyAccess(req, agent.companyId);
+
+    const limitParam = req.query.limit as string | undefined;
+    const limit = limitParam ? Math.max(1, Math.min(500, parseInt(limitParam, 10) || 50)) : 50;
+    const requests = await heartbeat.listWakeupRequests(id, limit);
+    res.json(requests);
+  });
+
+  router.get("/agents/:id/runs", async (req, res) => {
+    const id = req.params.id as string;
+    const agent = await svc.getById(id);
+    if (!agent) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    assertCompanyAccess(req, agent.companyId);
+
+    const limitParam = req.query.limit as string | undefined;
+    const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10) || 50)) : 50;
+    const runs = await heartbeat.list(agent.companyId, id, limit);
+    res.json(redactCurrentUserValue(runs, await getCurrentUserRedactionOptions()));
+  });
+
   // Shared handler body for the wakeup-style endpoints. The two routes differ
   // only in:
   //  - `source` — the modern /wakeup endpoint reads it from the request body

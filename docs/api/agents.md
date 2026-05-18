@@ -117,6 +117,44 @@ POST /api/agents/{agentId}/heartbeat/invoke
 
 Manually triggers a heartbeat for the agent.
 
+## List Heartbeat Runs (per agent)
+
+```
+GET /api/agents/{agentId}/runs?limit=50
+```
+
+Returns the most recent heartbeat runs for a specific agent, newest first.
+`limit` defaults to `50`, clamped to `[1, 1000]`.
+
+Convenience wrapper over `GET /api/companies/{companyId}/heartbeat-runs?agentId={agentId}`
+that does not require the caller to know the company id ahead of time. Same row shape
+as the company-scoped list. Use the company-scoped route when you need to mix runs from
+multiple agents in one query.
+
+## List Wakeup Requests (per agent)
+
+```
+GET /api/agents/{agentId}/wakeup-requests?limit=50
+```
+
+Returns the most recent wakeup requests for the agent, newest first. Includes requests
+that were **skipped** (e.g. `status=skipped` with `reason=wakeup_skipped`), so callers
+can diagnose why an agent isn't picking up wakes without log spelunking.
+`limit` defaults to `50`, clamped to `[1, 500]`.
+
+Each row carries:
+
+- `status` — `queued`, `claimed`, `promoted`, `completed`, `skipped`, `deferred_issue_execution`, `cancelled`, `failed`
+- `source` — `timer`, `assignment`, `on_demand`, `automation`, etc.
+- `triggerDetail` / `reason` — free-form labels explaining why the wake fired or was skipped
+- `runId` — heartbeat run id if the wake was promoted to a run, otherwise `null`
+- `coalescedCount` — how many subsequent wake requests were folded into this one
+- `requestedAt` / `claimedAt` / `finishedAt` — lifecycle timestamps
+
+This is the canonical endpoint used by the agent detail page's "Recent Wake Requests"
+panel. Pair it with `GET /api/agents/{agentId}/runs` when diagnosing whether an agent
+is awake and making progress on its work.
+
 ## Org Chart
 
 ```

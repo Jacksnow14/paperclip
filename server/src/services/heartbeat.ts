@@ -9489,6 +9489,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   return {
+    listWakeupRequests: async (agentId: string, limit = 50) => {
+      const clamped = Math.max(1, Math.min(500, Math.floor(limit) || 50));
+      return db
+        .select({
+          id: agentWakeupRequests.id,
+          companyId: agentWakeupRequests.companyId,
+          agentId: agentWakeupRequests.agentId,
+          source: agentWakeupRequests.source,
+          triggerDetail: agentWakeupRequests.triggerDetail,
+          reason: agentWakeupRequests.reason,
+          status: agentWakeupRequests.status,
+          coalescedCount: agentWakeupRequests.coalescedCount,
+          requestedByActorType: agentWakeupRequests.requestedByActorType,
+          requestedByActorId: agentWakeupRequests.requestedByActorId,
+          runId: agentWakeupRequests.runId,
+          requestedAt: agentWakeupRequests.requestedAt,
+          claimedAt: agentWakeupRequests.claimedAt,
+          finishedAt: agentWakeupRequests.finishedAt,
+          error: agentWakeupRequests.error,
+        })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId))
+        .orderBy(desc(agentWakeupRequests.requestedAt))
+        .limit(clamped);
+    },
+
     list: async (companyId: string, agentId?: string, limit?: number) => {
       const safeForLegacyEncoding = await hasUnsafeTextProjectionDatabase();
       const query = db

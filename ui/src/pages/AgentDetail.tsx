@@ -1248,6 +1248,85 @@ function LatestRunCard({ runs, agentId }: { runs: HeartbeatRun[]; agentId: strin
   );
 }
 
+/* ---- Recent Wake Requests Card ---- */
+
+const wakeupStatusTone: Record<string, string> = {
+  queued: "bg-muted text-muted-foreground",
+  claimed: "bg-cyan-100 text-cyan-700 dark:bg-cyan-900/50 dark:text-cyan-300",
+  promoted: "bg-cyan-100 text-cyan-700 dark:bg-cyan-900/50 dark:text-cyan-300",
+  completed: "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/50 dark:text-emerald-300",
+  skipped: "bg-amber-100 text-amber-700 dark:bg-amber-900/50 dark:text-amber-300",
+  deferred_issue_execution: "bg-amber-100 text-amber-700 dark:bg-amber-900/50 dark:text-amber-300",
+  cancelled: "bg-muted text-muted-foreground",
+  failed: "bg-rose-100 text-rose-700 dark:bg-rose-900/50 dark:text-rose-300",
+};
+
+function WakeupRequestsCard({ agentId, agentRouteId }: { agentId: string; agentRouteId: string }) {
+  const { data: requests } = useQuery({
+    queryKey: queryKeys.agents.wakeupRequests(agentId),
+    queryFn: () => agentsApi.wakeupRequests(agentId, 20),
+    refetchInterval: 15_000,
+  });
+
+  if (!requests || requests.length === 0) {
+    return (
+      <div className="space-y-3">
+        <h3 className="text-sm font-medium">Recent Wake Requests</h3>
+        <p className="text-sm text-muted-foreground">No wake requests recorded yet.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-medium">Recent Wake Requests</h3>
+        <span className="text-xs text-muted-foreground">last 20</span>
+      </div>
+      <div className="border border-border rounded-lg overflow-hidden">
+        {requests.map((req) => {
+          const tone = wakeupStatusTone[req.status] ?? "bg-muted text-muted-foreground";
+          const detail = req.reason ?? req.triggerDetail ?? req.error ?? null;
+          return (
+            <div
+              key={req.id}
+              className="flex items-center gap-3 px-3 py-2 border-b border-border last:border-b-0 text-xs"
+            >
+              <span
+                className={cn(
+                  "inline-flex items-center rounded-full px-1.5 py-0.5 font-medium",
+                  tone,
+                )}
+              >
+                {req.status}
+              </span>
+              <span className="font-mono text-muted-foreground">{req.source}</span>
+              {detail && (
+                <span className="truncate text-muted-foreground" title={detail}>
+                  {detail}
+                </span>
+              )}
+              {req.runId && (
+                <Link
+                  to={`/agents/${agentRouteId}/runs/${req.runId}`}
+                  className="ml-auto shrink-0 text-muted-foreground hover:text-foreground no-underline"
+                >
+                  run {req.runId.slice(0, 8)} &rarr;
+                </Link>
+              )}
+              {!req.runId && (
+                <span className="ml-auto shrink-0 text-muted-foreground">
+                  {relativeTime(new Date(req.requestedAt))}
+                </span>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 /* ---- Agent Overview (main single-page view) ---- */
 
 function AgentOverview({
@@ -1269,6 +1348,9 @@ function AgentOverview({
     <div className="space-y-8">
       {/* Latest Run */}
       <LatestRunCard runs={runs} agentId={agentRouteId} />
+
+      {/* Recent Wake Requests (incl. skipped) */}
+      <WakeupRequestsCard agentId={agentId} agentRouteId={agentRouteId} />
 
       {/* Charts */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">

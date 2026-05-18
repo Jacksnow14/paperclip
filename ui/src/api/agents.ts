@@ -196,7 +196,29 @@ export const agentsApi = {
     api.post<ClaudeLoginResult>(agentPath(id, companyId, "/claude-login"), {}),
   availableSkills: () =>
     api.get<{ skills: AvailableSkill[] }>("/skills/available"),
+  wakeupRequests: (id: string, limit = 50, companyId?: string) =>
+    api.get<AgentWakeupRequest[]>(agentPath(id, companyId, `/wakeup-requests?limit=${limit}`)),
+  runs: (id: string, limit = 50, companyId?: string) =>
+    api.get<HeartbeatRun[]>(agentPath(id, companyId, `/runs?limit=${limit}`)),
 };
+
+export interface AgentWakeupRequest {
+  id: string;
+  companyId: string;
+  agentId: string;
+  source: string;
+  triggerDetail: string | null;
+  reason: string | null;
+  status: string;
+  coalescedCount: number;
+  requestedByActorType: string | null;
+  requestedByActorId: string | null;
+  runId: string | null;
+  requestedAt: string;
+  claimedAt: string | null;
+  finishedAt: string | null;
+  error: string | null;
+}
 
 export interface AvailableSkill {
   name: string;

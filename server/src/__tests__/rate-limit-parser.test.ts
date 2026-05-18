@@ -17,6 +17,13 @@ describe("isRateLimitError", () => {
     expect(isRateLimitError("server returned RateLimit error")).toBe(true);
   });
 
+  it("matches Claude 'hit your limit' phrasing", () => {
+    expect(isRateLimitError("You've hit your limit · resets 1am (UTC)")).toBe(true);
+    expect(isRateLimitError("You've hit the limit for today")).toBe(true);
+    expect(isRateLimitError("You have reached your limit")).toBe(true);
+    expect(isRateLimitError("Usage exceeded your limit")).toBe(true);
+  });
+
   it("returns false for unrelated errors", () => {
     expect(isRateLimitError("ECONNREFUSED")).toBe(false);
     expect(isRateLimitError("session expired")).toBe(false);
@@ -64,6 +71,21 @@ describe("parseRateLimitResetTime", () => {
   it("parses ISO 8601 reset timestamps", () => {
     const t = parseRateLimitResetTime("rate limit: reset 2026-05-17T11:00:00Z", now);
     expect(t?.toISOString()).toBe("2026-05-17T11:00:00.000Z");
+  });
+
+  it("parses 'resets Ham (TZ)' bare-hour format", () => {
+    const t = parseRateLimitResetTime("You've hit your limit · resets 1am (UTC)", now);
+    expect(t?.toISOString()).toBe("2026-05-18T01:00:00.000Z");
+  });
+
+  it("parses 'resets HH:MM' with colon format", () => {
+    const t = parseRateLimitResetTime("resets 14:30 (UTC)", now);
+    expect(t?.toISOString()).toBe("2026-05-17T14:30:00.000Z");
+  });
+
+  it("parses 'reset 3pm' bare-hour pm format", () => {
+    const t = parseRateLimitResetTime("reset 3pm", now);
+    expect(t?.toISOString()).toBe("2026-05-17T15:00:00.000Z");
   });
 
   it("ignores rate-limit phrases without a numeric reset hint", () => {

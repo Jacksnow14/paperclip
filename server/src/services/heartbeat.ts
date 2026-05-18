@@ -3954,7 +3954,7 @@ export function heartbeatService(
         continue;
       }
 
-      const retryAfter = new Date(now.getTime() + 2 * 60 * 1000);
+      const retryAfter = parseRateLimitResetTime(latestRun.error, now) ?? computeBackoffRetryAfter(0, now);
       const updated = await issuesSvc.update(issue.id, {
         retryAfter,
         rateLimitRetryCount: 1,
@@ -3963,6 +3963,13 @@ export function heartbeatService(
         result.skipped += 1;
         continue;
       }
+
+      const agentName = (await getAgent(issue.assigneeAgentId!))?.name ?? "unknown";
+      await issuesSvc.addComment(
+        issue.id,
+        `watchdog ${now.toISOString()} — agent ${agentName} hit rate limits, wake scheduled at ${retryAfter.toISOString()}.`,
+        {},
+      );
 
       await logActivity(db, {
         companyId: issue.companyId,

@@ -10,6 +10,10 @@ const RATE_LIMIT_KEYWORDS = [
   "try again in",
   "retry after",
   "retry-after",
+  "hit your limit",
+  "hit the limit",
+  "reached your limit",
+  "exceeded your limit",
 ] as const;
 
 const BACKOFF_BASE_MS = 5 * 60 * 1000;
@@ -60,12 +64,19 @@ export function parseRateLimitResetTime(
     }
   }
 
-  const clockMatch = lower.match(
-    /try again at\s+(\d{1,2}):(\d{2})(?:\s*(am|pm))?(?:\s*\(?\s*([a-z+\-0-9_/]+))?/,
-  );
+  const clockMatch =
+    lower.match(
+      /try again at\s+(\d{1,2}):(\d{2})(?:\s*(am|pm))?(?:\s*\(?\s*([a-z+\-0-9_/]+))?/,
+    ) ??
+    lower.match(
+      /resets?\s+(\d{1,2}):(\d{2})(?:\s*(am|pm))?(?:\s*\(?\s*([a-z+\-0-9_/]+))?/,
+    ) ??
+    lower.match(
+      /resets?\s+(\d{1,2})()(am|pm)(?:\s*\(?\s*([a-z+\-0-9_/]+))?/,
+    );
   if (clockMatch) {
     const hourRaw = parseInt(clockMatch[1]!, 10);
-    const minute = parseInt(clockMatch[2]!, 10);
+    const minute = clockMatch[2] ? parseInt(clockMatch[2], 10) : 0;
     const ampm = clockMatch[3];
     if (
       Number.isFinite(hourRaw) &&

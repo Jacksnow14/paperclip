@@ -748,6 +748,12 @@ export async function startServer(): Promise<StartedServer> {
           }
         })
         .then(async () => {
+          const backfilled = await heartbeat.backfillStuckRateLimitedIssues();
+          if (backfilled.scheduled > 0) {
+            logger.warn({ ...backfilled }, "periodic backfill scheduled retry windows for stuck rate-limited blocked issues");
+          }
+        })
+        .then(async () => {
           const resumed = await heartbeat.reconcileBlockedRetryableIssues();
           if (resumed.resumed > 0) {
             logger.warn({ ...resumed }, "periodic blocked-retry reconciliation resumed rate-limited issues");

@@ -24,6 +24,7 @@ import { validate } from "../middleware/validate.js";
 import { forbidden, notFound } from "../errors.js";
 import { agentService, logActivity, memoryService, projectService } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
+import type { Request } from "express";
 
 function actorInfoFromReq(req: any) {
   if (req.actor.type === "agent") {
@@ -58,6 +59,17 @@ export function memoryRoutes(
   const agentsSvc = agentService(db);
   const projectsSvc = projectService(db);
 
+  async function assertBoardOrCompanyExec(req: Request, companyId: string) {
+    if (req.actor.type === "board") return;
+    if (req.actor.type === "agent" && req.actor.agentId) {
+      const agent = await agentsSvc.getById(req.actor.agentId);
+      if (agent && agent.companyId === companyId && (agent.role === "ceo" || agent.role === "cto")) {
+        return;
+      }
+    }
+    throw forbidden("Board or company executive access required");
+  }
+
   router.get("/companies/:companyId/memory/providers", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
@@ -79,7 +91,7 @@ export function memoryRoutes(
   router.post("/companies/:companyId/memory/bindings", validate(createMemoryBindingSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    assertBoard(req);
+    await assertBoardOrCompanyExec(req, companyId);
     const binding = await memory.createBinding(companyId, req.body);
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -101,11 +113,11 @@ export function memoryRoutes(
   });
 
   router.patch("/memory/bindings/:bindingId", validate(updateMemoryBindingSchema), async (req, res) => {
-    assertBoard(req);
     const bindingId = req.params.bindingId as string;
     const existing = await memory.getBindingById(bindingId);
     if (!existing) throw notFound("Memory binding not found");
     assertCompanyAccess(req, existing.companyId);
+    await assertBoardOrCompanyExec(req, existing.companyId);
     const binding = await memory.updateBinding(bindingId, req.body);
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -128,7 +140,7 @@ export function memoryRoutes(
   router.put("/companies/:companyId/memory/default-binding", validate(setCompanyMemoryBindingSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    assertBoard(req);
+    await assertBoardOrCompanyExec(req, companyId);
     const target = await memory.setCompanyDefault(companyId, req.body.bindingId);
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -160,7 +172,7 @@ export function memoryRoutes(
     const agent = await agentsSvc.getById(agentId);
     if (!agent) throw notFound("Agent not found");
     assertCompanyAccess(req, agent.companyId);
-    assertBoard(req);
+    await assertBoardOrCompanyExec(req, agent.companyId);
     const target = await memory.setAgentOverride(agent.id, req.body.bindingId);
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -191,7 +203,7 @@ export function memoryRoutes(
     const project = await projectsSvc.getById(projectId);
     if (!project) throw notFound("Project not found");
     assertCompanyAccess(req, project.companyId);
-    assertBoard(req);
+    await assertBoardOrCompanyExec(req, project.companyId);
     const target = await memory.setProjectOverride(project.id, req.body.bindingId);
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -396,7 +408,7 @@ export function memoryRoutes(
   router.post("/companies/:companyId/memory/retention/sweep", validate(memoryRetentionSweepSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    assertBoard(req);
+    await assertBoardOrCompanyExec(req, companyId);
     const result = await memory.sweepRetention(companyId, req.body, actorInfoFromReq(req));
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -417,7 +429,7 @@ export function memoryRoutes(
   router.get("/companies/:companyId/memory/operations", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    assertBoard(req);
+    await assertBoardOrCompanyExec(req, companyId);
     const parsed = memoryListOperationsQuerySchema.parse(req.query);
     res.json(await memory.listOperations(companyId, parsed));
   });
@@ -425,7 +437,7 @@ export function memoryRoutes(
   router.get("/companies/:companyId/memory/extraction-jobs", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    assertBoard(req);
+    await assertBoardOrCompanyExec(req, companyId);
     const parsed = memoryListExtractionJobsQuerySchema.parse(req.query);
     res.json(await memory.listExtractionJobs(companyId, parsed));
   });
@@ -433,7 +445,7 @@ export function memoryRoutes(
   router.post("/companies/:companyId/memory/refresh-jobs", validate(memoryRefreshJobSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    assertBoard(req);
+    await assertBoardOrCompanyExec(req, companyId);
     const result = await memory.startRefreshJob(companyId, req.body, actorInfoFromReq(req));
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -459,7 +471,7 @@ export function memoryRoutes(
     async (req, res) => {
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
-      assertBoard(req);
+      await assertBoardOrCompanyExec(req, companyId);
       const result = await memory.startSynthesisJob(companyId, req.body, actorInfoFromReq(req));
       const actor = getActorInfo(req);
       await logActivity(db, {

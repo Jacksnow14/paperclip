@@ -161,6 +161,7 @@ const localBasicConfigSchema = z
     enableIssueDocumentCapture: z.boolean().optional().default(true),
     maxHydrateSnippets: z.number().int().positive().max(10).optional().default(5),
     injectionMode: z.enum(MEMORY_INJECTION_MODES).optional().default("thin_index"),
+    maxCapturesPerDayPerTarget: z.number().int().nonnegative().optional().default(20),
   })
   .strict();
 
@@ -201,6 +202,7 @@ const LOCAL_BASIC_PROVIDER: MemoryProviderDescriptor = {
       enableIssueDocumentCapture: { type: "boolean", default: true },
       maxHydrateSnippets: { type: "integer", minimum: 1, maximum: 10, default: 5 },
       injectionMode: { type: "string", enum: ["thin_index", "top_k_facts"], default: "thin_index" },
+      maxCapturesPerDayPerTarget: { type: "integer", minimum: 0, default: 20 },
       hookPolicies: {
         type: "object",
         description: "Optional per-hook extraction policy overrides.",
@@ -280,6 +282,15 @@ const LOCAL_BASIC_PROVIDER: MemoryProviderDescriptor = {
           { value: "thin_index", label: "Thin index (default)" },
           { value: "top_k_facts", label: "Top-K facts" },
         ],
+      },
+      {
+        key: "maxCapturesPerDayPerTarget",
+        label: "Max captures/day",
+        description: "Daily capture limit per binding target. 0 = unlimited.",
+        input: "number",
+        defaultValue: 20,
+        suggestedValue: 20,
+        min: 0,
       },
     ],
     healthChecks: [
@@ -1698,6 +1709,34 @@ export function memoryService(
     if (!policy.enabled) return null;
     assertHookPolicySupported(input.binding, policy);
 
+    // AC3: per-target daily capture rate cap
+    if (input.binding.providerKey === LOCAL_BASIC_PROVIDER_KEY) {
+      const cfg = parseLocalBasicConfig(input.binding.config);
+      const cap = cfg.maxCapturesPerDayPerTarget;
+      if (cap > 0) {
+        const startOfDay = new Date();
+        startOfDay.setUTCHours(0, 0, 0, 0);
+        const [capRow] = await db
+          .select({ count: sql<number>`count(*)::int` })
+          .from(memoryOperations)
+          .where(
+            and(
+              eq(memoryOperations.bindingId, input.binding.id),
+              eq(memoryOperations.operationType, "capture"),
+              eq(memoryOperations.status, "succeeded"),
+              gte(memoryOperations.createdAt, startOfDay),
+            ),
+          );
+        const todayCount = Number(capRow?.count ?? 0);
+        if (todayCount >= cap) {
+          console.log(
+            `[paperclip:memory] capture dropped by rate cap; binding=${input.binding.id} cap=${cap} today=${todayCount} hook=${input.hookKind}`,
+          );
+          return null;
+        }
+      }
+    }
+
     if (policy.extractionMode === "raw_capture") {
       return {
         result: await service.capture(
@@ -2890,6 +2929,7 @@ export function memoryService(
         resultJson: {
           recordIds: records.map((record) => record.id),
           providerResult: providerResultJson,
+          contentBytes: Buffer.byteLength(data.content, "utf8"),
         },
         recordCount: records.length,
         usage,
@@ -3948,6 +3988,17 @@ export function memoryService(
         const countLabel = isPluginProvider(resolved.binding.providerKey)
           ? "available"
           : String(count);
+        // Skip the preamble tag entirely when scope has no records — saves tokens for no-op runs
+        if (!isPluginProvider(resolved.binding.providerKey) && count === 0) {
+          return {
+            preamble: null,
+            trace: buildSkippedMemoryHookTrace({
+              hookKind: "pre_run_hydrate",
+              reason: "empty_scope",
+              binding: mapBinding(resolved.binding),
+            }),
+          };
+        }
         const preamble = [
           `<memory-index binding="${resolved.binding.key}" records="${countLabel}" mode="thin_index">`,
           `Memory is available for this agent via explicit search.${!isPluginProvider(resolved.binding.providerKey) ? ` ${count} record${count === 1 ? "" : "s"} in scope.` : ""}`,
@@ -4023,6 +4074,16 @@ export function memoryService(
           trace: buildSkippedMemoryHookTrace({
             hookKind: "post_run_capture",
             reason: "hook_disabled",
+            binding: mapBinding(resolved.binding),
+          }),
+        };
+      }
+      // Skip captures with very short summaries — no useful signal to store
+      if (input.summary.trim().length < 50) {
+        return {
+          trace: buildSkippedMemoryHookTrace({
+            hookKind: "post_run_capture",
+            reason: "low_signal",
             binding: mapBinding(resolved.binding),
           }),
         };
@@ -4147,6 +4208,30 @@ export function memoryService(
       );
       if (!resolved.binding || !resolved.binding.enabled) return null;
       if (!isHookEnabled(resolved.binding, "issue_document_capture")) return null;
+
+      // AC4: skip capture when document content is unchanged since last capture
+      const contentHash = createHash("sha256").update(input.body).digest("hex");
+      const [lastRecord] = await db
+        .select({ metadata: memoryLocalRecords.metadata })
+        .from(memoryLocalRecords)
+        .where(
+          and(
+            eq(memoryLocalRecords.companyId, input.companyId),
+            eq(memoryLocalRecords.bindingId, resolved.binding.id),
+            eq(memoryLocalRecords.sourceIssueId, input.issueId),
+            eq(memoryLocalRecords.sourceDocumentKey, input.key),
+            isNull(memoryLocalRecords.deletedAt),
+          ),
+        )
+        .orderBy(desc(memoryLocalRecords.createdAt))
+        .limit(1);
+      if (lastRecord?.metadata?.contentHash === contentHash) {
+        console.log(
+          `[paperclip:memory] issue_document_capture deduped; issueId=${input.issueId} key=${input.key} hash=${contentHash.slice(0, 8)}`,
+        );
+        return null;
+      }
+
       const scopeType = input.projectId ? "project" : input.agentId ? "agent" : "org";
       const scopeId = input.projectId ?? input.agentId ?? input.companyId;
       return captureWithHookPolicy({
@@ -4175,6 +4260,7 @@ export function memoryService(
         content: input.body,
         summary: input.body.replace(/\s+/g, " ").slice(0, 240),
         actor: input.actor,
+        metadata: { contentHash },
       }).then((capture) => capture?.result ?? null);
     },
   };

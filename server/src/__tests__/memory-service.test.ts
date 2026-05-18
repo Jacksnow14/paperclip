@@ -348,6 +348,7 @@ describe("memoryService hook policies", () => {
     };
     const selectResults = [
       [{ target, binding }],
+      [{ count: 0 }],        // rate cap daily count check (0 captures today)
       [{ target, binding }],
     ];
     const insertResults = [

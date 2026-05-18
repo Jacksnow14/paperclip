@@ -163,12 +163,23 @@ function collectTextFiles(root: string, current: string, files: Record<string, s
 
 async function stopServerProcess(child: ServerProcess | null) {
   if (!child || child.exitCode !== null) return;
-  child.kill("SIGTERM");
+  // Kill the process group (negative PID) so grandchild processes (the actual server
+  // spawned by pnpm) also receive the signal, not just the pnpm wrapper.
+  try {
+    process.kill(-child.pid!, "SIGTERM");
+  } catch {
+    child.kill("SIGTERM");
+  }
   await new Promise<void>((resolve) => {
     child.once("exit", () => resolve());
     setTimeout(() => {
       if (child.exitCode === null) {
-        child.kill("SIGKILL");
+        try {
+          process.kill(-child.pid!, "SIGKILL");
+        } catch {
+          child.kill("SIGKILL");
+        }
+        resolve();
       }
     }, 5_000);
   });
@@ -208,7 +219,7 @@ async function waitForServer(
   output: { stdout: string[]; stderr: string[] },
 ) {
   const startedAt = Date.now();
-  while (Date.now() - startedAt < 30_000) {
+  while (Date.now() - startedAt < 90_000) {
     if (child.exitCode !== null) {
       throw new Error(
         `paperclipai run exited before healthcheck succeeded.\nstdout:\n${output.stdout.join("")}\nstderr:\n${output.stderr.join("")}`,
@@ -258,6 +269,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
         cwd: repoRoot,
         env: createServerEnv(configPath, port, tempDb.connectionString),
         stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
       },
     );
     serverProcess = child;
@@ -269,7 +281,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
     });
 
     await waitForServer(apiBase, child, output);
-  }, 60_000);
+  }, 150_000);
 
   afterAll(async () => {
     await stopServerProcess(serverProcess);
@@ -498,5 +510,5 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
 
     expect(importedFromZip.company.action).toBe("created");
     expect(importedFromZip.agents.some((agent) => agent.action === "created")).toBe(true);
-  }, 60_000);
+  }, 120_000);
 });

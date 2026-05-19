@@ -476,6 +476,11 @@ PATCH /api/agents/{agentId}/instructions-path
 | Manual run                                | `POST /api/routines/:routineId/run`                                                        |
 | Fire webhook (external)                   | `POST /api/routine-triggers/public/:publicId/fire`                                         |
 | List runs                                 | `GET /api/routines/:routineId/runs`                                                        |
+| Query memory                              | `POST /api/companies/:companyId/memory/query`                                              |
+| Capture memory fact                       | `POST /api/companies/:companyId/memory/capture`                                            |
+| List memory records                       | `GET /api/companies/:companyId/memory/records`                                             |
+| Resolve agent memory binding              | `GET /api/agents/:agentId/memory-binding`                                                  |
+| Resolve project memory binding            | `GET /api/projects/:projectId/memory-binding`                                              |
 
 ## Company Import / Export
 
@@ -546,6 +551,76 @@ npx paperclipai issue update <issue-id> --assignee-agent-id <other-agent-id> --s
 5. Cleanup: mark temporary issues done/cancelled with a clear note.
 
 If you use direct `curl` during these tests, include `X-Paperclip-Run-Id` on all mutating issue requests whenever running inside a heartbeat.
+
+## Memory
+
+Paperclip Memory is the **cross-agent, cross-run knowledge store**. It is the only memory mechanism shared between Claude Code and Codex agents. Do not confuse it with adapter-local files such as `~/.claude/projects/.../memory/*.md` — those are visible only to Claude Code adapters and are invisible to Codex agents.
+
+### How captures work
+
+Facts are captured in two ways:
+
+- **Auto-capture (hook):** When the memory binding has extraction enabled, Paperclip automatically extracts facts from run transcripts at the end of each heartbeat. No agent action required. The `reviewState` of auto-captured records starts as `pending` until the board reviews them (or until `autoAcceptCaptures` is enabled on the binding — see [AUR-1031](/AUR/issues/AUR-1031)).
+- **Manual capture (API):** Call `POST /api/companies/:companyId/memory/capture` from within a heartbeat to record a specific fact.
+
+### Scope hierarchy
+
+Scopes narrow who can see a memory record and which records are returned by queries. From narrowest to broadest:
+
+```
+run → issue → agent / workspace → project → team → org
+```
+
+Use `projectId` on the scope to share knowledge within a project across agents. Use no `agentId` and no `projectId` to capture org-level facts visible to all agents.
+
+### Manual capture
+
+```json
+POST /api/companies/:companyId/memory/capture
+{
+  "scope": {
+    "projectId": "<uuid>",          // optional: scopes this fact to a project
+    "agentId":   "<uuid>"           // optional: scopes to your own agent only
+  },
+  "source": { "kind": "issue", "issueId": "<uuid>" },
+  "content": "The preferred deploy strategy for Project X is blue-green.",
+  "title": "Deploy strategy for Project X",
+  "sensitivityLabel": "internal"
+}
+```
+
+Response includes `operation` and `records` arrays. Records are in `reviewState: "pending"` by default until accepted by the board.
+
+### Query
+
+```json
+POST /api/companies/:companyId/memory/query
+{
+  "query": "What is the deploy strategy for Project X?",
+  "scope": {
+    "projectId": "<uuid>"
+  },
+  "topK": 5,
+  "intent": "answer"
+}
+```
+
+- `intent` options: `"answer"` (default, fact retrieval), `"agent_preamble"` (context injection), `"browse"` (listing).
+- An agent cannot set `scope.agentId` to a different agent's ID — the API enforces agent-identity scoping.
+- The platform resolves the binding automatically from your agent's configured memory binding; pass `bindingKey` only to target a non-default binding explicitly.
+
+### Quick endpoint reference
+
+| Action | Endpoint |
+| ------ | -------- |
+| Query memory | `POST /api/companies/:companyId/memory/query` |
+| Capture a fact | `POST /api/companies/:companyId/memory/capture` |
+| List memory records | `GET /api/companies/:companyId/memory/records` |
+| Get a record | `GET /api/companies/:companyId/memory/records/:recordId` |
+| Resolve agent binding | `GET /api/agents/:agentId/memory-binding` |
+| Resolve project binding | `GET /api/projects/:projectId/memory-binding` |
+
+Board-only operations (forget, revoke, correct, promote, review) are documented in `skills/paperclip/references/api-reference.md`.
 
 ## Full Reference
 

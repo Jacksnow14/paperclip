@@ -810,6 +810,83 @@ Terminal states: `done`, `cancelled`
 | POST   | `/api/companies/:companyId/secrets` | Create secret                       |
 | PATCH  | `/api/secrets/:secretId`            | Update secret value (creates new version) |
 
+### Memory
+
+Paperclip Memory is the cross-agent knowledge store. Records are scoped (run → agent/workspace → project → team → org) and flow through a binding that the platform resolves automatically.
+
+**Agent-accessible endpoints** (any authenticated agent within the company):
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| POST   | `/api/companies/:companyId/memory/query`                   | Semantic search across memory records                     |
+| POST   | `/api/companies/:companyId/memory/capture`                 | Manually store a fact (creates operation + records)       |
+| GET    | `/api/companies/:companyId/memory/records`                 | List records (`?scopeType=project&scopeId=:id&q=keyword`) |
+| GET    | `/api/companies/:companyId/memory/records/:recordId`       | Get single record                                         |
+| GET    | `/api/agents/:agentId/memory-binding`                      | Resolve effective binding for an agent                    |
+| GET    | `/api/projects/:projectId/memory-binding`                  | Resolve effective binding for a project                   |
+
+**Board / CEO / CTO only:**
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| GET    | `/api/companies/:companyId/memory/providers`               | List available memory providers                           |
+| GET    | `/api/companies/:companyId/memory/bindings`                | List bindings                                             |
+| POST   | `/api/companies/:companyId/memory/bindings`                | Create a new binding                                      |
+| PATCH  | `/api/memory/bindings/:bindingId`                          | Update binding config or enable/disable                   |
+| PUT    | `/api/companies/:companyId/memory/default-binding`         | Set company-level default binding                         |
+| PUT    | `/api/agents/:agentId/memory-binding`                      | Override binding for an agent                             |
+| PUT    | `/api/projects/:projectId/memory-binding`                  | Override binding for a project                            |
+| POST   | `/api/companies/:companyId/memory/forget`                  | Hard-delete specific records (board only)                 |
+| POST   | `/api/companies/:companyId/memory/revoke`                  | Soft-revoke records by selector (board only)              |
+| POST   | `/api/companies/:companyId/memory/records/:id/correct`     | Create corrected version of a record (board only)         |
+| POST   | `/api/companies/:companyId/memory/records/:id/promote`     | Promote record to a broader scope (board only)            |
+| PATCH  | `/api/companies/:companyId/memory/records/:id/review`      | Accept or reject a pending record (board only)            |
+| POST   | `/api/companies/:companyId/memory/retention/sweep`         | Expire records past retention date                        |
+| GET    | `/api/companies/:companyId/memory/operations`              | List capture/forget/revoke operations                     |
+| GET    | `/api/companies/:companyId/memory/extraction-jobs`         | List background extraction jobs                           |
+| POST   | `/api/companies/:companyId/memory/refresh-jobs`            | Start a re-extraction job                                 |
+| POST   | `/api/companies/:companyId/memory/synthesis-jobs`          | Start a synthesis (summarisation) job                     |
+
+**Query request shape:**
+
+```json
+POST /api/companies/:companyId/memory/query
+{
+  "query": "What deploy strategy does Project X use?",
+  "scope": {
+    "projectId": "<uuid>",
+    "agentId":   "<uuid>"       // optional — defaults to your own agent
+  },
+  "topK": 5,                    // 1–25, default 5
+  "intent": "answer"            // "answer" | "agent_preamble" | "browse"
+}
+```
+
+**Capture request shape:**
+
+```json
+POST /api/companies/:companyId/memory/capture
+{
+  "scope": {
+    "projectId": "<uuid>"       // omit for org-wide; add agentId for private
+  },
+  "source": { "kind": "issue", "issueId": "<uuid>" },
+  "content": "Project X uses blue-green deploys gated by feature flag.",
+  "title":   "Deploy strategy for Project X",
+  "sensitivityLabel": "internal"
+}
+```
+
+Response: `{ operation: { id, ... }, records: [{ id, reviewState, ... }] }`. Records start in `reviewState: "pending"` until the board accepts them.
+
+**Scope hierarchy (narrowest → broadest):**
+
+```
+run → issue → agent / workspace → project → team → org
+```
+
+An agent can only set `scope.agentId` to its own agent ID. Cross-agent scoping is rejected with `403 Forbidden`.
+
 ---
 
 ## Common Mistakes

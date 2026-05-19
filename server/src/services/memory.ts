@@ -89,6 +89,9 @@ type ActorInfo = {
   agentId: string | null;
   userId: string | null;
   runId: string | null;
+  // Optional agent role (ceo/cto/cfo/cmo/...). Used by capture review-gate to decide
+  // whether the actor should auto-accept captures. Lazily resolved when missing.
+  role?: string | null;
 };
 
 type BindingRow = typeof memoryBindings.$inferSelect;
@@ -162,8 +165,15 @@ const localBasicConfigSchema = z
     maxHydrateSnippets: z.number().int().positive().max(10).optional().default(5),
     injectionMode: z.enum(MEMORY_INJECTION_MODES).optional().default("thin_index"),
     maxCapturesPerDayPerTarget: z.number().int().nonnegative().optional().default(20),
+    autoAcceptCaptures: z.boolean().optional().default(false),
   })
   .strict();
+
+const TRUSTED_AUTO_ACCEPT_ROLES = new Set(["ceo", "cto", "cfo", "cmo"]);
+
+function isTrustedAutoAcceptRole(role: string | null | undefined): boolean {
+  return !!role && TRUSTED_AUTO_ACCEPT_ROLES.has(role.toLowerCase());
+}
 
 type LocalBasicConfig = z.infer<typeof localBasicConfigSchema>;
 
@@ -203,6 +213,7 @@ const LOCAL_BASIC_PROVIDER: MemoryProviderDescriptor = {
       maxHydrateSnippets: { type: "integer", minimum: 1, maximum: 10, default: 5 },
       injectionMode: { type: "string", enum: ["thin_index", "top_k_facts"], default: "thin_index" },
       maxCapturesPerDayPerTarget: { type: "integer", minimum: 0, default: 20 },
+      autoAcceptCaptures: { type: "boolean", default: false },
       hookPolicies: {
         type: "object",
         description: "Optional per-hook extraction policy overrides.",
@@ -217,6 +228,7 @@ const LOCAL_BASIC_PROVIDER: MemoryProviderDescriptor = {
       enableIssueDocumentCapture: true,
       maxHydrateSnippets: 5,
       injectionMode: "thin_index",
+      autoAcceptCaptures: false,
       hookPolicies: {
         issue_comment_capture: {
           enabled: false,
@@ -291,6 +303,14 @@ const LOCAL_BASIC_PROVIDER: MemoryProviderDescriptor = {
         defaultValue: 20,
         suggestedValue: 20,
         min: 0,
+      },
+      {
+        key: "autoAcceptCaptures",
+        label: "Auto-accept captures",
+        description: "When true, captures land as accepted (visible to agents) instead of pending review. Trusted-actor roles (ceo/cto/cfo/cmo) always auto-accept regardless of this flag.",
+        input: "boolean",
+        defaultValue: false,
+        suggestedValue: false,
       },
     ],
     healthChecks: [
@@ -1091,6 +1111,36 @@ export function memoryService(
     return rows.map((row) => mapRecord(row));
   }
 
+  async function resolveActorRole(actor: ActorInfo): Promise<string | null> {
+    if (actor.role !== undefined) return actor.role ?? null;
+    if (actor.actorType !== "agent" || !actor.agentId) return null;
+    const [row] = await db
+      .select({ role: agents.role })
+      .from(agents)
+      .where(eq(agents.id, actor.agentId))
+      .limit(1);
+    return row?.role ?? null;
+  }
+
+  async function resolveEffectiveReviewState(
+    binding: BindingRow,
+    actor: ActorInfo,
+    requestedReviewState: MemoryRecord["reviewState"] | undefined,
+  ): Promise<MemoryRecord["reviewState"]> {
+    // Honor explicit non-pending reviewState requests verbatim. Hook captures pass "accepted"
+    // through DEFAULT_CAPTURE_HOOK_POLICY; board admins may post-process to "rejected".
+    if (requestedReviewState && requestedReviewState !== "pending") return requestedReviewState;
+
+    // Default-or-pending request: apply binding-level and trusted-actor auto-accept overrides.
+    if (binding.providerKey === LOCAL_BASIC_PROVIDER_KEY) {
+      const cfg = parseLocalBasicConfig(binding.config);
+      if (cfg.autoAcceptCaptures) return "accepted";
+    }
+    const role = await resolveActorRole(actor);
+    if (isTrustedAutoAcceptRole(role)) return "accepted";
+    return requestedReviewState ?? "pending";
+  }
+
   async function captureLocalBasic(
     binding: BindingRow,
     scope: MemoryScope,
@@ -1116,6 +1166,7 @@ export function memoryService(
     const scopeId = input.scopeId ?? normalizeScopeId(binding.companyId, scopeType, scope);
     const createdBy = actorPrincipal(input.actor);
     const owner = normalizePrincipal(input.owner, createdBy);
+    const effectiveReviewState = await resolveEffectiveReviewState(binding, input.actor, input.reviewState);
     const [row] = await db
       .insert(memoryLocalRecords)
       .values({
@@ -1151,7 +1202,7 @@ export function memoryService(
         retentionPolicy: input.retentionPolicy ?? null,
         expiresAt: input.expiresAt ? new Date(input.expiresAt) : null,
         retentionState: "active",
-        reviewState: input.reviewState ?? "pending",
+        reviewState: effectiveReviewState,
         citationJson: normalizeCitation(input.citation),
         createdByOperationId: operationId,
       })
@@ -2851,6 +2902,10 @@ export function memoryService(
       let records: MemoryRecord[];
       let usage: MemoryUsage[] = [];
       let providerResultJson: Record<string, unknown> | null = null;
+      // Resolve the effective reviewState once so the persisted record, the operation
+      // request log, and the policyDecision all reflect the same value (including any
+      // auto-accept override applied by binding flag or trusted-actor role).
+      const effectiveReviewState = await resolveEffectiveReviewState(binding, actor, data.reviewState);
 
       if (binding.providerKey === LOCAL_BASIC_PROVIDER_KEY) {
         records = await captureLocalBasic(
@@ -2870,7 +2925,7 @@ export function memoryService(
             content: data.content,
             summary: data.summary ?? null,
             metadata: data.metadata ?? {},
-            reviewState: data.reviewState,
+            reviewState: effectiveReviewState,
           },
           null,
         );
@@ -2894,7 +2949,7 @@ export function memoryService(
           content: data.content,
           summary: data.summary ?? null,
           metadata: data.metadata ?? {},
-          reviewState: data.reviewState,
+          reviewState: effectiveReviewState,
         });
         records = providerResult.records;
         usage = providerResult.usage ?? [];
@@ -2917,14 +2972,15 @@ export function memoryService(
           scopeId: data.scopeId ?? data.scope?.scopeId ?? null,
           owner: data.owner ?? null,
           sensitivityLabel: data.sensitivityLabel,
-          reviewState: data.reviewState,
+          reviewState: effectiveReviewState,
+          requestedReviewState: data.reviewState ?? null,
           expiresAt: data.expiresAt ? new Date(data.expiresAt).toISOString() : null,
           metadata: data.metadata ?? {},
         },
         policyDecision: {
           captureAllowed: true,
           sensitivityLabel: data.sensitivityLabel,
-          reviewState: data.reviewState,
+          reviewState: effectiveReviewState,
         },
         resultJson: {
           recordIds: records.map((record) => record.id),
@@ -3971,19 +4027,28 @@ export function memoryService(
         };
         let count = 0;
         if (!isPluginProvider(resolved.binding.providerKey)) {
-          const result = await countLocalBasic(
+          // AUR-1031: count must reflect the full scope chain visible to the agent
+          // (org + agent + project + issue + run). countLocalBasic's "filter" fields
+          // double as hard column equality filters (e.g. scopeProjectId = projectId),
+          // which would EXCLUDE org-scoped records. Instead we drive the count via
+          // buildRecordVisibilityConditions directly with the full scope chain.
+          const hydrateScope: MemoryScope = {
+            agentId: input.agentId,
+            projectId: input.projectId ?? null,
+            issueId: input.issueId ?? null,
+            runId: input.runId,
+          };
+          const visibility = buildRecordVisibilityConditions(
             input.companyId,
-            {
-              bindingId: resolved.binding.id,
-              limit: 1,
-              includeDeleted: false,
-              includeRevoked: false,
-              includeExpired: false,
-              includeSuperseded: false,
-            },
+            resolved.binding.id,
+            hydrateScope,
             actor,
           );
-          count = result.count;
+          const [row] = await db
+            .select({ count: sql<number>`count(*)::int` })
+            .from(memoryLocalRecords)
+            .where(and(...visibility));
+          count = Number(row?.count ?? 0);
         }
         const countLabel = isPluginProvider(resolved.binding.providerKey)
           ? "available"

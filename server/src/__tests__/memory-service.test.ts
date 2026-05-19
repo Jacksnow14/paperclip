@@ -1100,4 +1100,239 @@ describeEmbeddedPostgres("memoryService local basic persistence", () => {
     expect(chainRecords[2]!.supersededByRecordId).toBeNull();
     expect(chainRecords[2]!.scope.scopeType).toBe("org");
   });
+
+  // AUR-1031: agent captures default to pending unless the binding opts into auto-accept
+  // OR the actor's role is in the trusted set (ceo/cto/cfo/cmo). This is the regression
+  // that starved heartbeat-captured facts from cross-agent visibility.
+  it("captureLocalBasic respects autoAcceptCaptures binding flag for pending defaults", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "AutoAccept Binding Test",
+      issuePrefix: `A${companyId.replace(/-/g, "").slice(0, 5).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Worker", role: "general" });
+
+    const service = memoryService(db);
+    const actor = {
+      actorType: "agent" as const,
+      actorId: agentId,
+      agentId,
+      userId: null,
+      runId: null,
+    };
+
+    const defaultBinding = await service.createBinding(companyId, {
+      key: "binding-default",
+      name: "Default review",
+      providerKey: "local_basic",
+      config: {},
+      enabled: true,
+    });
+    await service.setCompanyDefault(companyId, defaultBinding.id);
+
+    // Default binding + general role + no explicit reviewState => stays pending.
+    const pendingCapture = await service.capture(
+      companyId,
+      {
+        bindingKey: "binding-default",
+        scope: { scopeType: "org", scopeId: companyId },
+        scopeType: "org",
+        scopeId: companyId,
+        source: { kind: "manual_note", externalRef: "auto-accept-default" },
+        title: "Default pending capture",
+        content: "Captured under default binding by a general-role agent.",
+        reviewState: "pending",
+      },
+      actor,
+    );
+    expect(pendingCapture.records[0].reviewState).toBe("pending");
+
+    const autoBinding = await service.createBinding(companyId, {
+      key: "binding-auto-accept",
+      name: "Auto-accept binding",
+      providerKey: "local_basic",
+      config: { autoAcceptCaptures: true },
+      enabled: true,
+    });
+
+    const autoCapture = await service.capture(
+      companyId,
+      {
+        bindingKey: "binding-auto-accept",
+        scope: { scopeType: "org", scopeId: companyId },
+        scopeType: "org",
+        scopeId: companyId,
+        source: { kind: "manual_note", externalRef: "auto-accept-on" },
+        title: "Auto-accept capture",
+        content: "Captured under a binding that opts into auto-accept.",
+        reviewState: "pending",
+      },
+      actor,
+    );
+    expect(autoCapture.records[0].reviewState).toBe("accepted");
+  });
+
+  it("captureLocalBasic auto-accepts captures from trusted executive roles", async () => {
+    const companyId = randomUUID();
+    const ceoAgentId = randomUUID();
+    const ctoAgentId = randomUUID();
+    const generalAgentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Trusted Actor Test",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 5).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      { id: ceoAgentId, companyId, name: "CEO Agent", role: "ceo" },
+      { id: ctoAgentId, companyId, name: "CTO Agent", role: "cto" },
+      { id: generalAgentId, companyId, name: "Worker Agent", role: "general" },
+    ]);
+
+    const service = memoryService(db);
+    const binding = await service.createBinding(companyId, {
+      key: "trusted-actor-binding",
+      name: "Trusted actor binding",
+      providerKey: "local_basic",
+      config: {},
+      enabled: true,
+    });
+    await service.setCompanyDefault(companyId, binding.id);
+
+    const ceoActor = {
+      actorType: "agent" as const,
+      actorId: ceoAgentId,
+      agentId: ceoAgentId,
+      userId: null,
+      runId: null,
+    };
+    const ctoActor = { ...ceoActor, actorId: ctoAgentId, agentId: ctoAgentId };
+    const generalActor = { ...ceoActor, actorId: generalAgentId, agentId: generalAgentId };
+
+    const ceoCapture = await service.capture(
+      companyId,
+      {
+        bindingKey: "trusted-actor-binding",
+        scope: { scopeType: "org", scopeId: companyId },
+        scopeType: "org",
+        scopeId: companyId,
+        source: { kind: "manual_note", externalRef: "trusted-ceo" },
+        title: "CEO note",
+        content: "CEO-authored memory should land accepted.",
+        reviewState: "pending",
+      },
+      ceoActor,
+    );
+    expect(ceoCapture.records[0].reviewState).toBe("accepted");
+
+    const ctoCapture = await service.capture(
+      companyId,
+      {
+        bindingKey: "trusted-actor-binding",
+        scope: { scopeType: "org", scopeId: companyId },
+        scopeType: "org",
+        scopeId: companyId,
+        source: { kind: "manual_note", externalRef: "trusted-cto" },
+        title: "CTO note",
+        content: "CTO-authored memory should land accepted.",
+        reviewState: "pending",
+      },
+      ctoActor,
+    );
+    expect(ctoCapture.records[0].reviewState).toBe("accepted");
+
+    const generalCapture = await service.capture(
+      companyId,
+      {
+        bindingKey: "trusted-actor-binding",
+        scope: { scopeType: "org", scopeId: companyId },
+        scopeType: "org",
+        scopeId: companyId,
+        source: { kind: "manual_note", externalRef: "untrusted-general" },
+        title: "General note",
+        content: "General role memory should remain pending until reviewed.",
+        reviewState: "pending",
+      },
+      generalActor,
+    );
+    expect(generalCapture.records[0].reviewState).toBe("pending");
+  });
+
+  // AUR-1031: thin_index hydrate must surface project/run-scoped records to the agent,
+  // not just org+agent. Previously countLocalBasic was called with bindingId only, which
+  // restricted deriveAllowedScopes to org+actor.agentId — project-scoped records were
+  // invisible in the preamble even when they should have been counted.
+  it("thin-index preRunHydrate counts records across org + agent + project scope chain", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Thin Index Scope Chain",
+      issuePrefix: `S${companyId.replace(/-/g, "").slice(0, 5).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({ id: projectId, companyId, name: "Scoped Project" });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Scope Test Agent" });
+
+    const service = memoryService(db);
+    const boardActor = {
+      actorType: "user" as const,
+      actorId: "board-user",
+      agentId: null,
+      userId: "board-user",
+      runId: null,
+    };
+
+    const binding = await service.createBinding(companyId, {
+      key: "thin-index-scope",
+      name: "Thin index scope chain",
+      providerKey: "local_basic",
+      config: { injectionMode: "thin_index" },
+      enabled: true,
+    });
+    await service.setCompanyDefault(companyId, binding.id);
+
+    // Project-scoped record — would be invisible without scope-chain widening.
+    await service.capture(
+      companyId,
+      {
+        bindingKey: "thin-index-scope",
+        scope: { scopeType: "project", scopeId: projectId, projectId },
+        scopeType: "project",
+        scopeId: projectId,
+        source: { kind: "manual_note", externalRef: "project-fact" },
+        title: "Project-scoped fact",
+        content: "A project-scoped fact that thin_index must count.",
+        reviewState: "accepted",
+      },
+      boardActor,
+    );
+
+    // Run hydrate WITHOUT a projectId — only org+agent visible. Project-scoped record
+    // is excluded; preamble is skipped because count is 0.
+    const noProjectResult = await service.preRunHydrate({
+      companyId,
+      agentId,
+      runId,
+      query: "any",
+    });
+    expect(noProjectResult.preamble).toBeNull();
+
+    // Run hydrate WITH the projectId — project-scoped record is now visible.
+    const scopedResult = await service.preRunHydrate({
+      companyId,
+      agentId,
+      runId,
+      projectId,
+      query: "any",
+    });
+    expect(scopedResult.preamble).not.toBeNull();
+    expect(scopedResult.preamble).toContain('mode="thin_index"');
+    expect(scopedResult.preamble).toContain("1 record in scope");
+  });
 });

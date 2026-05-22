@@ -3068,12 +3068,6 @@ export function issueRoutes(
       }
     }
 
-    await assertAgentInReviewReviewPath({
-      existing,
-      updateFields,
-      actorType: req.actor.type,
-    });
-
     // Auto-route in_review: prevent agents from leaving themselves as assignee
     const effectiveInReviewStatus =
       typeof updateFields.status === "string" ? updateFields.status : existing.status;
@@ -3101,6 +3095,12 @@ export function issueRoutes(
         }
       }
     }
+
+    await assertAgentInReviewReviewPath({
+      existing,
+      updateFields,
+      actorType: req.actor.type,
+    });
 
     const nextAssigneeAgentId =
       updateFields.assigneeAgentId === undefined ? existing.assigneeAgentId : (updateFields.assigneeAgentId as string | null);

@@ -26,8 +26,15 @@ const mockAccessService = vi.hoisted(() => ({
   hasPermission: vi.fn(async () => false),
 }));
 
+const mockIssueThreadInteractionService = vi.hoisted(() => ({
+  getActiveForIssue: vi.fn(async () => null),
+  listForIssue: vi.fn(async () => []),
+  resolve: vi.fn(async () => undefined),
+}));
+
 const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(async () => null),
+  list: vi.fn(async () => []),
   resolveByReference: vi.fn(async (_companyId: string, ref: string) => ({
     agent: { id: ref, companyId: "company-1" },
     ambiguous: false,
@@ -36,6 +43,9 @@ const mockAgentService = vi.hoisted(() => ({
 
 function registerModuleMocks() {
   vi.doMock("../services/index.js", () => ({
+    companyService: () => ({
+      getById: vi.fn(async () => ({ id: "company-1", attachmentMaxBytes: 10 * 1024 * 1024 })),
+    }),
     accessService: () => mockAccessService,
     agentService: () => mockAgentService,
     documentService: () => ({}),
@@ -56,13 +66,29 @@ function registerModuleMocks() {
       })),
       listCompanyIds: vi.fn(async () => ["company-1"]),
     }),
-    issueApprovalService: () => ({}),
-    issueService: () => mockIssueService,
-    logActivity: vi.fn(async () => undefined),
-    memoryService: () => ({
-      captureIssueComment: vi.fn(async () => undefined),
-      captureIssueDocument: vi.fn(async () => undefined),
+    issueApprovalService: () => ({
+      listApprovalsForIssue: vi.fn(async () => []),
     }),
+    issueRecoveryActionService: () => ({
+      getActiveForIssue: vi.fn(async () => null),
+      listActiveForIssues: vi.fn(async () => new Map()),
+    }),
+    issueReferenceService: () => ({
+      deleteDocumentSource: async () => undefined,
+      diffIssueReferenceSummary: () => ({
+        addedReferencedIssues: [],
+        removedReferencedIssues: [],
+        currentReferencedIssues: [],
+      }),
+      emptySummary: () => ({ outbound: [], inbound: [] }),
+      listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
+      syncComment: async () => undefined,
+      syncDocument: async () => undefined,
+      syncIssue: async () => undefined,
+    }),
+    issueService: () => mockIssueService,
+    issueThreadInteractionService: () => mockIssueThreadInteractionService,
+    logActivity: vi.fn(async () => undefined),
     projectService: () => ({}),
     routineService: () => ({
       syncRunStatusForIssue: vi.fn(async () => undefined),
@@ -70,6 +96,16 @@ function registerModuleMocks() {
     workProductService: () => ({}),
   }));
 }
+
+const fakeDb = {
+  select: vi.fn(() => ({
+    from: () => ({
+      where: (..._args: unknown[]) => ({
+        orderBy: async () => [],
+      }),
+    }),
+  })),
+};
 
 async function createAgentApp(agentId = "agent-1") {
   const [{ errorHandler }, { issueRoutes }] = await Promise.all([
@@ -88,7 +124,7 @@ async function createAgentApp(agentId = "agent-1") {
     };
     next();
   });
-  app.use("/api", issueRoutes({} as any, {} as any));
+  app.use("/api", issueRoutes(fakeDb as any, {} as any));
   app.use(errorHandler);
   return app;
 }
@@ -110,7 +146,7 @@ async function createBoardApp() {
     };
     next();
   });
-  app.use("/api", issueRoutes({} as any, {} as any));
+  app.use("/api", issueRoutes(fakeDb as any, {} as any));
   app.use(errorHandler);
   return app;
 }
@@ -194,6 +230,8 @@ describe("in_review auto-route guard", () => {
     }));
     // Agent needs tasks:assign to reassign to a different agent
     mockAccessService.hasPermission.mockResolvedValue(true);
+    // Provide a pending interaction so assertAgentInReviewReviewPath passes
+    mockIssueThreadInteractionService.listForIssue.mockResolvedValueOnce([{ status: "pending" }]);
 
     const res = await request(await createAgentApp())
       .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -279,23 +317,18 @@ describe("in_review auto-route guard", () => {
     );
   });
 
-  it("guard does not fire when agent is not the current assignee", async () => {
+  it("rejects non-owner agent with 409 before guard fires", async () => {
     const issue = { ...BASE_ISSUE, assigneeAgentId: "other-agent" };
     mockIssueService.getById.mockResolvedValue(issue);
-    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
-      ...issue,
-      ...patch,
-      updatedAt: new Date(),
-    }));
+    mockIssueService.assertCheckoutOwner.mockRejectedValueOnce(
+      Object.assign(new Error("checked out by another agent"), { statusCode: 409 }),
+    );
 
-    // agent-1 patches an issue currently assigned to other-agent -> no guard fires
     const res = await request(await createAgentApp("agent-1"))
       .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
       .send({ status: "in_review" });
 
-    expect(res.status).toBe(200);
-    const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
-    expect(patch.assigneeAgentId).toBeUndefined();
-    expect(patch.assigneeUserId).toBeUndefined();
+    expect(res.status).toBe(409);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 });

@@ -9,6 +9,12 @@ import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
 import { boardAuthService } from "../services/board-auth.js";
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function sanitizeRunId(value: string | undefined | null): string | undefined {
+  if (!value) return undefined;
+  return UUID_RE.test(value) ? value : undefined;
+}
+
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
 }
@@ -42,7 +48,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         if (cloudTenantActor) {
           req.actor = {
             ...cloudTenantActor,
-            runId: runIdHeader ?? undefined,
+            runId: sanitizeRunId(runIdHeader),
           };
           next();
           return;
@@ -88,14 +94,15 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
             companyIds: memberships.map((row) => row.companyId),
             memberships,
             isInstanceAdmin: Boolean(roleRow),
-            runId: runIdHeader ?? undefined,
+            runId: sanitizeRunId(runIdHeader),
             source: "session",
           };
           next();
           return;
         }
       }
-      if (runIdHeader) req.actor.runId = runIdHeader;
+      const sanitizedFallbackRunId = sanitizeRunId(runIdHeader);
+      if (sanitizedFallbackRunId) req.actor.runId = sanitizedFallbackRunId;
       next();
       return;
     }
@@ -120,7 +127,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
           memberships: access.memberships,
           isInstanceAdmin: access.isInstanceAdmin,
           keyId: boardKey.id,
-          runId: runIdHeader || undefined,
+          runId: sanitizeRunId(runIdHeader),
           source: "board_key",
         };
         next();
@@ -163,7 +170,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         agentId: claims.sub,
         companyId: claims.company_id,
         keyId: undefined,
-        runId: runIdHeader || claims.run_id || undefined,
+        runId: sanitizeRunId(runIdHeader) || sanitizeRunId(claims.run_id),
         source: "agent_jwt",
       };
       next();
@@ -191,7 +198,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       agentId: key.agentId,
       companyId: key.companyId,
       keyId: key.id,
-      runId: runIdHeader || undefined,
+      runId: sanitizeRunId(runIdHeader),
       source: "agent_key",
     };
 

@@ -2678,49 +2678,53 @@ export function issueRoutes(
       referenceSummary,
     );
 
-    await logActivity(db, {
-      companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.created",
-      entityType: "issue",
-      entityId: issue.id,
-      details: {
-        title: issue.title,
-        identifier: issue.identifier,
-        ...buildCreateIssueActivityStatusDetails(issue, res),
-        ...(Array.isArray(req.body.blockedByIssueIds) ? { blockedByIssueIds: req.body.blockedByIssueIds } : {}),
-        ...summarizeIssueReferenceActivityDetails({
-          addedReferencedIssues: referenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
-          removedReferencedIssues: referenceDiff.removedReferencedIssues.map(summarizeIssueRelationForActivity),
-          currentReferencedIssues: referenceDiff.currentReferencedIssues.map(summarizeIssueRelationForActivity),
-        }),
-      },
-    });
-
-    if (executionPolicy?.monitor) {
+    try {
       await logActivity(db, {
         companyId,
         actorType: actor.actorType,
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
-        action: "issue.monitor_scheduled",
+        action: "issue.created",
         entityType: "issue",
         entityId: issue.id,
         details: {
+          title: issue.title,
           identifier: issue.identifier,
-          nextCheckAt: executionPolicy.monitor.nextCheckAt,
-          notes: executionPolicy.monitor.notes,
-          scheduledBy: executionPolicy.monitor.scheduledBy,
-          serviceName: executionPolicy.monitor.serviceName ?? null,
-          timeoutAt: executionPolicy.monitor.timeoutAt ?? null,
-          maxAttempts: executionPolicy.monitor.maxAttempts ?? null,
-          recoveryPolicy: executionPolicy.monitor.recoveryPolicy ?? null,
+          ...buildCreateIssueActivityStatusDetails(issue, res),
+          ...(Array.isArray(req.body.blockedByIssueIds) ? { blockedByIssueIds: req.body.blockedByIssueIds } : {}),
+          ...summarizeIssueReferenceActivityDetails({
+            addedReferencedIssues: referenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
+            removedReferencedIssues: referenceDiff.removedReferencedIssues.map(summarizeIssueRelationForActivity),
+            currentReferencedIssues: referenceDiff.currentReferencedIssues.map(summarizeIssueRelationForActivity),
+          }),
         },
       });
+
+      if (executionPolicy?.monitor) {
+        await logActivity(db, {
+          companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          action: "issue.monitor_scheduled",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            identifier: issue.identifier,
+            nextCheckAt: executionPolicy.monitor.nextCheckAt,
+            notes: executionPolicy.monitor.notes,
+            scheduledBy: executionPolicy.monitor.scheduledBy,
+            serviceName: executionPolicy.monitor.serviceName ?? null,
+            timeoutAt: executionPolicy.monitor.timeoutAt ?? null,
+            maxAttempts: executionPolicy.monitor.maxAttempts ?? null,
+            recoveryPolicy: executionPolicy.monitor.recoveryPolicy ?? null,
+          },
+        });
+      }
+    } catch (err) {
+      logger.error({ err, issueId: issue.id, identifier: issue.identifier }, "Failed to log issue.created activity — issue was created successfully");
     }
 
     void queueIssueAssignmentWakeup({

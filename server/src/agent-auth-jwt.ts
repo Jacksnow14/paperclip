@@ -114,10 +114,10 @@ export function verifyLocalAgentJwt(token: string): LocalAgentJwtClaims | null {
   const sub = typeof claims.sub === "string" ? claims.sub : null;
   const companyId = typeof claims.company_id === "string" ? claims.company_id : null;
   const adapterType = typeof claims.adapter_type === "string" ? claims.adapter_type : null;
-  const runId = typeof claims.run_id === "string" ? claims.run_id : null;
+  const runId = typeof claims.run_id === "string" && claims.run_id ? claims.run_id : undefined;
   const iat = typeof claims.iat === "number" ? claims.iat : null;
   const exp = typeof claims.exp === "number" ? claims.exp : null;
-  if (!sub || !companyId || !adapterType || !runId || !iat || !exp) return null;
+  if (!sub || !companyId || !adapterType || !iat || !exp) return null;
 
   const now = Math.floor(Date.now() / 1000);
   if (exp < now) return null;
@@ -131,7 +131,7 @@ export function verifyLocalAgentJwt(token: string): LocalAgentJwtClaims | null {
     sub,
     company_id: companyId,
     adapter_type: adapterType,
-    run_id: runId,
+    run_id: runId ?? "",
     iat,
     exp,
     ...(issuer ? { iss: issuer } : {}),

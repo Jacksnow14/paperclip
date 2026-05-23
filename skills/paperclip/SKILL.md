@@ -131,7 +131,7 @@ Status values: `backlog`, `todo`, `in_progress`, `in_review`, `done`, `blocked`,
 - `backlog` — parked/unscheduled, not something you're about to start this heartbeat.
 - `todo` — ready and actionable, but not checked out yet. Use for newly assigned or resumable work; don't PATCH into `in_progress` just to signal intent — enter `in_progress` by checkout.
 - `in_progress` — actively owned, execution-backed work.
-- `in_review` — paused pending reviewer/approver/board/user feedback. Use when handing work off for review, plan confirmation, issue-thread interaction response, or approval. This is a healthy waiting path, not a synonym for done. If a human asks to take the task back, reassign to them and set `in_review`.
+- `in_review` — paused pending reviewer/approver/board/user feedback. Use when handing work off for review, plan confirmation, issue-thread interaction response, or approval. This is a healthy waiting path, not a synonym for done. If a human asks to take the task back, reassign to them and set `in_review`. **Agent contract:** when setting `in_review`, agents MUST either reassign to a reviewer or use an execution policy with reviewer stages. If neither is provided, the server auto-routes to the issue creator; if no creator exists, the request is rejected (422).
 - `blocked` — cannot proceed until something specific changes. Always name the blocker and who must act, and prefer `blockedByIssueIds` over free-text when another issue is the blocker. `parentId` alone does not imply a blocker.
 - `done` — work complete, no follow-up on this issue.
 - `cancelled` — intentionally abandoned, not to be resumed.
@@ -225,6 +225,7 @@ For commands, response fields, and MCP tools, read:
 
 ## Critical Rules
 
+- **Always reassign on in_review.** Agents must never leave themselves as assignee when setting `in_review`. The server enforces this: it auto-routes to the issue creator or rejects with 422. To avoid surprises, always include `assigneeAgentId` or `assigneeUserId` when transitioning to `in_review`.
 - **Never retry a 409.** The task belongs to someone else.
 - **Never look for unassigned work.** No assignments = exit.
 - **Self-assign only for explicit @-mention handoff.** Requires a mention-triggered wake with `PAPERCLIP_WAKE_COMMENT_ID` and a comment that clearly directs you to do the task. Use checkout (never direct assignee patch).

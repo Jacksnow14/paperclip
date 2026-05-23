@@ -3068,6 +3068,34 @@ export function issueRoutes(
       }
     }
 
+    // Auto-route in_review: prevent agents from leaving themselves as assignee
+    const effectiveInReviewStatus =
+      typeof updateFields.status === "string" ? updateFields.status : existing.status;
+    if (
+      effectiveInReviewStatus === "in_review" &&
+      req.actor.type === "agent" &&
+      req.actor.agentId &&
+      !transition.workflowControlledAssignment
+    ) {
+      const explicitAssigneeUserId =
+        req.body.assigneeUserId !== undefined ? (req.body.assigneeUserId as string | null) : undefined;
+      const effectiveAssigneeAgentId =
+        updateFields.assigneeAgentId !== undefined
+          ? updateFields.assigneeAgentId
+          : existing.assigneeAgentId;
+      if (effectiveAssigneeAgentId === req.actor.agentId && explicitAssigneeUserId === undefined) {
+        if (existing.createdByUserId) {
+          updateFields.assigneeAgentId = null;
+          updateFields.assigneeUserId = existing.createdByUserId;
+        } else {
+          res.status(422).json({
+            error: "in_review requires reassignment: set assigneeAgentId or assigneeUserId to a reviewer",
+          });
+          return;
+        }
+      }
+    }
+
     await assertAgentInReviewReviewPath({
       existing,
       updateFields,
@@ -3088,9 +3116,14 @@ export function issueRoutes(
       typeof nextAssigneeUserId === "string" &&
       !!existing.createdByUserId &&
       nextAssigneeUserId === existing.createdByUserId;
+    const isAgentAutoRoutedInReview =
+      effectiveInReviewStatus === "in_review" &&
+      req.actor.type === "agent" &&
+      updateFields.assigneeUserId === existing.createdByUserId &&
+      updateFields.assigneeAgentId === null;
 
     if (assigneeWillChange && !transition.workflowControlledAssignment) {
-      if (!isAgentReturningIssueToCreator) {
+      if (!isAgentReturningIssueToCreator && !isAgentAutoRoutedInReview) {
         await assertCanAssignTasks(req, existing.companyId);
       }
     }

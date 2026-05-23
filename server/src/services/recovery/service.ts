@@ -1994,6 +1994,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       successfulRunHandoffEscalated: 0,
       escalated: 0,
       skipped: 0,
+      reviewParkedSkipped: 0,
       issueIds: [] as string[],
     };
 
@@ -2109,6 +2110,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         result.skipped += 1;
         continue;
       }
+
+      if (latestRun?.errorCode === "issue_continuation_waiting_on_review") {
+        result.reviewParkedSkipped += 1;
+        result.skipped += 1;
+        continue;
+      }
+
       const handoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
       if (handoffEvidence) {
         if (!handoffEvidence.exhausted) {

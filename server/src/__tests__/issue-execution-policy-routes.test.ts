@@ -164,13 +164,14 @@ describe("issue execution policy routes", () => {
   });
 
   it("rejects an agent-authored in_review transition without a review path", async () => {
+    // No createdByUserId: auto-route guard returns 422 since there is no fallback reviewer
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "company-1",
       status: "todo",
       assigneeAgentId: "33333333-3333-4333-8333-333333333333",
       assigneeUserId: null,
-      createdByUserId: "local-board",
+      createdByUserId: null,
       identifier: "PAP-1003",
       title: "Missing review path",
       executionPolicy: null,
@@ -188,12 +189,7 @@ describe("issue execution policy routes", () => {
       .send({ status: "in_review" });
 
     expect(res.status).toBe(422);
-    expect(res.body.error).toContain("invalid_issue_disposition");
-    expect(res.body.error).toContain("request_confirmation");
-    expect(res.body.details).toMatchObject({
-      code: "invalid_issue_disposition",
-      missing: "review_path",
-    });
+    expect(res.body.error).toContain("in_review requires reassignment");
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 

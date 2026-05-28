@@ -176,6 +176,27 @@ A change is done when all are true:
 4. Docs updated when behavior or commands change
 5. PR description follows the [PR template](.github/PULL_REQUEST_TEMPLATE.md) with all sections filled in (including Model Used)
 
+## 12. Tool-Gap Logging
+
+When any agent hits a missing capability or must use a workaround, capture a Paperclip Memory record via `POST /api/companies/:companyId/memory/capture`. The Memory API has no native `key` field — encode the key in `title`:
+
+```json
+{
+  "title": "tool-gaps/YYYY-MM-DD/<your-agentId>/<capability-slug>",
+  "metadata": {
+    "category": "tool_gap",
+    "capability_needed": "<what you needed>",
+    "workaround_used": "<what you did instead>",
+    "estimated_cost_of_workaround": "<token or time estimate>",
+    "frequency": "one-off | recurring"
+  },
+  "scope": { "projectId": "<include when the issue belongs to a project>" },
+  "source": "<current issue ID and run reference>"
+}
+```
+
+Omit `scope.projectId` for gaps with no project affiliation. This data feeds the SGI Loop review cycle.
+
 ## 11. Fork-Specific: HenkDz/paperclip
 
 This is a fork of `paperclipai/paperclip` with QoL patches and an **external-only** Hermes adapter story on branch `feat/externalize-hermes-adapter` ([tree](https://github.com/HenkDz/paperclip/tree/feat/externalize-hermes-adapter)).

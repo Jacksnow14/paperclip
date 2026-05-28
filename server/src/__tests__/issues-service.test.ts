@@ -564,6 +564,36 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
   it("returns null instead of throwing for malformed non-uuid issue refs", async () => {
     await expect(svc.getById("not-a-uuid")).resolves.toBeNull();
   });
+
+  it("filters issues list by humanId / key query param", async () => {
+    const companyId = randomUUID();
+    const targetId = randomUUID();
+    const otherId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "AUR",
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values([
+      { id: targetId, companyId, issueNumber: 42, identifier: "AUR-42", title: "Target issue", status: "todo", priority: "medium", createdByUserId: "user-1" },
+      { id: otherId, companyId, issueNumber: 43, identifier: "AUR-43", title: "Other issue", status: "todo", priority: "medium", createdByUserId: "user-1" },
+    ]);
+
+    const byHumanId = await svc.list(companyId, { humanId: "AUR-42" });
+    expect(byHumanId).toHaveLength(1);
+    expect(byHumanId[0].id).toBe(targetId);
+
+    const byHumanIdLower = await svc.list(companyId, { humanId: "aur-42" });
+    expect(byHumanIdLower).toHaveLength(1);
+    expect(byHumanIdLower[0].id).toBe(targetId);
+
+    const byMissing = await svc.list(companyId, { humanId: "AUR-999" });
+    expect(byMissing).toHaveLength(0);
+  });
+
   it("filters issues by execution workspace id", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();

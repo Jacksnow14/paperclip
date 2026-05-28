@@ -792,6 +792,58 @@ describeEmbeddedPostgres("memoryService local basic persistence", () => {
     expect(results.map((record) => record.title).sort()).toEqual([...matches].sort());
   });
 
+  // AUR-1472: scorecard_adjusted and roi_ledger land as accepted without board review.
+  it("auto-accepts captures with scorecard_adjusted and roi_ledger categories", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip Auto-Accept Categories Test",
+      issuePrefix: `A${companyId.replace(/-/g, "").slice(0, 5).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const service = memoryService(db);
+    const actor = {
+      actorType: "user" as const,
+      actorId: "board-user",
+      agentId: null,
+      userId: "board-user",
+      runId: null,
+    };
+    const binding = await service.createBinding(companyId, {
+      key: "auto-accept-categories-test",
+      name: "Auto-accept categories test",
+      providerKey: "local_basic",
+      config: {},
+      enabled: true,
+    });
+    await service.setCompanyDefault(companyId, binding.id);
+
+    const cases: Array<{ category: string }> = [
+      { category: "scorecard_adjusted" },
+      { category: "roi_ledger" },
+    ];
+
+    for (const { category } of cases) {
+      const result = await service.capture(
+        companyId,
+        {
+          bindingKey: "auto-accept-categories-test",
+          scope: { scopeType: "org", scopeId: companyId },
+          source: { kind: "manual_note", externalRef: `auto-accept-${category}` },
+          title: `auto-accept/${category}/test`,
+          content: `Record with category ${category} must auto-accept.`,
+          metadata: { category },
+          // reviewState intentionally omitted — should be resolved automatically
+        },
+        actor,
+      );
+
+      expect(result.records).toHaveLength(1);
+      expect(result.records[0].reviewState).toBe("accepted");
+    }
+  });
+
   // AUR-964: canonical promotion-sensitivity invariant. Promotion may keep
   // sensitivity equal or strictly raise it; lowering is rejected as 422 to
   // prevent declassification while widening audience.

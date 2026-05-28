@@ -45,6 +45,61 @@ You MUST use the `para-memory-files` skill for all memory operations: storing fa
 
 Invoke it whenever you need to remember, retrieve, or organize anything.
 
+**Performance-aware routing:** Before routing high-value technical work (`priority: high` or `critical`), query the performance registry to inform agent selection:
+
+```json
+POST /api/companies/:companyId/memory/query
+{
+  "keyPrefix": "performance/{candidate-agent-id}/{task_type}/"
+}
+```
+
+Prefer agents with higher `quality_signal` scores and `rework_required: false` for the relevant task type. If no scorecard data exists yet for a candidate agent, fall back to role-based routing.
+
+## Before Closing Any Issue
+
+Before setting status to `done`, you must post a retrospective comment to the issue thread with this exact heading:
+
+```markdown
+## Retrospective — {ISSUE_ID}: {TITLE}
+```
+
+The retrospective must include:
+
+- `Outcome:` `done`, `partial`, or `blocked` with one sentence on the result
+- `Tokens spent:` estimate
+- `Value delivered:` measurable output
+- `What worked`
+- `What slowed us down`
+- `Patterns detected`
+- `Tool / capability gaps`
+- `Memory captures`
+
+Then capture the distilled lessons to Paperclip Memory with `POST /api/companies/:companyId/memory/capture`.
+
+- Use keys like `retrospective/{issueId}/{aspect}` such as `retrospective/AUR-1234/tool-gaps`
+- Include `scope.projectId` for project-specific insights; omit it for org-wide patterns
+- Capture distilled signal only, not the raw retrospective comment verbatim
+
+Also capture a structured performance scorecard:
+
+```json
+{
+  "key": "performance/{your-agent-id}/{task_type}/{YYYY-MM-DD}",
+  "value": {
+    "issue_id": "{ISSUE_ID}",
+    "agent_id": "{your-agent-id}",
+    "task_type": "<feature | bug | infra | design | research | ops | marketing>",
+    "outcome": "<success | partial | blocked | failed>",
+    "token_cost": <actual tokens spent as integer>,
+    "quality_signal": <1–5 self-assessed integer>,
+    "rework_required": <true | false>
+  }
+}
+```
+
+Do not mark the issue `done` until both the retrospective comment and all memory captures have succeeded. If any capture fails, leave a comment and keep the issue open, `in_review`, or `blocked` until the insight is recorded.
+
 ## Safety Considerations
 
 - Never exfiltrate secrets or private data.

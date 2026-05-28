@@ -295,6 +295,52 @@ When a `request_board_approval` arrives for a self-edit proposal:
 - Schedule: daily 06:00 UTC
 - Parent: [AUR-1395](/AUR/issues/AUR-1395) — SGI Path
 
+## 15. Issue AC Schema (SGI Loop G — Pre-flight)
+
+Every `todo` issue must satisfy the following acceptance-criteria schema before an executor wakes. An automated validator (SGI Loop G routine, every 10 minutes) checks new issues and blocks them if the schema is violated.
+
+### Required fields
+
+| Criterion | Check | Example |
+|-----------|-------|---------|
+| **A — Measurable AC** | Description has an `## Acceptance criteria` section, a `- [ ]` checklist, or measurable language ("must", "passes when", "done when") | `## Acceptance criteria\n- [ ] Route returns 200 with correct body` |
+| **B — Named artifact** | Description names the output: a file path, API route, memory record key, migration, document, or schema | `server/src/routes/foo.ts`, `/api/foo/bar`, `performance/{agentId}/…` |
+| **C — Named verifier** | Description says how the work is confirmed: a test, demo, board review, memory query, or audit | `pnpm test passes`, `curl /api/health returns 200`, `scorecard query` |
+
+**All three are required** unless the issue is exempt (see below).
+
+### Exemption
+
+Add `exec.preflight: skip` anywhere in the issue description to bypass all checks. Use this for:
+- Trivial follow-up comments or coordination issues
+- Monitoring / routine execution issues
+- Single-action patches where the artifact and verifier are self-evident
+
+Agent-authored structured issues (description starts with `##`) and known system-internal patterns are exempt automatically.
+
+### What happens on failure
+
+The validator:
+1. Moves the issue to `blocked`
+2. Posts a comment listing the missing fields and the template to fill them in
+3. Emits a `preflight/{issueId}/{date}` memory record
+
+The creator then edits the description, adds the missing fields, and moves the issue back to `todo`.
+
+### Dry-run
+
+For the first 48 hours after the routine is deployed, Loop G logs what it would have blocked without actually blocking. This allows schema tuning before enforcement becomes load-bearing. The dry-run window is controlled by the `preflight/dry-run-config` record in Paperclip Memory.
+
+### Detection Routine
+
+- Name: `SGI Loop G — AC Pre-flight Validator`
+- Owner: CTO (agent `371a1b08-0286-4a12-a516-f587f42df5eb`)
+- Schedule: every 10 minutes
+- Parent: [AUR-1395](/AUR/issues/AUR-1395) — SGI Path
+- Source: [AUR-1465](/AUR/issues/AUR-1465)
+
+---
+
 ## 11. Fork-Specific: HenkDz/paperclip
 
 This is a fork of `paperclipai/paperclip` with QoL patches and an **external-only** Hermes adapter story on branch `feat/externalize-hermes-adapter` ([tree](https://github.com/HenkDz/paperclip/tree/feat/externalize-hermes-adapter)).

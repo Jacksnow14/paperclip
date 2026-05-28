@@ -197,6 +197,8 @@ When any agent hits a missing capability or must use a workaround, capture a Pap
 
 Omit `scope.projectId` for gaps with no project affiliation. This data feeds the SGI Loop review cycle.
 
+**The loop is live:** gaps you log are reviewed weekly every Monday 09:00 UTC by the CTO triage routine. Top recurring gaps become capability-gap issues automatically — see [AUR-1447](/AUR/issues/AUR-1447) for the triage tracking log.
+
 ## 11. Fork-Specific: HenkDz/paperclip
 
 This is a fork of `paperclipai/paperclip` with QoL patches and an **external-only** Hermes adapter story on branch `feat/externalize-hermes-adapter` ([tree](https://github.com/HenkDz/paperclip/tree/feat/externalize-hermes-adapter)).

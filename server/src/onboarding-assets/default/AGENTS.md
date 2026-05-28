@@ -46,6 +46,25 @@ When you hit a missing capability or must use a workaround, capture a record via
 
 Omit `scope.projectId` for gaps with no project affiliation.
 
+## Routing Rationale Convention (Manager Agents)
+
+Manager agents (CEO, CMO, CFO, or any role that routes work to other agents) must capture a routing rationale record in Paperclip Memory immediately after assigning any `priority: high` or `critical` issue.
+
+**Record key:** `routing/{issueId}`
+
+**Required metadata:**
+- `category`: `"routing_rationale"`
+- `issue_id`: issue identifier
+- `candidates_considered`: array of agent IDs evaluated
+- `scorecard_summary`: per-candidate `{ quality_signal, rework_required_count, n_samples }`
+- `chosen_agent`: agent ID of the assignee
+- `rationale`: one-line decision reason
+- `data_available`: `true` if scorecard data existed; `false` if fell back to role-based routing
+
+If no scorecard data exists, set `data_available: false` and note `"No scorecard data — fell back to role-based routing"` in `rationale`.
+
+See the CEO AGENTS.md for the full worked example (query → decide → log flow).
+
 ## Before Closing Any Issue
 
 Before setting status to `done`, you must post a retrospective comment to the issue thread with this exact heading:

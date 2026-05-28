@@ -176,7 +176,35 @@ A change is done when all are true:
 4. Docs updated when behavior or commands change
 5. PR description follows the [PR template](.github/PULL_REQUEST_TEMPLATE.md) with all sections filled in (including Model Used)
 
-## 12. Tool-Gap Logging
+## 12. Routing Rationale Convention (Manager Agents)
+
+Any manager agent (CEO, CMO, CFO, or future manager roles) that routes a `priority: high` or `critical` issue to another agent **must** capture a routing rationale record in Paperclip Memory immediately after assignment.
+
+**Record key:** `routing/{issueId}`
+
+**Required metadata fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `category` | string | Always `"routing_rationale"` |
+| `issue_id` | string | The issue identifier (e.g. `AUR-1500`) |
+| `candidates_considered` | string[] | Agent IDs that were evaluated |
+| `scorecard_summary` | object | Per-candidate: `{ quality_signal, rework_required_count, n_samples }` |
+| `chosen_agent` | string | Agent ID of the assignee |
+| `rationale` | string | One-line decision reason |
+| `data_available` | boolean | `true` if scorecard data existed; `false` if fell back to role-based |
+
+**When no scorecard data exists:** set `data_available: false` and note `"No scorecard data — fell back to role-based routing"` in `rationale`. This is allowed but must be explicit.
+
+**Reference implementation:** CEO AGENTS.md — `## Memory and planning` → "Routing rationale capture" section with a full worked example.
+
+**Detection:** A watchdog routine (`routing-rationale-watchdog`) runs every 30 minutes. It queries all high/critical issues with an assignee and flags any that are missing `routing/{issueId}` records in memory. The detection script can also be run manually:
+
+```sh
+node scripts/check-routing-rationale.mjs
+```
+
+## 13. Tool-Gap Logging
 
 When any agent hits a missing capability or must use a workaround, capture a Paperclip Memory record via `POST /api/companies/:companyId/memory/capture`. The Memory API has no native `key` field — encode the key in `title`:
 
@@ -198,6 +226,74 @@ When any agent hits a missing capability or must use a workaround, capture a Pap
 Omit `scope.projectId` for gaps with no project affiliation. This data feeds the SGI Loop review cycle.
 
 **The loop is live:** gaps you log are reviewed weekly every Monday 09:00 UTC by the CTO triage routine. Top recurring gaps become capability-gap issues automatically — see [AUR-1447](/AUR/issues/AUR-1447) for the triage tracking log.
+
+## 14. Prompt Self-Edit Flow (SGI Loop C)
+
+The system can trigger prompt self-improvement when an agent's performance declines. All agents must follow this protocol when assigned a self-edit issue.
+
+### Trigger Conditions
+
+A daily detection routine (cron 06:00 UTC, owned by CTO) scans `performance/{agent}/{task_type}/*` scorecards in Paperclip Memory. A self-edit issue is opened for an agent when the **last 3 closed scorecards** for a given `{agent}/{task_type}` show:
+- **Declining quality**: `quality_signal` is strictly monotonically decreasing (e.g. 4 → 3 → 2), OR
+- **Repeated rework**: all 3 have `rework_required: true`
+
+### Agent Protocol: When Assigned a Self-Edit Issue
+
+When you receive an issue titled `Prompt self-edit required — {your-agent-id} / {task_type}`:
+
+1. **Read your own AGENTS.md** (your `instructions-path` file).
+2. **Identify the responsible section** — the instructions that govern the `{task_type}` work where quality declined.
+3. **Post a memory record** titled `prompt-improvement-proposal/{agentId}/{YYYY-MM-DD}`:
+
+   ```json
+   {
+     "title": "prompt-improvement-proposal/{agentId}/{YYYY-MM-DD}",
+     "content": "<one-line summary of the proposed change>",
+     "metadata": {
+       "category": "prompt_improvement_proposal",
+       "agent_id": "{your-agent-id}",
+       "task_type": "{task_type}",
+       "triggering_pattern": "<one-line: what went wrong in the last 3 runs>",
+       "current_instruction_excerpt": "<verbatim excerpt from your AGENTS.md being replaced>",
+       "proposed_edit": "<diff or full replacement of the affected section>",
+       "rationale": "<why this change prevents the pattern>",
+       "expected_impact": "<quality_signal improvement expected>"
+     }
+   }
+   ```
+
+4. **Create a board approval** (`POST /api/companies/{companyId}/approvals`, `type: request_board_approval`) with:
+   - `title`: `Self-edit proposal: {agentId} / {task_type}`
+   - `summary`: brief description of the problem and proposed fix
+   - `recommendedAction`: "Apply the proposed_edit to the agent's AGENTS.md"
+   - `risks`: ["Instruction change may affect behavior beyond the target task type"]
+   - `issueIds`: [this self-edit issue's id]
+
+5. **Set this issue `in_review`**, assigned to the CEO.
+
+### Safety Boundaries (Non-negotiable)
+
+- **Self-edit only.** You may ONLY propose changes to YOUR OWN `instructions-path` file.
+- **Never propose edits** to: other agents' instruction files, the root repo `AGENTS.md`, `SOUL.md`, `HEARTBEAT.md`, or any governance document.
+- The CEO enforces this in review — proposals targeting non-self files are automatically rejected.
+- All proposals are captured to memory regardless of approval outcome (auditable history).
+
+### CEO Approval Protocol
+
+When a `request_board_approval` arrives for a self-edit proposal:
+
+1. Fetch the `prompt-improvement-proposal/{agentId}/{YYYY-MM-DD}` memory record.
+2. **Verify** the proposed edit targets **only** the agent's own `instructions-path` file. Reject immediately if not.
+3. Assess the proposed change for correctness, safety, and alignment with agent role.
+4. **On approval**: apply the diff/replacement to the agent's AGENTS.md (Edit tool), then update the memory record with `outcome: approved`.
+5. **On rejection**: update the memory record with `outcome: rejected` and a `rejection_reason` field.
+
+### Detection Routine
+
+- Name: `SGI Loop C — Scorecard Streak Detection`
+- Owner: CTO (agent `371a1b08-0286-4a12-a516-f587f42df5eb`)
+- Schedule: daily 06:00 UTC
+- Parent: [AUR-1395](/AUR/issues/AUR-1395) — SGI Path
 
 ## 11. Fork-Specific: HenkDz/paperclip
 

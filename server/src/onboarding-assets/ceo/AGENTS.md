@@ -59,6 +59,70 @@ GET /api/companies/:companyId/memory/records?key=performance/{candidate-agent-id
 
 Prefer agents with higher `quality_signal` scores and `rework_required: false` for the relevant task type. If no scorecard data exists yet for a candidate agent, fall back to role-based routing.
 
+**Routing rationale capture (enforcement):** After routing any `priority: high` or `critical` task, you MUST capture a routing rationale record immediately after assignment. This is non-optional — it is the mechanism that makes scorecards load-bearing.
+
+Capture to: `POST /api/companies/:companyId/memory/capture`
+
+```json
+{
+  "title": "routing/{issueId}",
+  "content": "<one-line rationale>",
+  "metadata": {
+    "category": "routing_rationale",
+    "issue_id": "{issueId}",
+    "candidates_considered": ["agentId1", "agentId2"],
+    "scorecard_summary": {
+      "agentId1": { "quality_signal": 4, "rework_required_count": 0, "n_samples": 3 },
+      "agentId2": { "quality_signal": 3, "rework_required_count": 1, "n_samples": 2 }
+    },
+    "chosen_agent": "agentId1",
+    "rationale": "Chose agentId1: quality_signal 4 vs 3, no rework on 3 samples.",
+    "data_available": true
+  },
+  "source": "{issueId}/{runId}"
+}
+```
+
+If no scorecard data exists for any candidate, set `data_available: false`, note it explicitly in `rationale` (e.g., `"No scorecard data — fell back to role-based routing"`), and route by role as normal. Absence of data is allowed but must be visible.
+
+**Worked example (query → decide → log):**
+
+Routing AUR-1500 (priority: high, feature) to a coding agent:
+
+1. Query scorecards for each candidate:
+   ```
+   GET /api/companies/{companyId}/memory/records?titlePrefix=performance/38c3252d-ef90-48e9-8969-5c2a7d337e54/feature/&limit=10
+   GET /api/companies/{companyId}/memory/records?titlePrefix=performance/e8f947d2-761e-44b2-b576-3dbcc85b24bf/feature/&limit=10
+   ```
+
+2. Summarize results: Claude Code Fast — quality_signal avg 4, 0/5 rework, 5 samples. Claude Code Max — quality_signal 5, 0/1 rework, 1 sample.
+
+3. Decide: Claude Code Fast (consistent track record; 5 samples vs 1; comparable quality; lower cost).
+
+4. Assign the issue, then capture:
+   ```json
+   POST /api/companies/{companyId}/memory/capture
+   {
+     "title": "routing/AUR-1500",
+     "content": "Routed to Claude Code Fast: quality 4/5, 5 samples, no rework. Max has only 1 sample.",
+     "metadata": {
+       "category": "routing_rationale",
+       "issue_id": "AUR-1500",
+       "candidates_considered": ["38c3252d-ef90-48e9-8969-5c2a7d337e54", "e8f947d2-761e-44b2-b576-3dbcc85b24bf"],
+       "scorecard_summary": {
+         "38c3252d-ef90-48e9-8969-5c2a7d337e54": { "quality_signal": 4, "rework_required_count": 0, "n_samples": 5 },
+         "e8f947d2-761e-44b2-b576-3dbcc85b24bf": { "quality_signal": 5, "rework_required_count": 0, "n_samples": 1 }
+       },
+       "chosen_agent": "38c3252d-ef90-48e9-8969-5c2a7d337e54",
+       "rationale": "Claude Code Fast preferred: 5 samples vs 1, quality_signal 4 consistent, lower cost.",
+       "data_available": true
+     },
+     "source": "AUR-1500/{runId}"
+   }
+   ```
+
+Missing `routing/{issueId}` records for high/critical tasks will be flagged by the routing-rationale watchdog routine.
+
 ## Pre-task Memory Query
 
 At the start of each heartbeat for a new issue, the harness auto-queries Paperclip Memory and injects any relevant records as a preamble in your context. Read and apply the preamble before acting.

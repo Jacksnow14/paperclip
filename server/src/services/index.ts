@@ -56,3 +56,6 @@ export { notifyHireApproved, type NotifyHireApprovedInput } from "./hire-hook.js
 export { publishLiveEvent, subscribeCompanyLiveEvents } from "./live-events.js";
 export { reconcilePersistedRuntimeServicesOnStartup, restartDesiredRuntimeServicesOnStartup } from "./workspace-runtime.js";
 export { createStorageServiceFromConfig, getStorageService } from "../storage/index.js";
+
+export { memoryService, type MemoryPreRunHydrateResult, type MemoryPostRunCaptureResult } from "./memory.js";
+export { backgroundJobService, type BackgroundJobService } from "./background-jobs.js";

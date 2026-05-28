@@ -2914,6 +2914,174 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  async function seedRecentRecoveryActions(input: { companyId: string; count: number }) {
+    const dummyIssueIds: string[] = [];
+    for (let i = 0; i < input.count; i += 1) {
+      const dummyIssueId = randomUUID();
+      dummyIssueIds.push(dummyIssueId);
+      await db.insert(issues).values({
+        id: dummyIssueId,
+        companyId: input.companyId,
+        title: `Surge filler issue ${i}`,
+        status: "blocked",
+        priority: "medium",
+        issueNumber: 100 + i,
+        identifier: null,
+      });
+      await db.insert(issueRecoveryActions).values({
+        companyId: input.companyId,
+        sourceIssueId: dummyIssueId,
+        kind: "stranded_assigned_issue",
+        status: "active",
+        ownerType: "agent",
+        cause: "stranded_assigned_issue",
+        fingerprint: `surge-filler-${i}-${randomUUID()}`,
+        nextAction: "wait_for_human",
+      });
+    }
+    return dummyIssueIds;
+  }
+
+  it("suppresses transient-classified recovery during a recovery-action surge", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "claude_transient_upstream",
+      runError: "claude upstream 529 overloaded",
+    });
+    await seedRecentRecoveryActions({ companyId, count: 6 });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.surgeSuppressed).toBe(1);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.dispatchRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(sourceIssue?.status).toBe("in_progress");
+
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(recoveryActions).toHaveLength(0);
+
+    const followupRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId)));
+    expect(followupRuns).toHaveLength(1);
+    expect(followupRuns[0]?.id).toBe(runId);
+
+    const surgeActivity = await db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "recovery.surge_suppressed")));
+    expect(surgeActivity).toHaveLength(1);
+    expect(surgeActivity[0]?.details).toMatchObject({ companyId, count: 1 });
+  });
+
+  it("does not suppress non-transient stranded work even during a recovery-action surge", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "task_runtime_error",
+      runError: "uncaught exception in run",
+    });
+    await seedRecentRecoveryActions({ companyId, count: 6 });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.surgeSuppressed).toBe(0);
+    expect(result.continuationRequeued + result.escalated).toBeGreaterThan(0);
+    expect(result.issueIds).toContain(issueId);
+
+    const followupRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId)));
+    expect(followupRuns.length).toBeGreaterThanOrEqual(1);
+    expect(followupRuns.some((row) => row.id === runId)).toBe(true);
+
+    const surgeActivity = await db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "recovery.surge_suppressed")));
+    expect(surgeActivity).toHaveLength(0);
+  });
+
+  it("tracks the surgeSuppressed counter accurately across multiple transient candidates", async () => {
+    const { companyId, agentId, issueId: firstIssueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "adapter_failed",
+    });
+
+    const secondIssueId = randomUUID();
+    const secondRunId = randomUUID();
+    const secondWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: secondWakeId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: secondIssueId },
+      status: "failed",
+      runId: secondRunId,
+      claimedAt: new Date("2026-03-19T00:00:00.000Z"),
+      finishedAt: new Date("2026-03-19T00:05:00.000Z"),
+    });
+    await db.insert(heartbeatRuns).values({
+      id: secondRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      wakeupRequestId: secondWakeId,
+      contextSnapshot: { issueId: secondIssueId, taskId: secondIssueId, wakeReason: "issue_assigned" },
+      startedAt: new Date("2026-03-19T00:00:00.000Z"),
+      finishedAt: new Date("2026-03-19T00:05:00.000Z"),
+      updatedAt: new Date("2026-03-19T00:05:00.000Z"),
+      errorCode: "process_lost",
+      error: "process detached",
+      livenessState: null,
+    });
+    await db.insert(issues).values({
+      id: secondIssueId,
+      companyId,
+      title: "Second stranded transient issue",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      checkoutRunId: secondRunId,
+      issueNumber: 50,
+      identifier: null,
+      startedAt: new Date("2026-03-19T00:00:00.000Z"),
+    });
+
+    await seedRecentRecoveryActions({ companyId, count: 6 });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.surgeSuppressed).toBe(2);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds.includes(firstIssueId)).toBe(false);
+    expect(result.issueIds.includes(secondIssueId)).toBe(false);
+
+    const surgeActivity = await db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "recovery.surge_suppressed")));
+    expect(surgeActivity).toHaveLength(1);
+    expect(surgeActivity[0]?.details).toMatchObject({ companyId, count: 2 });
+  });
+
   it("does not reconcile user-assigned work through the agent stranded-work recovery path", async () => {
     const { issueId, runId } = await seedStrandedIssueFixture({
       status: "todo",

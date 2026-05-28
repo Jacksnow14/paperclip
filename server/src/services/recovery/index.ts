@@ -29,6 +29,8 @@ export type {
   IssueLivenessState,
 } from "./issue-graph-liveness.js";
 export {
+  RECOVERY_SURGE_LOOKBACK_MS,
+  RECOVERY_SURGE_THRESHOLD,
   recoveryService,
 } from "./service.js";
 export {

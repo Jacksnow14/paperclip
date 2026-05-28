@@ -530,7 +530,17 @@ export interface HostToWorkerMethods {
     params: PluginEnvironmentExecuteParams,
     result: PluginEnvironmentExecuteResult,
   ];
+  /** Invoke a plugin-registered memory provider for query, capture, or forget operations. */
+  invokeMemoryProvider: [params: InvokeMemoryProviderParams, result: InvokeMemoryProviderResult];
 }
+
+export interface InvokeMemoryProviderParams {
+  providerKey: string;
+  action: "query" | "capture" | "forget";
+  input: unknown;
+}
+
+export type InvokeMemoryProviderResult = unknown;
 
 /** Union of all host→worker method names. */
 export type HostToWorkerMethodName = keyof HostToWorkerMethods;

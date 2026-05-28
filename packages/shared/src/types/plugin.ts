@@ -30,6 +30,7 @@ import type { Agent } from "./agent.js";
 import type { CompanySkill } from "./company-skill.js";
 import type { Project } from "./project.js";
 import type { Routine, RoutineTrigger, RoutineVariable } from "./routine.js";
+import type { MemoryProviderCapabilities, MemoryProviderConfigMetadata } from "./memory.js";
 
 // ---------------------------------------------------------------------------
 // JSON Schema placeholder – plugins declare config schemas as JSON Schema
@@ -51,6 +52,22 @@ export type {
 // ---------------------------------------------------------------------------
 // Manifest sub-types — nested declarations within PaperclipPluginManifestV1
 // ---------------------------------------------------------------------------
+
+/** Declares a memory provider a plugin contributes. Requires `memory.providers.register` capability. */
+export interface PluginMemoryProviderDeclaration {
+  /** Stable provider key unique within the plugin manifest. */
+  key: string;
+  /** Human-readable name shown in the operator UI. */
+  displayName: string;
+  /** Optional description of what the provider does. */
+  description?: string;
+  /** Capability flags surfaced in the host provider catalog. */
+  capabilities?: Partial<MemoryProviderCapabilities>;
+  /** Optional JSON Schema for provider-specific binding config. */
+  configSchema?: JsonSchema;
+  /** Optional UI metadata for rendering provider-specific binding config. */
+  configMetadata?: MemoryProviderConfigMetadata;
+}
 
 /**
  * Declares a scheduled job a plugin can run.
@@ -529,6 +546,8 @@ export interface PaperclipPluginManifestV1 {
   webhooks?: PluginWebhookDeclaration[];
   /** Agent tools this plugin contributes. Requires `agent.tools.register` capability. */
   tools?: PluginToolDeclaration[];
+  /** Memory providers this plugin contributes. Requires `memory.providers.register` capability. */
+  memoryProviders?: PluginMemoryProviderDeclaration[];
   /** Restricted plugin-owned database namespace declaration. */
   database?: PluginDatabaseDeclaration;
   /** Scoped JSON API routes mounted under `/api/plugins/:pluginId/api/*`. */

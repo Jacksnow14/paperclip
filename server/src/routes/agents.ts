@@ -2686,6 +2686,14 @@ export function agentRoutes(
       );
     }
 
+    if (requestedRuntimeConfig) {
+      const existingPolicy = parseSchedulerHeartbeatPolicy(existing.runtimeConfig);
+      const newPolicy = parseSchedulerHeartbeatPolicy(agent.runtimeConfig);
+      if (existingPolicy.enabled && !newPolicy.enabled) {
+        await heartbeat.cancelQueuedTimerRunsForAgent(agent.id);
+      }
+    }
+
     await logActivity(db, {
       companyId: agent.companyId,
       actorType: actor.actorType,

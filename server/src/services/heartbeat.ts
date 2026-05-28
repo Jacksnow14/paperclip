@@ -57,6 +57,7 @@ import type {
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
+import { memoryService } from "./memory.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
@@ -170,6 +171,27 @@ const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_STRING_CHARS = 16 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS = 50;
+
+function deriveMemoryTaskType(title: string): string {
+  const lower = title.toLowerCase();
+  if (/\bfix\b|\bbug\b|\berror\b|\bfail\b|\bcrash\b|\bregress/.test(lower)) return "bug";
+  if (/\binfra\b|\bdeploy\b|\bci\b|\bcd\b|\bdocker\b|\bmigrat/.test(lower)) return "infra";
+  if (/\bdesign\b|\bui\b|\bux\b|\bmockup\b|\bwireframe/.test(lower)) return "design";
+  if (/\bresearch\b|\binvestigat\b|\banalys\b|\bexplore\b/.test(lower)) return "research";
+  return "feature";
+}
+
+function buildPreTaskMemoryQuery(title: string): string {
+  const taskType = deriveMemoryTaskType(title);
+  const stopwords = new Set(["the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by", "from", "is", "are", "was", "were"]);
+  const keywords = title
+    .toLowerCase()
+    .replace(/[^\w\s]/g, " ")
+    .split(/\s+/)
+    .filter(w => w.length > 2 && !stopwords.has(w))
+    .slice(0, 6);
+  return [taskType, ...keywords].join(" ");
+}
 
 export function redactDetectedSuccessfulRunProgressSummaryForBoard(
   summary: string,
@@ -6593,6 +6615,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileStrandedAssignedIssues();
   }
 
+  async function reconcileBlockedRetryableIssues(now: Date = new Date()) {
+    return recovery.reconcileBlockedRetryableIssues(now);
+  }
+
+  async function backfillStuckRateLimitedIssues(now: Date = new Date()) {
+    return recovery.backfillStuckRateLimitedIssues(now);
+  }
+
   function issueIdFromRunContext(contextSnapshot: unknown) {
     const context = parseObject(contextSnapshot);
     return readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
@@ -7665,6 +7695,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
+
+      // Pre-task memory query: hydrate relevant memory before adapter execution
+      if (issueRef) {
+        try {
+          const memSvc = memoryService(db);
+          const memHydrate = await memSvc.preRunHydrate({
+            companyId: agent.companyId,
+            agentId: agent.id,
+            projectId: resolvedProjectId,
+            issueId: issueRef.id,
+            runId: run.id,
+            query: buildPreTaskMemoryQuery(issueRef.title),
+          });
+          if (memHydrate.preamble) {
+            context.paperclipMemoryPreamble = memHydrate.preamble;
+          } else {
+            delete context.paperclipMemoryPreamble;
+          }
+          const traceStatus = memHydrate.trace.status;
+          const traceRecords = memHydrate.trace.recordCount;
+          const traceReason = memHydrate.trace.reason ? ` reason=${memHydrate.trace.reason}` : "";
+          await onLog("stdout", `[paperclip:memory] pre-run hydrate ${traceStatus}; ${traceRecords} records${traceReason}\n`);
+        } catch (memErr) {
+          delete context.paperclipMemoryPreamble;
+          await onLog("stderr", `[paperclip:memory] pre-run hydrate failed: ${memErr instanceof Error ? memErr.message : String(memErr)}\n`);
+        }
+      } else {
+        delete context.paperclipMemoryPreamble;
+      }
+
       const adapterResult = await adapter.execute({
         runId: run.id,
         agent,
@@ -9460,6 +9520,46 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return runs.length;
   }
 
+  async function cancelQueuedTimerRunsForAgentInternal(
+    agentId: string,
+    reason = "Cancelled because timer heartbeat was disabled",
+  ) {
+    // Also cancel automation runs whose contextSnapshot preserves wakeSource='timer'.
+    // scheduleBoundedRetryForRun spreads the original contextSnapshot into every retry,
+    // so wakeSource:'timer' is present at all retry depths without requiring a recursive join.
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+          or(
+            eq(heartbeatRuns.invocationSource, "timer"),
+            and(
+              eq(heartbeatRuns.invocationSource, "automation"),
+              sql`${heartbeatRuns.contextSnapshot} ->> 'wakeSource' = 'timer'`,
+            ),
+          ),
+        ),
+      );
+
+    for (const run of runs) {
+      await setRunStatus(run.id, "cancelled", {
+        finishedAt: new Date(),
+        error: reason,
+        errorCode: "cancelled",
+      });
+      await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+        finishedAt: new Date(),
+        error: reason,
+      });
+      await releaseIssueExecutionAndPromote(run);
+    }
+
+    return runs.length;
+  }
+
   async function cancelBudgetScopeWork(scope: BudgetEnforcementScope) {
     if (scope.scopeType === "agent") {
       await cancelActiveForAgentInternal(scope.scopeId, "Cancelled due to budget pause");
@@ -9770,6 +9870,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     },
 
     reconcileStrandedAssignedIssues,
+    reconcileBlockedRetryableIssues,
+    backfillStuckRateLimitedIssues,
 
     buildIssueGraphLivenessAutoRecoveryPreview,
 
@@ -9825,6 +9927,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     cancelRun: (runId: string) => cancelRunInternal(runId),
 
     cancelActiveForAgent: (agentId: string) => cancelActiveForAgentInternal(agentId),
+
+    cancelQueuedTimerRunsForAgent: (agentId: string) => cancelQueuedTimerRunsForAgentInternal(agentId),
 
     cancelBudgetScopeWork,
 

@@ -779,6 +779,8 @@ export const PLUGIN_CAPABILITIES = [
   "local.folders",
   // Agent Tools
   "agent.tools.register",
+  // Memory Providers
+  "memory.providers.register",
   // UI
   "instance.settings.register",
   "ui.sidebar.register",
@@ -1072,3 +1074,144 @@ export const PLUGIN_BRIDGE_ERROR_CODES = [
   "UNKNOWN",
 ] as const;
 export type PluginBridgeErrorCode = (typeof PLUGIN_BRIDGE_ERROR_CODES)[number];
+
+export const MEMORY_BINDING_TARGET_TYPES = ["company", "project", "agent"] as const;
+export type MemoryBindingTargetType = (typeof MEMORY_BINDING_TARGET_TYPES)[number];
+
+export const MEMORY_PROVIDER_KINDS = ["builtin", "plugin"] as const;
+export type MemoryProviderKind = (typeof MEMORY_PROVIDER_KINDS)[number];
+
+export const MEMORY_OPERATION_TYPES = [
+  "query",
+  "capture",
+  "upsert",
+  "list",
+  "get",
+  "forget",
+  "revoke",
+  "correct",
+  "review",
+  "retention_sweep",
+  "promote",
+] as const;
+export type MemoryOperationType = (typeof MEMORY_OPERATION_TYPES)[number];
+
+export const MEMORY_OPERATION_STATUSES = ["succeeded", "failed"] as const;
+export type MemoryOperationStatus = (typeof MEMORY_OPERATION_STATUSES)[number];
+
+export const MEMORY_TRIGGER_KINDS = ["manual", "hook"] as const;
+export type MemoryTriggerKind = (typeof MEMORY_TRIGGER_KINDS)[number];
+
+export const MEMORY_HOOK_KINDS = [
+  "pre_run_hydrate",
+  "post_run_capture",
+  "issue_comment_capture",
+  "issue_document_capture",
+] as const;
+export type MemoryHookKind = (typeof MEMORY_HOOK_KINDS)[number];
+
+export const MEMORY_INJECTION_MODES = ["thin_index", "top_k_facts"] as const;
+export type MemoryInjectionMode = (typeof MEMORY_INJECTION_MODES)[number];
+
+export const MEMORY_HOOK_EXTRACTION_MODES = [
+  "raw_capture",
+  "provider_managed",
+  "paperclip_managed",
+] as const;
+export type MemoryHookExtractionMode = (typeof MEMORY_HOOK_EXTRACTION_MODES)[number];
+
+export const MEMORY_HOOK_RUN_MODES = ["sync", "async"] as const;
+export type MemoryHookRunMode = (typeof MEMORY_HOOK_RUN_MODES)[number];
+
+export const MEMORY_EXTRACTION_HARNESSES = [
+  "server_worker",
+  "plugin_worker",
+  "agent",
+] as const;
+export type MemoryExtractionHarness = (typeof MEMORY_EXTRACTION_HARNESSES)[number];
+
+export const MEMORY_SOURCE_KINDS = [
+  "issue_comment",
+  "issue_document",
+  "issue",
+  "run",
+  "activity",
+  "manual_note",
+  "external_document",
+] as const;
+export type MemorySourceKind = (typeof MEMORY_SOURCE_KINDS)[number];
+
+export const MEMORY_EXTRACTION_JOB_STATUSES = [
+  "queued",
+  "running",
+  "succeeded",
+  "failed",
+  "cancelled",
+] as const;
+export type MemoryExtractionJobStatus = (typeof MEMORY_EXTRACTION_JOB_STATUSES)[number];
+
+export const MEMORY_SCOPE_TYPES = ["run", "agent", "workspace", "project", "team", "org"] as const;
+export type MemoryScopeType = (typeof MEMORY_SCOPE_TYPES)[number];
+
+export const MEMORY_PRINCIPAL_TYPES = ["agent", "user", "system", "team", "org"] as const;
+export type MemoryPrincipalType = (typeof MEMORY_PRINCIPAL_TYPES)[number];
+
+export const MEMORY_SENSITIVITY_LABELS = ["public", "internal", "confidential", "restricted"] as const;
+export type MemorySensitivityLabel = (typeof MEMORY_SENSITIVITY_LABELS)[number];
+
+export const MEMORY_RETENTION_STATES = ["active", "expired", "revoked"] as const;
+export type MemoryRetentionState = (typeof MEMORY_RETENTION_STATES)[number];
+
+export const MEMORY_REVIEW_STATES = ["pending", "accepted", "rejected"] as const;
+export type MemoryReviewState = (typeof MEMORY_REVIEW_STATES)[number];
+
+export const BACKGROUND_JOB_BACKEND_KINDS = [
+  "server_worker",
+  "plugin_worker",
+  "agent_run",
+] as const;
+export type BackgroundJobBackendKind = (typeof BACKGROUND_JOB_BACKEND_KINDS)[number];
+
+export const BACKGROUND_JOB_STATUSES = [
+  "active",
+  "paused",
+  "archived",
+] as const;
+export type BackgroundJobStatus = (typeof BACKGROUND_JOB_STATUSES)[number];
+
+export const BACKGROUND_JOB_RUN_STATUSES = [
+  "queued",
+  "running",
+  "succeeded",
+  "failed",
+  "cancelled",
+] as const;
+export type BackgroundJobRunStatus = (typeof BACKGROUND_JOB_RUN_STATUSES)[number];
+
+export const BACKGROUND_JOB_RUN_TRIGGERS = [
+  "manual",
+  "schedule",
+  "hook",
+  "retry",
+] as const;
+export type BackgroundJobRunTrigger = (typeof BACKGROUND_JOB_RUN_TRIGGERS)[number];
+
+export const BACKGROUND_JOB_EVENT_TYPES = [
+  "queued",
+  "started",
+  "progress",
+  "log",
+  "checkpoint",
+  "completed",
+  "failed",
+  "cancelled",
+] as const;
+export type BackgroundJobEventType = (typeof BACKGROUND_JOB_EVENT_TYPES)[number];
+
+export const BACKGROUND_JOB_EVENT_LEVELS = [
+  "debug",
+  "info",
+  "warn",
+  "error",
+] as const;
+export type BackgroundJobEventLevel = (typeof BACKGROUND_JOB_EVENT_LEVELS)[number];

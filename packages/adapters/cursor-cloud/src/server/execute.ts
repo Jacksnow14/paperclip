@@ -399,10 +399,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? ""
       : renderTemplate(promptTemplate, templateData).trim();
   const paperclipEnvNote = renderPaperclipEnvNote(remoteEnv);
+  const memoryContext = asString(context.paperclipMemoryPreamble, "").trim();
   const prompt = joinPromptSections([
     instructions.prefix,
     renderedBootstrapPrompt,
     wakePrompt,
+    memoryContext,
     paperclipEnvNote,
     renderedPrompt,
   ]);

@@ -696,6 +696,21 @@ export async function startServer(): Promise<StartedServer> {
         }
       })
       .then(async () => {
+        const backfilled = await heartbeat.backfillStuckRateLimitedIssues();
+        if (backfilled.scheduled > 0) {
+          logger.warn(
+            { ...backfilled },
+            "startup backfill scheduled retry windows for stuck rate-limited blocked issues",
+          );
+        }
+      })
+      .then(async () => {
+        const resumed = await heartbeat.reconcileBlockedRetryableIssues();
+        if (resumed.resumed > 0) {
+          logger.warn({ ...resumed }, "startup blocked-retry reconciliation resumed rate-limited issues");
+        }
+      })
+      .then(async () => {
         const reconciled = await heartbeat.reconcileIssueGraphLiveness();
         if (reconciled.escalationsCreated > 0) {
           logger.warn({ ...reconciled }, "startup issue-graph liveness reconciliation created escalations");
@@ -762,6 +777,12 @@ export async function startServer(): Promise<StartedServer> {
           }
         })
         .then(async () => {
+          const resumed = await heartbeat.reconcileBlockedRetryableIssues();
+          if (resumed.resumed > 0) {
+            logger.warn({ ...resumed }, "periodic blocked-retry reconciliation resumed rate-limited issues");
+          }
+        })
+        .then(async () => {
           const reconciled = await heartbeat.reconcileIssueGraphLiveness();
           if (reconciled.escalationsCreated > 0) {
             logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation created escalations");
@@ -784,7 +805,13 @@ export async function startServer(): Promise<StartedServer> {
         });
     }, config.heartbeatSchedulerIntervalMs);
   }
-  
+
+  // Gmail inbound intake runs on demand only: the manual endpoint
+  // (`POST /api/companies/:companyId/gmail/intake/poll`) and the routine
+  // scheduling path. There is intentionally no process-level poller here —
+  // a long-lived setInterval would poll every company on every server process
+  // regardless of company governance, budget, or routine configuration.
+
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
 

@@ -192,6 +192,24 @@ describe("buildAgentUpdatePatch", () => {
     });
   });
 
+  it("emits heartbeat.enabled: false when timer heartbeat is toggled off", () => {
+    const agent = makeAgent();
+    // agent has heartbeat enabled: true at start
+
+    const patch = buildAgentUpdatePatch(
+      agent,
+      makeOverlay({
+        heartbeat: { enabled: false },
+      }),
+    );
+
+    const rc = patch.runtimeConfig as Record<string, unknown>;
+    const hb = rc?.heartbeat as Record<string, unknown>;
+    expect(hb?.enabled).toBe(false);
+    // interval should be preserved from the existing runtimeConfig
+    expect(hb?.intervalSec).toBe(300);
+  });
+
   it("preserves adapter-agnostic keys when changing adapter types", () => {
     const patch = buildAgentUpdatePatch(
       makeAgent(),

@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, lte, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -58,9 +58,24 @@ import {
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import {
+  computeBackoffRetryAfter,
+  isRateLimitError,
+  parseRateLimitResetTime,
+  RATE_LIMIT_MAX_RETRY_COUNT,
+} from "../rate-limit-parser.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
+export const RECOVERY_SURGE_THRESHOLD = 5;
+export const RECOVERY_SURGE_LOOKBACK_MS = 30 * 60 * 1000;
+const TRANSIENT_RECOVERY_ERROR_CODES = new Set([
+  "adapter_failed",
+  "claude_transient_upstream",
+  "codex_transient_upstream",
+  "process_lost",
+  "cli_rate_limited",
+]);
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
@@ -87,7 +102,7 @@ type RecoveryWakeup = (
 
 type LatestIssueRun = Pick<
   typeof heartbeatRuns.$inferSelect,
-  "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "livenessState"
+  "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "finishedAt" | "livenessState"
 > | null;
 type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & { status: "succeeded" };
 
@@ -413,6 +428,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         error: heartbeatRuns.error,
         errorCode: heartbeatRuns.errorCode,
         contextSnapshot: heartbeatRuns.contextSnapshot,
+        finishedAt: heartbeatRuns.finishedAt,
         livenessState: heartbeatRuns.livenessState,
       })
       .from(heartbeatRuns)
@@ -1809,6 +1825,80 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows.map((row) => row.blockerIssueId));
   }
 
+  function computeRateLimitRetrySchedule(input: {
+    issue: typeof issues.$inferSelect;
+    latestRun: LatestIssueRun;
+    now?: Date;
+    mode: "escalate" | "backfill";
+  }):
+    | { kind: "scheduled"; retryAfter: Date; nextRetryCount: number }
+    | { kind: "permanent"; nextRetryCount: number }
+    | null {
+    if (!input.latestRun) return null;
+    if (input.latestRun.errorCode !== "adapter_failed") return null;
+    if (!isRateLimitError(input.latestRun.error)) return null;
+
+    const now = input.now ?? new Date();
+    const priorCount = Math.max(0, input.issue.rateLimitRetryCount ?? 0);
+    const nextRetryCount = priorCount + 1;
+    if (nextRetryCount > RATE_LIMIT_MAX_RETRY_COUNT) {
+      return { kind: "permanent", nextRetryCount: priorCount };
+    }
+
+    const parseAnchor = input.latestRun.finishedAt ?? now;
+    const parsedRetryAfter = parseRateLimitResetTime(input.latestRun.error, parseAnchor);
+    if (parsedRetryAfter && parsedRetryAfter.getTime() > now.getTime()) {
+      return {
+        kind: "scheduled",
+        retryAfter: parsedRetryAfter,
+        nextRetryCount,
+      };
+    }
+
+    if (input.mode === "backfill" && parsedRetryAfter) {
+      return {
+        kind: "scheduled",
+        retryAfter: now,
+        nextRetryCount,
+      };
+    }
+
+    return {
+      kind: "scheduled",
+      retryAfter: computeBackoffRetryAfter(priorCount, now),
+      nextRetryCount,
+    };
+  }
+
+  async function resolveRateLimitResumeAssignee(input: {
+    issue: typeof issues.$inferSelect;
+  }) {
+    const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
+      input.issue.companyId,
+      input.issue.id,
+    );
+    const candidateIds = [
+      activeRecoveryAction?.returnOwnerAgentId ?? null,
+      activeRecoveryAction?.previousOwnerAgentId ?? null,
+      input.issue.assigneeAgentId,
+    ].filter((value, index, array): value is string => Boolean(value) && array.indexOf(value) === index);
+
+    for (const agentId of candidateIds) {
+      const agent = await getAgent(agentId);
+      if (agent && agent.companyId === input.issue.companyId && isAgentInvokable(agent)) {
+        return {
+          agent,
+          activeRecoveryAction,
+        };
+      }
+    }
+
+    return {
+      agent: null,
+      activeRecoveryAction,
+    };
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: "todo" | "in_progress";
@@ -1825,6 +1915,69 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
     }
 
+    const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+    const rateLimitInfo = computeRateLimitRetrySchedule({
+      issue: input.issue,
+      latestRun: input.latestRun,
+      mode: "escalate",
+    });
+    if (rateLimitInfo) {
+      const updatePatch: Partial<typeof issues.$inferInsert> & { blockedByIssueIds: string[] } = {
+        status: "blocked",
+        blockedByIssueIds: blockerIds,
+      };
+      if (rateLimitInfo.kind === "scheduled") {
+        updatePatch.retryAfter = rateLimitInfo.retryAfter;
+        updatePatch.rateLimitRetryCount = rateLimitInfo.nextRetryCount;
+      } else {
+        updatePatch.retryAfter = null;
+        updatePatch.rateLimitRetryCount = rateLimitInfo.nextRetryCount;
+      }
+
+      const updated = await issuesSvc.update(input.issue.id, updatePatch);
+      if (!updated) return null;
+
+      let commentBody = input.comment ?? "";
+      if (rateLimitInfo.kind === "scheduled") {
+        commentBody +=
+          `\n\nRate-limit detected. Paperclip will auto-resume this issue after ${rateLimitInfo.retryAfter.toISOString()}` +
+          ` (attempt ${rateLimitInfo.nextRetryCount} of ${RATE_LIMIT_MAX_RETRY_COUNT}).`;
+      } else {
+        commentBody +=
+          `\n\nRate-limit auto-retry budget exhausted (${rateLimitInfo.nextRetryCount} attempts).` +
+          " Leaving this issue blocked for manual intervention.";
+      }
+      await issuesSvc.addComment(input.issue.id, commentBody, {}, { authorType: "system" });
+
+      await logActivity(db, {
+        companyId: input.issue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: input.issue.id,
+        details: {
+          identifier: input.issue.identifier,
+          status: "blocked",
+          previousStatus: input.previousStatus,
+          source: "recovery.reconcile_stranded_assigned_issue",
+          latestRunId: input.latestRun?.id ?? null,
+          latestRunStatus: input.latestRun?.status ?? null,
+          latestRunErrorCode: input.latestRun?.errorCode ?? null,
+          blockerIssueIds: blockerIds,
+          rateLimit: {
+            kind: rateLimitInfo.kind,
+            retryAfter: rateLimitInfo.kind === "scheduled" ? rateLimitInfo.retryAfter.toISOString() : null,
+            retryCount: rateLimitInfo.nextRetryCount,
+          },
+        },
+      });
+
+      return updated;
+    }
+
     const recoveryCause = input.recoveryCause ?? "stranded_assigned_issue";
     const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
       issue: input.issue,
@@ -1833,7 +1986,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       recoveryCause,
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
     });
-    const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
       blockedByIssueIds: blockerIds,
@@ -1984,6 +2136,26 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         ),
       );
 
+    const surgeWindowStart = new Date(Date.now() - RECOVERY_SURGE_LOOKBACK_MS);
+    const recentRecoveryActionRows = await db
+      .select({
+        companyId: issueRecoveryActions.companyId,
+        count: sql<number>`count(*)::int`,
+      })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.status, "active"),
+          gt(issueRecoveryActions.createdAt, surgeWindowStart),
+        ),
+      )
+      .groupBy(issueRecoveryActions.companyId);
+    const recentRecoveryActionsByCompany = new Map<string, number>();
+    for (const row of recentRecoveryActionRows) {
+      recentRecoveryActionsByCompany.set(row.companyId, Number(row.count));
+    }
+    const surgeSuppressedByCompany = new Map<string, number>();
+
     const result = {
       assignmentDispatched: 0,
       dispatchRequeued: 0,
@@ -1994,6 +2166,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       successfulRunHandoffEscalated: 0,
       escalated: 0,
       skipped: 0,
+      surgeSuppressed: 0,
       issueIds: [] as string[],
     };
 
@@ -2021,6 +2194,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       const latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+
+      const recentRecoveryCount = recentRecoveryActionsByCompany.get(issue.companyId) ?? 0;
+      const latestRunErrorCode = latestRun?.errorCode ?? null;
+      const isTransientLatestRunError =
+        latestRunErrorCode !== null && TRANSIENT_RECOVERY_ERROR_CODES.has(latestRunErrorCode);
+      if (recentRecoveryCount > RECOVERY_SURGE_THRESHOLD && isTransientLatestRunError) {
+        result.surgeSuppressed += 1;
+        surgeSuppressedByCompany.set(
+          issue.companyId,
+          (surgeSuppressedByCompany.get(issue.companyId) ?? 0) + 1,
+        );
+        continue;
+      }
+
       if (isStrandedIssueRecoveryIssue(issue) && isUnsuccessfulTerminalIssueRun(latestRun)) {
         const updated = await escalateStrandedRecoveryIssueInPlace({
           issue,
@@ -2224,6 +2411,207 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     result.orphanBlockersAssigned = orphanBlockerRecovery.assigned;
     result.skipped += orphanBlockerRecovery.skipped;
     result.issueIds.push(...orphanBlockerRecovery.issueIds);
+
+    if (result.surgeSuppressed > 0) {
+      for (const [companyId, count] of surgeSuppressedByCompany.entries()) {
+        await logActivity(db, {
+          companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: null,
+          runId: null,
+          action: "recovery.surge_suppressed",
+          entityType: "company",
+          entityId: companyId,
+          details: {
+            companyId,
+            count,
+            threshold: RECOVERY_SURGE_THRESHOLD,
+            lookbackMs: RECOVERY_SURGE_LOOKBACK_MS,
+            recentRecoveryActionCount: recentRecoveryActionsByCompany.get(companyId) ?? 0,
+          },
+        });
+      }
+    }
+
+    return result;
+  }
+
+  async function reconcileBlockedRetryableIssues(now: Date = new Date()) {
+    const candidates = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.status, "blocked"),
+          isNull(issues.assigneeUserId),
+          sql`${issues.assigneeAgentId} is not null`,
+          isNull(issues.hiddenAt),
+          sql`${issues.retryAfter} is not null`,
+          lte(issues.retryAfter, now),
+        ),
+      );
+
+    const result = {
+      resumed: 0,
+      skipped: 0,
+      issueIds: [] as string[],
+    };
+
+    for (const issue of candidates) {
+      const unresolvedBlockerIds = await existingUnresolvedBlockerIssueIds(issue.companyId, issue.id);
+      if (unresolvedBlockerIds.length > 0) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const { agent, activeRecoveryAction } = await resolveRateLimitResumeAssignee({ issue });
+      if (!agent) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await hasActiveExecutionPath(issue.companyId, issue.id)) {
+        await issuesSvc.update(issue.id, { retryAfter: null });
+        result.skipped += 1;
+        continue;
+      }
+
+      const updated = await issuesSvc.update(issue.id, {
+        status: "todo",
+        retryAfter: null,
+        assigneeAgentId: agent.id,
+      });
+      if (!updated) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (activeRecoveryAction) {
+        await recoveryActionsSvc.resolveActiveForIssue({
+          companyId: issue.companyId,
+          sourceIssueId: issue.id,
+          actionId: activeRecoveryAction.id,
+          status: "resolved",
+          outcome: "restored",
+          resolutionNote: "Rate-limit window expired and Paperclip auto-resumed the source issue.",
+        });
+      }
+
+      const wake = await deps.enqueueWakeup(agent.id, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "rate_limit_retry",
+        payload: { issueId: issue.id },
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        contextSnapshot: {
+          issueId: issue.id,
+          taskId: issue.id,
+          wakeReason: "rate_limit_retry",
+          source: "issue.rate_limit_retry",
+        },
+      });
+
+      await issuesSvc.addComment(
+        issue.id,
+        `Rate-limit window expired. Paperclip is auto-resuming this issue.` +
+          ` Retry attempt ${issue.rateLimitRetryCount ?? 0} of ${RATE_LIMIT_MAX_RETRY_COUNT}.`,
+        {},
+        { authorType: "system" },
+      );
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          identifier: issue.identifier,
+          status: "todo",
+          previousStatus: "blocked",
+          source: "recovery.reconcile_blocked_retryable_issue",
+          wakeRunId: wake?.id ?? null,
+          restoredAssigneeAgentId: agent.id,
+          resolvedRecoveryActionId: activeRecoveryAction?.id ?? null,
+          rateLimitRetryCount: issue.rateLimitRetryCount ?? 0,
+        },
+      });
+
+      result.resumed += 1;
+      result.issueIds.push(issue.id);
+    }
+
+    return result;
+  }
+
+  async function backfillStuckRateLimitedIssues(now: Date = new Date()) {
+    const candidates = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.status, "blocked"),
+          isNull(issues.hiddenAt),
+          isNull(issues.retryAfter),
+          isNull(issues.assigneeUserId),
+          sql`${issues.assigneeAgentId} is not null`,
+          eq(issues.rateLimitRetryCount, 0),
+        ),
+      );
+
+    const result = {
+      scheduled: 0,
+      skipped: 0,
+      issueIds: [] as string[],
+    };
+
+    for (const issue of candidates) {
+      const latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+      const rateLimitInfo = computeRateLimitRetrySchedule({
+        issue,
+        latestRun,
+        now,
+        mode: "backfill",
+      });
+      if (!rateLimitInfo || rateLimitInfo.kind !== "scheduled") {
+        result.skipped += 1;
+        continue;
+      }
+
+      const updated = await issuesSvc.update(issue.id, {
+        retryAfter: rateLimitInfo.retryAfter,
+        rateLimitRetryCount: rateLimitInfo.nextRetryCount,
+      });
+      if (!updated) {
+        result.skipped += 1;
+        continue;
+      }
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          identifier: issue.identifier,
+          source: "recovery.backfill_stuck_rate_limited_issue",
+          retryAfter: rateLimitInfo.retryAfter.toISOString(),
+          rateLimitRetryCount: rateLimitInfo.nextRetryCount,
+        },
+      });
+
+      result.scheduled += 1;
+      result.issueIds.push(issue.id);
+    }
 
     return result;
   }
@@ -3046,6 +3434,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recordWatchdogDecision,
     scanSilentActiveRuns,
     reconcileStrandedAssignedIssues,
+    reconcileBlockedRetryableIssues,
+    backfillStuckRateLimitedIssues,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileIssueGraphLiveness,
     readRecoveryTimerIntervalMs,

@@ -16,6 +16,36 @@ You are an agent at Paperclip company.
 
 Do not let work sit here. You must always update your task with a comment.
 
+## Pre-task Memory Query
+
+At the start of each heartbeat for a new issue, the harness auto-queries Paperclip Memory and injects any relevant records as a preamble in your context. Read and apply the preamble before acting.
+
+If you need additional memory context beyond the injected preamble, query directly:
+`POST /api/companies/:companyId/memory/query` with `query` = task type + title keywords, `scope.projectId` if applicable.
+
+Task type derivation: `bug` | `infra` | `design` | `research` | `feature` based on title keywords.
+
+## Tool-Gap Logging
+
+When you hit a missing capability or must use a workaround, capture a record via `POST /api/companies/:companyId/memory/capture`. The Memory API has no native `key` field — encode the key in `title`:
+
+```json
+{
+  "title": "tool-gaps/YYYY-MM-DD/<your-agentId>/<capability-slug>",
+  "metadata": {
+    "category": "tool_gap",
+    "capability_needed": "<what you needed>",
+    "workaround_used": "<what you did instead>",
+    "estimated_cost_of_workaround": "<token or time estimate>",
+    "frequency": "one-off | recurring"
+  },
+  "scope": { "projectId": "<include when the issue belongs to a project>" },
+  "source": "<current issue ID and run reference>"
+}
+```
+
+Omit `scope.projectId` for gaps with no project affiliation.
+
 ## Before Closing Any Issue
 
 Before setting status to `done`, you must post a retrospective comment to the issue thread with this exact heading:
@@ -41,12 +71,14 @@ Then capture the distilled lessons to Paperclip Memory with `POST /api/companies
 - Include `scope.projectId` for project-specific insights; omit it for org-wide patterns
 - Capture distilled signal only, not the raw retrospective comment verbatim
 
-Also capture a structured performance scorecard:
+Also capture a structured performance scorecard. The Memory API has no native `key` field — encode the registry key in `title`, put the scorecard fields in `metadata`, and put a one-line human-readable summary in `content`:
 
 ```json
 {
-  "key": "performance/{your-agent-id}/{task_type}/{YYYY-MM-DD}",
-  "value": {
+  "title": "performance/{your-agent-id}/{task_type}/{YYYY-MM-DD}",
+  "content": "<one-line summary, e.g. 'Shipped AUR-1416 scorecard fix, quality 4, no rework.'>",
+  "metadata": {
+    "category": "performance_scorecard",
     "issue_id": "{ISSUE_ID}",
     "agent_id": "{your-agent-id}",
     "task_type": "<feature | bug | infra | design | research | ops | marketing>",
@@ -54,8 +86,12 @@ Also capture a structured performance scorecard:
     "token_cost": <actual tokens spent as integer>,
     "quality_signal": <1–5 self-assessed integer>,
     "rework_required": <true | false>
-  }
+  },
+  "scope": { "projectId": "<include when the issue belongs to a project>" },
+  "source": "<current issue ID and run reference>"
 }
 ```
+
+Routing queries find scorecards by `titlePrefix=performance/{agent}/{task_type}/` on `GET /api/companies/:companyId/memory/records`, so the `title` MUST follow the schema above verbatim.
 
 Do not mark the issue `done` until both the retrospective comment and all memory captures have succeeded. If any capture fails, leave a comment and keep the issue open, `in_review`, or `blocked` until the insight is recorded.

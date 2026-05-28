@@ -224,7 +224,7 @@ export const memoryCaptureSchema = z
     content: z.string().trim().min(1).max(20000),
     summary: z.string().trim().max(2000).nullable().optional(),
     metadata: z.record(z.unknown()).optional(),
-    reviewState: z.enum(MEMORY_REVIEW_STATES).optional().default("pending"),
+    reviewState: z.enum(MEMORY_REVIEW_STATES).optional(),
   })
   .strict();
 

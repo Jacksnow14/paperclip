@@ -71,6 +71,11 @@ async function main() {
   const candidates = rawIssues.filter(issue => {
     if (!['high', 'critical'].includes(issue.priority)) return false;
     if (!issue.assigneeAgentId) return false;
+    // Exempt auto-created issues (routine executions, system-internal SGI work).
+    // The §12 convention applies only to a *manager routing* a high/critical issue
+    // to another agent. Routine-fired issues are auto-assigned to the routine owner
+    // with no routing decision, so they have no routing/{issueId} rationale by design.
+    if (issue.originKind && issue.originKind !== 'manual') return false;
     const key = issue.id ?? issue.identifier;
     if (seen.has(key)) return false;
     seen.add(key);

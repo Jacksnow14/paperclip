@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { FLAG_REGEX, isExempt, resolveCancelReason } from './check-routing-rationale.mjs';
+import {
+  FLAG_REGEX,
+  isExempt,
+  resolveCancelReason,
+  LIST_DESC_TRUNCATION,
+  mayBeTruncated,
+} from './check-routing-rationale.mjs';
 
 // ── FLAG_REGEX ────────────────────────────────────────────────────────────────
 
@@ -48,6 +54,35 @@ test('isExempt: not exempt when neither pattern matches', () => {
 
 test('isExempt: missing description does not throw', () => {
   assert.equal(isExempt({ title: 'Normal issue' }), false);
+});
+
+// ── description truncation (list endpoint hides the exemption token) ──────────
+
+test('mayBeTruncated: short description is not truncated', () => {
+  assert.equal(mayBeTruncated('short'), false);
+  assert.equal(mayBeTruncated(''), false);
+  assert.equal(mayBeTruncated(undefined), false);
+});
+
+test('mayBeTruncated: description at the list limit may be truncated', () => {
+  assert.equal(mayBeTruncated('x'.repeat(LIST_DESC_TRUNCATION - 1)), false);
+  assert.equal(mayBeTruncated('x'.repeat(LIST_DESC_TRUNCATION)), true);
+  assert.equal(mayBeTruncated('x'.repeat(LIST_DESC_TRUNCATION + 500)), true);
+});
+
+test('isExempt misses a token truncated off by the list endpoint (why hydration is needed)', () => {
+  // Full description contains the token past the truncation boundary.
+  const full = `${'x'.repeat(LIST_DESC_TRUNCATION + 100)}\nexec.routing-rationale: skip`;
+  assert.ok(isExempt({ title: 'Long issue', description: full }), 'full desc is exempt');
+
+  // The list endpoint hands back only the first LIST_DESC_TRUNCATION chars.
+  const listView = full.slice(0, LIST_DESC_TRUNCATION);
+  assert.equal(
+    isExempt({ title: 'Long issue', description: listView }),
+    false,
+    'truncated list view loses the token → must hydrate full description first',
+  );
+  assert.ok(mayBeTruncated(listView), 'and we can detect that it might be truncated');
 });
 
 // ── resolveCancelReason ───────────────────────────────────────────────────────

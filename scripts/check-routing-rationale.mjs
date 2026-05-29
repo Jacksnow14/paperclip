@@ -44,6 +44,20 @@ import { parseArgs } from 'node:util';
 export const FLAG_REGEX = /routing-rationale[- ]gap:\s*(AUR-\d+)/i;
 
 /**
+ * The issues LIST endpoint truncates `description` to this many chars
+ * (server: ISSUE_LIST_DESCRIPTION_MAX_CHARS in services/issues.ts). The
+ * `exec.routing-rationale: skip` exemption token can sit past this boundary,
+ * so a list-fetched description at or above this length may be truncated and
+ * must be re-fetched in full before evaluating exemption.
+ */
+export const LIST_DESC_TRUNCATION = 1200;
+
+/** A list-fetched description this long may be truncated — fetch the full issue. */
+export function mayBeTruncated(description) {
+  return (description ?? '').length >= LIST_DESC_TRUNCATION;
+}
+
+/**
  * Returns true if an issue is exempt from the routing-rationale convention.
  * Exempt issues are never flagged and any existing open flags are auto-resolved.
  */
@@ -117,6 +131,20 @@ async function main({ windowMinutes, apply, apiUrl, apiKey, companyId }) {
   };
   const { apiGet, apiPatch, apiPost } = makeApiHelpers(apiUrl, headers);
 
+  // The issues LIST endpoint truncates descriptions, which can hide the
+  // exemption token. Re-fetch the full issue (cached) only when the
+  // list-fetched description is long enough to possibly be truncated.
+  const fullDescCache = new Map();
+  async function withFullDescription(issue) {
+    if (!mayBeTruncated(issue.description)) return issue;
+    const key = issue.id ?? issue.identifier;
+    if (!fullDescCache.has(key)) {
+      const full = await apiGet(`/api/issues/${key}`);
+      fullDescCache.set(key, full?.description ?? issue.description ?? '');
+    }
+    return { ...issue, description: fullDescCache.get(key) };
+  }
+
   if (!apply) {
     console.log('[DRY-RUN] No changes will be written. Pass --apply to execute.\n');
   }
@@ -145,7 +173,8 @@ async function main({ windowMinutes, apply, apiUrl, apiKey, companyId }) {
     const match = FLAG_REGEX.exec(flag.title);
     if (!match) continue;
     const targetId = match[1];
-    const target = issueByIdentifier.get(targetId) ?? null;
+    const rawTarget = issueByIdentifier.get(targetId) ?? null;
+    const target = rawTarget ? await withFullDescription(rawTarget) : null;
 
     // Check routing record only when target is open and non-exempt
     let hasRecord = false;
@@ -189,11 +218,21 @@ async function main({ windowMinutes, apply, apiUrl, apiKey, companyId }) {
   // ── Phase B: Detect + file ─────────────────────────────────────────────────
   console.log('── Phase B: Detect and file new flags ──');
 
+  // Pool of issues subject to §12, then hydrate full descriptions so the
+  // exemption token is not missed due to list-endpoint truncation.
+  const pool = await Promise.all(
+    rawIssues
+      .filter(issue =>
+        ['high', 'critical'].includes(issue.priority) &&
+        issue.assigneeAgentId &&
+        (!issue.originKind || issue.originKind === 'manual'))
+      .map(withFullDescription)
+  );
+
+  const exemptIssues = pool.filter(isExempt);
+
   const seen = new Set();
-  const candidates = rawIssues.filter(issue => {
-    if (!['high', 'critical'].includes(issue.priority)) return false;
-    if (!issue.assigneeAgentId) return false;
-    if (issue.originKind && issue.originKind !== 'manual') return false;
+  const candidates = pool.filter(issue => {
     if (isExempt(issue)) return false;
     const key = issue.id ?? issue.identifier;
     if (seen.has(key)) return false;
@@ -201,14 +240,6 @@ async function main({ windowMinutes, apply, apiUrl, apiKey, companyId }) {
     const updated = issue.updatedAt ?? issue.assignedAt;
     if (!updated) return true;
     return new Date(updated) >= new Date(windowStart);
-  });
-
-  // Report exempt issues for visibility
-  const exemptIssues = rawIssues.filter(issue => {
-    if (!['high', 'critical'].includes(issue.priority)) return false;
-    if (!issue.assigneeAgentId) return false;
-    if (issue.originKind && issue.originKind !== 'manual') return false;
-    return isExempt(issue);
   });
 
   if (exemptIssues.length > 0) {

@@ -2,139 +2,352 @@
 /**
  * check-routing-rationale.mjs
  *
- * Detects high/critical priority issues that have an assigned agent but
- * are missing a routing/{issueId} rationale record in Paperclip Memory.
+ * Self-cleaning, deterministic watchdog for the routing-rationale convention
+ * (AGENTS.md §12). Runs as a scheduled routine every 30 minutes with --apply.
+ *
+ * Lifecycle:
+ *   Phase A — Auto-resolve stale flags (always runs, ignores window):
+ *     Cancel open flag issues whose target is done/cancelled, already has a
+ *     routing/{id} memory record, or is now exempt. Posts a one-line reason.
+ *
+ *   Phase B — Detect + file (within --window-minutes):
+ *     Flag high/critical assigned manual issues updated in the window that are
+ *     still missing routing/{id} records, deduplicating against Phase A's
+ *     remaining open flags.
  *
  * Usage:
- *   node scripts/check-routing-rationale.mjs [--window-minutes N]
+ *   node scripts/check-routing-rationale.mjs [--window-minutes N] [--apply]
+ *
+ *   Without --apply: dry-run — prints full plan, writes nothing.
+ *   With --apply:    executes cancellations and files new flags (idempotent).
  *
  * Env vars required:
  *   PAPERCLIP_API_URL    Base URL (e.g. http://localhost:3000)
  *   PAPERCLIP_API_KEY    Bearer token
  *   PAPERCLIP_COMPANY_ID Company UUID
  *
+ * Exemption rules (no flag filed; existing open flags auto-resolved):
+ *   1. Issue description contains token `exec.routing-rationale: skip`
+ *   2. Issue title matches /content slot/i
+ *
  * Exit codes:
- *   0 — all high/critical assigned issues have routing records (clean)
- *   1 — one or more issues are missing routing records (flag)
+ *   0 — clean (nothing to do, or all actions applied)
+ *   1 — dry-run with pending actions (apply to execute)
  *   2 — configuration/API error
  */
 
 import { parseArgs } from 'node:util';
 
-const { values: args } = parseArgs({
-  options: {
-    'window-minutes': { type: 'string', default: '60' },
-    help: { type: 'boolean', short: 'h', default: false },
-  },
-});
+// ── Exported core utilities (used in tests) ──────────────────────────────────
 
-if (args.help) {
-  console.log('Usage: node scripts/check-routing-rationale.mjs [--window-minutes N]');
-  console.log('  --window-minutes N  Only check issues updated in last N minutes (default: 60)');
-  process.exit(0);
+/** Matches both flag title formats produced in the wild. */
+export const FLAG_REGEX = /routing-rationale[- ]gap:\s*(AUR-\d+)/i;
+
+/**
+ * Returns true if an issue is exempt from the routing-rationale convention.
+ * Exempt issues are never flagged and any existing open flags are auto-resolved.
+ */
+export function isExempt(issue) {
+  if (issue.description && issue.description.includes('exec.routing-rationale: skip')) return true;
+  if (/content slot/i.test(issue.title ?? '')) return true;
+  return false;
 }
 
-const API_URL = process.env.PAPERCLIP_API_URL;
-const API_KEY = process.env.PAPERCLIP_API_KEY;
-const COMPANY_ID = process.env.PAPERCLIP_COMPANY_ID;
-const WINDOW_MINUTES = parseInt(args['window-minutes'], 10);
-
-if (!API_URL || !API_KEY || !COMPANY_ID) {
-  console.error('ERROR: PAPERCLIP_API_URL, PAPERCLIP_API_KEY, and PAPERCLIP_COMPANY_ID must be set.');
-  process.exit(2);
-}
-
-const headers = {
-  Authorization: `Bearer ${API_KEY}`,
-  'Content-Type': 'application/json',
-};
-
-async function apiGet(path) {
-  const res = await fetch(`${API_URL}${path}`, { headers });
-  if (!res.ok) {
-    throw new Error(`GET ${path} → ${res.status} ${res.statusText}`);
+/**
+ * Returns a cancel reason string if the flag should be resolved, or null if
+ * the flag is still valid and should remain open.
+ *
+ * @param {{ target: object|null, hasRecord: boolean }} opts
+ */
+export function resolveCancelReason({ target, targetId, hasRecord }) {
+  if (!target || ['done', 'cancelled'].includes(target.status)) {
+    return target
+      ? `Auto-resolved by routing-rationale-watchdog: ${targetId} is ${target.status} — routing rationale moot.`
+      : `Auto-resolved by routing-rationale-watchdog: ${targetId} not found among open issues — routing rationale moot.`;
   }
-  return res.json();
+  if (isExempt(target)) {
+    return `Auto-resolved by routing-rationale-watchdog: ${targetId} is exempt from routing rationale (exec.routing-rationale: skip or content-slot pattern).`;
+  }
+  if (hasRecord) {
+    return `Auto-resolved by routing-rationale-watchdog: routing/${targetId} record now exists.`;
+  }
+  return null;
 }
 
-async function main() {
-  const windowStart = new Date(Date.now() - WINDOW_MINUTES * 60 * 1000).toISOString();
+// ── API helpers ───────────────────────────────────────────────────────────────
 
-  // Fetch all active assigned issues (API priority filter is not reliably enforced server-side)
+function makeApiHelpers(API_URL, headers) {
+  async function apiGet(path) {
+    const res = await fetch(`${API_URL}${path}`, { headers });
+    if (!res.ok) throw new Error(`GET ${path} → ${res.status} ${res.statusText}`);
+    return res.json();
+  }
+
+  async function apiPatch(path, body) {
+    const res = await fetch(`${API_URL}${path}`, {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`PATCH ${path} → ${res.status} ${res.statusText}`);
+    return res.json();
+  }
+
+  async function apiPost(path, body) {
+    const res = await fetch(`${API_URL}${path}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`POST ${path} → ${res.status} ${res.statusText}`);
+    return res.json();
+  }
+
+  return { apiGet, apiPatch, apiPost };
+}
+
+// ── Main routine ──────────────────────────────────────────────────────────────
+
+async function main({ windowMinutes, apply, apiUrl, apiKey, companyId }) {
+  const windowStart = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
+
+  const headers = {
+    Authorization: `Bearer ${apiKey}`,
+    'Content-Type': 'application/json',
+  };
+  const { apiGet, apiPatch, apiPost } = makeApiHelpers(apiUrl, headers);
+
+  if (!apply) {
+    console.log('[DRY-RUN] No changes will be written. Pass --apply to execute.\n');
+  }
+
+  // Fetch all open issues once — used by both phases
   const issuesBatch = await apiGet(
-    `/api/companies/${COMPANY_ID}/issues?status=todo,in_progress,in_review,blocked&limit=500`
+    `/api/companies/${companyId}/issues?status=todo,in_progress,in_review,blocked&limit=500`
   );
   const rawIssues = Array.isArray(issuesBatch) ? issuesBatch : (issuesBatch.issues ?? []);
 
-  // Client-side: keep only high + critical, with an assignee, updated in the window
-  const seen = new Set();
-  const candidates = rawIssues.filter(issue => {
-    if (!['high', 'critical'].includes(issue.priority)) return false;
-    if (!issue.assigneeAgentId) return false;
-    // Exempt auto-created issues (routine executions, system-internal SGI work).
-    // The §12 convention applies only to a *manager routing* a high/critical issue
-    // to another agent. Routine-fired issues are auto-assigned to the routine owner
-    // with no routing decision, so they have no routing/{issueId} rationale by design.
-    if (issue.originKind && issue.originKind !== 'manual') return false;
-    const key = issue.id ?? issue.identifier;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    const updated = issue.updatedAt ?? issue.assignedAt;
-    if (!updated) return true; // include if no timestamp (conservative)
-    return new Date(updated) >= new Date(windowStart);
-  });
-
-  if (candidates.length === 0) {
-    console.log(`✓ No high/critical assigned issues updated in the last ${WINDOW_MINUTES} minutes.`);
-    process.exit(0);
+  // Build lookup by identifier
+  const issueByIdentifier = new Map();
+  for (const issue of rawIssues) {
+    if (issue.identifier) issueByIdentifier.set(issue.identifier, issue);
   }
 
-  console.log(`Checking ${candidates.length} high/critical assigned issues for routing rationale records...\n`);
+  // ── Phase A: Auto-resolve stale flags ──────────────────────────────────────
+  console.log('── Phase A: Auto-resolve stale flags ──');
 
-  // For each candidate, check if routing/{issueId} memory record exists
-  const missing = [];
-  const found = [];
+  const flagIssues = rawIssues.filter(issue => FLAG_REGEX.test(issue.title ?? ''));
+  const openFlagTargets = new Set(); // target identifiers with still-valid open flags
 
-  await Promise.all(candidates.map(async (issue) => {
-    const id = issue.identifier ?? issue.id;
-    const records = await apiGet(
-      `/api/companies/${COMPANY_ID}/memory/records?titlePrefix=routing/${id}&limit=1`
-    );
-    const hasRecord = Array.isArray(records) ? records.length > 0 : false;
-    if (hasRecord) {
-      found.push(issue);
-    } else {
-      missing.push(issue);
+  const toCancel = [];
+
+  for (const flag of flagIssues) {
+    const match = FLAG_REGEX.exec(flag.title);
+    if (!match) continue;
+    const targetId = match[1];
+    const target = issueByIdentifier.get(targetId) ?? null;
+
+    // Check routing record only when target is open and non-exempt
+    let hasRecord = false;
+    if (target && !['done', 'cancelled'].includes(target.status) && !isExempt(target)) {
+      const records = await apiGet(
+        `/api/companies/${companyId}/memory/records?titlePrefix=routing/${targetId}&limit=1`
+      );
+      hasRecord = Array.isArray(records)
+        ? records.length > 0
+        : (records?.records?.length ?? 0) > 0;
     }
-  }));
 
-  if (found.length > 0) {
-    console.log(`✓ ${found.length} issue(s) with routing rationale:`);
-    for (const issue of found) {
-      console.log(`  - ${issue.identifier ?? issue.id}: ${issue.title}`);
+    const cancelReason = resolveCancelReason({ target, targetId, hasRecord });
+
+    if (cancelReason) {
+      toCancel.push({ flag, targetId, reason: cancelReason });
+    } else {
+      openFlagTargets.add(targetId);
+    }
+  }
+
+  if (toCancel.length === 0) {
+    console.log('  No stale flags to resolve.\n');
+  } else {
+    for (const { flag, targetId, reason } of toCancel) {
+      const flagId = flag.id ?? flag.identifier;
+      console.log(`  CANCEL ${flag.identifier ?? flagId} → ${targetId}: ${reason}`);
+      if (apply) {
+        await apiPatch(`/api/issues/${flagId}`, { status: 'cancelled' });
+        await apiPost(`/api/issues/${flagId}/comments`, { body: reason });
+        console.log(`    → cancelled + commented.`);
+      }
     }
     console.log();
   }
 
-  if (missing.length === 0) {
-    console.log('✓ All high/critical assigned issues have routing rationale records.');
+  if (openFlagTargets.size > 0) {
+    console.log(`  Keeping ${openFlagTargets.size} flag(s) still valid: ${[...openFlagTargets].join(', ')}\n`);
+  }
+
+  // ── Phase B: Detect + file ─────────────────────────────────────────────────
+  console.log('── Phase B: Detect and file new flags ──');
+
+  const seen = new Set();
+  const candidates = rawIssues.filter(issue => {
+    if (!['high', 'critical'].includes(issue.priority)) return false;
+    if (!issue.assigneeAgentId) return false;
+    if (issue.originKind && issue.originKind !== 'manual') return false;
+    if (isExempt(issue)) return false;
+    const key = issue.id ?? issue.identifier;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    const updated = issue.updatedAt ?? issue.assignedAt;
+    if (!updated) return true;
+    return new Date(updated) >= new Date(windowStart);
+  });
+
+  // Report exempt issues for visibility
+  const exemptIssues = rawIssues.filter(issue => {
+    if (!['high', 'critical'].includes(issue.priority)) return false;
+    if (!issue.assigneeAgentId) return false;
+    if (issue.originKind && issue.originKind !== 'manual') return false;
+    return isExempt(issue);
+  });
+
+  if (exemptIssues.length > 0) {
+    console.log(`  EXEMPT (${exemptIssues.length}):`);
+    for (const issue of exemptIssues) {
+      console.log(`    - ${issue.identifier ?? issue.id}: ${issue.title}`);
+    }
+    console.log();
+  }
+
+  if (candidates.length === 0) {
+    console.log(`  No high/critical assigned manual issues updated in the last ${windowMinutes} minutes.\n`);
+  }
+
+  const toFile = [];
+  const skippedDedup = [];
+  const skippedHasRecord = [];
+
+  await Promise.all(candidates.map(async (issue) => {
+    const id = issue.identifier ?? issue.id;
+
+    // Dedup: an open flag for this target already exists (Phase A kept it)
+    if (openFlagTargets.has(id)) {
+      skippedDedup.push(issue);
+      return;
+    }
+
+    const records = await apiGet(
+      `/api/companies/${companyId}/memory/records?titlePrefix=routing/${id}&limit=1`
+    );
+    const hasRecord = Array.isArray(records)
+      ? records.length > 0
+      : (records?.records?.length ?? 0) > 0;
+
+    if (hasRecord) {
+      skippedHasRecord.push(issue);
+    } else {
+      toFile.push(issue);
+    }
+  }));
+
+  if (skippedDedup.length > 0) {
+    console.log(`  SKIPPED-DEDUP — open flag exists (${skippedDedup.length}):`);
+    for (const issue of skippedDedup) {
+      console.log(`    - ${issue.identifier ?? issue.id}: ${issue.title}`);
+    }
+    console.log();
+  }
+
+  if (skippedHasRecord.length > 0) {
+    console.log(`  HAS RECORD — routing rationale present (${skippedHasRecord.length}):`);
+    for (const issue of skippedHasRecord) {
+      console.log(`    - ${issue.identifier ?? issue.id}: ${issue.title}`);
+    }
+    console.log();
+  }
+
+  if (toFile.length === 0) {
+    console.log('  No new flags to file.\n');
+  } else {
+    for (const issue of toFile) {
+      const id = issue.identifier ?? issue.id;
+      const assignee = issue.assigneeAgentId ?? 'unknown';
+      const title = `routing-rationale gap: ${id} missing routing/${id} record`;
+      const description = [
+        `## Routing rationale gap detected`,
+        ``,
+        `Issue **${id}** ("${issue.title}") is \`${issue.priority}\` priority, assigned to agent \`${assignee}\`, but is missing a \`routing/${id}\` rationale record in Paperclip Memory.`,
+        ``,
+        `The manager that assigned this issue must capture a routing rationale record per AGENTS.md §12.`,
+        ``,
+        `**Required record key:** \`routing/${id}\``,
+        ``,
+        `exec.preflight: skip`,
+      ].join('\n');
+      console.log(`  FILE: "${title}"`);
+      if (apply) {
+        await apiPost(`/api/companies/${companyId}/issues`, { title, description });
+        console.log(`    → filed.`);
+      }
+    }
+    console.log();
+  }
+
+  // ── Summary ────────────────────────────────────────────────────────────────
+  console.log('── Summary ──');
+  console.log(`  Resolved:      ${toCancel.length}`);
+  console.log(`  Filed:         ${toFile.length}`);
+  console.log(`  Skipped-dedup: ${skippedDedup.length}`);
+  console.log(`  Exempt:        ${exemptIssues.length}`);
+
+  const hasPendingActions = toCancel.length > 0 || toFile.length > 0;
+  if (!apply && hasPendingActions) {
+    console.log('\n[DRY-RUN] Pass --apply to execute the above actions.');
+    return 1;
+  }
+  return 0;
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+// Run only when invoked directly (not imported by tests)
+const isMain = process.argv[1] && import.meta.url.endsWith(
+  process.argv[1].replace(/\\/g, '/').split('/').pop()
+);
+
+if (isMain) {
+  const { values: args } = parseArgs({
+    options: {
+      'window-minutes': { type: 'string', default: '60' },
+      apply: { type: 'boolean', default: false },
+      help: { type: 'boolean', short: 'h', default: false },
+    },
+  });
+
+  if (args.help) {
+    console.log('Usage: node scripts/check-routing-rationale.mjs [--window-minutes N] [--apply]');
+    console.log('  --window-minutes N  Only check issues updated in last N minutes (default: 60)');
+    console.log('  --apply             Execute changes (default: dry-run, exit 1 if actions pending)');
     process.exit(0);
   }
 
-  console.error(`⚠  ${missing.length} high/critical issue(s) MISSING routing rationale records:`);
-  for (const issue of missing) {
-    const assignee = issue.assigneeAgentId ?? 'unknown';
-    console.error(`  - ${issue.identifier ?? issue.id} [${issue.priority}] → assignee: ${assignee}`);
-    console.error(`    Title: ${issue.title}`);
-    console.error(`    Missing record: routing/${issue.identifier ?? issue.id}`);
-  }
-  console.error();
-  console.error('Routing rationale records must be captured by the manager that assigned these issues.');
-  console.error('See AGENTS.md §12 for the convention and schema.');
-  process.exit(1);
-}
+  const API_URL = process.env.PAPERCLIP_API_URL;
+  const API_KEY = process.env.PAPERCLIP_API_KEY;
+  const COMPANY_ID = process.env.PAPERCLIP_COMPANY_ID;
 
-main().catch(err => {
-  console.error('FATAL:', err.message);
-  process.exit(2);
-});
+  if (!API_URL || !API_KEY || !COMPANY_ID) {
+    console.error('ERROR: PAPERCLIP_API_URL, PAPERCLIP_API_KEY, and PAPERCLIP_COMPANY_ID must be set.');
+    process.exit(2);
+  }
+
+  main({
+    windowMinutes: parseInt(args['window-minutes'], 10),
+    apply: args.apply,
+    apiUrl: API_URL,
+    apiKey: API_KEY,
+    companyId: COMPANY_ID,
+  }).then(code => process.exit(code)).catch(err => {
+    console.error('FATAL:', err.message);
+    process.exit(2);
+  });
+}

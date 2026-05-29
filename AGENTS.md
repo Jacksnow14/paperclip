@@ -198,10 +198,16 @@ Any manager agent (CEO, CMO, CFO, or future manager roles) that routes a `priori
 
 **Reference implementation:** CEO AGENTS.md — `## Memory and planning` → "Routing rationale capture" section with a full worked example.
 
-**Detection:** A watchdog routine (`routing-rationale-watchdog`) runs every 30 minutes. It queries all high/critical issues with an assignee and flags any that are missing `routing/{issueId}` records in memory. The detection script can also be run manually:
+**Detection:** A watchdog routine (`routing-rationale-watchdog`) runs every 30 minutes invoking `scripts/check-routing-rationale.mjs --apply`. The script is **self-cleaning and deterministic**: it auto-resolves stale flags (Phase A — target done/cancelled/exempt or routing record now present) and deduplicates before filing new ones (Phase B), so re-running is always a no-op. The routine must invoke with `--apply`; without it the script is a safe dry-run. Manual dry-run:
 
 ```sh
 node scripts/check-routing-rationale.mjs
+```
+
+Manual apply:
+
+```sh
+node scripts/check-routing-rationale.mjs --apply
 ```
 
 ## 13. Tool-Gap Logging

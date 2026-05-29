@@ -1422,4 +1422,135 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(run.source).toBe("webhook");
     expect(run.status).toBe("issue_created");
   });
+
+  it("reuse_and_rewake creates a fresh issue on first fire", async () => {
+    const { companyId, agentId, projectId, svc, wakeups } = await seedFixture();
+    const rollingRoutine = await svc.create(
+      companyId,
+      {
+        projectId,
+        goalId: null,
+        parentIssueId: null,
+        title: "rolling watchdog",
+        description: "Watchdog that reuses its issue",
+        assigneeAgentId: agentId,
+        priority: "medium",
+        status: "active",
+        concurrencyPolicy: "reuse_and_rewake",
+        catchUpPolicy: "skip_missed",
+      },
+      {},
+    );
+
+    const run = await svc.runRoutine(rollingRoutine.id, { source: "schedule" });
+
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).toBeTruthy();
+    expect(wakeups).toHaveLength(1);
+    expect(wakeups[0]?.opts.reason).toBe("issue_assigned");
+
+    const allIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.originId, rollingRoutine.id));
+    expect(allIssues).toHaveLength(1);
+  });
+
+  it("reuse_and_rewake rewakes the open rolling issue without creating a new one", async () => {
+    const { companyId, agentId, projectId, svc, issueSvc, wakeups } = await seedFixture();
+    const rollingRoutine = await svc.create(
+      companyId,
+      {
+        projectId,
+        goalId: null,
+        parentIssueId: null,
+        title: "rolling watchdog",
+        description: null,
+        assigneeAgentId: agentId,
+        priority: "medium",
+        status: "active",
+        concurrencyPolicy: "reuse_and_rewake",
+        catchUpPolicy: "skip_missed",
+      },
+      {},
+    );
+
+    // First fire creates the issue
+    const run1 = await svc.runRoutine(rollingRoutine.id, { source: "schedule" });
+    expect(run1.status).toBe("issue_created");
+    const rollingIssueId = run1.linkedIssueId!;
+
+    // Second fire must reuse the same issue
+    const run2 = await svc.runRoutine(rollingRoutine.id, { source: "schedule" });
+    expect(run2.status).toBe("issue_created");
+    expect(run2.linkedIssueId).toBe(rollingIssueId);
+
+    const allIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.originId, rollingRoutine.id));
+    expect(allIssues).toHaveLength(1);
+    expect(wakeups).toHaveLength(2);
+  });
+
+  it("reuse_and_rewake reopens a closed rolling issue instead of spawning a new one", async () => {
+    const { companyId, agentId, projectId, svc, issueSvc, wakeups } = await seedFixture();
+    const rollingRoutine = await svc.create(
+      companyId,
+      {
+        projectId,
+        goalId: null,
+        parentIssueId: null,
+        title: "rolling watchdog",
+        description: null,
+        assigneeAgentId: agentId,
+        priority: "medium",
+        status: "active",
+        concurrencyPolicy: "reuse_and_rewake",
+        catchUpPolicy: "skip_missed",
+      },
+      {},
+    );
+
+    // First fire creates the issue
+    const run1 = await svc.runRoutine(rollingRoutine.id, { source: "schedule" });
+    const rollingIssueId = run1.linkedIssueId!;
+
+    // Simulate agent marking the issue done
+    await db.update(issues).set({ status: "done", updatedAt: new Date() }).where(eq(issues.id, rollingIssueId));
+
+    // Second fire must reopen the same issue, not create a new one
+    const run2 = await svc.runRoutine(rollingRoutine.id, { source: "schedule" });
+    expect(run2.status).toBe("issue_created");
+    expect(run2.linkedIssueId).toBe(rollingIssueId);
+
+    const [reopenedIssue] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, rollingIssueId));
+    expect(reopenedIssue?.status).toBe("todo");
+
+    const allIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.originId, rollingRoutine.id));
+    expect(allIssues).toHaveLength(1);
+  });
+
+  it("reuse_and_rewake does not affect other concurrency policies", async () => {
+    const { routine, svc } = await seedFixture();
+    // default concurrencyPolicy is coalesce_if_active — confirm it still creates fresh issues
+    const run1 = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(run1.status).toBe("issue_created");
+
+    // Mark done so engine sees no live issue
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, run1.linkedIssueId!));
+
+    const run2 = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(run2.status).toBe("issue_created");
+    expect(run2.linkedIssueId).not.toBe(run1.linkedIssueId);
+
+    const allIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.originId, routine.id));
+    expect(allIssues).toHaveLength(2);
+  });
 });

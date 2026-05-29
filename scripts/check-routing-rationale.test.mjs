@@ -55,6 +55,45 @@ test('isExempt: recurring daily-brief publication titles', () => {
   assert.ok(isExempt({ title: 'Daily Brief — 2026-05-30', description: '' }));
 });
 
+test('isExempt: lane-b content-script child task ("Write script — ...") is exempt', () => {
+  // AUR-1592-style: generated child of a Content Slot lane-b request.
+  assert.ok(isExempt({
+    title: 'Write script — Build a personal knowledge base with Notion AI',
+    description: 'Target: 60s. Write a hook, story, CTA. Return JSON.\n\nThis is an ai_tools topic for Workflow Signal (lane-b).',
+  }));
+  // AUR-1600-style: same class, but the marker reads "Workflow Signal channel"
+  // rather than the literal "(lane-b)" — must still be exempt.
+  assert.ok(isExempt({
+    title: 'Write script — How GPT-4o reads screenshots and fixes UI bugs',
+    description: 'Target: 60s. Mode: ai_tools (Workflow Signal channel — professional dev/AI workflow audience). Write a hook, 3-4 key points.',
+  }));
+});
+
+test('isExempt: content-pipeline "Render & Upload" child task is exempt', () => {
+  // AUR-1593/1598-style: Video Editor render child of a Content Slot.
+  assert.ok(isExempt({
+    title: 'Render & Upload — 2026-05-29T20:00:03Z',
+    description: '## Video Editor Render Task\n\nParent slot: AUR-1591\n```json\n{"script_source":"content_manager","voice_path":"elevenlabs"}\n```',
+  }));
+});
+
+test('isExempt: genuine technical "Write script" / "Render" tasks are NOT exempt', () => {
+  assert.equal(isExempt({
+    title: 'Write script to migrate DB',
+    description: 'Backfill the users table and update the routing config.',
+  }), false);
+  // "Write script" title without the content-pipeline marker must not be exempted.
+  assert.equal(isExempt({
+    title: 'Write script for nightly backup',
+    description: 'Cron job that dumps postgres to S3.',
+  }), false);
+  // A real "Render & Upload" engineering task without the Video Editor marker.
+  assert.equal(isExempt({
+    title: 'Render & Upload build artifacts to CDN',
+    description: 'Wire the CI step that renders docs and uploads to the bucket.',
+  }), false);
+});
+
 test('isExempt: not exempt when neither pattern matches', () => {
   assert.equal(isExempt({ title: 'Normal issue', description: 'Some work' }), false);
   assert.equal(isExempt({ title: 'Fix daily cron job', description: 'no brief here' }), false);

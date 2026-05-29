@@ -69,6 +69,17 @@ export function isExempt(issue) {
   // routing/{id} rationale is meaningless. They recur daily and would otherwise be
   // flagged-then-auto-resolved every day — a known false-positive class (AUR-1550).
   if (/daily\b.*\bbrief/i.test(issue.title ?? '')) return true;
+  // Content-pipeline children (Content Slot → "Write script" → "Render & Upload")
+  // are short-form video production tasks, not technical-routing decisions, so a
+  // routing/{id} rationale is meaningless. Their Content-Slot parents match
+  // /content slot/i above, but the generated children carry plain titles and slip
+  // through, recurring every slot. Pair each child title with a content-pipeline
+  // marker in the description so genuine technical tasks (e.g. "Write script to
+  // migrate DB") are NOT exempted (AUR-1595, AUR-1550 false-positive class).
+  const title = issue.title ?? '';
+  const description = issue.description ?? '';
+  if (/^\s*write script\b/i.test(title) && /workflow signal/i.test(description)) return true;
+  if (/^\s*render & upload\b/i.test(title) && /video editor render task/i.test(description)) return true;
   return false;
 }
 

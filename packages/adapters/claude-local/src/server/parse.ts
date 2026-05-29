@@ -196,6 +196,26 @@ export function isClaudeUnknownSessionError(parsed: Record<string, unknown>): bo
   );
 }
 
+// Detects the upstream 400 error when the claude CLI replays a transcript that
+// contains thinking/redacted_thinking blocks in the latest assistant message.
+// The API rejects these with: "messages.N.content.M: `thinking` or
+// `redacted_thinking` blocks in the latest assistant message cannot be modified."
+export function isClaudeCorruptedThinkingResumeError(parsed: Record<string, unknown>): boolean {
+  const resultText = asString(parsed.result, "").trim();
+  const allMessages = [resultText, ...extractClaudeErrorMessages(parsed)]
+    .map((msg) => msg.trim())
+    .filter(Boolean);
+
+  // Two-signal check: (1) this is a messages/content API path error, (2) the
+  // specific thinking-block mutability rejection. Kept separate so backtick-
+  // delimited token names (`` `thinking` ``) don't break the match.
+  return allMessages.some(
+    (msg) =>
+      /messages.*content/i.test(msg) &&
+      /(?:thinking|redacted_thinking).*(?:cannot be modified|must remain)/i.test(msg),
+  );
+}
+
 function buildClaudeTransientHaystack(input: {
   parsed?: Record<string, unknown> | null;
   stdout?: string | null;
@@ -375,7 +395,12 @@ export function isClaudeTransientUpstreamError(input: {
 }): boolean {
   const parsed = input.parsed ?? null;
   // Deterministic failures are handled by their own classifiers.
-  if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeUnknownSessionError(parsed))) {
+  if (
+    parsed &&
+    (isClaudeMaxTurnsResult(parsed) ||
+      isClaudeUnknownSessionError(parsed) ||
+      isClaudeCorruptedThinkingResumeError(parsed))
+  ) {
     return false;
   }
   const loginMeta = detectClaudeLoginRequired({

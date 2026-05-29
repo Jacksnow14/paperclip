@@ -51,6 +51,7 @@ import {
   describeClaudeFailure,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
+  isClaudeCorruptedThinkingResumeError,
   isClaudeMaxTurnsResult,
   isClaudeTransientUpstreamError,
   isClaudeUnknownSessionError,
@@ -950,11 +951,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       !initial.proc.timedOut &&
       (initial.proc.exitCode ?? 0) !== 0 &&
       initial.parsed &&
-      isClaudeUnknownSessionError(initial.parsed)
+      (isClaudeUnknownSessionError(initial.parsed) ||
+        isClaudeCorruptedThinkingResumeError(initial.parsed))
     ) {
+      const reason = isClaudeCorruptedThinkingResumeError(initial.parsed)
+        ? "corrupted thinking-block transcript"
+        : "unavailable";
       await onLog(
         "stdout",
-        `[paperclip] Claude resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
+        `[paperclip] Claude resume session "${sessionId}" failed (${reason}); retrying with a fresh session.\n`,
       );
       const retry = await runAttempt(null);
       return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });

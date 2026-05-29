@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   extractClaudeRetryNotBefore,
+  isClaudeCorruptedThinkingResumeError,
   isClaudeTransientUpstreamError,
 } from "./parse.js";
 
@@ -91,6 +92,65 @@ describe("isClaudeTransientUpstreamError", () => {
     expect(
       isClaudeTransientUpstreamError({
         errorMessage: "Invalid request_error: Unknown parameter 'foo'.",
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("isClaudeCorruptedThinkingResumeError", () => {
+  it("detects the exact error string from the bug report", () => {
+    expect(
+      isClaudeCorruptedThinkingResumeError({
+        is_error: true,
+        result:
+          "messages.1.content.27: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified.",
+      }),
+    ).toBe(true);
+  });
+
+  it("detects the error via the errors array", () => {
+    expect(
+      isClaudeCorruptedThinkingResumeError({
+        is_error: true,
+        errors: [
+          {
+            message:
+              "messages.0.content.3: `redacted_thinking` blocks in the latest assistant message cannot be modified.",
+          },
+        ],
+      }),
+    ).toBe(true);
+  });
+
+  it("does not false-positive on plain assistant text mentioning thinking", () => {
+    expect(
+      isClaudeCorruptedThinkingResumeError({
+        result: "I was thinking about the problem carefully.",
+      }),
+    ).toBe(false);
+  });
+
+  it("does not false-positive on an unknown-session error", () => {
+    expect(
+      isClaudeCorruptedThinkingResumeError({
+        result: "No conversation found with session id abc-123",
+        errors: [{ message: "No conversation found with session id abc-123" }],
+      }),
+    ).toBe(false);
+  });
+
+  it("does not false-positive on an empty parsed object", () => {
+    expect(isClaudeCorruptedThinkingResumeError({})).toBe(false);
+  });
+
+  it("isClaudeTransientUpstreamError returns false for the thinking-block 400", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          is_error: true,
+          result:
+            "messages.1.content.27: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified.",
+        },
       }),
     ).toBe(false);
   });

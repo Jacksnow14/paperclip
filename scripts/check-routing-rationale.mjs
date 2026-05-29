@@ -122,7 +122,16 @@ function makeApiHelpers(API_URL, headers) {
 
 // ── Main routine ──────────────────────────────────────────────────────────────
 
-async function main({ windowMinutes, apply, apiUrl, apiKey, companyId }) {
+/**
+ * Status filter for the working-issue fetch. MUST include `backlog`: flags
+ * filed by Phase B (and any other issue) default to `backlog` status server-side
+ * (services/issues.ts: `status: values.status ?? "backlog"`). If `backlog` is
+ * omitted here, Phase A never sees stale backlog flags (they never auto-resolve)
+ * and Phase B never counts them as open (it files duplicates). See AUR-1581.
+ */
+export const ISSUE_STATUS_FILTER = 'backlog,todo,in_progress,in_review,blocked';
+
+export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId }) {
   const windowStart = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
 
   const headers = {
@@ -151,7 +160,7 @@ async function main({ windowMinutes, apply, apiUrl, apiKey, companyId }) {
 
   // Fetch all open issues once — used by both phases
   const issuesBatch = await apiGet(
-    `/api/companies/${companyId}/issues?status=todo,in_progress,in_review,blocked&limit=500`
+    `/api/companies/${companyId}/issues?status=${ISSUE_STATUS_FILTER}&limit=500`
   );
   const rawIssues = Array.isArray(issuesBatch) ? issuesBatch : (issuesBatch.issues ?? []);
 
@@ -317,7 +326,12 @@ async function main({ windowMinutes, apply, apiUrl, apiKey, companyId }) {
       ].join('\n');
       console.log(`  FILE: "${title}"`);
       if (apply) {
-        await apiPost(`/api/companies/${companyId}/issues`, { title, description });
+        // File in `todo`, not the server default `backlog`: these flags are
+        // actionable (a manager must add the routing record) and should be
+        // visible in the working set by default. The filter above also covers
+        // `backlog` defensively so pre-existing/manually-moved flags still
+        // auto-resolve and dedup. See AUR-1581.
+        await apiPost(`/api/companies/${companyId}/issues`, { title, description, status: 'todo' });
         console.log(`    → filed.`);
       }
     }

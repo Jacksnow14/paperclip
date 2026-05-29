@@ -7,6 +7,8 @@ import {
   resolveCancelReason,
   LIST_DESC_TRUNCATION,
   mayBeTruncated,
+  ISSUE_STATUS_FILTER,
+  main,
 } from './check-routing-rationale.mjs';
 
 // ── FLAG_REGEX ────────────────────────────────────────────────────────────────
@@ -198,4 +200,116 @@ test('dedup: skips filing flag when open flag already exists for target', async 
   // Phase B dedup: AUR-100 is in openFlagTargets → skip filing
   const candidateId = openIssues[0].identifier;
   assert.ok(openFlagTargets.has(candidateId), 'dedup should skip AUR-100 — flag already open');
+});
+
+// ── backlog-status flag visibility (AUR-1581) ─────────────────────────────────
+
+test('ISSUE_STATUS_FILTER includes backlog so backlog flags are fetched', () => {
+  assert.ok(
+    ISSUE_STATUS_FILTER.split(',').includes('backlog'),
+    'backlog must be in the working-issue fetch filter — flags default to backlog server-side',
+  );
+});
+
+/**
+ * Drives main() with a mocked fetch. Captures the issues-fetch URL and any
+ * mutating calls (PATCH cancel, POST comment, POST new-flag).
+ *
+ * @param {object[]} openIssues   what the issues LIST endpoint returns
+ * @param {(prefix:string)=>object[]} memoryFor  routing records for a titlePrefix
+ */
+function mockApi(t, openIssues, memoryFor) {
+  const calls = { issuesFetchUrl: null, patched: [], comments: [], filed: [] };
+  t.mock.method(global, 'fetch', async (url, opts = {}) => {
+    const method = opts.method ?? 'GET';
+    if (method === 'PATCH') {
+      calls.patched.push({ url, body: JSON.parse(opts.body) });
+      return { ok: true, json: async () => ({}) };
+    }
+    if (method === 'POST') {
+      if (url.includes('/comments')) calls.comments.push({ url, body: JSON.parse(opts.body) });
+      else if (/\/companies\/[^/]+\/issues$/.test(url)) calls.filed.push({ url, body: JSON.parse(opts.body) });
+      return { ok: true, json: async () => ({ id: 'new-flag', identifier: 'AUR-NEW' }) };
+    }
+    // GET
+    if (url.includes('/issues?')) {
+      calls.issuesFetchUrl = url;
+      return { ok: true, json: async () => openIssues };
+    }
+    if (url.includes('/memory/records')) {
+      const m = url.match(/titlePrefix=([^&]+)/);
+      const prefix = m ? decodeURIComponent(m[1]) : '';
+      return { ok: true, json: async () => memoryFor(prefix) };
+    }
+    return { ok: true, json: async () => ({}) };
+  });
+  return calls;
+}
+
+const now = () => new Date().toISOString();
+const runOpts = { windowMinutes: 60, apply: true, apiUrl: 'http://x', apiKey: 'k', companyId: 'co-1' };
+
+test('backlog flag whose gap is now closed (routing record exists) → auto-resolved', async (t) => {
+  const openIssues = [
+    {
+      id: 'f1', identifier: 'AUR-301', status: 'backlog', priority: 'low',
+      title: 'routing-rationale gap: AUR-300 missing routing/AUR-300 record', description: '',
+    },
+    {
+      id: 't300', identifier: 'AUR-300', status: 'in_progress', priority: 'high',
+      assigneeAgentId: 'a1', originKind: 'manual', updatedAt: now(),
+      title: 'Real work', description: '',
+    },
+  ];
+  // Gap is closed: routing/AUR-300 record now exists.
+  const calls = mockApi(t, openIssues, (prefix) =>
+    prefix.startsWith('routing/AUR-300') ? [{ title: 'routing/AUR-300' }] : []);
+
+  const code = await main(runOpts);
+
+  assert.ok(calls.issuesFetchUrl.includes('status=backlog,'), 'fetch must include backlog');
+  assert.equal(calls.patched.length, 1, 'the backlog flag should be cancelled');
+  assert.match(calls.patched[0].url, /\/api\/issues\/f1$/);
+  assert.equal(calls.patched[0].body.status, 'cancelled');
+  assert.equal(calls.filed.length, 0, 'no new flag filed');
+  assert.equal(code, 0);
+});
+
+test('backlog flag whose gap is still open → counted as dedup, no duplicate filed', async (t) => {
+  const openIssues = [
+    {
+      id: 'f2', identifier: 'AUR-401', status: 'backlog', priority: 'low',
+      title: 'routing-rationale gap: AUR-400 missing routing/AUR-400 record', description: '',
+    },
+    {
+      id: 't400', identifier: 'AUR-400', status: 'in_progress', priority: 'high',
+      assigneeAgentId: 'a1', originKind: 'manual', updatedAt: now(),
+      title: 'Real work', description: '',
+    },
+  ];
+  // Gap still open: no routing record for AUR-400.
+  const calls = mockApi(t, openIssues, () => []);
+
+  const code = await main(runOpts);
+
+  assert.ok(calls.issuesFetchUrl.includes('status=backlog,'), 'fetch must include backlog');
+  assert.equal(calls.patched.length, 0, 'flag stays open — gap not closed');
+  assert.equal(calls.filed.length, 0, 'must NOT file a duplicate — backlog flag dedups');
+  assert.equal(code, 0);
+});
+
+test('new flags are filed in todo, not the server-default backlog', async (t) => {
+  const openIssues = [
+    {
+      id: 't500', identifier: 'AUR-500', status: 'in_progress', priority: 'high',
+      assigneeAgentId: 'a1', originKind: 'manual', updatedAt: now(),
+      title: 'Needs routing rationale', description: '',
+    },
+  ];
+  const calls = mockApi(t, openIssues, () => []); // no record, no existing flag
+
+  await main(runOpts);
+
+  assert.equal(calls.filed.length, 1, 'one new flag filed');
+  assert.equal(calls.filed[0].body.status, 'todo', 'filed in todo so it is actionable + visible');
 });

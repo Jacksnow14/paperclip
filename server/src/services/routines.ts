@@ -937,6 +937,27 @@ export function routineService(
       .then((rows) => rows[0]?.issues ?? null);
   }
 
+  // For reuse_and_rewake: find the singleton issue regardless of status (open or closed).
+  async function findRollingExecutionIssue(
+    routine: typeof routines.$inferSelect,
+    executor: Db = db,
+  ) {
+    return executor
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, routine.companyId),
+          eq(issues.originKind, "routine_execution"),
+          eq(issues.originId, routine.id),
+          isNull(issues.hiddenAt),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {
     return executor
       .update(routineRuns)
@@ -1192,6 +1213,46 @@ export function routineService(
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
+        // reuse_and_rewake: find the singleton issue (open or closed) and rewake it.
+        if (input.routine.concurrencyPolicy === "reuse_and_rewake") {
+          const rollingIssue = await findRollingExecutionIssue(input.routine, txDb);
+          if (rollingIssue) {
+            const isOpen = OPEN_ISSUE_STATUSES.includes(rollingIssue.status as typeof OPEN_ISSUE_STATUSES[number]);
+            if (!isOpen) {
+              // Reopen outside the transaction so the row lock is released before
+              // queueIssueAssignmentWakeup's wakeup callback can update the same row.
+              await db
+                .update(issues)
+                .set({ status: "todo", updatedAt: new Date() })
+                .where(eq(issues.id, rollingIssue.id));
+              rollingIssue.status = "todo";
+            }
+            await queueIssueAssignmentWakeup({
+              heartbeat,
+              issue: rollingIssue,
+              reason: "issue_assigned",
+              mutation: "update",
+              contextSource: "routine.dispatch",
+              requestedByActorType: input.source === "schedule" ? "system" : undefined,
+              rethrowOnError: true,
+            });
+            const updated = await finalizeRun(createdRun.id, {
+              status: "issue_created",
+              linkedIssueId: rollingIssue.id,
+            }, txDb);
+            await updateRoutineTouchedState({
+              routineId: input.routine.id,
+              triggerId: input.trigger?.id ?? null,
+              triggeredAt,
+              status: "issue_created",
+              issueId: rollingIssue.id,
+              nextRunAt,
+            }, txDb);
+            return updated ?? createdRun;
+          }
+          // No prior issue — fall through to create one fresh (first fire).
+        }
+
         const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
           kind: issueOriginKind,
           id: issueOriginId,

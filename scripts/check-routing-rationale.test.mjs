@@ -50,8 +50,14 @@ test('isExempt: content slot title pattern', () => {
   assert.ok(isExempt({ title: 'CONTENT SLOT lane-a request', description: '' }));
 });
 
+test('isExempt: recurring daily-brief publication titles', () => {
+  assert.ok(isExempt({ title: 'Post 2026-05-29 daily AI brief to AUR-27', description: '' }));
+  assert.ok(isExempt({ title: 'Daily Brief — 2026-05-30', description: '' }));
+});
+
 test('isExempt: not exempt when neither pattern matches', () => {
   assert.equal(isExempt({ title: 'Normal issue', description: 'Some work' }), false);
+  assert.equal(isExempt({ title: 'Fix daily cron job', description: 'no brief here' }), false);
 });
 
 test('isExempt: missing description does not throw', () => {

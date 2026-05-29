@@ -64,6 +64,11 @@ export function mayBeTruncated(description) {
 export function isExempt(issue) {
   if (issue.description && issue.description.includes('exec.routing-rationale: skip')) return true;
   if (/content slot/i.test(issue.title ?? '')) return true;
+  // Recurring daily-brief publication tasks (e.g. "Post 2026-05-29 daily AI brief
+  // to AUR-27") are content publication, not technical-routing decisions, so a
+  // routing/{id} rationale is meaningless. They recur daily and would otherwise be
+  // flagged-then-auto-resolved every day — a known false-positive class (AUR-1550).
+  if (/daily\b.*\bbrief/i.test(issue.title ?? '')) return true;
   return false;
 }
 

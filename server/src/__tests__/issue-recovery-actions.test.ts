@@ -764,4 +764,195 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow?.status).toBe("active");
   });
+
+  it("auto-resolves missing_disposition action with outcome restored when PATCH sets status to done", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_state",
+      fingerprint: "missing-disposition:auto-resolve-done",
+      evidence: { sourceRunId: "run-1" },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp();
+
+    const res = await request(app)
+      .patch(`/api/issues/${sourceIssueId}`)
+      .send({ status: "done" })
+      .expect(200);
+
+    expect(res.body.status).toBe("done");
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({
+      status: "resolved",
+      outcome: "restored",
+    });
+    expect(actionRow?.resolvedAt).toBeTruthy();
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+  });
+
+  it("auto-resolves missing_disposition action with outcome blocked when PATCH sets status to blocked", async () => {
+    const { companyId, managerId, coderId, sourceIssueId, prefix } = await seedCompany();
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Blocking issue",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 2,
+      identifier: `${prefix}-2`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: sourceIssueId,
+      type: "blocks",
+    });
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_state",
+      fingerprint: "missing-disposition:auto-resolve-blocked",
+      evidence: { sourceRunId: "run-1" },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp();
+
+    const res = await request(app)
+      .patch(`/api/issues/${sourceIssueId}`)
+      .send({ status: "blocked", blockedByIssueIds: [blockerIssueId] })
+      .expect(200);
+
+    expect(res.body.status).toBe("blocked");
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({
+      status: "resolved",
+      outcome: "blocked",
+    });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+  });
+
+  it("auto-resolves missing_disposition action with outcome cancelled when PATCH sets status to cancelled", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_state",
+      fingerprint: "missing-disposition:auto-resolve-cancelled",
+      evidence: { sourceRunId: "run-1" },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp();
+
+    const res = await request(app)
+      .patch(`/api/issues/${sourceIssueId}`)
+      .send({ status: "cancelled" })
+      .expect(200);
+
+    expect(res.body.status).toBe("cancelled");
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({
+      status: "cancelled",
+      outcome: "cancelled",
+    });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+  });
+
+  it("does not auto-resolve recovery actions of other kinds on PATCH status change", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "stranded:fingerprint",
+      evidence: {},
+      nextAction: "Restore a live execution path.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp();
+
+    await request(app)
+      .patch(`/api/issues/${sourceIssueId}`)
+      .send({ status: "done" })
+      .expect(200);
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow?.status).toBe("active");
+  });
+
+  it("explicit recovery-actions/resolve route succeeds without double-resolve when suppressRecoveryActionAutoResolve is set", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "successful_run_missing_state",
+      fingerprint: "missing-disposition:explicit-resolve",
+      evidence: { sourceRunId: "run-1" },
+      nextAction: "Choose a valid issue disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp();
+
+    const resolved = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "done",
+        resolutionNote: "Explicit board resolution.",
+      })
+      .expect(200);
+
+    expect(resolved.body.issue).toMatchObject({
+      id: sourceIssueId,
+      status: "done",
+      activeRecoveryAction: null,
+    });
+    expect(resolved.body.recoveryAction).toMatchObject({
+      id: action.id,
+      status: "resolved",
+      outcome: "restored",
+    });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+  });
 });

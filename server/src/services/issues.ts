@@ -75,6 +75,7 @@ import {
 } from "./issue-tree-control.js";
 import { parseIssueGraphLivenessIncidentKey } from "./recovery/origins.js";
 import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
+import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -4250,6 +4251,7 @@ export function issueService(db: Db) {
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
         actorUserId?: string | null;
+        suppressRecoveryActionAutoResolve?: boolean;
       },
       dbOrTx: any = db,
     ) => {
@@ -4265,6 +4267,7 @@ export function issueService(db: Db) {
         blockedByIssueIds,
         actorAgentId,
         actorUserId,
+        suppressRecoveryActionAutoResolve,
         ...issueData
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
@@ -4472,6 +4475,36 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+
+        const VALID_AUTO_RESOLVE_STATUSES = ["done", "cancelled", "in_review", "blocked"] as const;
+        if (
+          !suppressRecoveryActionAutoResolve &&
+          issueData.status &&
+          issueData.status !== existing.status &&
+          (VALID_AUTO_RESOLVE_STATUSES as readonly string[]).includes(issueData.status)
+        ) {
+          const recoverySvc = issueRecoveryActionService(tx);
+          const active = await recoverySvc.getActiveForIssue(existing.companyId, id);
+          if (active && active.kind === "missing_disposition") {
+            const outcomeMap: Record<string, "restored" | "blocked" | "cancelled"> = {
+              done: "restored",
+              in_review: "restored",
+              blocked: "blocked",
+              cancelled: "cancelled",
+            };
+            const outcome = outcomeMap[issueData.status] ?? "restored";
+            const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
+            await recoverySvc.resolveActiveForIssue({
+              companyId: existing.companyId,
+              sourceIssueId: id,
+              actionId: active.id,
+              status: actionStatus,
+              outcome,
+              resolutionNote: `Auto-resolved on disposition ${issueData.status} via issue update`,
+            });
+          }
+        }
+
         if (nextLabelIds !== undefined) {
           await syncIssueLabels(updated.id, existing.companyId, nextLabelIds, tx);
         }

@@ -1883,6 +1883,7 @@ export function issueRoutes(
             status: sourceIssueStatus,
             actorAgentId: actor.agentId ?? null,
             actorUserId: actor.actorType === "user" ? actor.actorId : null,
+            suppressRecoveryActionAutoResolve: true,
           },
           tx,
         );

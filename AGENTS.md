@@ -297,6 +297,8 @@ When a `request_board_approval` arrives for a self-edit proposal:
 
 ## 15. Issue AC Schema (SGI Loop G — Pre-flight)
 
+> **RETIRED (2026-05-29, CTO decision — [AUR-1547](/AUR/issues/AUR-1547)).** The Loop G validator routine is **paused and will not be re-enabled**. It emitted **0 `preflight/` records in its entire lifetime** despite the daily retro audit independently finding 10/30 non-compliant issues — its detection was inert and not worth its `*/10` token cost. The AC schema below is retained as **authoring guidance** (issue creators should still follow A/B/C), but it is no longer machine-enforced. Re-enabling requires first proving, in a test, that it emits a `preflight/` record on a real bad-AC issue.
+
 Every `todo` issue must satisfy the following acceptance-criteria schema before an executor wakes. An automated validator (SGI Loop G routine, every 10 minutes) checks new issues and blocks them if the schema is violated.
 
 ### Required fields
@@ -334,10 +336,21 @@ For the first 48 hours after the routine is deployed, Loop G logs what it would 
 ### Detection Routine
 
 - Name: `SGI Loop G — AC Pre-flight Validator`
+- Status: **RETIRED — paused, do not re-enable** (see banner above; [AUR-1547](/AUR/issues/AUR-1547))
 - Owner: CTO (agent `371a1b08-0286-4a12-a516-f587f42df5eb`)
-- Schedule: every 10 minutes
+- Schedule: was every 10 minutes (now paused)
 - Parent: [AUR-1395](/AUR/issues/AUR-1395) — SGI Path
 - Source: [AUR-1465](/AUR/issues/AUR-1465)
+
+---
+
+## 16. Rolling-issue watchdog routines (`reuse_and_rewake`)
+
+Monitor/watchdog routines that fire frequently must **not** churn a new execution issue per fire. Set their `concurrencyPolicy` to **`reuse_and_rewake`** ([AUR-1547](/AUR/issues/AUR-1547)): the engine reuses **one** rolling execution issue across fires — reopening it to `todo` and re-queuing a heartbeat wake if it was closed — instead of creating a new issue. An empty fire spawns nothing.
+
+**Routine-operator rule:** on a rolling (`reuse_and_rewake`) execution issue, **post each run's result as a comment on the single rolling issue — do NOT mark it `done` between fires.** Closing it each fire is exactly the churn pattern this policy exists to stop (the old behavior produced ~144 issues/day for the `*/10` validator). Leave the issue open; the next fire re-wakes the same issue.
+
+Applies to the active watchdogs: `routing-rationale-watchdog`, `loop-f-hire-watchdog` (F-1), and `SGI Loop F-2 — Retire/Repurpose Proposal Watchdog` (F-2). These are PATCHed to `reuse_and_rewake` post-deploy ([AUR-1551](/AUR/issues/AUR-1551)).
 
 ---
 

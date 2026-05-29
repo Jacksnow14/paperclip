@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   extractCodexRetryNotBefore,
+  isCodexNoProgressResumedRun,
   isCodexTransientUpstreamError,
   isCodexUnknownSessionError,
   parseCodexJsonl,
@@ -30,6 +31,7 @@ describe("parseCodexJsonl", () => {
         outputTokens: 4,
       },
       errorMessage: "resume failed",
+      hadAgentMessage: true,
     });
   });
 
@@ -63,7 +65,85 @@ describe("parseCodexJsonl", () => {
         outputTokens: 4,
       },
       errorMessage: null,
+      hadAgentMessage: true,
     });
+  });
+
+  it("reports hadAgentMessage=false when no agent_message event was produced", () => {
+    const stdout = [
+      JSON.stringify({ type: "thread.started", thread_id: "thread_empty" }),
+      JSON.stringify({
+        type: "turn.completed",
+        usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 },
+      }),
+    ].join("\n");
+
+    expect(parseCodexJsonl(stdout).hadAgentMessage).toBe(false);
+  });
+});
+
+describe("isCodexNoProgressResumedRun", () => {
+  it("detects a resumed session that produced zero tokens, no summary, and no agent_message", () => {
+    const parsed = parseCodexJsonl("");
+    expect(
+      isCodexNoProgressResumedRun({
+        parsed,
+        stdout: "",
+        stderr: "",
+      }),
+    ).toBe(true);
+  });
+
+  it("returns false when the resumed run actually produced an agent_message", () => {
+    const stdout = [
+      JSON.stringify({ type: "thread.started", thread_id: "thread_alive" }),
+      JSON.stringify({
+        type: "item.completed",
+        item: { type: "agent_message", text: "Picked the next subtask." },
+      }),
+      JSON.stringify({
+        type: "turn.completed",
+        usage: { input_tokens: 5, cached_input_tokens: 0, output_tokens: 3 },
+      }),
+    ].join("\n");
+    const parsed = parseCodexJsonl(stdout);
+    expect(
+      isCodexNoProgressResumedRun({
+        parsed,
+        stdout,
+        stderr: "",
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false for empty resumed runs that surface a transient-upstream error", () => {
+    const parsed = parseCodexJsonl("");
+    expect(
+      isCodexNoProgressResumedRun({
+        parsed,
+        stdout: "",
+        stderr:
+          "Error running remote compact task: We're currently experiencing high demand, which may cause temporary errors.",
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false when there are tokens billed even without a summary", () => {
+    const stdout = [
+      JSON.stringify({ type: "thread.started", thread_id: "thread_billed" }),
+      JSON.stringify({
+        type: "turn.completed",
+        usage: { input_tokens: 12, cached_input_tokens: 0, output_tokens: 0 },
+      }),
+    ].join("\n");
+    const parsed = parseCodexJsonl(stdout);
+    expect(
+      isCodexNoProgressResumedRun({
+        parsed,
+        stdout,
+        stderr: "",
+      }),
+    ).toBe(false);
   });
 });
 

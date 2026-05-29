@@ -15,6 +15,7 @@ export function parseCodexJsonl(stdout: string) {
   let sessionId: string | null = null;
   let finalMessage: string | null = null;
   let errorMessage: string | null = null;
+  let hadAgentMessage = false;
   const usage = {
     inputTokens: 0,
     cachedInputTokens: 0,
@@ -43,6 +44,7 @@ export function parseCodexJsonl(stdout: string) {
     if (type === "item.completed") {
       const item = parseObject(event.item);
       if (asString(item.type, "") === "agent_message") {
+        hadAgentMessage = true;
         const text = asString(item.text, "");
         if (text) finalMessage = text;
       }
@@ -69,7 +71,31 @@ export function parseCodexJsonl(stdout: string) {
     summary: finalMessage?.trim() ?? "",
     usage,
     errorMessage,
+    hadAgentMessage,
   };
+}
+
+export function isCodexNoProgressResumedRun(input: {
+  parsed: ReturnType<typeof parseCodexJsonl>;
+  stdout?: string | null;
+  stderr?: string | null;
+}): boolean {
+  const { parsed } = input;
+  if (parsed.usage.inputTokens !== 0 || parsed.usage.outputTokens !== 0) return false;
+  if (parsed.summary.length > 0) return false;
+  if (parsed.hadAgentMessage) return false;
+  // Transient upstream errors have their own bounded-retry path; do not
+  // misclassify them as dead resumed sessions.
+  if (
+    isCodexTransientUpstreamError({
+      stdout: input.stdout ?? "",
+      stderr: input.stderr ?? "",
+      errorMessage: parsed.errorMessage ?? "",
+    })
+  ) {
+    return false;
+  }
+  return true;
 }
 
 export function isCodexUnknownSessionError(stdout: string, stderr: string): boolean {

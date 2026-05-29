@@ -275,6 +275,25 @@ describe("codex remote execution", () => {
     await mkdir(workspaceDir, { recursive: true });
     await mkdir(codexHomeDir, { recursive: true });
     await writeFile(path.join(codexHomeDir, "auth.json"), "{}", "utf8");
+    runChildProcess.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: [
+        JSON.stringify({ type: "thread.started", thread_id: "session-123" }),
+        JSON.stringify({
+          type: "item.completed",
+          item: { type: "agent_message", text: "ok" },
+        }),
+        JSON.stringify({
+          type: "turn.completed",
+          usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 },
+        }),
+      ].join("\n"),
+      stderr: "",
+      pid: 123,
+      startedAt: new Date().toISOString(),
+    });
 
     await execute({
       runId: "run-ssh-resume",
@@ -348,6 +367,25 @@ describe("codex remote execution", () => {
     await mkdir(workspaceDir, { recursive: true });
     await mkdir(codexHomeDir, { recursive: true });
     await writeFile(path.join(codexHomeDir, "auth.json"), "{}", "utf8");
+    runChildProcess.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: [
+        JSON.stringify({ type: "thread.started", thread_id: "session-123" }),
+        JSON.stringify({
+          type: "item.completed",
+          item: { type: "agent_message", text: "ok" },
+        }),
+        JSON.stringify({
+          type: "turn.completed",
+          usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 },
+        }),
+      ].join("\n"),
+      stderr: "",
+      pid: 123,
+      startedAt: new Date().toISOString(),
+    });
 
     await execute({
       runId: "run-target",
@@ -418,5 +456,130 @@ describe("codex remote execution", () => {
     ]);
     expect(call?.[3].env.CODEX_HOME).toBe(`${managedRemoteWorkspace}/.paperclip-runtime/codex/home`);
     expect(call?.[3].remoteExecution?.remoteCwd).toBe(managedRemoteWorkspace);
+  });
+
+  it("rotates to a fresh session and clears the persisted session when a resumed run returns no progress", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-no-progress-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    const codexHomeDir = path.join(rootDir, "codex-home");
+    await mkdir(workspaceDir, { recursive: true });
+    await mkdir(codexHomeDir, { recursive: true });
+    await writeFile(path.join(codexHomeDir, "auth.json"), "{}", "utf8");
+
+    const emptyRun = {
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: "",
+      pid: 123,
+      startedAt: new Date().toISOString(),
+    };
+    runChildProcess.mockResolvedValueOnce(emptyRun).mockResolvedValueOnce(emptyRun);
+
+    const result = await execute({
+      runId: "run-no-progress",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "CodexCoder",
+        adapterType: "codex_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: "session-stale",
+        sessionParams: {
+          sessionId: "session-stale",
+          cwd: workspaceDir,
+        },
+        sessionDisplayId: "session-stale",
+        taskKey: null,
+      },
+      config: {
+        command: "codex",
+        env: {
+          CODEX_HOME: codexHomeDir,
+        },
+        cwd: workspaceDir,
+      },
+      context: {
+        paperclipWorkspace: {
+          cwd: workspaceDir,
+          source: "project_primary",
+        },
+      },
+      onLog: async () => {},
+    });
+
+    expect(runChildProcess).toHaveBeenCalledTimes(2);
+    const firstCall = runChildProcess.mock.calls[0] as unknown as
+      | [string, string, string[]]
+      | undefined;
+    const secondCall = runChildProcess.mock.calls[1] as unknown as
+      | [string, string, string[]]
+      | undefined;
+    expect(firstCall?.[2]).toEqual(["exec", "--json", "resume", "session-stale", "-"]);
+    expect(secondCall?.[2]).toEqual(["exec", "--json", "-"]);
+    expect(result.clearSession).toBe(true);
+    expect(result.sessionId).toBeNull();
+  });
+
+  it("drops the persisted session when a resumed run times out", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-resume-timeout-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    const codexHomeDir = path.join(rootDir, "codex-home");
+    await mkdir(workspaceDir, { recursive: true });
+    await mkdir(codexHomeDir, { recursive: true });
+    await writeFile(path.join(codexHomeDir, "auth.json"), "{}", "utf8");
+
+    runChildProcess.mockResolvedValueOnce({
+      exitCode: 143,
+      signal: null,
+      timedOut: true,
+      stdout: "",
+      stderr: "",
+      pid: 124,
+      startedAt: new Date().toISOString(),
+    });
+
+    const result = await execute({
+      runId: "run-resume-timeout",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "CodexCoder",
+        adapterType: "codex_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: "session-hung",
+        sessionParams: {
+          sessionId: "session-hung",
+          cwd: workspaceDir,
+        },
+        sessionDisplayId: "session-hung",
+        taskKey: null,
+      },
+      config: {
+        command: "codex",
+        env: {
+          CODEX_HOME: codexHomeDir,
+        },
+        cwd: workspaceDir,
+      },
+      context: {
+        paperclipWorkspace: {
+          cwd: workspaceDir,
+          source: "project_primary",
+        },
+      },
+      onLog: async () => {},
+    });
+
+    expect(runChildProcess).toHaveBeenCalledTimes(1);
+    expect(result.timedOut).toBe(true);
+    expect(result.clearSession).toBe(true);
   });
 });

@@ -41,6 +41,7 @@ import {
 import {
   parseCodexJsonl,
   extractCodexRetryNotBefore,
+  isCodexNoProgressResumedRun,
   isCodexTransientUpstreamError,
   isCodexUnknownSessionError,
 } from "./parse.js";
@@ -827,18 +828,44 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   try {
     const initial = await runAttempt(sessionId);
-    if (
-      sessionId &&
-      !initial.proc.timedOut &&
-      (initial.proc.exitCode ?? 0) !== 0 &&
-      isCodexUnknownSessionError(initial.proc.stdout, initial.rawStderr)
-    ) {
-      await onLog(
-        "stdout",
-        `[paperclip] Codex resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
-      );
-      const retry = await runAttempt(null);
-      return toResult(retry, true, true);
+    if (sessionId) {
+      if (
+        !initial.proc.timedOut &&
+        (initial.proc.exitCode ?? 0) !== 0 &&
+        isCodexUnknownSessionError(initial.proc.stdout, initial.rawStderr)
+      ) {
+        await onLog(
+          "stdout",
+          `[paperclip] Codex resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
+        );
+        const retry = await runAttempt(null);
+        return toResult(retry, true, true);
+      }
+
+      if (initial.proc.timedOut) {
+        // A hung resume must not be re-persisted; drop the stale session so
+        // the next heartbeat starts clean.
+        await onLog(
+          "stdout",
+          `[paperclip] Codex resume session "${sessionId}" timed out; dropping the stale session.\n`,
+        );
+        return toResult(initial, true, false);
+      }
+
+      if (
+        isCodexNoProgressResumedRun({
+          parsed: initial.parsed,
+          stdout: initial.proc.stdout,
+          stderr: initial.rawStderr,
+        })
+      ) {
+        await onLog(
+          "stdout",
+          `[paperclip] Codex resume session "${sessionId}" returned no progress (0 tokens, no agent message); retrying once with a fresh session.\n`,
+        );
+        const retry = await runAttempt(null);
+        return toResult(retry, true, true);
+      }
     }
 
     return toResult(initial, false, false);

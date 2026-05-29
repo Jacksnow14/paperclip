@@ -1008,7 +1008,7 @@ export function memoryService(
   // need no board review — captures land as accepted immediately so CEO
   // routing queries and SGI Loop 2 see them within the same heartbeat.
   // Revoke by removing a category from this set and running a policy sweep.
-  const AUTO_ACCEPT_CATEGORIES = new Set(["performance_scorecard", "tool_gap", "lesson", "routing_rationale", "synthesis", "scorecard_adjusted", "roi_ledger", "capacity_decision", "prompt_improvement_proposal"]);
+  const AUTO_ACCEPT_CATEGORIES = new Set(["performance_scorecard", "tool_gap", "lesson", "routing_rationale", "synthesis", "scorecard_adjusted", "roi_ledger", "capacity_decision", "prompt_improvement_proposal", "experiment", "experiment_conclusion"]);
 
   function resolveReviewState(metadata?: Record<string, unknown>): "pending" | "accepted" {
     const category = metadata?.category;

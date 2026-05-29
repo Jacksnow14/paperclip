@@ -822,6 +822,8 @@ describeEmbeddedPostgres("memoryService local basic persistence", () => {
     const cases: Array<{ category: string }> = [
       { category: "scorecard_adjusted" },
       { category: "roi_ledger" },
+      { category: "experiment" },
+      { category: "experiment_conclusion" },
     ];
 
     for (const { category } of cases) {

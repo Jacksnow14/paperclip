@@ -938,6 +938,8 @@ export function routineService(
   }
 
   // For reuse_and_rewake: find the singleton issue regardless of status (open or closed).
+  // Prefer a currently-open issue so that legacy churn (many stale closed execution
+  // issues) can't cause us to reopen an old closed one while a live one already exists.
   async function findRollingExecutionIssue(
     routine: typeof routines.$inferSelect,
     executor: Db = db,
@@ -953,7 +955,11 @@ export function routineService(
           isNull(issues.hiddenAt),
         ),
       )
-      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .orderBy(
+        desc(inArray(issues.status, OPEN_ISSUE_STATUSES)),
+        desc(issues.updatedAt),
+        desc(issues.createdAt),
+      )
       .limit(1)
       .then((rows) => rows[0] ?? null);
   }

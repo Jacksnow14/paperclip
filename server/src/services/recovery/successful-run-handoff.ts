@@ -341,6 +341,7 @@ export function decideSuccessfulRunHandoff(input: {
   hasPendingInteractionOrApproval: boolean;
   hasExplicitBlockerPath: boolean;
   hasOpenRecoveryIssue: boolean;
+  hasActiveMissingDispositionRecoveryAction: boolean;
   hasPauseHold: boolean;
   budgetBlocked: boolean;
   idempotentWakeExists: boolean;
@@ -377,6 +378,9 @@ export function decideSuccessfulRunHandoff(input: {
   }
   if (input.hasExplicitBlockerPath) return { kind: "skip", reason: "explicit blocker path owns the next action" };
   if (input.hasOpenRecoveryIssue) return { kind: "skip", reason: "open recovery issue owns the ambiguity" };
+  if (input.hasActiveMissingDispositionRecoveryAction) {
+    return { kind: "skip", reason: "active missing-disposition recovery action owns the next action" };
+  }
   if (input.hasPauseHold) return { kind: "skip", reason: "issue is under an active pause hold" };
   if (input.budgetBlocked) return { kind: "skip", reason: "budget hard stop blocks corrective wake" };
   if (input.idempotentWakeExists) {

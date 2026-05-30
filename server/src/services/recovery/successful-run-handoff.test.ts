@@ -51,6 +51,7 @@ function decide(overrides: Partial<Parameters<typeof decideSuccessfulRunHandoff>
     hasPendingInteractionOrApproval: false,
     hasExplicitBlockerPath: false,
     hasOpenRecoveryIssue: false,
+    hasActiveMissingDispositionRecoveryAction: false,
     hasPauseHold: false,
     budgetBlocked: false,
     idempotentWakeExists: false,
@@ -121,6 +122,13 @@ describe("successful run handoff decision", () => {
     expect(decide({ hasExplicitBlockerPath: true })).toEqual({
       kind: "skip",
       reason: "explicit blocker path owns the next action",
+    });
+  });
+
+  it("does not queue another corrective handoff when an active missing-disposition recovery action already exists", () => {
+    expect(decide({ hasActiveMissingDispositionRecoveryAction: true })).toEqual({
+      kind: "skip",
+      reason: "active missing-disposition recovery action owns the next action",
     });
   });
 

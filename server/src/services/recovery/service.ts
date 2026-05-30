@@ -2303,6 +2303,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
+        const existingMissingDispositionAction = await recoveryActionsSvc.getActiveForIssue(
+          issue.companyId,
+          issue.id,
+        );
+        if (
+          existingMissingDispositionAction &&
+          existingMissingDispositionAction.cause === SUCCESSFUL_RUN_MISSING_STATE_REASON
+        ) {
+          // Idempotency guard: once this issue has been escalated for an exhausted
+          // successful-run handoff, the active recovery action owns the next step.
+          // Re-running reconcile must not re-escalate, re-comment, or re-dispatch the
+          // source-scoped recovery wake — that previously produced an every-minute loop.
+          result.skipped += 1;
+          continue;
+        }
+
         const updated = await escalateStrandedAssignedIssue({
           issue,
           previousStatus: "in_progress",

@@ -1715,6 +1715,101 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("does not re-escalate or re-dispatch a corrective wake on subsequent reconcile ticks for an already-escalated exhausted handoff", async () => {
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    const sourceRunId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          resumeFromRunId: sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(first.successfulRunHandoffEscalated).toBe(1);
+    expect(first.issueIds).toEqual([issueId]);
+
+    // After escalation the source-scoped recovery wake is queued and a recovery action exists.
+    const wakesAfterFirstTick = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    const recoveryWakesAfterFirstTick = wakesAfterFirstTick.filter(
+      (wakeup) => wakeup.reason === "source_scoped_recovery_action",
+    );
+    expect(recoveryWakesAfterFirstTick).toHaveLength(1);
+    const recoveryActionsAfterFirstTick = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(recoveryActionsAfterFirstTick).toHaveLength(1);
+    expect(recoveryActionsAfterFirstTick[0]?.attemptCount).toBe(1);
+    const commentsAfterFirstTick = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    const exhaustedNoticesAfterFirstTick = commentsAfterFirstTick.filter(
+      (comment) => comment.body === SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
+    );
+    expect(exhaustedNoticesAfterFirstTick).toHaveLength(1);
+
+    // Simulate the conditions that previously caused the every-minute loop:
+    // the issue is somehow flipped back to in_progress while the latest run still
+    // shows an exhausted successful-run handoff and the recovery action is still active.
+    await db
+      .update(issues)
+      .set({ status: "in_progress" })
+      .where(eq(issues.id, issueId));
+
+    const second = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(second.successfulRunHandoffEscalated).toBe(0);
+    expect(second.issueIds).toEqual([]);
+
+    const wakesAfterSecondTick = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    const recoveryWakesAfterSecondTick = wakesAfterSecondTick.filter(
+      (wakeup) => wakeup.reason === "source_scoped_recovery_action",
+    );
+    // No additional source-scoped recovery wake was enqueued on the second tick.
+    expect(recoveryWakesAfterSecondTick).toHaveLength(1);
+
+    const recoveryActionsAfterSecondTick = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    // attemptCount must not be bumped by the idempotent second tick.
+    expect(recoveryActionsAfterSecondTick).toHaveLength(1);
+    expect(recoveryActionsAfterSecondTick[0]?.attemptCount).toBe(1);
+
+    const commentsAfterSecondTick = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    const exhaustedNoticesAfterSecondTick = commentsAfterSecondTick.filter(
+      (comment) => comment.body === SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
+    );
+    // No duplicate escalation notice.
+    expect(exhaustedNoticesAfterSecondTick).toHaveLength(1);
+  });
+
   it("clears the detached warning when the run reports activity again", async () => {
     const { runId } = await seedRunFixture({
       includeIssue: false,

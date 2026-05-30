@@ -28,7 +28,11 @@
  *
  * Exemption rules (no flag filed; existing open flags auto-resolved):
  *   1. Issue description contains token `exec.routing-rationale: skip`
- *   2. Issue title matches /content slot/i
+ *   2. Issue title matches /content slot/i (and content-pipeline children)
+ *   3. Recurring daily-brief publication tasks
+ *   4. Single-owner role-routed approval/sign-off gates (title framed as
+ *      "{subject} sign-off: ..." / "... approval gate — ...") — no candidate
+ *      pool, so no routing decision to document (AUR-1632)
  *
  * Exit codes:
  *   0 — clean (nothing to do, or all actions applied)
@@ -80,6 +84,17 @@ export function isExempt(issue) {
   const description = issue.description ?? '';
   if (/^\s*write script\b/i.test(title) && /workflow signal/i.test(description)) return true;
   if (/^\s*render & upload\b/i.test(title) && /video editor render task/i.test(description)) return true;
+  // Single-owner role-routed approval/sign-off gates (e.g. "CFO sign-off: Standard
+  // ~$160/mo subscription tier", "Legal approval gate — vendor X") route to the sole
+  // owner of a role. There is no candidate pool to compare via performance
+  // scorecards, so a routing/{id} rationale is meaningless — filing one would be
+  // no-signal DB spam (AUR-1632, false-positive class of AUR-1630/AUR-1631).
+  // Anchor on the gate framing: "sign-off" / "approval" (optionally "approval gate")
+  // immediately followed by a ':' or '—' separator. This matches the "{subject}
+  // sign-off: {what}" gate title form while NOT exempting genuine engineering tasks
+  // that merely BUILD such a feature ("Add approval gate to deploy pipeline",
+  // "Implement sign-off flow") — those have no gate delimiter after the phrase.
+  if (/\b(?:sign[-\s]?off|approval(?:\s+gate)?)\s*[:—]/i.test(title)) return true;
   return false;
 }
 
@@ -96,7 +111,7 @@ export function resolveCancelReason({ target, targetId, hasRecord }) {
       : `Auto-resolved by routing-rationale-watchdog: ${targetId} not found among open issues — routing rationale moot.`;
   }
   if (isExempt(target)) {
-    return `Auto-resolved by routing-rationale-watchdog: ${targetId} is exempt from routing rationale (exec.routing-rationale: skip or content-slot pattern).`;
+    return `Auto-resolved by routing-rationale-watchdog: ${targetId} is exempt from routing rationale (exec.routing-rationale: skip, content-slot, daily-brief, or single-owner sign-off/approval gate).`;
   }
   if (hasRecord) {
     return `Auto-resolved by routing-rationale-watchdog: routing/${targetId} record now exists.`;

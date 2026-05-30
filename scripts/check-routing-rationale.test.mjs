@@ -94,6 +94,32 @@ test('isExempt: genuine technical "Write script" / "Render" tasks are NOT exempt
   }), false);
 });
 
+test('isExempt: single-owner role-routed sign-off / approval gate is exempt', () => {
+  // AUR-1630-style: CTO→CFO budget sign-off gate. No candidate pool, no routing
+  // decision to document (AUR-1632 false-positive class).
+  assert.ok(isExempt({
+    title: 'CFO sign-off: Standard ~$160/mo subscription tier',
+    description: '',
+  }));
+  // "sign off" (space) and em-dash separator variants.
+  assert.ok(isExempt({ title: 'Legal sign off — vendor contract X', description: '' }));
+  // "approval:" and "approval gate —" gate framings.
+  assert.ok(isExempt({ title: 'Budget approval: Q3 SaaS spend', description: '' }));
+  assert.ok(isExempt({ title: 'Compliance approval gate — data retention policy', description: '' }));
+});
+
+test('isExempt: genuine engineering task that BUILDS a sign-off/approval feature is NOT exempt', () => {
+  // No gate delimiter after the phrase → still flagged (no regression).
+  assert.equal(isExempt({
+    title: 'Add approval gate to deploy pipeline',
+    description: 'Wire a manual approval step into CD before prod rollout.',
+  }), false);
+  assert.equal(isExempt({
+    title: 'Implement sign-off flow for invoices',
+    description: 'Build the multi-step sign-off UI and API.',
+  }), false);
+});
+
 test('isExempt: not exempt when neither pattern matches', () => {
   assert.equal(isExempt({ title: 'Normal issue', description: 'Some work' }), false);
   assert.equal(isExempt({ title: 'Fix daily cron job', description: 'no brief here' }), false);
@@ -357,4 +383,56 @@ test('new flags are filed in todo, not the server-default backlog', async (t) =>
 
   assert.equal(calls.filed.length, 1, 'one new flag filed');
   assert.equal(calls.filed[0].body.status, 'todo', 'filed in todo so it is actionable + visible');
+});
+
+test('main: sign-off gate is exempt (not filed) while a real coding task is still flagged', async (t) => {
+  const openIssues = [
+    // AUR-1630-class: high-priority single-owner sign-off gate, no routing record.
+    {
+      id: 'g1', identifier: 'AUR-1630', status: 'in_progress', priority: 'high',
+      assigneeAgentId: 'cfo', originKind: 'manual', updatedAt: now(),
+      title: 'CFO sign-off: Standard ~$160/mo subscription tier', description: '',
+    },
+    // Genuine high-priority coding task, no routing record → must still be flagged.
+    {
+      id: 'c1', identifier: 'AUR-1700', status: 'in_progress', priority: 'high',
+      assigneeAgentId: 'a1', originKind: 'manual', updatedAt: now(),
+      title: 'Refactor the auth middleware', description: 'Swap session storage backend.',
+    },
+  ];
+  const calls = mockApi(t, openIssues, () => []); // no routing records exist
+
+  await main(runOpts);
+
+  assert.equal(calls.filed.length, 1, 'exactly one flag filed — the coding task, not the gate');
+  assert.match(calls.filed[0].body.title, /AUR-1700/, 'the coding task is flagged');
+  assert.ok(
+    !calls.filed.some(f => /AUR-1630/.test(f.body.title)),
+    'the sign-off gate must NOT be flagged (exempt)',
+  );
+});
+
+test('main: existing open flag for a sign-off gate auto-resolves in Phase A', async (t) => {
+  const openIssues = [
+    // Stale flag targeting a sign-off gate.
+    {
+      id: 'f1630', identifier: 'AUR-1631', status: 'todo', priority: 'low',
+      title: 'routing-rationale gap: AUR-1630 missing routing/AUR-1630 record', description: '',
+    },
+    // The sign-off gate target — now recognized as exempt.
+    {
+      id: 'g1', identifier: 'AUR-1630', status: 'in_progress', priority: 'high',
+      assigneeAgentId: 'cfo', originKind: 'manual', updatedAt: now(),
+      title: 'CFO sign-off: Standard ~$160/mo subscription tier', description: '',
+    },
+  ];
+  const calls = mockApi(t, openIssues, () => []); // no routing record needed — exempt
+
+  await main(runOpts);
+
+  assert.equal(calls.patched.length, 1, 'the stale flag should be cancelled');
+  assert.match(calls.patched[0].url, /\/api\/issues\/f1630$/);
+  assert.equal(calls.patched[0].body.status, 'cancelled');
+  assert.ok(calls.comments.some(c => /exempt/i.test(c.body.body)), 'cancel comment cites exemption');
+  assert.equal(calls.filed.length, 0, 'no new flag filed for the exempt gate');
 });

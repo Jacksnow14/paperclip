@@ -1986,10 +1986,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       recoveryCause,
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
     });
+    // Keep the recovery action active across the blocked transition. Without this,
+    // the issues.update auto-resolve would flip the action to `resolved/blocked`
+    // moments after we created it, defeating the active-action guards in both
+    // `reconcileStrandedAssignedIssues` (Guard 1) and `decideSuccessfulRunHandoff`
+    // (Guard 2). That allowed exhausted successful-run handoffs to re-escalate
+    // every minute (AUR-1642). The recovery owner's later disposition update will
+    // auto-resolve the action as usual because they go through a separate update
+    // call without this flag.
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
       blockedByIssueIds: blockerIds,
       assigneeAgentId: recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
+      suppressRecoveryActionAutoResolve: true,
     });
     if (!updated) return null;
 

@@ -1760,6 +1760,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
     expect(recoveryActionsAfterFirstTick).toHaveLength(1);
     expect(recoveryActionsAfterFirstTick[0]?.attemptCount).toBe(1);
+    // Sticky-marker assertion: the recovery action must survive the
+    // `blocked` transition so Guard 1 (reconcile) and Guard 2
+    // (decideSuccessfulRunHandoff) can match on subsequent ticks. Without
+    // suppressRecoveryActionAutoResolve, issues.update auto-resolves this
+    // row to status: "resolved" / outcome: "blocked" and the guards never
+    // fire — that was the AUR-1642 every-minute loop.
+    expect(recoveryActionsAfterFirstTick[0]?.status).toBe("active");
+    expect(recoveryActionsAfterFirstTick[0]?.cause).toBe(SUCCESSFUL_RUN_MISSING_STATE_REASON);
     const commentsAfterFirstTick = await db
       .select()
       .from(issueComments)
@@ -1769,12 +1777,44 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     );
     expect(exhaustedNoticesAfterFirstTick).toHaveLength(1);
 
-    // Simulate the conditions that previously caused the every-minute loop:
-    // the issue is somehow flipped back to in_progress while the latest run still
-    // shows an exhausted successful-run handoff and the recovery action is still active.
+    // Reproduce the real production driver of the every-minute loop:
+    // the source-scoped recovery wake fires, the recovery owner runs on the
+    // issue (checkout flips status back to in_progress), the run succeeds
+    // without recording a valid disposition, and a fresh
+    // `finish_successful_run_handoff` corrective run gets stamped on the
+    // issue. The next reconcile tick must NOT re-escalate or re-dispatch
+    // another wake against this issue.
+    const correctiveRunId = randomUUID();
+    const corrective = new Date("2026-03-19T00:10:00.000Z");
+    await db.insert(heartbeatRuns).values({
+      id: correctiveRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "succeeded",
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "finish_successful_run_handoff",
+        sourceRunId,
+        resumeFromRunId: sourceRunId,
+        handoffRequired: true,
+        handoffReason: "successful_run_missing_state",
+        missingDisposition: "clear_next_step",
+        handoffAttempt: 1,
+        maxHandoffAttempts: 1,
+      },
+      startedAt: corrective,
+      finishedAt: corrective,
+      updatedAt: corrective,
+      errorCode: null,
+      error: null,
+      livenessState: "advanced",
+    });
     await db
       .update(issues)
-      .set({ status: "in_progress" })
+      .set({ status: "in_progress", checkoutRunId: correctiveRunId })
       .where(eq(issues.id, issueId));
 
     const second = await heartbeat.reconcileStrandedAssignedIssues();
@@ -1798,6 +1838,29 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // attemptCount must not be bumped by the idempotent second tick.
     expect(recoveryActionsAfterSecondTick).toHaveLength(1);
     expect(recoveryActionsAfterSecondTick[0]?.attemptCount).toBe(1);
+    expect(recoveryActionsAfterSecondTick[0]?.status).toBe("active");
+
+    // Live-flow proof for Guard 2 (heartbeat.ts:4202-4215): the exact query
+    // that handleSuccessfulRunHandoff uses to compute
+    // hasActiveMissingDispositionRecoveryAction must return a row, so that
+    // decideSuccessfulRunHandoff(... hasActiveMissingDispositionRecoveryAction = true)
+    // and skips the corrective wake. Before the fix the action was
+    // auto-resolved on the `blocked` transition, so this query returned
+    // nothing and Guard 2 computed false in production.
+    const guard2QueryRow = await db
+      .select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+          eq(issueRecoveryActions.cause, SUCCESSFUL_RUN_MISSING_STATE_REASON),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    expect(guard2QueryRow).not.toBeNull();
 
     const commentsAfterSecondTick = await db
       .select()

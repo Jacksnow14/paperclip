@@ -1,5 +1,6 @@
 import { google } from "googleapis";
 import { logger } from "../middleware/logger.js";
+import { assertNoUnresolvedPlaceholders } from "./outbound-render-guard.js";
 
 const DOMAIN = "tryauranode.com";
 export const GMAIL_SUPPORTED_ALIASES = ["board", "alex", "leo", "adrian"] as const;
@@ -103,6 +104,7 @@ export function createGmailService() {
   }
 
   async function sendMessage(alias: GmailAlias, opts: GmailSendOptions) {
+    assertNoUnresolvedPlaceholders(opts.subject, opts.body);
     const gmail = buildGmailClient(alias);
     const from = resolveMailboxEmail(alias);
     const raw = buildRawMessage(from, opts.to, opts.subject, opts.body);

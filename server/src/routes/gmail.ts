@@ -9,6 +9,7 @@ import {
   isSupportedGmailAlias,
   GMAIL_SUPPORTED_ALIASES,
 } from "../services/gmail.js";
+import { UnresolvedPlaceholderError } from "../services/outbound-render-guard.js";
 import { createGmailIntakeService } from "../services/gmail-intake.js";
 
 const sendMessageBodySchema = z.object({
@@ -96,8 +97,15 @@ export function gmailRoutes(db: Db) {
       assertGmailAvailable();
       if (!isSupportedGmailAlias(mailbox)) throw badRequest(`Unsupported mailbox: ${mailbox}`);
       const body = req.body as z.infer<typeof sendMessageBodySchema>;
-      const data = await gmail.sendMessage(mailbox, body);
-      res.status(201).json(data);
+      try {
+        const data = await gmail.sendMessage(mailbox, body);
+        res.status(201).json(data);
+      } catch (err) {
+        if (err instanceof UnresolvedPlaceholderError) {
+          throw unprocessable(err.message, { tokens: err.tokens });
+        }
+        throw err;
+      }
     },
   );
 

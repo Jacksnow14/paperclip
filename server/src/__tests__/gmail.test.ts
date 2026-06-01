@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { UnresolvedPlaceholderError } from "../services/outbound-render-guard.js";
 
 // Mock googleapis before importing the service
 const mockMessagesList = vi.fn();
@@ -198,6 +199,58 @@ describe("createGmailService", () => {
       expect(decoded).toContain("Subject: Hello");
       expect(decoded).toContain("World");
       expect(result).toEqual({ id: "sent1" });
+    });
+
+    it("rejects with UnresolvedPlaceholderError and never calls send when subject has a stray token", async () => {
+      const service = createGmailService();
+      await expect(
+        service.sendMessage("board", {
+          to: "user@example.com",
+          subject: "Hi [Name], check this out",
+          body: "Here is the content.",
+        }),
+      ).rejects.toThrow(UnresolvedPlaceholderError);
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+    });
+
+    it("rejects with UnresolvedPlaceholderError and never calls send when body has a stray token", async () => {
+      const service = createGmailService();
+      await expect(
+        service.sendMessage("board", {
+          to: "user@example.com",
+          subject: "Clean subject",
+          body: "Hello {{firstName}}, your report is ready.",
+        }),
+      ).rejects.toThrow(UnresolvedPlaceholderError);
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+    });
+
+    it("names the offending token in the error", async () => {
+      const service = createGmailService();
+      let caught: UnresolvedPlaceholderError | undefined;
+      try {
+        await service.sendMessage("board", {
+          to: "user@example.com",
+          subject: "Hi [Name]",
+          body: "body",
+        });
+      } catch (err) {
+        caught = err as UnresolvedPlaceholderError;
+      }
+      expect(caught).toBeInstanceOf(UnresolvedPlaceholderError);
+      expect(caught!.tokens).toContain("[Name]");
+    });
+
+    it("allows send when subject and body have no unresolved tokens", async () => {
+      mockMessagesSend.mockResolvedValue({ data: { id: "clean1" } });
+      const service = createGmailService();
+      const result = await service.sendMessage("board", {
+        to: "user@example.com",
+        subject: "Your order has shipped",
+        body: "Hi Ada, your order #12345 is on the way.",
+      });
+      expect(mockMessagesSend).toHaveBeenCalledOnce();
+      expect(result).toEqual({ id: "clean1" });
     });
 
     it("threads the reply when replyToMessageId is given", async () => {

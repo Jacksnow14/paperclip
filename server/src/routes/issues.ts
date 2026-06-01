@@ -1091,6 +1091,31 @@ export function issueRoutes(
       if (await hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, issue.assigneeAgentId)) {
         return true;
       }
+      const allowedByAuditGrant = await access.hasPermission(
+        issue.companyId,
+        "agent",
+        actorAgentId,
+        "tasks:audit_status",
+      );
+      if (allowedByAuditGrant) {
+        const actor = getActorInfo(req);
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          action: "issue.audit_status_override",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            permission: "tasks:audit_status",
+            assigneeAgentId: issue.assigneeAgentId,
+            actorAgentId,
+          },
+        });
+        return true;
+      }
       if (issue.status === "in_progress") {
         res.status(409).json({
           error: "Issue is checked out by another agent",
@@ -1139,6 +1164,47 @@ export function issueRoutes(
       });
     }
     return true;
+  }
+
+  async function assertAgentCommentAllowed(
+    req: Request,
+    res: Response,
+    issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null },
+  ) {
+    if (req.actor.type !== "agent") return true;
+    const actorAgentId = req.actor.agentId;
+    if (!actorAgentId) {
+      res.status(403).json({ error: "Agent authentication required" });
+      return false;
+    }
+    if (issue.assigneeAgentId !== null && issue.assigneeAgentId !== actorAgentId) {
+      const hasAuditCommentGrant = await access.hasPermission(
+        issue.companyId,
+        "agent",
+        actorAgentId,
+        "tasks:audit_comment",
+      );
+      if (hasAuditCommentGrant) {
+        const actor = getActorInfo(req);
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          action: "issue.audit_comment_override",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            permission: "tasks:audit_comment",
+            assigneeAgentId: issue.assigneeAgentId,
+            actorAgentId,
+          },
+        });
+        return true;
+      }
+    }
+    return assertAgentIssueMutationAllowed(req, res, issue);
   }
 
   function assertStructuredCommentFieldsAllowed(
@@ -4508,7 +4574,7 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    if (!(await assertAgentCommentAllowed(req, res, issue))) return;
     if (!assertStructuredCommentFieldsAllowed(req, res, {
       presentation: req.body.presentation,
       metadata: req.body.metadata,

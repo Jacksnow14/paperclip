@@ -40,9 +40,14 @@ When you hit a missing capability or must use a workaround, capture a record via
     "frequency": "one-off | recurring"
   },
   "scope": { "projectId": "<include when the issue belongs to a project>" },
-  "source": "<current issue ID and run reference>"
+  "source": { "kind": "issue", "issueId": "<issue UUID>" }
 }
 ```
+
+> **`source` is an object, not a string.** Shape: `{ "kind": <kind>, "<idField>": "<uuid>" }`.
+> `kind` is one of `issue | issue_comment | issue_document | run | activity | manual_note | external_document`.
+> Pass the matching id as a **UUID**: `issueId`, `commentId`, `documentKey`, `runId`, `activityId`, or `externalRef`.
+> The `AUR-NNNN` human id is **not** accepted as `issueId` — resolve it first via `GET /api/companies/{companyId}/issues?q=AUR-NNNN` and use the returned `id`.
 
 Omit `scope.projectId` for gaps with no project affiliation.
 
@@ -107,7 +112,7 @@ Also capture a structured performance scorecard. The Memory API has no native `k
     "rework_required": <true | false>
   },
   "scope": { "projectId": "<include when the issue belongs to a project>" },
-  "source": "<current issue ID and run reference>"
+  "source": { "kind": "issue", "issueId": "<issue UUID>" }
 }
 ```
 

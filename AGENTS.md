@@ -225,9 +225,14 @@ When any agent hits a missing capability or must use a workaround, capture a Pap
     "frequency": "one-off | recurring"
   },
   "scope": { "projectId": "<include when the issue belongs to a project>" },
-  "source": "<current issue ID and run reference>"
+  "source": { "kind": "issue", "issueId": "<issue UUID>" }
 }
 ```
+
+> **`source` is an object, not a string.** Shape: `{ "kind": <kind>, "<idField>": "<uuid>" }`.
+> `kind` is one of `issue | issue_comment | issue_document | run | activity | manual_note | external_document`.
+> Pass the matching id as a **UUID**: `issueId`, `commentId`, `documentKey`, `runId`, `activityId`, or `externalRef`.
+> The `AUR-NNNN` human id is **not** accepted as `issueId` — resolve it first via `GET /api/companies/{companyId}/issues?q=AUR-NNNN` and use the returned `id`. Example: `"source": { "kind": "run", "runId": "97fa700e-9deb-4c78-a0c5-2e673edca959" }`.
 
 Omit `scope.projectId` for gaps with no project affiliation. This data feeds the SGI Loop review cycle.
 

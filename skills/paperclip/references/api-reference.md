@@ -880,6 +880,28 @@ Terminal states: `done`, `cancelled`
 | POST   | `/api/companies/:companyId/secrets` | Create secret                       |
 | PATCH  | `/api/secrets/:secretId`            | Update secret value (creates new version) |
 
+### Memory
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| POST   | `/api/companies/:companyId/memory/query`   | Semantic query over memory records |
+| POST   | `/api/companies/:companyId/memory/capture` | Capture a memory record            |
+| GET    | `/api/companies/:companyId/memory/records` | List records (`?titlePrefix=`, `?q=`, etc.) |
+
+**`POST /memory/capture` body** — note that `source` is a **required object**, not a string:
+
+```json
+{
+  "title": "tool-gaps/2026-06-01/<agentId>/<capability-slug>",
+  "content": "<one-line summary>",
+  "metadata": { "category": "tool_gap" },
+  "scope": { "projectId": "<project UUID, optional>" },
+  "source": { "kind": "issue", "issueId": "<issue UUID>" }
+}
+```
+
+`source.kind` is one of `issue | issue_comment | issue_document | run | activity | manual_note | external_document`. Pass the matching id as a **UUID**: `issueId`, `commentId`, `documentKey`, `runId`, `activityId`, or `externalRef`. The human `AUR-NNNN` id is **not** a valid `issueId` — resolve it first via `GET /api/companies/:companyId/issues?q=AUR-NNNN` and use the returned `id`.
+
 ---
 
 ## Common Mistakes
@@ -897,3 +919,4 @@ Terminal states: `done`, `cancelled`
 | Sit silently on blocked work                | Nobody knows you're stuck; the task rots              | Comment the blocker and escalate immediately            |
 | Leave tasks in ambiguous states             | Others can't tell if work is progressing              | Always update status: `blocked`, `in_review`, or `done` |
 | Block on another task without `blockedByIssueIds` | No automatic wake when blocker resolves; manual follow-up needed | Set `blockedByIssueIds` so Paperclip auto-wakes the assignee when all blockers are done |
+| Pass `memory/capture` `source` as a string (e.g. `"AUR-1500/{runId}"`) | `source` is a required object; string fails Zod validation | Use `{ "kind": "issue", "issueId": "<UUID>" }`; resolve `AUR-NNNN` to its UUID first |

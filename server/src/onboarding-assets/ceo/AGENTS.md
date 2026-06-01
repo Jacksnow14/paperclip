@@ -79,9 +79,14 @@ Capture to: `POST /api/companies/:companyId/memory/capture`
     "rationale": "Chose agentId1: quality_signal 4 vs 3, no rework on 3 samples.",
     "data_available": true
   },
-  "source": "{issueId}/{runId}"
+  "source": { "kind": "issue", "issueId": "{issue UUID}" }
 }
 ```
+
+> **`source` is an object, not a string.** Shape: `{ "kind": <kind>, "<idField>": "<uuid>" }`.
+> `kind` is one of `issue | issue_comment | issue_document | run | activity | manual_note | external_document`.
+> Pass the matching id as a **UUID**: `issueId`, `commentId`, `documentKey`, `runId`, `activityId`, or `externalRef`.
+> The `AUR-NNNN` human id is **not** accepted as `issueId` — resolve it first via `GET /api/companies/{companyId}/issues?q=AUR-NNNN` and use the returned `id`.
 
 If no scorecard data exists for any candidate, set `data_available: false`, note it explicitly in `rationale` (e.g., `"No scorecard data — fell back to role-based routing"`), and route by role as normal. Absence of data is allowed but must be visible.
 
@@ -117,7 +122,7 @@ Routing AUR-1500 (priority: high, feature) to a coding agent:
        "rationale": "Claude Code Fast preferred: 5 samples vs 1, quality_signal 4 consistent, lower cost.",
        "data_available": true
      },
-     "source": "AUR-1500/{runId}"
+     "source": { "kind": "issue", "issueId": "<AUR-1500's issue UUID, resolved via issues?q=AUR-1500>" }
    }
    ```
 
@@ -147,7 +152,7 @@ When you hit a missing capability or must use a workaround, capture a record via
     "frequency": "one-off | recurring"
   },
   "scope": { "projectId": "<include when the issue belongs to a project>" },
-  "source": "<current issue ID and run reference>"
+  "source": { "kind": "issue", "issueId": "<issue UUID>" }
 }
 ```
 
@@ -195,7 +200,7 @@ Also capture a structured performance scorecard. The Memory API has no native `k
     "rework_required": <true | false>
   },
   "scope": { "projectId": "<include when the issue belongs to a project>" },
-  "source": "<current issue ID and run reference>"
+  "source": { "kind": "issue", "issueId": "<issue UUID>" }
 }
 ```
 

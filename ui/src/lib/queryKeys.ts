@@ -151,6 +151,10 @@ export const queryKeys = {
     ["user-profile", companyId, userSlug] as const,
   sidebarBadges: (companyId: string) => ["sidebar-badges", companyId] as const,
   inboxDismissals: (companyId: string) => ["inbox-dismissals", companyId] as const,
+  mail: {
+    conversations: (companyId: string, filters?: Record<string, string | undefined>) =>
+      ["mail", "conversations", companyId, filters ?? {}] as const,
+  },
   activity: (companyId: string) => ["activity", companyId] as const,
   costs: (companyId: string, from?: string, to?: string) =>
     ["costs", companyId, from, to] as const,

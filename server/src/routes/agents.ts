@@ -93,6 +93,7 @@ import { DEFAULT_GEMINI_LOCAL_MODEL } from "@paperclipai/adapter-gemini-local";
 import { DEFAULT_OPENCODE_LOCAL_MODEL } from "@paperclipai/adapter-opencode-local";
 import { requireOpenCodeModelId } from "@paperclipai/adapter-opencode-local/server";
 import {
+  DEFAULT_AGENT_BUNDLE_FILES,
   loadDefaultAgentInstructionsBundle,
   resolveDefaultAgentInstructionsBundleRole,
 } from "../services/default-agent-instructions.js";
@@ -3480,6 +3481,87 @@ export function agentRoutes(
       adapterType: agent.adapterType,
       outputSilence: await heartbeat.buildRunOutputSilence({ ...run, companyId: issue.companyId }),
     });
+  });
+
+  router.post("/companies/:companyId/agents/reseed-instructions", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    if (req.actor.type !== "board") {
+      throw forbidden("Only board-authenticated callers can reseed agent instructions");
+    }
+    await assertBoardCanManageAgentsForCompany(req, companyId);
+
+    const dryRun = req.body?.dryRun === true;
+    const templateFilter = typeof req.body?.template === "string" ? req.body.template : null;
+
+    const agents = await svc.list(companyId);
+    const actor = getActorInfo(req);
+
+    const results: Array<{
+      agentId: string;
+      agentName: string;
+      role: string;
+      filesReseeded: string[];
+      skipped: boolean;
+      reason?: string;
+    }> = [];
+
+    for (const agent of agents) {
+      const role = resolveDefaultAgentInstructionsBundleRole(agent.role);
+      const templateFiles = DEFAULT_AGENT_BUNDLE_FILES[role];
+
+      const filesToReseed = templateFilter
+        ? templateFiles.filter((f) => f === templateFilter)
+        : templateFiles;
+
+      if (filesToReseed.length === 0) {
+        results.push({ agentId: agent.id, agentName: agent.name, role, filesReseeded: [], skipped: true, reason: "no matching template files" });
+        continue;
+      }
+
+      let bundle: Awaited<ReturnType<typeof instructions.getBundle>>;
+      try {
+        bundle = await instructions.getBundle(agent);
+      } catch {
+        results.push({ agentId: agent.id, agentName: agent.name, role, filesReseeded: [], skipped: true, reason: "could not resolve bundle" });
+        continue;
+      }
+
+      if (!bundle.rootPath) {
+        results.push({ agentId: agent.id, agentName: agent.name, role, filesReseeded: [], skipped: true, reason: "no managed bundle root" });
+        continue;
+      }
+
+      const filesReseeded: string[] = [];
+      if (!dryRun) {
+        const templateBundle = await loadDefaultAgentInstructionsBundle(role);
+        for (const fileName of filesToReseed) {
+          const content = templateBundle[fileName];
+          if (content === undefined) continue;
+          await instructions.writeFile(agent, fileName, content, {});
+          filesReseeded.push(fileName);
+        }
+        if (filesReseeded.length > 0) {
+          await logActivity(db, {
+            companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            action: "agent.instructions_reseeded",
+            entityType: "agent",
+            entityId: agent.id,
+            details: { filesReseeded, role, dryRun: false },
+          });
+        }
+      } else {
+        filesReseeded.push(...filesToReseed);
+      }
+
+      results.push({ agentId: agent.id, agentName: agent.name, role, filesReseeded, skipped: false });
+    }
+
+    res.json({ dryRun, results });
   });
 
   return router;

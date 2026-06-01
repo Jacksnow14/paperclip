@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  createRoutineTriggerSchema,
   routineRevisionSnapshotV1Schema,
   updateRoutineSchema,
 } from "./routine.js";
@@ -82,5 +83,101 @@ describe("routine validators", () => {
       title: "Daily triage",
       baseRevisionId,
     }).baseRevisionId).toBe(baseRevisionId);
+  });
+});
+
+describe("createRoutineTriggerSchema — schedule branch", () => {
+  it("accepts a runAt one-shot trigger", () => {
+    const result = createRoutineTriggerSchema.parse({
+      kind: "schedule",
+      runAt: "2026-06-01T12:00:00Z",
+    });
+    expect(result.kind).toBe("schedule");
+    // @ts-expect-error - runAt is on the schedule branch
+    expect(result.runAt).toBe("2026-06-01T12:00:00Z");
+  });
+
+  it("accepts a cron trigger without runAt", () => {
+    const result = createRoutineTriggerSchema.parse({
+      kind: "schedule",
+      cronExpression: "0 9 * * 1",
+    });
+    expect(result.kind).toBe("schedule");
+    // @ts-expect-error - cronExpression is on the schedule branch
+    expect(result.cronExpression).toBe("0 9 * * 1");
+  });
+
+  it("rejects a trigger with both cronExpression and runAt", () => {
+    expect(() =>
+      createRoutineTriggerSchema.parse({
+        kind: "schedule",
+        cronExpression: "0 9 * * 1",
+        runAt: "2026-06-01T12:00:00Z",
+      }),
+    ).toThrow();
+  });
+
+  it("rejects a trigger with neither cronExpression nor runAt", () => {
+    expect(() =>
+      createRoutineTriggerSchema.parse({
+        kind: "schedule",
+      }),
+    ).toThrow();
+  });
+
+  it("accepts executionLimit on a cron trigger", () => {
+    const result = createRoutineTriggerSchema.parse({
+      kind: "schedule",
+      cronExpression: "0 9 * * 1",
+      executionLimit: 5,
+    });
+    // @ts-expect-error - executionLimit is on the schedule branch
+    expect(result.executionLimit).toBe(5);
+  });
+
+  it("rejects executionLimit of 0", () => {
+    expect(() =>
+      createRoutineTriggerSchema.parse({
+        kind: "schedule",
+        cronExpression: "0 9 * * 1",
+        executionLimit: 0,
+      }),
+    ).toThrow();
+  });
+
+  it("round-trips runLimit/runCount in revision snapshot triggers", () => {
+    const parsed = routineRevisionSnapshotV1Schema.parse({
+      version: 1,
+      routine: {
+        id: routineId,
+        companyId,
+        projectId: null,
+        goalId: null,
+        parentIssueId: null,
+        title: "Daily triage",
+        description: null,
+        assigneeAgentId: null,
+        priority: "medium",
+        status: "active",
+        concurrencyPolicy: "coalesce_if_active",
+        catchUpPolicy: "skip_missed",
+        variables: [],
+      },
+      triggers: [{
+        id: triggerId,
+        kind: "schedule",
+        label: null,
+        enabled: false,
+        cronExpression: null,
+        timezone: null,
+        publicId: null,
+        signingMode: null,
+        replayWindowSec: null,
+        runLimit: 1,
+        runCount: 1,
+      }],
+    });
+    expect(parsed.triggers[0]?.runLimit).toBe(1);
+    expect(parsed.triggers[0]?.runCount).toBe(1);
   });
 });

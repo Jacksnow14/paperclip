@@ -17,6 +17,9 @@ export interface GmailSendOptions {
   subject: string;
   body: string;
   replyToMessageId?: string;
+  /** Reply-To address for the outgoing message. Callers sending from auranode.ai Resend outbound
+   *  should set this to the owning @tryauranode.com mailbox so replies land in the Gmail intake. */
+  replyTo?: string;
 }
 
 export interface GmailListOptions {
@@ -68,17 +71,24 @@ function buildGmailClient(alias: GmailAlias) {
   return google.gmail({ version: "v1", auth: buildAuthClient(alias) });
 }
 
-function buildRawMessage(from: string, to: string, subject: string, body: string): string {
-  const message = [
+function buildRawMessage(from: string, to: string, subject: string, body: string, replyTo?: string): string {
+  const lines = [
     `From: ${from}`,
     `To: ${to}`,
     `Subject: ${subject}`,
     "MIME-Version: 1.0",
     "Content-Type: text/plain; charset=utf-8",
-    "",
-    body,
-  ].join("\r\n");
-  return Buffer.from(message).toString("base64url");
+  ];
+  if (replyTo) lines.push(`Reply-To: ${replyTo}`);
+  lines.push("", body);
+  return Buffer.from(lines.join("\r\n")).toString("base64url");
+}
+
+/** Returns the @tryauranode.com address for a given mailbox alias.
+ *  Resend outbound from auranode.ai should set Reply-To to this address so replies
+ *  are routed through the Gmail intake pipeline. */
+export function replyToForMailbox(mailbox: GmailAlias): string {
+  return resolveMailboxEmail(mailbox);
 }
 
 export function isSupportedGmailAlias(alias: string): alias is GmailAlias {
@@ -107,7 +117,7 @@ export function createGmailService() {
     assertNoUnresolvedPlaceholders(opts.subject, opts.body);
     const gmail = buildGmailClient(alias);
     const from = resolveMailboxEmail(alias);
-    const raw = buildRawMessage(from, opts.to, opts.subject, opts.body);
+    const raw = buildRawMessage(from, opts.to, opts.subject, opts.body, opts.replyTo);
     const requestBody: { raw: string; threadId?: string } = { raw };
     if (opts.replyToMessageId) {
       const original = await getMessage(alias, opts.replyToMessageId);

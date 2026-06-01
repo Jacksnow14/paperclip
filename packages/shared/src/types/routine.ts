@@ -67,6 +67,7 @@ export interface Routine {
   updatedByUserId: string | null;
   lastTriggeredAt: Date | null;
   lastEnqueuedAt: Date | null;
+  expiresAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
   managedByPlugin?: RoutineManagedByPlugin | null;
@@ -98,6 +99,7 @@ export interface RoutineRevisionSnapshotRoutineV1 {
   concurrencyPolicy: RoutineConcurrencyPolicy;
   catchUpPolicy: RoutineCatchUpPolicy;
   variables: RoutineVariable[];
+  expiresAt: Date | null;
 }
 
 export interface RoutineRevisionSnapshotTriggerV1 {
@@ -110,6 +112,8 @@ export interface RoutineRevisionSnapshotTriggerV1 {
   publicId: string | null;
   signingMode: RoutineTriggerSigningMode | null;
   replayWindowSec: number | null;
+  runLimit: number | null;
+  runCount: number;
 }
 
 export interface RoutineRevisionSnapshotV1 {
@@ -151,6 +155,9 @@ export interface RoutineTrigger {
   secretId: string | null;
   signingMode: string | null;
   replayWindowSec: number | null;
+  runLimit: number | null;
+  runCount: number;
+  triggerPayload: Record<string, unknown> | null;
   lastRotatedAt: Date | null;
   lastResult: string | null;
   createdByAgentId: string | null;

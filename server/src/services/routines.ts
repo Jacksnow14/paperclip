@@ -406,6 +406,7 @@ function routineRevisionSnapshotRoutine(routine: RoutineRow): RoutineRevisionSna
     concurrencyPolicy: routine.concurrencyPolicy as RoutineRevisionSnapshotV1["routine"]["concurrencyPolicy"],
     catchUpPolicy: routine.catchUpPolicy as RoutineRevisionSnapshotV1["routine"]["catchUpPolicy"],
     variables: routine.variables ?? [],
+    expiresAt: routine.expiresAt,
   };
 }
 
@@ -420,6 +421,8 @@ function routineRevisionSnapshotTrigger(trigger: RoutineTriggerRow): RoutineRevi
     publicId: trigger.publicId,
     signingMode: trigger.signingMode as RoutineRevisionSnapshotV1["triggers"][number]["signingMode"],
     replayWindowSec: trigger.replayWindowSec,
+    runLimit: trigger.runLimit,
+    runCount: trigger.runCount,
   };
 }
 
@@ -938,6 +941,8 @@ export function routineService(
   }
 
   // For reuse_and_rewake: find the singleton issue regardless of status (open or closed).
+  // Prefer a currently-open issue so that legacy churn (many stale closed execution
+  // issues) can't cause us to reopen an old closed one while a live one already exists.
   async function findRollingExecutionIssue(
     routine: typeof routines.$inferSelect,
     executor: Db = db,
@@ -953,7 +958,11 @@ export function routineService(
           isNull(issues.hiddenAt),
         ),
       )
-      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .orderBy(
+        desc(inArray(issues.status, OPEN_ISSUE_STATUSES)),
+        desc(issues.updatedAt),
+        desc(issues.createdAt),
+      )
       .limit(1)
       .then((rows) => rows[0] ?? null);
   }
@@ -1592,6 +1601,7 @@ export function routineService(
             concurrencyPolicy: input.concurrencyPolicy,
             catchUpPolicy: input.catchUpPolicy,
             variables,
+            expiresAt: input.expiresAt ? new Date(input.expiresAt) : null,
             createdByAgentId: actor.agentId ?? null,
             createdByUserId: actor.userId ?? null,
             updatedByAgentId: actor.agentId ?? null,
@@ -1672,6 +1682,7 @@ export function routineService(
           concurrencyPolicy: patch.concurrencyPolicy ?? locked.concurrencyPolicy,
           catchUpPolicy: patch.catchUpPolicy ?? locked.catchUpPolicy,
           variables: nextVariables,
+          expiresAt: patch.expiresAt === undefined ? locked.expiresAt : (patch.expiresAt ? new Date(patch.expiresAt) : null),
           updatedByAgentId: actor.agentId ?? null,
           updatedByUserId: actor.userId ?? null,
         };
@@ -1712,6 +1723,7 @@ export function routineService(
             concurrencyPolicy: candidate.concurrencyPolicy,
             catchUpPolicy: candidate.catchUpPolicy,
             variables: candidate.variables,
+            expiresAt: candidate.expiresAt,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
             updatedAt: new Date(),
@@ -1739,13 +1751,22 @@ export function routineService(
       let publicId: string | null = null;
       let nextRunAt: Date | null = null;
 
+      let runLimit: number | null = null;
+      let scheduleTriggerPayload: Record<string, unknown> | null = null;
       if (input.kind === "schedule") {
         assertScheduleCompatibleVariables(routine.variables ?? []);
-        const timeZone = input.timezone || "UTC";
-        assertTimeZone(timeZone);
-        const error = validateCron(input.cronExpression);
-        if (error) throw unprocessable(error);
-        nextRunAt = nextCronTickInTimeZone(input.cronExpression, timeZone, new Date());
+        if (input.runAt) {
+          nextRunAt = new Date(input.runAt);
+          runLimit = input.executionLimit ?? 1;
+        } else {
+          const timeZone = input.timezone || "UTC";
+          assertTimeZone(timeZone);
+          const error = validateCron(input.cronExpression!);
+          if (error) throw unprocessable(error);
+          nextRunAt = nextCronTickInTimeZone(input.cronExpression!, timeZone, new Date());
+          if (input.executionLimit != null) runLimit = input.executionLimit;
+        }
+        scheduleTriggerPayload = input.triggerPayload ?? null;
       }
 
       if (input.kind === "webhook") {
@@ -1769,9 +1790,12 @@ export function routineService(
             kind: input.kind,
             label: input.label ?? null,
             enabled: input.enabled ?? true,
-            cronExpression: input.kind === "schedule" ? input.cronExpression : null,
+            cronExpression: input.kind === "schedule" ? (input.cronExpression ?? null) : null,
             timezone: input.kind === "schedule" ? (input.timezone || "UTC") : null,
             nextRunAt,
+            runLimit: input.kind === "schedule" ? runLimit : null,
+            runCount: 0,
+            triggerPayload: input.kind === "schedule" ? scheduleTriggerPayload : null,
             publicId,
             secretId,
             signingMode: input.kind === "webhook" ? input.signingMode : null,
@@ -1808,24 +1832,51 @@ export function routineService(
       let nextRunAt = existing.nextRunAt;
       let cronExpression = existing.cronExpression;
       let timezone = existing.timezone;
+      let runLimit = existing.runLimit;
 
       if (existing.kind === "schedule") {
         const routine = await getRoutineById(existing.routineId);
         if (!routine) throw notFound("Routine not found");
-        if (patch.cronExpression !== undefined) {
-          if (patch.cronExpression == null) throw unprocessable("Scheduled triggers require cronExpression");
+
+        const settingRunAt = patch.runAt !== undefined;
+        const settingCron = patch.cronExpression !== undefined;
+
+        if (settingRunAt && patch.runAt != null) {
+          // Switch to one-shot: clear cron, set nextRunAt from runAt
+          cronExpression = null;
+          timezone = null;
+          nextRunAt = new Date(patch.runAt);
+          runLimit = patch.executionLimit ?? 1;
+        } else if (settingCron) {
+          if (patch.cronExpression == null) throw unprocessable("Scheduled triggers require cronExpression when runAt is not set");
           const error = validateCron(patch.cronExpression);
           if (error) throw unprocessable(error);
           cronExpression = patch.cronExpression;
+          if (patch.timezone !== undefined) {
+            if (patch.timezone == null) throw unprocessable("Scheduled triggers require timezone");
+            assertTimeZone(patch.timezone);
+            timezone = patch.timezone;
+          }
+          if (cronExpression && timezone) {
+            nextRunAt = nextCronTickInTimeZone(cronExpression, timezone, new Date());
+          }
+          if (patch.executionLimit !== undefined) {
+            runLimit = patch.executionLimit;
+          }
+        } else {
+          if (patch.timezone !== undefined) {
+            if (patch.timezone == null) throw unprocessable("Scheduled triggers require timezone");
+            assertTimeZone(patch.timezone);
+            timezone = patch.timezone;
+          }
+          if (cronExpression && timezone) {
+            nextRunAt = nextCronTickInTimeZone(cronExpression, timezone, new Date());
+          }
+          if (patch.executionLimit !== undefined) {
+            runLimit = patch.executionLimit;
+          }
         }
-        if (patch.timezone !== undefined) {
-          if (patch.timezone == null) throw unprocessable("Scheduled triggers require timezone");
-          assertTimeZone(patch.timezone);
-          timezone = patch.timezone;
-        }
-        if (cronExpression && timezone) {
-          nextRunAt = nextCronTickInTimeZone(cronExpression, timezone, new Date());
-        }
+
         if ((patch.enabled ?? existing.enabled) === true) {
           assertScheduleCompatibleVariables(routine.variables ?? []);
         }
@@ -1842,6 +1893,10 @@ export function routineService(
             cronExpression,
             timezone,
             nextRunAt,
+            runLimit: existing.kind === "schedule" ? runLimit : existing.runLimit,
+            triggerPayload: existing.kind === "schedule" && patch.triggerPayload !== undefined
+              ? patch.triggerPayload
+              : existing.triggerPayload,
             signingMode: patch.signingMode === undefined ? existing.signingMode : patch.signingMode,
             replayWindowSec: patch.replayWindowSec === undefined ? existing.replayWindowSec : patch.replayWindowSec,
             updatedByAgentId: actor.agentId ?? null,
@@ -2025,6 +2080,7 @@ export function routineService(
             concurrencyPolicy: routineSnapshot.concurrencyPolicy,
             catchUpPolicy: routineSnapshot.catchUpPolicy,
             variables: routineSnapshot.variables,
+            expiresAt: routineSnapshot.expiresAt ?? null,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
             updatedAt: now,
@@ -2312,25 +2368,59 @@ export function routineService(
 
       let triggered = 0;
       for (const row of due) {
-        if (!row.trigger.nextRunAt || !row.trigger.cronExpression || !row.trigger.timezone) continue;
+        if (!row.trigger.nextRunAt) continue;
 
-        let runCount = 1;
-        let claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, now);
+        if (row.routine.expiresAt != null && row.routine.expiresAt <= now) {
+          await db.update(routines)
+            .set({ status: "archived", updatedAt: new Date() })
+            .where(and(eq(routines.id, row.routine.id), eq(routines.status, "active")));
+          continue;
+        }
 
-        if (row.routine.catchUpPolicy === "enqueue_missed_with_cap") {
-          let cursor: Date | null = row.trigger.nextRunAt;
-          runCount = 0;
-          while (cursor && cursor <= now && runCount < MAX_CATCH_UP_RUNS) {
-            runCount += 1;
-            claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression, row.trigger.timezone, cursor);
-            cursor = claimedNextRunAt;
+        const isCronTrigger = !!row.trigger.cronExpression && !!row.trigger.timezone;
+
+        let dispatchCount = 1;
+        let claimedNextRunAt: Date | null = null;
+
+        if (isCronTrigger) {
+          claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression!, row.trigger.timezone!, now);
+
+          if (row.routine.catchUpPolicy === "enqueue_missed_with_cap") {
+            let cursor: Date | null = row.trigger.nextRunAt;
+            dispatchCount = 0;
+            while (cursor && cursor <= now && dispatchCount < MAX_CATCH_UP_RUNS) {
+              dispatchCount += 1;
+              claimedNextRunAt = nextCronTickInTimeZone(row.trigger.cronExpression!, row.trigger.timezone!, cursor);
+              cursor = claimedNextRunAt;
+            }
           }
         }
+        // runAt-only trigger: dispatchCount = 1, claimedNextRunAt = null
+
+        const existingRunCount = row.trigger.runCount ?? 0;
+        if (row.trigger.runLimit != null) {
+          const remaining = row.trigger.runLimit - existingRunCount;
+          if (remaining <= 0) {
+            // Limit already exhausted; disable and skip
+            await db.update(routineTriggers)
+              .set({ enabled: false, nextRunAt: null, updatedAt: new Date() })
+              .where(eq(routineTriggers.id, row.trigger.id));
+            continue;
+          }
+          dispatchCount = Math.min(dispatchCount, remaining);
+        }
+
+        const newRunCount = existingRunCount + dispatchCount;
+        const willExhaust = row.trigger.runLimit != null && newRunCount >= row.trigger.runLimit;
+        const newNextRunAt = (willExhaust || !isCronTrigger) ? null : claimedNextRunAt;
+        const newEnabled = willExhaust ? false : true;
 
         const claimed = await db
           .update(routineTriggers)
           .set({
-            nextRunAt: claimedNextRunAt,
+            nextRunAt: newNextRunAt,
+            enabled: newEnabled,
+            runCount: newRunCount,
             updatedAt: new Date(),
           })
           .where(
@@ -2344,11 +2434,12 @@ export function routineService(
           .then((rows) => rows[0] ?? null);
         if (!claimed) continue;
 
-        for (let i = 0; i < runCount; i += 1) {
+        for (let i = 0; i < dispatchCount; i += 1) {
           await dispatchRoutineRun({
             routine: row.routine,
             trigger: row.trigger,
             source: "schedule",
+            payload: row.trigger.triggerPayload ?? undefined,
           });
           triggered += 1;
         }

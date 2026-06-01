@@ -89,7 +89,7 @@ All trigger kinds accept an optional `label` field (max 120 chars), which is use
 POST /api/routines/{routineId}/triggers
 ```
 
-### Schedule (cron)
+### Schedule — recurring cron
 
 ```json
 {
@@ -102,6 +102,27 @@ POST /api/routines/{routineId}/triggers
 - `cronExpression`: standard 5-field cron syntax
 - `timezone`: IANA timezone string (for example `UTC` or `America/New_York`)
 - The server computes `nextRunAt` automatically
+- Optional `executionLimit` (integer ≥ 1): stop after N successful fires, then auto-disable the trigger
+
+### Schedule — one-shot (`runAt`)
+
+Use `runAt` instead of `cronExpression` to fire once at a specific time, then auto-disable:
+
+```json
+{
+  "kind": "schedule",
+  "runAt": "2026-06-01T14:00:00Z"
+}
+```
+
+- `runAt`: ISO-8601 UTC datetime string; mutually exclusive with `cronExpression` — you must provide exactly one
+- After the trigger fires once the server sets `enabled = false` and `nextRunAt = null` — it will never refire
+- Optional `executionLimit` overrides the default limit of 1 (useful for `runAt` + limit > 1 combinations)
+- Optional `triggerPayload` (JSON object): passed through to the spawned execution issue's description template interpolation, identical to manual/webhook/api trigger payloads
+
+**Known limitation:** The scheduler ticks once per minute (1-minute granularity). `runAt` values with sub-minute precision are rounded to the next tick. Sub-minute `delaySeconds` wakeups are still not achievable via routines.
+
+**Updating a `runAt` trigger:** PATCH the trigger with a new `runAt` to reschedule; or set `cronExpression` to convert it back to a recurring trigger (clears the one-shot semantics).
 
 ### Webhook
 

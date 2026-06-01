@@ -42,6 +42,7 @@ import { pluginRoutes } from "./routes/plugins.js";
 import { adapterRoutes } from "./routes/adapters.js";
 import { gmailRoutes } from "./routes/gmail.js";
 import { memoryRoutes } from "./routes/memory.js";
+import { dbMigratePatchRoutes } from "./routes/db-migrate-patch.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { applyUiBranding } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
@@ -205,6 +206,7 @@ export async function createApp(
   api.use(goalRoutes(db));
   api.use(approvalRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(memoryRoutes(db));
+  api.use(dbMigratePatchRoutes(db));
   api.use(secretRoutes(db));
   api.use(costRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(gmailRoutes(db));

@@ -1,11 +1,11 @@
 import fs from "node:fs/promises";
 
-const DEFAULT_AGENT_BUNDLE_FILES = {
+export const DEFAULT_AGENT_BUNDLE_FILES = {
   default: ["AGENTS.md"],
   ceo: ["AGENTS.md", "HEARTBEAT.md", "SOUL.md", "TOOLS.md"],
 } as const;
 
-type DefaultAgentBundleRole = keyof typeof DEFAULT_AGENT_BUNDLE_FILES;
+export type DefaultAgentBundleRole = keyof typeof DEFAULT_AGENT_BUNDLE_FILES;
 
 function resolveDefaultAgentBundleUrl(role: DefaultAgentBundleRole, fileName: string) {
   return new URL(`../onboarding-assets/${role}/${fileName}`, import.meta.url);

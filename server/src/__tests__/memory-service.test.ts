@@ -1115,4 +1115,144 @@ describeEmbeddedPostgres("memoryService local basic persistence", () => {
     expect(winner).toBeDefined();
     expect(origin!.supersededByRecordId).toBe(winner!.id);
   });
+
+  // AUR-1675: tool_gap dedup — one incident = one record within the dedup window
+  it("deduplicates identical tool_gap captures within the window", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip Tool Gap Dedup Test",
+      issuePrefix: `D${companyId.replace(/-/g, "").slice(0, 5).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const service = memoryService(db);
+    const actor = {
+      actorType: "user" as const,
+      actorId: "board-user",
+      agentId: null,
+      userId: "board-user",
+      runId: null,
+    };
+    const binding = await service.createBinding(companyId, {
+      key: "tool-gap-dedup-test",
+      name: "Tool gap dedup test",
+      providerKey: "local_basic",
+      config: {},
+      enabled: true,
+    });
+    await service.setCompanyDefault(companyId, binding.id);
+
+    const captureParams = {
+      bindingKey: "tool-gap-dedup-test",
+      scope: { scopeType: "org" as const, scopeId: companyId },
+      source: { kind: "manual_note" as const, externalRef: "tool-gap-dedup-test" },
+      title: "tool-gaps/2026-06-01/board-user/browser-automation",
+      content: "Browser automation capability missing.",
+      metadata: { category: "tool_gap" },
+    };
+
+    const first = await service.capture(companyId, captureParams, actor);
+    const second = await service.capture(companyId, captureParams, actor);
+
+    // Both calls return the same record id
+    expect(first.records).toHaveLength(1);
+    expect(second.records).toHaveLength(1);
+    expect(second.records[0].id).toBe(first.records[0].id);
+
+    // Only one record stored
+    const stored = await service.listRecords(companyId, { limit: 100 }, actor);
+    const toolGapRecords = stored.filter(
+      (r) => r.title === captureParams.title,
+    );
+    expect(toolGapRecords).toHaveLength(1);
+
+    // Second operation's resultJson has dedup: true
+    expect((second.operation.resultJson as Record<string, unknown>)?.dedup).toBe(true);
+  });
+
+  it("does not dedup captures with a non-tool_gap category even with the same title", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip Non-Gap Dedup Test",
+      issuePrefix: `N${companyId.replace(/-/g, "").slice(0, 5).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const service = memoryService(db);
+    const actor = {
+      actorType: "user" as const,
+      actorId: "board-user",
+      agentId: null,
+      userId: "board-user",
+      runId: null,
+    };
+    const binding = await service.createBinding(companyId, {
+      key: "non-gap-dedup-test",
+      name: "Non-gap dedup test",
+      providerKey: "local_basic",
+      config: {},
+      enabled: true,
+    });
+    await service.setCompanyDefault(companyId, binding.id);
+
+    const captureParams = {
+      bindingKey: "non-gap-dedup-test",
+      scope: { scopeType: "org" as const, scopeId: companyId },
+      source: { kind: "manual_note" as const, externalRef: "non-gap-dedup-test" },
+      title: "tool-gaps/2026-06-01/board-user/browser-automation",
+      content: "Same title but different category — no dedup.",
+      metadata: { category: "lesson" },
+    };
+
+    const first = await service.capture(companyId, captureParams, actor);
+    const second = await service.capture(companyId, captureParams, actor);
+
+    expect(first.records[0].id).not.toBe(second.records[0].id);
+    const stored = await service.listRecords(companyId, { limit: 100 }, actor);
+    expect(stored.filter((r) => r.title === captureParams.title)).toHaveLength(2);
+  });
+
+  it("does not dedup tool_gap captures with different titles", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip Diff Title Dedup Test",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 5).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const service = memoryService(db);
+    const actor = {
+      actorType: "user" as const,
+      actorId: "board-user",
+      agentId: null,
+      userId: "board-user",
+      runId: null,
+    };
+    const binding = await service.createBinding(companyId, {
+      key: "diff-title-dedup-test",
+      name: "Diff title dedup test",
+      providerKey: "local_basic",
+      config: {},
+      enabled: true,
+    });
+    await service.setCompanyDefault(companyId, binding.id);
+
+    const baseParams = {
+      bindingKey: "diff-title-dedup-test",
+      scope: { scopeType: "org" as const, scopeId: companyId },
+      source: { kind: "manual_note" as const, externalRef: "diff-title-dedup-test" },
+      content: "Different capability slug — must not dedup.",
+      metadata: { category: "tool_gap" },
+    };
+
+    const first = await service.capture(companyId, { ...baseParams, title: "tool-gaps/2026-06-01/board-user/browser-automation" }, actor);
+    const second = await service.capture(companyId, { ...baseParams, title: "tool-gaps/2026-06-01/board-user/screen-capture" }, actor);
+
+    expect(first.records[0].id).not.toBe(second.records[0].id);
+    const stored = await service.listRecords(companyId, { limit: 100 }, actor);
+    expect(stored.filter((r) => r.metadata?.category === "tool_gap")).toHaveLength(2);
+  });
 });

@@ -1534,6 +1534,140 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(allIssues).toHaveLength(1);
   });
 
+  it("reuse_and_rewake reuses the open issue even when a closed one was updated more recently", async () => {
+    const { companyId, agentId, projectId, issueSvc, svc } = await seedFixture();
+    const rollingRoutine = await svc.create(
+      companyId,
+      {
+        projectId,
+        goalId: null,
+        parentIssueId: null,
+        title: "rolling watchdog",
+        description: null,
+        assigneeAgentId: agentId,
+        priority: "medium",
+        status: "active",
+        concurrencyPolicy: "reuse_and_rewake",
+        catchUpPolicy: "skip_missed",
+      },
+      {},
+    );
+
+    // First fire creates the live (open) rolling issue.
+    const run1 = await svc.runRoutine(rollingRoutine.id, { source: "schedule" });
+    const openIssueId = run1.linkedIssueId!;
+
+    // Legacy churn: a stale closed execution issue exists and was touched MORE
+    // recently than the open one (mirrors the pre-reform backlog of done issues).
+    const staleClosed = await issueSvc.create(companyId, {
+      projectId,
+      title: "stale closed execution issue",
+      description: null,
+      status: "done",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      originKind: "routine_execution",
+      originId: rollingRoutine.id,
+      originRunId: randomUUID(),
+    });
+    const newer = new Date(Date.now() + 60_000);
+    await db.update(issues).set({ updatedAt: newer }).where(eq(issues.id, staleClosed.id));
+    await db.update(issues).set({ updatedAt: new Date(Date.now() - 60_000) }).where(eq(issues.id, openIssueId));
+
+    // Next fire must reuse the OPEN issue, not reopen the more-recent closed one.
+    const run2 = await svc.runRoutine(rollingRoutine.id, { source: "schedule" });
+    expect(run2.status).toBe("issue_created");
+    expect(run2.linkedIssueId).toBe(openIssueId);
+
+    const [staleAfter] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, staleClosed.id));
+    expect(staleAfter?.status).toBe("done");
+
+    const openIssues = await db
+      .select({ id: issues.id, status: issues.status })
+      .from(issues)
+      .where(eq(issues.originId, rollingRoutine.id));
+    const stillOpen = openIssues.filter((i) =>
+      ["backlog", "todo", "in_progress", "in_review", "blocked"].includes(i.status),
+    );
+    expect(stillOpen).toHaveLength(1);
+    expect(stillOpen[0]?.id).toBe(openIssueId);
+  });
+
+  it("one-shot runAt trigger fires once then auto-disables", async () => {
+    const { routine, svc } = await seedFixture();
+    const actor = {};
+
+    // Register a runAt trigger in the past so it's immediately due
+    const past = new Date(Date.now() - 5_000);
+    const { trigger } = await svc.createTrigger(
+      routine.id,
+      { kind: "schedule", runAt: past.toISOString() },
+      actor,
+    );
+    expect(trigger.runLimit).toBe(1);
+    expect(trigger.runCount).toBe(0);
+    expect(trigger.enabled).toBe(true);
+
+    // First tick — should fire and then auto-disable
+    const result1 = await svc.tickScheduledTriggers(new Date());
+    expect(result1.triggered).toBe(1);
+
+    const [afterFire] = await db
+      .select({ enabled: routineTriggers.enabled, nextRunAt: routineTriggers.nextRunAt, runCount: routineTriggers.runCount })
+      .from(routineTriggers)
+      .where(eq(routineTriggers.id, trigger.id));
+    expect(afterFire?.enabled).toBe(false);
+    expect(afterFire?.nextRunAt).toBeNull();
+    expect(afterFire?.runCount).toBe(1);
+
+    // Second tick — already disabled, should not fire again
+    const result2 = await svc.tickScheduledTriggers(new Date());
+    expect(result2.triggered).toBe(0);
+  });
+
+  it("cron trigger with executionLimit stops after N fires", async () => {
+    const { routine, svc } = await seedFixture();
+    const actor = {};
+
+    // Create cron trigger with executionLimit=2 — use a past time so it fires immediately
+    const { trigger } = await svc.createTrigger(
+      routine.id,
+      { kind: "schedule", cronExpression: "* * * * *", timezone: "UTC", executionLimit: 2 },
+      actor,
+    );
+    expect(trigger.runLimit).toBe(2);
+
+    // Override nextRunAt to past so tick picks it up
+    const past = new Date(Date.now() - 5_000);
+    await db.update(routineTriggers).set({ nextRunAt: past }).where(eq(routineTriggers.id, trigger.id));
+
+    // First fire
+    const result1 = await svc.tickScheduledTriggers(new Date());
+    expect(result1.triggered).toBe(1);
+    const [after1] = await db.select({ runCount: routineTriggers.runCount, enabled: routineTriggers.enabled })
+      .from(routineTriggers).where(eq(routineTriggers.id, trigger.id));
+    expect(after1?.runCount).toBe(1);
+    expect(after1?.enabled).toBe(true);
+
+    // Force nextRunAt back to past for second fire
+    await db.update(routineTriggers).set({ nextRunAt: past }).where(eq(routineTriggers.id, trigger.id));
+
+    // Second fire — should hit limit, auto-disable
+    const result2 = await svc.tickScheduledTriggers(new Date());
+    expect(result2.triggered).toBe(1);
+    const [after2] = await db.select({ runCount: routineTriggers.runCount, enabled: routineTriggers.enabled, nextRunAt: routineTriggers.nextRunAt })
+      .from(routineTriggers).where(eq(routineTriggers.id, trigger.id));
+    expect(after2?.runCount).toBe(2);
+    expect(after2?.enabled).toBe(false); // disabled — nextRunAt irrelevant, tick filters on enabled=true
+
+    // Third tick — no fire
+    const result3 = await svc.tickScheduledTriggers(new Date());
+    expect(result3.triggered).toBe(0);
+  });
+
   it("reuse_and_rewake does not affect other concurrency policies", async () => {
     const { routine, svc } = await seedFixture();
     // default concurrencyPolicy is coalesce_if_active — confirm it still creates fresh issues
@@ -1552,5 +1686,67 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .from(issues)
       .where(eq(issues.originId, routine.id));
     expect(allIssues).toHaveLength(2);
+  });
+
+  it("expiresAt in the past: tickScheduledTriggers archives routine and does not dispatch", async () => {
+    const { companyId, routine, svc } = await seedFixture();
+
+    // Set expiresAt to a past time
+    const pastExpiry = new Date(Date.now() - 60_000);
+    await db.update(routines).set({ expiresAt: pastExpiry }).where(eq(routines.id, routine.id));
+
+    // Add a schedule trigger due now
+    const past = new Date(Date.now() - 5_000);
+    await svc.createTrigger(routine.id, { kind: "schedule", runAt: past.toISOString() }, {});
+
+    const result = await svc.tickScheduledTriggers(new Date());
+    expect(result.triggered).toBe(0);
+
+    const [updated] = await db
+      .select({ status: routines.status })
+      .from(routines)
+      .where(eq(routines.id, routine.id));
+    expect(updated?.status).toBe("archived");
+
+    const runs = await db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id));
+    expect(runs).toHaveLength(0);
+  });
+
+  it("expiresAt in the future: tickScheduledTriggers fires normally", async () => {
+    const { routine, svc } = await seedFixture();
+
+    // Set expiresAt to a future time
+    const futureExpiry = new Date(Date.now() + 3_600_000);
+    await db.update(routines).set({ expiresAt: futureExpiry }).where(eq(routines.id, routine.id));
+
+    // Add a schedule trigger due now
+    const past = new Date(Date.now() - 5_000);
+    await svc.createTrigger(routine.id, { kind: "schedule", runAt: past.toISOString() }, {});
+
+    const result = await svc.tickScheduledTriggers(new Date());
+    expect(result.triggered).toBe(1);
+
+    const [still] = await db
+      .select({ status: routines.status })
+      .from(routines)
+      .where(eq(routines.id, routine.id));
+    expect(still?.status).toBe("active");
+  });
+
+  it("expiresAt null: tickScheduledTriggers fires normally (no expiry)", async () => {
+    const { routine, svc } = await seedFixture();
+
+    // expiresAt is null by default — add a trigger due now
+    const past = new Date(Date.now() - 5_000);
+    await svc.createTrigger(routine.id, { kind: "schedule", runAt: past.toISOString() }, {});
+
+    const result = await svc.tickScheduledTriggers(new Date());
+    expect(result.triggered).toBe(1);
+
+    const [still] = await db
+      .select({ status: routines.status })
+      .from(routines)
+      .where(eq(routines.id, routine.id));
+    expect(still?.status).toBe("active");
   });
 });

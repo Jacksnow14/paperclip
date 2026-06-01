@@ -77,6 +77,7 @@ export { pluginJobs, pluginJobRuns } from "./plugin_jobs.js";
 export { pluginWebhookDeliveries } from "./plugin_webhooks.js";
 export { pluginLogs } from "./plugin_logs.js";
 export { gmailIntakeRecords } from "./gmail_intake_records.js";
+export { gmailOutboundRecords } from "./gmail_outbound_records.js";
 export { memoryBindings } from "./memory_bindings.js";
 export { memoryBindingTargets } from "./memory_binding_targets.js";
 export { memoryLocalRecords } from "./memory_local_records.js";

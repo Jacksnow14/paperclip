@@ -60,6 +60,7 @@ export const createRoutineSchema = z.object({
   concurrencyPolicy: z.enum(ROUTINE_CONCURRENCY_POLICIES).optional().default("coalesce_if_active"),
   catchUpPolicy: z.enum(ROUTINE_CATCH_UP_POLICIES).optional().default("skip_missed"),
   variables: z.array(routineVariableSchema).optional().default([]),
+  expiresAt: z.string().datetime().optional().nullable(),
 });
 
 export type CreateRoutine = z.infer<typeof createRoutineSchema>;
@@ -83,6 +84,7 @@ export const routineRevisionSnapshotRoutineV1Schema = z.object({
   concurrencyPolicy: z.enum(ROUTINE_CONCURRENCY_POLICIES),
   catchUpPolicy: z.enum(ROUTINE_CATCH_UP_POLICIES),
   variables: z.array(routineVariableSchema),
+  expiresAt: z.coerce.date().nullable(),
 }).strict();
 
 export const routineRevisionSnapshotTriggerV1Schema = z.object({
@@ -95,6 +97,8 @@ export const routineRevisionSnapshotTriggerV1Schema = z.object({
   publicId: z.string().nullable(),
   signingMode: z.enum(ROUTINE_TRIGGER_SIGNING_MODES).nullable(),
   replayWindowSec: z.number().int().min(30).max(86_400).nullable(),
+  runLimit: z.number().int().min(1).nullable().optional().default(null),
+  runCount: z.number().int().min(0).optional().default(0),
 }).strict();
 
 export const routineRevisionSnapshotV1Schema = z.object({
@@ -115,8 +119,11 @@ const baseTriggerSchema = z.object({
 export const createRoutineTriggerSchema = z.discriminatedUnion("kind", [
   baseTriggerSchema.extend({
     kind: z.literal("schedule"),
-    cronExpression: z.string().trim().min(1),
-    timezone: z.string().trim().min(1).default("UTC"),
+    cronExpression: z.string().trim().min(1).optional(),
+    timezone: z.string().trim().min(1).optional().default("UTC"),
+    runAt: z.string().datetime().optional(),
+    executionLimit: z.number().int().min(1).optional(),
+    triggerPayload: z.record(z.unknown()).optional().nullable(),
   }),
   baseTriggerSchema.extend({
     kind: z.literal("webhook"),
@@ -126,7 +133,26 @@ export const createRoutineTriggerSchema = z.discriminatedUnion("kind", [
   baseTriggerSchema.extend({
     kind: z.literal("api"),
   }),
-]);
+]).superRefine((val, ctx) => {
+  if (val.kind === "schedule") {
+    const hasCron = val.cronExpression != null && val.cronExpression.length > 0;
+    const hasRunAt = val.runAt != null;
+    if (!hasCron && !hasRunAt) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["cronExpression"],
+        message: "Schedule triggers require either cronExpression or runAt",
+      });
+    }
+    if (hasCron && hasRunAt) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["runAt"],
+        message: "Schedule triggers cannot have both cronExpression and runAt",
+      });
+    }
+  }
+});
 
 export type CreateRoutineTrigger = z.infer<typeof createRoutineTriggerSchema>;
 
@@ -135,6 +161,9 @@ export const updateRoutineTriggerSchema = z.object({
   enabled: z.boolean().optional(),
   cronExpression: z.string().trim().min(1).optional().nullable(),
   timezone: z.string().trim().min(1).optional().nullable(),
+  runAt: z.string().datetime().optional().nullable(),
+  executionLimit: z.number().int().min(1).optional().nullable(),
+  triggerPayload: z.record(z.unknown()).optional().nullable(),
   signingMode: z.enum(ROUTINE_TRIGGER_SIGNING_MODES).optional().nullable(),
   replayWindowSec: z.number().int().min(30).max(86_400).optional().nullable(),
 });

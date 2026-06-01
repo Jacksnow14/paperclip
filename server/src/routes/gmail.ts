@@ -11,12 +11,16 @@ import {
 } from "../services/gmail.js";
 import { UnresolvedPlaceholderError } from "../services/outbound-render-guard.js";
 import { createGmailIntakeService } from "../services/gmail-intake.js";
+import { createGmailOutboundService } from "../services/gmail-outbound.js";
+import type { ConversationResponseStatus } from "../services/gmail-outbound.js";
 
 const sendMessageBodySchema = z.object({
   to: z.string().email(),
   subject: z.string().min(1),
   body: z.string().min(1),
   replyToMessageId: z.string().optional(),
+  campaign: z.string().optional(),
+  issueId: z.string().uuid().optional(),
 });
 
 const modifyLabelsBodySchema = z.object({
@@ -31,6 +35,12 @@ const vacationSettingsBodySchema = z.object({
   startTimeIso: z.string().datetime().optional(),
   endTimeIso: z.string().datetime().optional(),
 });
+
+const VALID_RESPONSE_STATUSES = new Set<ConversationResponseStatus>([
+  "needs-pickup",
+  "awaiting-reply",
+  "replied",
+]);
 
 function assertGmailAvailable() {
   if (!process.env.GOOGLE_WORKSPACE_SA_KEY) {
@@ -52,6 +62,7 @@ export function gmailRoutes(db: Db) {
   const router = Router();
   const gmail = createGmailService();
   const intake = createGmailIntakeService(db);
+  const outbound = createGmailOutboundService(db);
 
   router.get("/companies/:companyId/gmail/mailboxes", (req, res) => {
     const companyId = req.params.companyId as string;
@@ -97,15 +108,34 @@ export function gmailRoutes(db: Db) {
       assertGmailAvailable();
       if (!isSupportedGmailAlias(mailbox)) throw badRequest(`Unsupported mailbox: ${mailbox}`);
       const body = req.body as z.infer<typeof sendMessageBodySchema>;
+      let data: Awaited<ReturnType<typeof gmail.sendMessage>>;
       try {
-        const data = await gmail.sendMessage(mailbox, body);
-        res.status(201).json(data);
+        data = await gmail.sendMessage(mailbox, body);
       } catch (err) {
         if (err instanceof UnresolvedPlaceholderError) {
           throw unprocessable(err.message, { tokens: err.tokens });
         }
         throw err;
       }
+
+      // Persist outbound record — non-fatal: failure must not break the send response.
+      if (data.id && data.threadId) {
+        const sentByAgentId = req.actor?.type === "agent" ? (req.actor.agentId ?? null) : null;
+        void outbound.persistSend({
+          companyId,
+          mailbox,
+          gmailThreadId: data.threadId,
+          gmailMessageId: data.id,
+          recipient: body.to,
+          subject: body.subject,
+          campaign: body.campaign ?? undefined,
+          issueId: body.issueId ?? undefined,
+          sentByAgentId,
+          sentAt: new Date(),
+        });
+      }
+
+      res.status(201).json(data);
     },
   );
 
@@ -203,6 +233,47 @@ export function gmailRoutes(db: Db) {
       assertGmailAvailable();
       const results = await intake.pollAllMailboxes(companyId);
       res.json({ results });
+    },
+  );
+
+  // Returns needs-reply aging for open email-origin issues, sorted by replyDueAt ascending.
+  // Query param: slaBusinessDays (integer 1–30, default 2).
+  router.get(
+    "/companies/:companyId/gmail/intake/aging",
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertCompanyAccess(req, companyId);
+      const rawSla = req.query.slaBusinessDays;
+      const slaBusinessDays = rawSla != null ? Number(rawSla) : 2;
+      if (!Number.isInteger(slaBusinessDays) || slaBusinessDays < 1 || slaBusinessDays > 30) {
+        throw badRequest("slaBusinessDays must be an integer between 1 and 30");
+      }
+      const aging = await intake.getAgingReport(companyId, slaBusinessDays);
+      res.json({ slaBusinessDays, aging });
+    },
+  );
+
+  // Unified conversation view: joins outbound + inbound records by thread.
+  router.get(
+    "/companies/:companyId/mail/conversations",
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertCompanyAccess(req, companyId);
+      const q = req.query as Record<string, unknown>;
+      const mailboxFilter = typeof q.mailbox === "string" ? q.mailbox : undefined;
+      const ownerFilter = typeof q.owner === "string" ? q.owner : undefined;
+      const campaignFilter = typeof q.campaign === "string" ? q.campaign : undefined;
+      const statusRaw = typeof q.status === "string" ? q.status : undefined;
+      if (statusRaw && !VALID_RESPONSE_STATUSES.has(statusRaw as ConversationResponseStatus)) {
+        throw badRequest(`Invalid status filter: ${statusRaw}. Must be one of: needs-pickup, awaiting-reply, replied`);
+      }
+      const conversations = await outbound.queryConversations(companyId, {
+        mailbox: mailboxFilter,
+        owner: ownerFilter,
+        campaign: campaignFilter,
+        status: statusRaw as ConversationResponseStatus | undefined,
+      });
+      res.json({ conversations });
     },
   );
 

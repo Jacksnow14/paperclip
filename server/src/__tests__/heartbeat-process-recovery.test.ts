@@ -76,6 +76,7 @@ import {
   redactDetectedSuccessfulRunProgressSummaryForBoard,
 } from "../services/heartbeat.ts";
 import {
+  STANDING_THREAD_ORIGIN_KIND,
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
@@ -3238,6 +3239,51 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "recovery.surge_suppressed")));
     expect(surgeActivity).toHaveLength(1);
     expect(surgeActivity[0]?.details).toMatchObject({ companyId, count: 2 });
+  });
+
+  it("skips a standing-thread issue even when assigned in_progress with a productive-terminal run", async () => {
+    // A standing/log thread runs productively but intentionally never closes the issue.
+    // reconcileStrandedAssignedIssues must not enqueue a continuation wake or flip it to blocked.
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      retryReason: "issue_continuation_needed",
+      runSource: "issue.productive_terminal_continuation_recovery",
+      livenessState: "advanced",
+    });
+
+    // Mark the issue as a standing thread.
+    await db
+      .update(issues)
+      .set({ originKind: STANDING_THREAD_ORIGIN_KIND })
+      .where(eq(issues.id, issueId));
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.skipped).toBeGreaterThanOrEqual(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+
+    const wakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "queued")));
+    expect(wakes).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+
+    const newRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, agentId)));
+    // Only the original seeded run should exist — no recovery run queued.
+    expect(newRuns).toHaveLength(1);
+    expect(newRuns[0]?.id).toBe(runId);
   });
 
   it("does not reconcile user-assigned work through the agent stranded-work recovery path", async () => {

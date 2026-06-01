@@ -2,8 +2,10 @@ export {
   RECOVERY_KEY_PREFIXES,
   RECOVERY_ORIGIN_KINDS,
   RECOVERY_REASON_KINDS,
+  STANDING_THREAD_ORIGIN_KIND,
   buildIssueGraphLivenessIncidentKey,
   buildIssueGraphLivenessLeafKey,
+  isStandingThreadOriginKind,
   isStrandedIssueRecoveryOriginKind,
   parseIssueGraphLivenessIncidentKey,
 } from "./origins.js";

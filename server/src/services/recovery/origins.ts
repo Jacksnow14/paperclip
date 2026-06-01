@@ -5,6 +5,12 @@ export const RECOVERY_ORIGIN_KINDS = {
   staleActiveRunEvaluation: "stale_active_run_evaluation",
 } as const;
 
+export const STANDING_THREAD_ORIGIN_KIND = "standing_thread" as const;
+
+export function isStandingThreadOriginKind(originKind: string | null | undefined): boolean {
+  return originKind === STANDING_THREAD_ORIGIN_KIND;
+}
+
 export const RECOVERY_REASON_KINDS = {
   runLivenessContinuation: "run_liveness_continuation",
 } as const;

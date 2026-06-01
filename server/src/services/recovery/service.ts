@@ -45,7 +45,9 @@ import {
 } from "./successful-run-handoff.js";
 import {
   RECOVERY_ORIGIN_KINDS,
+  STANDING_THREAD_ORIGIN_KIND,
   buildIssueGraphLivenessLeafKey,
+  isStandingThreadOriginKind,
   isStrandedIssueRecoveryOriginKind,
   parseIssueGraphLivenessIncidentKey,
 } from "./origins.js";
@@ -2198,6 +2200,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (isStandingThreadOriginKind(issue.originKind)) {
         result.skipped += 1;
         continue;
       }

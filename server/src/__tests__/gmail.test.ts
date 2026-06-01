@@ -44,7 +44,7 @@ vi.mock("googleapis", () => ({
 }));
 
 // Import after mock setup
-const { createGmailService, isSupportedGmailAlias, GMAIL_SUPPORTED_ALIASES } = await import(
+const { createGmailService, isSupportedGmailAlias, GMAIL_SUPPORTED_ALIASES, replyToForMailbox } = await import(
   "../services/gmail.js"
 );
 
@@ -370,5 +370,16 @@ describe("createGmailService", () => {
         String(new Date("2026-06-07T00:00:00.000Z").getTime()),
       );
     });
+  });
+});
+
+describe("replyToForMailbox", () => {
+  it.each([
+    ["board", "board@tryauranode.com"],
+    ["alex", "alex@tryauranode.com"],
+    ["leo", "leo@tryauranode.com"],
+    ["adrian", "adrian@tryauranode.com"],
+  ] as const)("%s → %s", (mailbox, expected) => {
+    expect(replyToForMailbox(mailbox)).toBe(expected);
   });
 });

@@ -24,6 +24,7 @@ const mockMemoryService = vi.hoisted(() => ({
   forget: vi.fn(),
   revoke: vi.fn(),
   correct: vi.fn(),
+  agentUpdate: vi.fn(),
   promote: vi.fn(),
   review: vi.fn(),
   sweepRetention: vi.fn(),
@@ -485,6 +486,115 @@ describe("memory routes", () => {
         }),
       }),
     );
+  });
+
+  describe("PATCH /companies/:companyId/memory/records/:recordId (agent update)", () => {
+    const recordId = "44444444-4444-4444-8444-444444444444";
+    const agentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    function makeRecord(overrides: Record<string, unknown> = {}) {
+      return {
+        id: recordId,
+        owner: { type: "agent", id: agentId },
+        metadata: { category: "experiment", status: "proposed" },
+        content: "Hypothesis: X causes Y",
+        ...overrides,
+      };
+    }
+
+    beforeEach(() => {
+      mockMemoryService.agentUpdate = vi.fn();
+      mockMemoryService.getRecord.mockResolvedValue(makeRecord());
+      mockMemoryService.agentUpdate.mockResolvedValue({
+        operation: { id: "op-update-1" },
+        record: makeRecord({ metadata: { category: "experiment", status: "approved", board_approval_id: "cd95d0c6" } }),
+      });
+    });
+
+    it("allows an owner agent to update metadata on an experiment record", async () => {
+      const app = createApp({ type: "agent", agentId, companyId: companyA });
+
+      const res = await request(app)
+        .patch(`/api/companies/${companyA}/memory/records/${recordId}`)
+        .send({ metadata: { status: "approved", board_approval_id: "cd95d0c6" } });
+
+      expect(res.status).toBe(200);
+      expect(mockMemoryService.agentUpdate).toHaveBeenCalledWith(
+        companyA,
+        recordId,
+        { metadata: { status: "approved", board_approval_id: "cd95d0c6" } },
+        expect.objectContaining({ actorType: "agent", agentId }),
+      );
+      expect(mockLogActivity).toHaveBeenCalledOnce();
+    });
+
+    it("blocks a non-owner agent from updating the record", async () => {
+      const otherAgent = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      const app = createApp({ type: "agent", agentId: otherAgent, companyId: companyA });
+
+      const res = await request(app)
+        .patch(`/api/companies/${companyA}/memory/records/${recordId}`)
+        .send({ metadata: { status: "approved" } });
+
+      expect(res.status).toBe(403);
+      expect(res.body).toEqual({ error: "Agent can only update memory records it owns" });
+      expect(mockMemoryService.agentUpdate).not.toHaveBeenCalled();
+    });
+
+    it("blocks an agent from updating a record with a non-allowlisted category", async () => {
+      mockMemoryService.getRecord.mockResolvedValue(makeRecord({ metadata: { category: "lesson" } }));
+      const app = createApp({ type: "agent", agentId, companyId: companyA });
+
+      const res = await request(app)
+        .patch(`/api/companies/${companyA}/memory/records/${recordId}`)
+        .send({ metadata: { status: "approved" } });
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toMatch(/lesson/);
+      expect(mockMemoryService.agentUpdate).not.toHaveBeenCalled();
+    });
+
+    it("blocks an agent from updating a record with no category", async () => {
+      mockMemoryService.getRecord.mockResolvedValue(makeRecord({ metadata: {} }));
+      const app = createApp({ type: "agent", agentId, companyId: companyA });
+
+      const res = await request(app)
+        .patch(`/api/companies/${companyA}/memory/records/${recordId}`)
+        .send({ metadata: { status: "approved" } });
+
+      expect(res.status).toBe(403);
+      expect(mockMemoryService.agentUpdate).not.toHaveBeenCalled();
+    });
+
+    it("allows board users to update any record without category restriction", async () => {
+      mockMemoryService.getRecord.mockResolvedValue(makeRecord({ metadata: { category: "lesson" } }));
+      const app = createApp({
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        companyIds: [companyA],
+        isInstanceAdmin: false,
+      });
+
+      const res = await request(app)
+        .patch(`/api/companies/${companyA}/memory/records/${recordId}`)
+        .set("Origin", "http://localhost:3100")
+        .send({ metadata: { status: "approved" } });
+
+      expect(res.status).toBe(200);
+      expect(mockMemoryService.agentUpdate).toHaveBeenCalled();
+    });
+
+    it("returns 400 for an empty update body", async () => {
+      const app = createApp({ type: "agent", agentId, companyId: companyA });
+
+      const res = await request(app)
+        .patch(`/api/companies/${companyA}/memory/records/${recordId}`)
+        .send({});
+
+      expect(res.status).toBe(400);
+      expect(mockMemoryService.agentUpdate).not.toHaveBeenCalled();
+    });
   });
 
   it("starts memory refresh jobs through the memory service and logs activity", async () => {

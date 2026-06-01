@@ -1178,6 +1178,7 @@ export type {
 export type {
   MemoryBinding,
   MemoryBindingTarget,
+  MemoryAgentUpdateResult,
   MemoryCaptureResult,
   MemoryCitation,
   MemoryCorrectResult,

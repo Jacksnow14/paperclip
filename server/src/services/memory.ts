@@ -16,6 +16,8 @@ import {
   projects,
 } from "@paperclipai/db";
 import type {
+  MemoryAgentUpdate,
+  MemoryAgentUpdateResult,
   MemoryBinding,
   MemoryBindingTarget,
   MemoryBindingTargetType,
@@ -64,7 +66,7 @@ import type {
   MemorySourceRef,
   MemoryUsage,
 } from "@paperclipai/shared";
-import { MEMORY_INJECTION_MODES, createMemoryBindingSchema, memoryCorrectSchema, memoryHookPoliciesSchema, memoryPromoteSchema, memoryRefreshJobSchema, memoryRetentionSweepSchema, memoryReviewSchema, memoryRevokeSchema, memorySynthesisJobSchema, updateMemoryBindingSchema } from "@paperclipai/shared";
+import { MEMORY_INJECTION_MODES, createMemoryBindingSchema, memoryAgentUpdateSchema, memoryCorrectSchema, memoryHookPoliciesSchema, memoryPromoteSchema, memoryRefreshJobSchema, memoryRetentionSweepSchema, memoryReviewSchema, memoryRevokeSchema, memorySynthesisJobSchema, updateMemoryBindingSchema } from "@paperclipai/shared";
 import { z } from "zod";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { costService } from "./costs.js";
@@ -2746,6 +2748,56 @@ export function memoryService(
         originalRecord: mapRecord({ ...originalRow, supersededByRecordId: correctedRecordId, updatedAt: correctedAt }),
         correctedRecord: mapRecord(attachedCorrectedRow ?? { ...correctedRow, createdByOperationId: operation.id }),
       } satisfies MemoryCorrectResult;
+    },
+
+    agentUpdate: async (
+      companyId: string,
+      recordId: string,
+      data: MemoryAgentUpdate,
+      actor: ActorInfo,
+    ): Promise<MemoryAgentUpdateResult> => {
+      const parsed = memoryAgentUpdateSchema.parse(data);
+      const existingRow = await db
+        .select()
+        .from(memoryLocalRecords)
+        .where(and(eq(memoryLocalRecords.companyId, companyId), eq(memoryLocalRecords.id, recordId)))
+        .then((rows) => rows[0] ?? null);
+      if (!existingRow) throw notFound("Memory record not found");
+
+      const updatedAt = new Date();
+      const mergedMetadata =
+        parsed.metadata !== undefined
+          ? { ...(existingRow.metadata ?? {}), ...parsed.metadata }
+          : existingRow.metadata;
+
+      const [updatedRow] = await db
+        .update(memoryLocalRecords)
+        .set({
+          metadata: mergedMetadata,
+          ...(parsed.content !== undefined ? { content: parsed.content } : {}),
+          ...("title" in parsed ? { title: parsed.title ?? null } : {}),
+          ...("summary" in parsed ? { summary: parsed.summary ?? null } : {}),
+          updatedAt,
+        })
+        .where(and(eq(memoryLocalRecords.companyId, companyId), eq(memoryLocalRecords.id, recordId)))
+        .returning();
+      if (!updatedRow) throw notFound("Memory record not found");
+
+      const binding = await getBindingOrThrow(updatedRow.bindingId);
+      const operation = await logOperation({
+        companyId,
+        binding,
+        actor,
+        operationType: "upsert",
+        triggerKind: "manual",
+        scope: scopeFromRow(updatedRow),
+        source: sourceFromRow(updatedRow),
+        requestJson: { recordId, updatedFields: Object.keys(parsed) },
+        resultJson: { recordId: updatedRow.id },
+        recordCount: 1,
+      });
+
+      return { operation, record: mapRecord(updatedRow) } satisfies MemoryAgentUpdateResult;
     },
 
     promote: async (

@@ -1,6 +1,7 @@
 import { Router } from "express";
 import type { Db } from "@paperclipai/db";
 import {
+  memoryAgentUpdateSchema,
   memoryCaptureSchema,
   memoryCorrectSchema,
   memoryForgetSchema,
@@ -283,6 +284,64 @@ export function memoryRoutes(
     if (!record) throw notFound("Memory record not found");
     res.json(record);
   });
+
+  // Categories that agents are permitted to update on their own records.
+  const AGENT_MUTABLE_CATEGORIES = new Set([
+    "experiment",
+    "experiment_conclusion",
+    "hypothesis",
+    "observation",
+    "performance_scorecard",
+    "scorecard_adjusted",
+    "tool_gap",
+  ]);
+
+  router.patch(
+    "/companies/:companyId/memory/records/:recordId",
+    validate(memoryAgentUpdateSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertCompanyAccess(req, companyId);
+
+      const recordId = req.params.recordId as string;
+      const record = await memory.getRecord(companyId, recordId, actorInfoFromReq(req));
+      if (!record) throw notFound("Memory record not found");
+
+      if (req.actor.type === "agent") {
+        // Agents may only update records they own.
+        if (record.owner?.type !== "agent" || record.owner.id !== req.actor.agentId) {
+          throw forbidden("Agent can only update memory records it owns");
+        }
+        // Restrict to allowlisted categories to prevent arbitrary record mutation.
+        const category = typeof record.metadata?.category === "string" ? record.metadata.category : null;
+        if (!category || !AGENT_MUTABLE_CATEGORIES.has(category)) {
+          throw forbidden(
+            `Agent cannot update records with category '${category ?? "(none)"}'. Allowed: ${[...AGENT_MUTABLE_CATEGORIES].join(", ")}`,
+          );
+        }
+      } else {
+        // Board users have unrestricted update access (they can already use /correct).
+        assertBoard(req);
+      }
+
+      const result = await memory.agentUpdate(companyId, recordId, req.body, actorInfoFromReq(req));
+      const actor = getActorInfo(req);
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        action: "memory.updated",
+        entityType: "memory_record",
+        entityId: result.record.id,
+        details: {
+          recordId: result.record.id,
+          updatedFields: Object.keys(req.body as Record<string, unknown>),
+        },
+      });
+      res.json(result);
+    },
+  );
 
   router.post("/companies/:companyId/memory/revoke", validate(memoryRevokeSchema), async (req, res) => {
     const companyId = req.params.companyId as string;

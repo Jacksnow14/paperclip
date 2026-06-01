@@ -304,6 +304,16 @@ export const memoryPromoteSchema = z
   })
   .strict();
 
+export const memoryAgentUpdateSchema = z
+  .object({
+    metadata: z.record(z.unknown()).optional(),
+    content: z.string().trim().min(1).max(20000).optional(),
+    title: z.string().trim().max(200).nullable().optional(),
+    summary: z.string().trim().max(2000).nullable().optional(),
+  })
+  .strict()
+  .refine((data) => Object.keys(data).length > 0, "At least one field must be provided");
+
 export const memoryRetentionSweepSchema = z
   .object({
     now: z.coerce.date().optional(),
@@ -433,3 +443,4 @@ export type MemoryListOperationsQuery = z.infer<typeof memoryListOperationsQuery
 export type MemoryListExtractionJobsQuery = z.infer<typeof memoryListExtractionJobsQuerySchema>;
 export type MemoryRefreshJob = z.infer<typeof memoryRefreshJobSchema>;
 export type MemorySynthesisJob = z.infer<typeof memorySynthesisJobSchema>;
+export type MemoryAgentUpdate = z.infer<typeof memoryAgentUpdateSchema>;

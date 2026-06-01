@@ -420,6 +420,11 @@ export interface MemoryCorrectResult {
   correctedRecord: MemoryRecord;
 }
 
+export interface MemoryAgentUpdateResult {
+  operation: MemoryOperation;
+  record: MemoryRecord;
+}
+
 export interface MemoryPromoteResult {
   operation: MemoryOperation;
   originalRecord: MemoryRecord;

@@ -44,10 +44,15 @@ const mockProjectService = vi.hoisted(() => ({
   getById: vi.fn(),
 }));
 
+const mockIssueService = vi.hoisted(() => ({
+  getByIdentifier: vi.fn(),
+}));
+
 const mockLogActivity = vi.hoisted(() => vi.fn());
 
 vi.mock("../services/index.js", () => ({
   agentService: () => mockAgentService,
+  issueService: () => mockIssueService,
   logActivity: mockLogActivity,
   memoryService: () => mockMemoryService,
   projectService: () => mockProjectService,
@@ -594,6 +599,90 @@ describe("memory routes", () => {
 
       expect(res.status).toBe(400);
       expect(mockMemoryService.agentUpdate).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("POST /companies/:companyId/memory/capture — AUR-NNNN source.issueId resolution", () => {
+    const issueUuid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const captureBody = {
+      source: { kind: "issue", issueId: "AUR-1234" },
+      content: "Resolved issue ref test",
+      sensitivityLabel: "internal",
+    };
+    const captureResult = {
+      operation: { id: "op-capture-1", bindingId: bindingId, source: { kind: "issue", issueId: issueUuid } },
+      records: [{ id: "dd000000-0000-4000-8000-000000000000" }],
+    };
+    const boardActor = {
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      companyIds: [companyA],
+      isInstanceAdmin: false,
+    };
+
+    it("resolves AUR-NNNN to UUID before persisting", async () => {
+      mockIssueService.getByIdentifier.mockResolvedValue({ id: issueUuid, companyId: companyA });
+      mockMemoryService.capture.mockResolvedValue(captureResult);
+      const app = createApp(boardActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send(captureBody);
+
+      expect(res.status).toBe(201);
+      expect(mockIssueService.getByIdentifier).toHaveBeenCalledWith("AUR-1234");
+      expect(mockMemoryService.capture).toHaveBeenCalledWith(
+        companyA,
+        expect.objectContaining({ source: { kind: "issue", issueId: issueUuid } }),
+        expect.objectContaining({ actorType: "user" }),
+      );
+    });
+
+    it("passes through a valid UUID without extra lookup", async () => {
+      mockMemoryService.capture.mockResolvedValue(captureResult);
+      const app = createApp(boardActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...captureBody, source: { kind: "issue", issueId: issueUuid } });
+
+      expect(res.status).toBe(201);
+      expect(mockIssueService.getByIdentifier).not.toHaveBeenCalled();
+      expect(mockMemoryService.capture).toHaveBeenCalledWith(
+        companyA,
+        expect.objectContaining({ source: { kind: "issue", issueId: issueUuid } }),
+        expect.anything(),
+      );
+    });
+
+    it("returns 422 for an unknown AUR-NNNN identifier", async () => {
+      mockIssueService.getByIdentifier.mockResolvedValue(null);
+      const app = createApp(boardActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...captureBody, source: { kind: "issue", issueId: "AUR-9999" } });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toMatch(/AUR-9999/);
+      expect(mockMemoryService.capture).not.toHaveBeenCalled();
+    });
+
+    it("returns 422 when the resolved issue belongs to a different company", async () => {
+      mockIssueService.getByIdentifier.mockResolvedValue({ id: issueUuid, companyId: companyB });
+      const app = createApp(boardActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send(captureBody);
+
+      expect(res.status).toBe(422);
+      expect(mockMemoryService.capture).not.toHaveBeenCalled();
     });
   });
 

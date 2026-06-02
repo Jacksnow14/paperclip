@@ -141,6 +141,9 @@ export function healthRoutes(
       features: {
         companyDeletionEnabled: opts.companyDeletionEnabled,
       },
+      capabilities: {
+        gmail: !!process.env.GOOGLE_WORKSPACE_SA_KEY,
+      },
       ...(devServer ? { devServer } : {}),
     });
   });

@@ -352,68 +352,48 @@ describe("runChildProcess", () => {
     expect(result.stdout).toContain('"type":"result"');
   });
 
-  it.skipIf(process.platform === "win32")("does not clean up noisy runs that have no terminal output", async () => {
-    const runId = randomUUID();
-    let observed = "";
-    const resultPromise = runChildProcess(
-      runId,
-      process.execPath,
-      [
-        "-e",
+  it.skipIf(process.platform === "win32")(
+    "kills descendant process group when parent exits (AUR-1714 zombie-leak fix)",
+    async () => {
+      const runId = randomUUID();
+      let observed = "";
+      const resultPromise = runChildProcess(
+        runId,
+        process.execPath,
         [
-          "const { spawn } = require('node:child_process');",
-          "const child = spawn(process.execPath, ['-e', \"setInterval(() => process.stdout.write('noise\\\\n'), 50)\"], { stdio: ['ignore', 'inherit', 'ignore'] });",
-          "process.stdout.write(`descendant:${child.pid}\\n`);",
-          "setTimeout(() => process.exit(0), 25);",
-        ].join(" "),
-      ],
-      {
-        cwd: process.cwd(),
-        env: {},
-        timeoutSec: 0,
-        graceSec: 1,
-        onLog: async (_stream, chunk) => {
-          observed += chunk;
+          "-e",
+          [
+            "const { spawn } = require('node:child_process');",
+            "const child = spawn(process.execPath, ['-e', \"setInterval(() => process.stdout.write('noise\\\\n'), 50)\"], { stdio: ['ignore', 'inherit', 'ignore'] });",
+            "process.stdout.write(`descendant:${child.pid}\\n`);",
+            "setTimeout(() => process.exit(0), 25);",
+          ].join(" "),
+        ],
+        {
+          cwd: process.cwd(),
+          env: {},
+          timeoutSec: 0,
+          graceSec: 1,
+          onLog: async (_stream, chunk) => {
+            observed += chunk;
+          },
+          // No terminalResultCleanup configured — previously this kept the
+          // run promise pending forever while the descendant kept the stdio
+          // pipes open. With AUR-1714 the parent-exit handler signals the
+          // process group so descendants exit and the run resolves.
         },
-        terminalResultCleanup: {
-          graceMs: 50,
-          hasTerminalResult: ({ stdout }) => stdout.includes('"type":"result"'),
-        },
-      },
-    );
+      );
 
-    const pidMatch = await waitForTextMatch(() => observed, /descendant:(\d+)/);
-    const descendantPid = Number.parseInt(pidMatch?.[1] ?? "", 10);
-    expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
+      const pidMatch = await waitForTextMatch(() => observed, /descendant:(\d+)/);
+      const descendantPid = Number.parseInt(pidMatch?.[1] ?? "", 10);
+      expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true);
 
-    const race = await Promise.race([
-      resultPromise.then(() => "settled" as const),
-      new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 300)),
-    ]);
-    expect(race).toBe("pending");
-    expect(isPidAlive(descendantPid)).toBe(true);
-
-    const running = runningProcesses.get(runId) as
-      | { child: { kill(signal: NodeJS.Signals): boolean }; processGroupId: number | null }
-      | undefined;
-    try {
-      if (running?.processGroupId) {
-        process.kill(-running.processGroupId, "SIGKILL");
-      } else {
-        running?.child.kill("SIGKILL");
-      }
-      await resultPromise;
-    } finally {
-      runningProcesses.delete(runId);
-      if (isPidAlive(descendantPid)) {
-        try {
-          process.kill(descendantPid, "SIGKILL");
-        } catch {
-          // Ignore cleanup races.
-        }
-      }
-    }
-  });
+      const result = await resultPromise;
+      expect(result.exitCode).toBe(0);
+      expect(runningProcesses.has(runId)).toBe(false);
+      expect(await waitForPidExit(descendantPid, 2_000)).toBe(true);
+    },
+  );
 });
 
 describe("renderPaperclipWakePrompt", () => {

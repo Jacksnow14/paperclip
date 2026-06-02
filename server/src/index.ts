@@ -31,6 +31,7 @@ import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
 import {
   feedbackService,
   heartbeatService,
+  issueService,
   instanceSettingsService,
   reconcilePersistedRuntimeServicesOnStartup,
   routineService,
@@ -668,9 +669,91 @@ export async function startServer(): Promise<StartedServer> {
     .catch((err) => {
       logger.error({ err }, "startup reconciliation of persisted runtime services failed");
     });
-  
+
+  // Backstop sweep for leaked child-process registry entries / kernel zombies
+  // (AUR-1714). Kept independent of heartbeatSchedulerEnabled so any server
+  // that spawns adapter children benefits, including instances that delegate
+  // scheduling elsewhere.
+  {
+    const { startProcessReaper } = await import("@paperclipai/adapter-utils/process-reaper");
+    startProcessReaper({
+      intervalMs: 60_000,
+      logger: {
+        warn: (obj, msg) => logger.warn(obj, msg),
+      },
+    });
+  }
+
   if (config.heartbeatSchedulerEnabled) {
-    const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
+    const { isDiskPressureActive, updateDiskPressure, shouldFireCeoAlert, checkDisk, formatDiskReport } = await import("./services/disk-monitor.js");
+
+    const DISK_CHECK_INTERVAL_MS = 60_000;
+    const DISK_HEALTH_REPORT_INTERVAL_MS = 24 * 60 * 60 * 1000;
+    const CEO_AGENT_ID = "3823a155-b4d4-4b06-b7d3-b3a55c6cbc1b";
+    const issuesSvc = issueService(db as any);
+
+    const getFirstCompanyId = async (): Promise<string | undefined> => {
+      const rows = await (db as any).select({ id: companies.id }).from(companies).limit(1);
+      return rows[0]?.id;
+    };
+
+    setInterval(() => {
+      const result = updateDiskPressure(config.databaseBackupDir, config.databaseBackupDir);
+      if (result.act && shouldFireCeoAlert()) {
+        void (async () => {
+          try {
+            const companyId = await getFirstCompanyId();
+            if (companyId) {
+              await issuesSvc.create(companyId, {
+                title: `[DISK ALERT] Disk usage critical: ${result.diskStats.usedPercent.toFixed(1)}%`,
+                description: `## Disk High-Water-Mark Alert\n\nDisk usage has reached **${result.diskStats.usedPercent.toFixed(1)}%** (≥${result.thresholds.actPercent}% act threshold).\n\n${formatDiskReport(result)}\n\nImmediate actions taken:\n- Non-critical run admission throttled until disk recovers\n- Emergency backup pruning triggered on next backup cycle\n\nManual action may be needed to free disk space.`,
+                status: "todo",
+                priority: "critical",
+                assigneeAgentId: CEO_AGENT_ID,
+              });
+              logger.warn({ usedPercent: result.diskStats.usedPercent }, "disk-monitor: created CEO disk alert issue");
+            }
+          } catch (err) {
+            logger.error({ err }, "disk-monitor: failed to create CEO disk alert issue");
+          }
+        })();
+      }
+    }, DISK_CHECK_INTERVAL_MS);
+
+    setInterval(() => {
+      void (async () => {
+        try {
+          const result = checkDisk(config.databaseBackupDir, config.databaseBackupDir);
+          const freeGb = (result.diskStats.freeBytes / (1024 ** 3)).toFixed(2);
+          const backupMb = (result.backupDirStats.totalSizeBytes / (1024 ** 2)).toFixed(1);
+          logger.info(
+            {
+              diskUsedPercent: result.diskStats.usedPercent.toFixed(1),
+              diskFreeGb: freeGb,
+              backupDirMb: backupMb,
+              backupFileCount: result.backupDirStats.fileCount,
+              childProcessCount: result.childProcessCount,
+            },
+            `Daily health report: ${formatDiskReport(result)}`,
+          );
+          const companyId = await getFirstCompanyId();
+          if (companyId) {
+            const today = new Date().toISOString().slice(0, 10);
+            await issuesSvc.create(companyId, {
+              title: `Daily disk health report — ${today}`,
+              description: `## Daily Health Report\n\n**Date:** ${new Date().toISOString()}\n\n| Metric | Value |\n|---|---|\n| Disk used | ${result.diskStats.usedPercent.toFixed(1)}% |\n| Disk free | ${freeGb} GiB |\n| Backup dir size | ${backupMb} MiB |\n| Backup files | ${result.backupDirStats.fileCount} |\n| Child processes | ${result.childProcessCount} |\n\n${result.warning ? `⚠️ Disk usage above ${result.thresholds.warnPercent}% warn threshold.` : "✅ Disk usage normal."}`,
+              status: "done",
+              priority: "low",
+              assigneeAgentId: CEO_AGENT_ID,
+            });
+          }
+        } catch (err) {
+          logger.error({ err }, "daily health report failed");
+        }
+      })();
+    }, DISK_HEALTH_REPORT_INTERVAL_MS);
+
+    const heartbeat = heartbeatService(db as any, { pluginWorkerManager, isDiskPressureActive });
     const routines = routineService(db as any, { pluginWorkerManager });
   
     // Reap orphaned running runs at startup while in-memory execution state is empty,

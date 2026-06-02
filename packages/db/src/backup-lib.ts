@@ -11,6 +11,10 @@ export type BackupRetentionPolicy = {
   dailyDays: number;
   weeklyWeeks: number;
   monthlyMonths: number;
+  /** Max backups kept in the hourly/short tier; older ones fall into daily-per-day bucketing. Default 48. */
+  hourlyCount?: number;
+  /** Hard footprint cap in bytes; 0 = unlimited. Oldest kept dumps removed first when exceeded. Default 8 GiB. */
+  maxBytes?: number;
 };
 
 export type RunDatabaseBackupOptions = {
@@ -107,22 +111,51 @@ function monthKey(date: Date): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
 }
 
+function dayKey(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KiB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)}MiB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)}GiB`;
+}
+
+const PRUNE_DEFAULT_HOURLY_COUNT = 48;
+const PRUNE_DEFAULT_MAX_BYTES = 8 * 1024 * 1024 * 1024; // 8 GiB
+
 /**
+ * @internal exported for unit testing
  * Tiered backup pruning:
- * - Daily tier: keep ALL backups from the last `dailyDays` days
- * - Weekly tier: keep the NEWEST backup per calendar week for `weeklyWeeks` weeks
- * - Monthly tier: keep the NEWEST backup per calendar month for `monthlyMonths` months
- * - Everything else is deleted
+ * 1. Hourly/short tier: keep the newest `hourlyCount` backups unconditionally (default 48)
+ * 2. Daily tier: for backups within `dailyDays` not in hourly tier, keep newest per calendar day
+ * 3. Weekly tier: keep the NEWEST backup per calendar week for `weeklyWeeks` weeks
+ * 4. Monthly tier: keep the NEWEST backup per calendar month for `monthlyMonths` months
+ * 5. Hard byte cap: if total kept footprint > `maxBytes`, delete oldest kept dumps until under cap
+ * 6. Everything else is deleted
+ *
+ * Under hourly cadence the directory self-bounds to roughly hourlyCount + dailyDays +
+ * weeklyWeeks + monthlyMonths instead of 24×dailyDays.
  */
-function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, filenamePrefix: string): number {
+export function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, filenamePrefix: string): number {
   if (!existsSync(backupDir)) return 0;
+
+  const rawHourlyCount = retention.hourlyCount ?? PRUNE_DEFAULT_HOURLY_COUNT;
+  const rawMaxBytes = retention.maxBytes ?? PRUNE_DEFAULT_MAX_BYTES;
+  // Env overrides win over stored settings
+  const envMaxBytes = process.env.PAPERCLIP_DB_BACKUP_MAX_BYTES ? parseInt(process.env.PAPERCLIP_DB_BACKUP_MAX_BYTES, 10) : NaN;
+  const envHourlyCount = process.env.PAPERCLIP_DB_BACKUP_HOURLY_COUNT ? parseInt(process.env.PAPERCLIP_DB_BACKUP_HOURLY_COUNT, 10) : NaN;
+  const effectiveMaxBytes = !isNaN(envMaxBytes) && envMaxBytes >= 0 ? envMaxBytes : rawMaxBytes;
+  const effectiveHourlyCount = Math.max(1, !isNaN(envHourlyCount) && envHourlyCount > 0 ? envHourlyCount : rawHourlyCount);
 
   const now = Date.now();
   const dailyCutoff = now - Math.max(1, retention.dailyDays) * 24 * 60 * 60 * 1000;
   const weeklyCutoff = now - Math.max(1, retention.weeklyWeeks) * 7 * 24 * 60 * 60 * 1000;
   const monthlyCutoff = now - Math.max(1, retention.monthlyMonths) * 30 * 24 * 60 * 60 * 1000;
 
-  type BackupEntry = { name: string; fullPath: string; mtimeMs: number };
+  type BackupEntry = { name: string; fullPath: string; mtimeMs: number; sizeBytes: number };
   const entries: BackupEntry[] = [];
 
   for (const name of readdirSync(backupDir)) {
@@ -130,48 +163,81 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
     if (!name.endsWith(".sql") && !name.endsWith(".sql.gz")) continue;
     const fullPath = resolve(backupDir, name);
     const stat = statSync(fullPath);
-    entries.push({ name, fullPath, mtimeMs: stat.mtimeMs });
+    entries.push({ name, fullPath, mtimeMs: stat.mtimeMs, sizeBytes: stat.size });
   }
 
-  // Sort newest first so the first entry per week/month bucket is the one we keep
+  // Sort newest first so tier buckets always claim the freshest representative
   entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
-  const keepWeekBuckets = new Set<string>();
-  const keepMonthBuckets = new Set<string>();
-  const toDelete: string[] = [];
+  const kept = new Set<string>();
 
-  for (const entry of entries) {
-    // Daily tier — keep everything within dailyDays
-    if (entry.mtimeMs >= dailyCutoff) continue;
-
-    const date = new Date(entry.mtimeMs);
-    const week = isoWeekKey(date);
-    const month = monthKey(date);
-
-    // Weekly tier — keep newest per calendar week
-    if (entry.mtimeMs >= weeklyCutoff) {
-      if (keepWeekBuckets.has(week)) {
-        toDelete.push(entry.fullPath);
-      } else {
-        keepWeekBuckets.add(week);
-      }
-      continue;
-    }
-
-    // Monthly tier — keep newest per calendar month
-    if (entry.mtimeMs >= monthlyCutoff) {
-      if (keepMonthBuckets.has(month)) {
-        toDelete.push(entry.fullPath);
-      } else {
-        keepMonthBuckets.add(month);
-      }
-      continue;
-    }
-
-    // Beyond all retention tiers — delete
-    toDelete.push(entry.fullPath);
+  // Tier 1: hourly — newest effectiveHourlyCount dumps unconditionally kept
+  for (let i = 0; i < Math.min(effectiveHourlyCount, entries.length); i++) {
+    kept.add(entries[i]!.fullPath);
   }
 
+  // Tier 2: daily — within dailyDays, keep one per calendar day
+  const dayBuckets = new Set<string>();
+  for (const entry of entries) {
+    if (kept.has(entry.fullPath)) continue;
+    if (entry.mtimeMs < dailyCutoff) continue;
+    const key = dayKey(new Date(entry.mtimeMs));
+    if (!dayBuckets.has(key)) {
+      dayBuckets.add(key);
+      kept.add(entry.fullPath);
+    }
+  }
+
+  // Tier 3: weekly — within weeklyWeeks but outside dailyDays, newest per ISO week
+  const weekBuckets = new Set<string>();
+  for (const entry of entries) {
+    if (kept.has(entry.fullPath)) continue;
+    if (entry.mtimeMs >= dailyCutoff) continue;
+    if (entry.mtimeMs < weeklyCutoff) continue;
+    const key = isoWeekKey(new Date(entry.mtimeMs));
+    if (!weekBuckets.has(key)) {
+      weekBuckets.add(key);
+      kept.add(entry.fullPath);
+    }
+  }
+
+  // Tier 4: monthly — within monthlyMonths but outside weeklyWeeks, newest per month
+  const monthBuckets = new Set<string>();
+  for (const entry of entries) {
+    if (kept.has(entry.fullPath)) continue;
+    if (entry.mtimeMs >= weeklyCutoff) continue;
+    if (entry.mtimeMs < monthlyCutoff) continue;
+    const key = monthKey(new Date(entry.mtimeMs));
+    if (!monthBuckets.has(key)) {
+      monthBuckets.add(key);
+      kept.add(entry.fullPath);
+    }
+  }
+
+  // Tier 5: hard byte cap — evict oldest kept until under cap (always keep at least 1)
+  if (effectiveMaxBytes > 0) {
+    const keptEntries = entries.filter((e) => kept.has(e.fullPath)); // newest first
+    let totalBytes = keptEntries.reduce((sum, e) => sum + e.sizeBytes, 0);
+    if (totalBytes > effectiveMaxBytes) {
+      const beforeBytes = totalBytes;
+      const oldestFirst = [...keptEntries].reverse();
+      const evicted: string[] = [];
+      for (const entry of oldestFirst) {
+        if (kept.size <= 1) break;
+        if (totalBytes <= effectiveMaxBytes) break;
+        kept.delete(entry.fullPath);
+        evicted.push(entry.name);
+        totalBytes -= entry.sizeBytes;
+      }
+      if (evicted.length > 0) {
+        console.warn(
+          `[backup] Byte cap enforced: dropped ${evicted.length} dump(s) (before=${formatBytes(beforeBytes)}, after=${formatBytes(totalBytes)}, cap=${formatBytes(effectiveMaxBytes)}): ${evicted.join(", ")}`,
+        );
+      }
+    }
+  }
+
+  const toDelete = entries.filter((e) => !kept.has(e.fullPath)).map((e) => e.fullPath);
   for (const filePath of toDelete) {
     unlinkSync(filePath);
   }

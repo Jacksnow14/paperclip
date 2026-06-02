@@ -2309,6 +2309,8 @@ export type HeartbeatEnvironmentRuntime = ReturnType<typeof environmentRuntimeSe
 export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: HeartbeatEnvironmentRuntime;
+  /** When provided, non-critical run admission is throttled while it returns true. */
+  isDiskPressureActive?: () => boolean;
 }
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
@@ -2316,6 +2318,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
   });
+  const checkDiskPressure = options.isDiskPressureActive ?? (() => false);
 
   const runLogStore = getRunLogStore();
   const secretsSvc = secretService(db);
@@ -6747,9 +6750,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return left.createdAt.getTime() - right.createdAt.getTime();
       });
 
+      const diskPressure = checkDiskPressure();
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       for (const queuedRun of prioritizedRuns) {
         if (claimedRuns.length >= availableSlots) break;
+        // Disk pressure gate: shed non-critical run admission until disk recovers.
+        // Critical-priority issues are always admitted regardless of disk state.
+        if (diskPressure) {
+          const queuedIssueId = readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId);
+          const queuedIssue = queuedIssueId ? issueById.get(queuedIssueId) : null;
+          if (queuedIssue?.priority !== "critical") continue;
+        }
         const claimed = await claimQueuedRun(queuedRun);
         if (claimed) claimedRuns.push(claimed);
       }

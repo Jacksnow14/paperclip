@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import { createBufferedTextFileWriter, pruneOldBackups, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -353,4 +353,182 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
     },
     20_000,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Retention logic unit tests — no real DB required
+// ---------------------------------------------------------------------------
+
+function createBackupFiles(
+  dir: string,
+  prefix: string,
+  timestamps: Array<{ iso: string; sizeBytes?: number }>,
+): void {
+  for (const { iso, sizeBytes = 1024 } of timestamps) {
+    const safe = iso.replace(/[:-]/g, "").replace("T", "-").slice(0, 15);
+    const filename = `${prefix}-${safe}.sql.gz`;
+    const fullPath = path.join(dir, filename);
+    fs.writeFileSync(fullPath, Buffer.alloc(sizeBytes));
+    const mtime = new Date(iso);
+    fs.utimesSync(fullPath, mtime, mtime);
+  }
+}
+
+function listBackupFiles(dir: string, prefix: string): string[] {
+  return fs.readdirSync(dir)
+    .filter((f) => f.startsWith(`${prefix}-`) && f.endsWith(".sql.gz"))
+    .sort();
+}
+
+function keyPart(iso: string): string {
+  return iso.replace(/[:-]/g, "").replace("T", "-").slice(0, 13);
+}
+
+describe("pruneOldBackups — retention logic", () => {
+  it("hourly count cap: 7 days × hourly cadence self-bounds to hourlyCount + daily/weekly/monthly", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-prune-hourly-"));
+    cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+    const now = new Date("2026-01-08T12:00:00Z");
+    const timestamps: Array<{ iso: string }> = [];
+    // 7 days × 24 hours = 168 hourly dumps
+    for (let day = 0; day < 7; day++) {
+      for (let hour = 0; hour < 24; hour++) {
+        const d = new Date(now.getTime() - (day * 24 + hour) * 60 * 60 * 1000);
+        timestamps.push({ iso: d.toISOString() });
+      }
+    }
+    createBackupFiles(dir, "pc", timestamps);
+    expect(listBackupFiles(dir, "pc").length).toBe(168);
+
+    pruneOldBackups(dir, {
+      dailyDays: 7,
+      weeklyWeeks: 2,
+      monthlyMonths: 1,
+      hourlyCount: 48,
+      maxBytes: 0, // no byte cap for this test
+    }, "pc");
+
+    const remaining = listBackupFiles(dir, "pc");
+    // hourlyCount(48) + at most 7 daily + 2 weekly representatives ≈ ≤60
+    expect(remaining.length).toBeLessThan(70);
+    expect(remaining.length).toBeGreaterThan(0);
+    // Newest backup must always survive
+    const newest = timestamps.reduce((a, b) => a.iso > b.iso ? a : b);
+    expect(remaining.some((f) => f.includes(keyPart(newest.iso)))).toBe(true);
+  });
+
+  it("hourly count cap: newest N are always kept, oldest pruned", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-prune-newest-"));
+    cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+    const now = new Date("2026-01-08T10:00:00Z");
+    const timestamps = Array.from({ length: 10 }, (_, i) => ({
+      iso: new Date(now.getTime() - i * 60 * 60 * 1000).toISOString(),
+    }));
+    createBackupFiles(dir, "pc", timestamps);
+
+    pruneOldBackups(dir, {
+      dailyDays: 7,
+      weeklyWeeks: 2,
+      monthlyMonths: 1,
+      hourlyCount: 3,
+      maxBytes: 0,
+    }, "pc");
+
+    const remaining = listBackupFiles(dir, "pc");
+    // 3 hourly + at most 1 per additional day within dailyDays
+    expect(remaining.length).toBeLessThanOrEqual(4);
+    // The 3 newest must survive
+    const sortedDesc = [...timestamps].sort((a, b) => b.iso.localeCompare(a.iso));
+    for (const ts of sortedDesc.slice(0, 3)) {
+      expect(remaining.some((f) => f.includes(keyPart(ts.iso)))).toBe(true);
+    }
+  });
+
+  it("byte cap: removes oldest kept when total exceeds cap", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-prune-bytes-"));
+    cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+    const now = new Date("2026-01-08T12:00:00Z");
+    const MB = 1024 * 1024;
+    // 5 files 1h apart, each 10 MiB → 50 MiB total, cap at 25 MiB → must keep 2
+    const timestamps = Array.from({ length: 5 }, (_, i) => ({
+      iso: new Date(now.getTime() - i * 60 * 60 * 1000).toISOString(),
+      sizeBytes: 10 * MB,
+    }));
+    createBackupFiles(dir, "pc", timestamps);
+
+    pruneOldBackups(dir, {
+      dailyDays: 7,
+      weeklyWeeks: 2,
+      monthlyMonths: 1,
+      hourlyCount: 10,
+      maxBytes: 25 * MB,
+    }, "pc");
+
+    const remaining = listBackupFiles(dir, "pc");
+    expect(remaining.length).toBe(2); // 2×10 MiB = 20 MiB ≤ 25 MiB cap
+    // The 2 newest must survive
+    const sortedDesc = [...timestamps].sort((a, b) => b.iso.localeCompare(a.iso));
+    for (const ts of sortedDesc.slice(0, 2)) {
+      expect(remaining.some((f) => f.includes(keyPart(ts.iso)))).toBe(true);
+    }
+  });
+
+  it("byte cap: always keeps at least 1 backup even if every file exceeds cap", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-prune-mincap-"));
+    cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+    const MB = 1024 * 1024;
+    const timestamps = [
+      { iso: new Date("2026-01-08T12:00:00Z").toISOString(), sizeBytes: 100 * MB },
+      { iso: new Date("2026-01-08T11:00:00Z").toISOString(), sizeBytes: 100 * MB },
+    ];
+    createBackupFiles(dir, "pc", timestamps);
+
+    pruneOldBackups(dir, {
+      dailyDays: 7,
+      weeklyWeeks: 2,
+      monthlyMonths: 1,
+      hourlyCount: 10,
+      maxBytes: 1 * MB, // cap smaller than any single file
+    }, "pc");
+
+    // Must always keep at least 1 (the newest)
+    const remaining = listBackupFiles(dir, "pc");
+    expect(remaining.length).toBe(1);
+    expect(remaining.some((f) => f.includes(keyPart(timestamps[0]!.iso)))).toBe(true);
+  });
+
+  it("tier fall-through: daily → weekly → monthly; nothing survives beyond monthlyMonths", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-prune-tiers-"));
+    cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+    const now = new Date("2026-03-01T12:00:00Z");
+    const timestamps = Array.from({ length: 90 }, (_, day) => ({
+      iso: new Date(now.getTime() - day * 24 * 60 * 60 * 1000).toISOString(),
+    }));
+    createBackupFiles(dir, "pc", timestamps);
+
+    pruneOldBackups(dir, {
+      dailyDays: 7,
+      weeklyWeeks: 4,
+      monthlyMonths: 2,
+      hourlyCount: 2,
+      maxBytes: 0,
+    }, "pc");
+
+    const remaining = listBackupFiles(dir, "pc");
+    // hourly(2) + ~5 daily + ~4 weekly + ~2 monthly ≈ ≤20
+    expect(remaining.length).toBeLessThanOrEqual(20);
+    expect(remaining.length).toBeGreaterThan(0);
+    // Nothing older than monthlyMonths×30 days should survive
+    const cutoffMs = now.getTime() - 2 * 30 * 24 * 60 * 60 * 1000;
+    const tooOld = remaining.filter((f) => {
+      const ts = timestamps.find((t) => f.includes(keyPart(t.iso)));
+      return ts !== undefined && new Date(ts.iso).getTime() < cutoffMs;
+    });
+    expect(tooOld.length).toBe(0);
+  });
 });

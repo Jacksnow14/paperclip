@@ -702,30 +702,49 @@ export async function startServer(): Promise<StartedServer> {
       return rows[0]?.id;
     };
 
-    const artifactRetentionConfig = resolveArtifactRetentionPolicy();
+    // AUR-1735: resolve artifact-retention from instance settings each tick so
+    // operator changes take effect without a server restart. Falls back to the
+    // dormant baseline (CI/dev) or the prod-default activation overlay (prod).
+    const loadArtifactRetentionConfig = async () => {
+      try {
+        const general = await backupSettingsSvc.getGeneral();
+        return resolveArtifactRetentionPolicy(general.artifactRetention, {
+          prodDefaultActivation: config.artifactRetentionProdDefault,
+        });
+      } catch (err) {
+        logger.warn({ err }, "artifact-retention: failed to load instance settings, using dormant baseline");
+        return resolveArtifactRetentionPolicy(undefined, {
+          prodDefaultActivation: config.artifactRetentionProdDefault,
+        });
+      }
+    };
 
     setInterval(() => {
       const result = updateDiskPressure(config.databaseBackupDir, config.databaseBackupDir);
-      // On disk pressure, run artifact-retention as a dry-run pass alongside
-      // backup pruning. Active deletion stays gated on `activeDirs` being
-      // explicitly populated by the operator (AUR-1722 hard safety gate).
-      if (result.act && artifactRetentionConfig.enabled) {
-        try {
-          const artifactReport = runArtifactRetention(artifactRetentionConfig, {
-            dryRun: artifactRetentionConfig.activeDirs.length === 0,
-            diskPressureActive: true,
-          });
-          logger.warn(
-            {
-              reclaimableBytes: artifactReport.totalReclaimableBytes,
-              reclaimedBytes: artifactReport.totalReclaimedBytes,
-              dirs: artifactReport.dirs.length,
-            },
-            `artifact-retention pressure pass:\n${formatArtifactRetentionReport(artifactReport)}`,
-          );
-        } catch (err) {
-          logger.warn({ err }, "artifact-retention: pressure pass failed");
-        }
+      // On disk pressure, run artifact-retention alongside backup pruning.
+      // Active deletion stays gated on `activeDirs` being explicitly populated
+      // by the operator (AUR-1722 hard safety gate).
+      if (result.act) {
+        void (async () => {
+          const artifactRetentionConfig = await loadArtifactRetentionConfig();
+          if (!artifactRetentionConfig.enabled) return;
+          try {
+            const artifactReport = runArtifactRetention(artifactRetentionConfig, {
+              dryRun: artifactRetentionConfig.activeDirs.length === 0,
+              diskPressureActive: true,
+            });
+            logger.warn(
+              {
+                reclaimableBytes: artifactReport.totalReclaimableBytes,
+                reclaimedBytes: artifactReport.totalReclaimedBytes,
+                dirs: artifactReport.dirs.length,
+              },
+              `artifact-retention pressure pass:\n${formatArtifactRetentionReport(artifactReport)}`,
+            );
+          } catch (err) {
+            logger.warn({ err }, "artifact-retention: pressure pass failed");
+          }
+        })();
       }
       if (result.act && shouldFireCeoAlert()) {
         void (async () => {
@@ -764,13 +783,18 @@ export async function startServer(): Promise<StartedServer> {
             },
             `Daily health report: ${formatDiskReport(result)}`,
           );
-          // AUR-1722: per-dir artifact footprint + dry-run reclaimable estimate
+          // AUR-1722 + AUR-1735: per-dir artifact footprint, daily grooming pass.
+          // When the policy is active (enabled + activeDirs non-empty), this is
+          // the daily real-mode prune that keeps disk under 80% without waiting
+          // for the 90% pressure branch. When dormant or in dry-run, the same
+          // call produces the report-only estimate.
           let artifactSection = "";
+          const artifactRetentionConfig = await loadArtifactRetentionConfig();
           if (artifactRetentionConfig.enabled) {
             try {
               const footprints = getArtifactDirFootprints(artifactRetentionConfig.dirs);
-              const dryRunReport = runArtifactRetention(artifactRetentionConfig, {
-                dryRun: true,
+              const groomReport = runArtifactRetention(artifactRetentionConfig, {
+                dryRun: artifactRetentionConfig.activeDirs.length === 0,
                 diskPressureActive: false,
               });
               const fmt = (b: number) =>
@@ -783,9 +807,20 @@ export async function startServer(): Promise<StartedServer> {
                 .filter((fp) => fp.totalEntries > 0)
                 .map((fp) => `| ${fp.path} | ${fp.kind} | ${fmt(fp.totalBytes)} | ${fp.totalEntries} |`)
                 .join("\n");
-              const totalReclaimable = fmt(dryRunReport.totalReclaimableBytes);
+              const totalReclaimable = fmt(groomReport.totalReclaimableBytes);
+              const totalReclaimed = fmt(groomReport.totalReclaimedBytes);
               const totalActive = artifactRetentionConfig.activeDirs.length;
-              artifactSection = `\n\n### Artifact Retention (AUR-1722)\n\n${rows ? `| Path | Kind | Footprint | Entries |\n|---|---|---|---|\n${rows}\n` : "_no in-scope dirs present_\n"}\n**Dry-run reclaimable**: ${totalReclaimable}  ·  **Active dirs**: ${totalActive} (active deletion is gated; ${totalActive === 0 ? "currently dry-run only" : "see config"})`;
+              const modeLabel = totalActive === 0 ? "dry-run only" : "active grooming";
+              artifactSection = `\n\n### Artifact Retention (AUR-1722)\n\n${rows ? `| Path | Kind | Footprint | Entries |\n|---|---|---|---|\n${rows}\n` : "_no in-scope dirs present_\n"}\n**Reclaimable**: ${totalReclaimable}  ·  **Reclaimed today**: ${totalReclaimed}  ·  **Active dirs**: ${totalActive} (${modeLabel})`;
+              logger.warn(
+                {
+                  reclaimableBytes: groomReport.totalReclaimableBytes,
+                  reclaimedBytes: groomReport.totalReclaimedBytes,
+                  dirs: groomReport.dirs.length,
+                  activeDirs: totalActive,
+                },
+                `artifact-retention daily grooming pass:\n${formatArtifactRetentionReport(groomReport)}`,
+              );
             } catch (err) {
               logger.warn({ err }, "daily health report: artifact section failed");
             }

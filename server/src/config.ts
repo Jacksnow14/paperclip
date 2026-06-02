@@ -85,6 +85,7 @@ export interface Config {
   feedbackExportBackendToken: string | undefined;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
+  artifactRetentionProdDefault: boolean;
   companyDeletionEnabled: boolean;
   telemetryEnabled: boolean;
 }
@@ -331,6 +332,10 @@ export function loadConfig(): Config {
     feedbackExportBackendToken,
     heartbeatSchedulerEnabled: process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
+    // AUR-1735: opt-in switch that activates the AUR-1722 artifact-retention
+    // policy when persisted instance settings are still dormant. Set on the
+    // prod (default) deployment; leave unset on CI/dev so they stay dormant.
+    artifactRetentionProdDefault: process.env.PAPERCLIP_ARTIFACT_RETENTION_PROD_DEFAULT === "true",
     companyDeletionEnabled,
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
   };

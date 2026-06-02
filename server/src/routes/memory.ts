@@ -21,8 +21,9 @@ import {
   createMemoryBindingSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
-import { forbidden, notFound } from "../errors.js";
-import { agentService, logActivity, memoryService, projectService } from "../services/index.js";
+import { forbidden, notFound, unprocessable } from "../errors.js";
+import { agentService, issueService, logActivity, memoryService, projectService } from "../services/index.js";
+import { isUuidLike, normalizeIssueIdentifier } from "@paperclipai/shared";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 
 function actorInfoFromReq(req: any) {
@@ -57,6 +58,16 @@ export function memoryRoutes(
   });
   const agentsSvc = agentService(db);
   const projectsSvc = projectService(db);
+  const issuesSvc = issueService(db);
+
+  async function resolveSourceIssueId(companyId: string, issueId: string): Promise<string | null> {
+    if (isUuidLike(issueId)) return issueId;
+    const normalized = normalizeIssueIdentifier(issueId);
+    if (!normalized) return null;
+    const issue = await issuesSvc.getByIdentifier(normalized);
+    if (!issue || issue.companyId !== companyId) return null;
+    return issue.id;
+  }
 
   router.get("/companies/:companyId/memory/providers", async (req, res) => {
     const companyId = req.params.companyId as string;
@@ -226,6 +237,15 @@ export function memoryRoutes(
     if (req.actor.type === "agent" && payload.scope?.agentId && payload.scope.agentId !== req.actor.agentId) {
       throw forbidden("Agent cannot capture memory for another agent scope");
     }
+    if (payload.source?.issueId) {
+      const resolvedId = await resolveSourceIssueId(companyId, payload.source.issueId);
+      if (!resolvedId) {
+        throw unprocessable(
+          `source.issueId '${payload.source.issueId}' could not be resolved to an issue in this company`,
+        );
+      }
+      payload.source = { ...payload.source, issueId: resolvedId };
+    }
     const result = await memory.capture(companyId, payload, actorInfoFromReq(req));
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -347,7 +367,17 @@ export function memoryRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     assertBoard(req);
-    const result = await memory.revoke(companyId, req.body, actorInfoFromReq(req));
+    const payload = req.body;
+    if (payload.selector?.source?.issueId) {
+      const resolvedId = await resolveSourceIssueId(companyId, payload.selector.source.issueId);
+      if (!resolvedId) {
+        throw unprocessable(
+          `selector.source.issueId '${payload.selector.source.issueId}' could not be resolved to an issue in this company`,
+        );
+      }
+      payload.selector = { ...payload.selector, source: { ...payload.selector.source, issueId: resolvedId } };
+    }
+    const result = await memory.revoke(companyId, payload, actorInfoFromReq(req));
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId,

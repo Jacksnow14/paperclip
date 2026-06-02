@@ -60,7 +60,8 @@ export const memoryScopeSchema = z
 export const memorySourceRefSchema = z
   .object({
     kind: z.enum(MEMORY_SOURCE_KINDS),
-    issueId: z.string().uuid().nullable().optional(),
+    // Accepts a UUID or a human identifier like AUR-1234; the server resolves AUR-NNNN to UUID on capture.
+    issueId: z.string().trim().min(1).max(200).nullable().optional(),
     commentId: z.string().uuid().nullable().optional(),
     documentKey: z.string().trim().max(64).nullable().optional(),
     runId: z.string().uuid().nullable().optional(),

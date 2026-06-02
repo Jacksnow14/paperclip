@@ -1012,6 +1012,8 @@ export function memoryService(
   // Revoke by removing a category from this set and running a policy sweep.
   const AUTO_ACCEPT_CATEGORIES = new Set(["performance_scorecard", "tool_gap", "lesson", "routing_rationale", "synthesis", "scorecard_adjusted", "roi_ledger", "capacity_decision", "prompt_improvement_proposal", "experiment", "experiment_conclusion"]);
 
+  const TOOL_GAP_DEDUP_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+
   function resolveReviewState(metadata?: Record<string, unknown>): "pending" | "accepted" {
     const category = metadata?.category;
     if (typeof category === "string" && AUTO_ACCEPT_CATEGORIES.has(category)) {
@@ -1040,11 +1042,36 @@ export function memoryService(
       reviewState?: MemoryRecord["reviewState"];
     },
     operationId: string | null,
-  ) {
+  ): Promise<{ records: MemoryRecord[]; dedup: boolean }> {
     const scopeType = input.scopeType ?? normalizeScopeType(scope);
     const scopeId = input.scopeId ?? normalizeScopeId(binding.companyId, scopeType, scope);
     const createdBy = actorPrincipal(input.actor);
     const owner = normalizePrincipal(input.owner, createdBy);
+
+    // Idempotent dedup for tool_gap captures: same title + owner within window → return existing record
+    if (input.metadata?.category === "tool_gap" && input.title) {
+      const dedupWindowStart = new Date(Date.now() - TOOL_GAP_DEDUP_WINDOW_MS);
+      const existing = await db
+        .select()
+        .from(memoryLocalRecords)
+        .where(
+          and(
+            eq(memoryLocalRecords.companyId, binding.companyId),
+            eq(memoryLocalRecords.title, input.title),
+            eq(memoryLocalRecords.ownerType, owner.type),
+            eq(memoryLocalRecords.ownerId, owner.id),
+            isNull(memoryLocalRecords.revokedAt),
+            isNull(memoryLocalRecords.supersededByRecordId),
+            isNull(memoryLocalRecords.deletedAt),
+            gte(memoryLocalRecords.createdAt, dedupWindowStart),
+          ),
+        )
+        .limit(1);
+      if (existing.length > 0) {
+        return { records: [mapRecord(existing[0])], dedup: true };
+      }
+    }
+
     const [row] = await db
       .insert(memoryLocalRecords)
       .values({
@@ -1086,7 +1113,7 @@ export function memoryService(
       })
       .returning();
 
-    return [mapRecord(row)];
+    return { records: [mapRecord(row)], dedup: false };
   }
 
   async function persistCatalogRecords(
@@ -2387,9 +2414,10 @@ export function memoryService(
       let records: MemoryRecord[];
       let usage: MemoryUsage[] = [];
       let providerResultJson: Record<string, unknown> | null = null;
+      let isDedup = false;
 
       if (binding.providerKey === LOCAL_BASIC_PROVIDER_KEY) {
-        records = await captureLocalBasic(
+        const captureResult = await captureLocalBasic(
           binding,
           data.scope ?? {},
           data.source,
@@ -2410,6 +2438,8 @@ export function memoryService(
           },
           null,
         );
+        records = captureResult.records;
+        isDedup = captureResult.dedup;
       } else {
         if (!pluginMemoryProviders) {
           throw unprocessable(`Unknown memory provider: ${binding.providerKey}`);
@@ -2465,11 +2495,14 @@ export function memoryService(
         resultJson: {
           recordIds: records.map((record) => record.id),
           providerResult: providerResultJson,
+          ...(isDedup && { dedup: true }),
         },
         recordCount: records.length,
         usage,
       });
-      records = await attachCreatedByOperation(companyId, records, operation.id);
+      if (!isDedup) {
+        records = await attachCreatedByOperation(companyId, records, operation.id);
+      }
       return { operation, records } satisfies MemoryCaptureResult;
     },
 

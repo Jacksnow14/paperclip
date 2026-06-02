@@ -67,3 +67,73 @@ Environment variables take precedence over instance settings.
 2. **At least 1 backup always kept** — even if a single file exceeds the byte cap, it is never deleted.
 3. **Critical work keeps running** — the disk pressure gate only sheds non-critical and lower priority run admission; issues with `priority: critical` are always admitted.
 4. **No silent truncation** — the byte cap logs every evicted filename, before/after footprint, and the cap limit.
+
+## Artifact Retention (AUR-1722)
+
+Project work-product trees (run outputs, caches, build artifacts, rotating pools, logs) are retained alongside backups under the same disk guardrail. Implemented in `server/src/services/artifact-retention.ts`.
+
+### Configuration shape
+
+Per-directory rules live under `instanceSettings.general.artifactRetention`:
+
+```jsonc
+{
+  "enabled": false,                       // ships dormant; flip true once paths are approved
+  "excludeAlways": ["~/vps_upload/runs_ready", "~/vps_upload/assets/channels", ...],
+  "activeDirs": [],                       // HARD GATE: empty = dry-run for every dir
+  "dirs": [
+    {
+      "path": "~/vps_upload/runs",
+      "kind": "run_output",
+      "shape": "subdir",
+      "maxAgeDays": 7,
+      "requireFile": "short.mp4"          // only completed runs are candidates
+    },
+    {
+      "path": "~/vps_upload/youtubedownloader/downloads",
+      "kind": "cache",
+      "shape": "file",
+      "maxAgeDays": 14,
+      "requirePairedSiblings": {          // only prune if segments exist in assets/bg
+        "dir": "~/vps_upload/assets/bg",
+        "pattern": "{basename}_seg_*.mp4",
+        "minCount": 1
+      }
+    }
+  ]
+}
+```
+
+The AUR-1722 baseline (encoded in `server/src/services/artifact-retention-config.ts`, sourced from the Content Manager classification on AUR-1726) is used when settings.dirs is empty.
+
+### Selection rules
+
+Per-rule, in order:
+
+1. **Runtime gates** — `requireFile`, `excludeIfFile`, and `requirePairedSiblings` decide *eligibility*. An ineligible entry can never be pruned.
+2. **Age cap** — entries older than `maxAgeDays` (or all entries if `maxAgeDays: 0`).
+3. **Count cap** — keep the newest `maxCount`; older eligible entries are candidates.
+4. **Byte cap** — keep newest under `maxBytes`; oldest eligible candidates drop until under.
+
+Entries are reported newest-first; selection deletes oldest-first.
+
+### Safety gates (HARD requirements per board)
+
+- **Default mode is dry-run**: `runArtifactRetention(config)` with no options reports what it *would* prune; it deletes nothing.
+- **Active deletion requires three conditions ALL true**: `enabled: true`, `dryRun: false`, AND the dir's path is listed in `activeDirs`. A path missing from `activeDirs` stays dry-run even on disk pressure.
+- **`excludeAlways` is the override** — a path listed here is skipped even if listed in both `dirs` and `activeDirs`.
+- **`pressureOnly` rules** only act when `diskPressureActive=true` (≥ act threshold).
+- **Disabled by default** — `enabled: false` short-circuits before scanning. Hosts without these dirs see zero behavior change.
+
+### Integration points
+
+- **Daily health report** includes a per-in-scope-directory footprint table and the total dry-run reclaimable estimate.
+- **Disk pressure (≥ act threshold)** triggers an artifact-retention pass after backup pruning. Active deletion happens only for paths explicitly in `activeDirs`; everything else is logged as "would prune".
+
+### Approval workflow
+
+1. Operator (or board) reviews the daily health report's artifact section.
+2. For paths that look safe to delete, the operator adds them to `instanceSettings.general.artifactRetention.activeDirs` and flips `enabled: true`.
+3. The next pressure pass actively deletes only those approved paths.
+
+This is the gate the AUR-1722 board demanded: *"Wire a request_board_approval (or surface to CTO for sign-off) before flipping any artifact dir to active pruning."*

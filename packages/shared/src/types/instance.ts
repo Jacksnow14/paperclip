@@ -35,11 +35,62 @@ export const DEFAULT_BACKUP_RETENTION: BackupRetentionPolicy = {
   maxBytes: DEFAULT_MAX_BYTES,
 };
 
+/**
+ * Per-directory artifact retention rule (AUR-1722). See
+ * `server/src/services/artifact-retention.ts` for evaluation semantics. The
+ * runtime conditions (`requireFile`, `excludeIfFile`, `requirePairedSiblings`)
+ * encode the Content Manager classification from AUR-1726.
+ */
+export interface ArtifactRetentionDirRule {
+  path: string;
+  kind:
+    | "cache"
+    | "run_output"
+    | "debug"
+    | "rotating_pool"
+    | "log"
+    | "build_artifact"
+    | "deliverable_with_floor";
+  shape: "subdir" | "file";
+  pattern?: string;
+  maxAgeDays?: number;
+  maxCount?: number;
+  maxBytes?: number;
+  pressureOnly?: boolean;
+  requireFile?: string;
+  excludeIfFile?: string;
+  requirePairedSiblings?: {
+    dir: string;
+    pattern: string;
+    minCount: number;
+  };
+}
+
+export interface ArtifactRetentionPolicy {
+  enabled: boolean;
+  dirs: ArtifactRetentionDirRule[];
+  excludeAlways: string[];
+  /**
+   * Board-approval gate: paths NOT in this list are evaluated and reported only,
+   * never deleted. AUR-1722 requires this to remain empty until classification +
+   * dry-run output is reviewed by CTO/board.
+   */
+  activeDirs: string[];
+}
+
+export const DEFAULT_ARTIFACT_RETENTION: ArtifactRetentionPolicy = {
+  enabled: false,
+  dirs: [],
+  excludeAlways: [],
+  activeDirs: [],
+};
+
 export interface InstanceGeneralSettings {
   censorUsernameInLogs: boolean;
   keyboardShortcuts: boolean;
   feedbackDataSharingPreference: FeedbackDataSharingPreference;
   backupRetention: BackupRetentionPolicy;
+  artifactRetention: ArtifactRetentionPolicy;
 }
 
 export interface InstanceExperimentalSettings {

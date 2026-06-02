@@ -436,3 +436,67 @@ test('main: existing open flag for a sign-off gate auto-resolves in Phase A', as
   assert.ok(calls.comments.some(c => /exempt/i.test(c.body.body)), 'cancel comment cites exemption');
   assert.equal(calls.filed.length, 0, 'no new flag filed for the exempt gate');
 });
+
+// ── Memory API 404 hardening (AUR-1718) ───────────────────────────────────────
+
+test('main: Memory API 404 → exit code 3 (BLOCKED), zero mutations', async (t) => {
+  // Scenario: issues endpoint works fine, but /memory/records returns 404
+  // (stale server process, memory routes not mounted). The watchdog must abort
+  // before any mutation and return exit code 3 — not silently exit 0.
+  const openIssues = [
+    {
+      id: 't1', identifier: 'AUR-999', status: 'in_progress', priority: 'high',
+      assigneeAgentId: 'a1', originKind: 'manual', updatedAt: now(),
+      title: 'Important work without routing record', description: '',
+    },
+    {
+      id: 'f1', identifier: 'AUR-998', status: 'todo', priority: 'low',
+      title: 'routing-rationale gap: AUR-997 missing routing/AUR-997 record', description: '',
+    },
+  ];
+
+  const mutations = { patched: [], comments: [], filed: [] };
+  t.mock.method(global, 'fetch', async (url, opts = {}) => {
+    const method = opts.method ?? 'GET';
+    if (method === 'PATCH') {
+      mutations.patched.push(url);
+      return { ok: true, json: async () => ({}) };
+    }
+    if (method === 'POST') {
+      if (url.includes('/comments')) mutations.comments.push(url);
+      else mutations.filed.push(url);
+      return { ok: true, json: async () => ({}) };
+    }
+    if (url.includes('/issues?')) {
+      return { ok: true, json: async () => openIssues };
+    }
+    if (url.includes('/memory/records')) {
+      // Simulate Memory API unavailable
+      return { ok: false, status: 404, statusText: 'Not Found' };
+    }
+    return { ok: true, json: async () => ({}) };
+  });
+
+  const code = await main(runOpts);
+
+  assert.equal(code, 3, 'must return exit code 3 (BLOCKED) when Memory API is 404');
+  assert.equal(mutations.patched.length, 0, 'no PATCH mutations when Memory API is 404');
+  assert.equal(mutations.comments.length, 0, 'no comment mutations when Memory API is 404');
+  assert.equal(mutations.filed.length, 0, 'no new flags filed when Memory API is 404');
+});
+
+test('main: anti-flood cap limits new flags per run and logs deferred', async (t) => {
+  // Build 5 candidate issues, but cap at 2 per run. Expect 2 filed, 3 deferred.
+  const openIssues = Array.from({ length: 5 }, (_, i) => ({
+    id: `t${i}`, identifier: `AUR-${600 + i}`, status: 'in_progress', priority: 'high',
+    assigneeAgentId: 'a1', originKind: 'manual', updatedAt: now(),
+    title: `Work item ${i}`, description: '',
+  }));
+
+  const calls = mockApi(t, openIssues, () => []); // no routing records — all would be flagged
+
+  const code = await main({ ...runOpts, maxNewFlags: 2 });
+
+  assert.equal(calls.filed.length, 2, 'only 2 flags filed (cap reached)');
+  assert.equal(code, 0);
+});

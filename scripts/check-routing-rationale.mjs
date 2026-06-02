@@ -38,6 +38,7 @@
  *   0 — clean (nothing to do, or all actions applied)
  *   1 — dry-run with pending actions (apply to execute)
  *   2 — configuration/API error
+ *   3 — BLOCKED: Memory API unavailable (watchdog cannot run this cycle)
  */
 
 import { parseArgs } from 'node:util';
@@ -128,6 +129,17 @@ function makeApiHelpers(API_URL, headers) {
     return res.json();
   }
 
+  /**
+   * Probe an endpoint for availability. Returns { available: false } on 404
+   * (Memory routes not mounted). Throws for all other non-ok statuses.
+   */
+  async function apiProbe(path) {
+    const res = await fetch(`${API_URL}${path}`, { headers });
+    if (res.status === 404) return { available: false };
+    if (!res.ok) throw new Error(`GET ${path} → ${res.status} ${res.statusText}`);
+    return { available: true };
+  }
+
   async function apiPatch(path, body) {
     const res = await fetch(`${API_URL}${path}`, {
       method: 'PATCH',
@@ -148,7 +160,7 @@ function makeApiHelpers(API_URL, headers) {
     return res.json();
   }
 
-  return { apiGet, apiPatch, apiPost };
+  return { apiGet, apiProbe, apiPatch, apiPost };
 }
 
 // ── Main routine ──────────────────────────────────────────────────────────────
@@ -162,14 +174,14 @@ function makeApiHelpers(API_URL, headers) {
  */
 export const ISSUE_STATUS_FILTER = 'backlog,todo,in_progress,in_review,blocked';
 
-export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId }) {
+export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, maxNewFlags = 20 }) {
   const windowStart = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
 
   const headers = {
     Authorization: `Bearer ${apiKey}`,
     'Content-Type': 'application/json',
   };
-  const { apiGet, apiPatch, apiPost } = makeApiHelpers(apiUrl, headers);
+  const { apiGet, apiProbe, apiPatch, apiPost } = makeApiHelpers(apiUrl, headers);
 
   // The issues LIST endpoint truncates descriptions, which can hide the
   // exemption token. Re-fetch the full issue (cached) only when the
@@ -187,6 +199,20 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId }) 
 
   if (!apply) {
     console.log('[DRY-RUN] No changes will be written. Pass --apply to execute.\n');
+  }
+
+  // ── Memory API availability probe (must pass before any mutation) ──────────
+  // A 404 here means the server process is stale and /memory routes are not
+  // mounted. Abort immediately — proceeding would either crash mid-Phase-A or
+  // silently skip all checks and exit 0 (false "clean"). Exit 3 so the
+  // routine/heartbeat surfaces an honest BLOCKED signal.
+  const memProbe = await apiProbe(`/api/companies/${companyId}/memory/records?limit=1`);
+  if (!memProbe.available) {
+    console.error('BLOCKED: Memory API unavailable — watchdog cannot run.');
+    console.error('  /api/companies/:id/memory/records → 404 Not Found');
+    console.error('  Root cause: stale server process without memory routes mounted.');
+    console.error('  Resolution: operator must rebuild and restart the Paperclip server.');
+    return 3;
   }
 
   // Fetch all open issues once — used by both phases
@@ -337,10 +363,25 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId }) 
     console.log();
   }
 
-  if (toFile.length === 0) {
+  // Anti-flood cap: after a Memory outage, every legitimate gap will be missing
+  // its routing/{id} record, so Phase B could file dozens of flags at once.
+  // Cap new filings per run and log deferred ones so the backlog drains
+  // gradually over subsequent runs rather than flooding the board.
+  const toFileThisRun = toFile.slice(0, maxNewFlags);
+  const deferred = toFile.slice(maxNewFlags);
+
+  if (deferred.length > 0) {
+    console.log(`  DEFERRED — cap reached (max-new-flags=${maxNewFlags}), held back ${deferred.length}:`);
+    for (const issue of deferred) {
+      console.log(`    - ${issue.identifier ?? issue.id}: ${issue.title}`);
+    }
+    console.log(`  Re-run the watchdog to process the remainder.\n`);
+  }
+
+  if (toFileThisRun.length === 0) {
     console.log('  No new flags to file.\n');
   } else {
-    for (const issue of toFile) {
+    for (const issue of toFileThisRun) {
       const id = issue.identifier ?? issue.id;
       const assignee = issue.assigneeAgentId ?? 'unknown';
       const title = `routing-rationale gap: ${id} missing routing/${id} record`;
@@ -372,11 +413,12 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId }) 
   // ── Summary ────────────────────────────────────────────────────────────────
   console.log('── Summary ──');
   console.log(`  Resolved:      ${toCancel.length}`);
-  console.log(`  Filed:         ${toFile.length}`);
+  console.log(`  Filed:         ${toFileThisRun.length}`);
+  console.log(`  Deferred:      ${deferred.length}`);
   console.log(`  Skipped-dedup: ${skippedDedup.length}`);
   console.log(`  Exempt:        ${exemptIssues.length}`);
 
-  const hasPendingActions = toCancel.length > 0 || toFile.length > 0;
+  const hasPendingActions = toCancel.length > 0 || toFileThisRun.length > 0;
   if (!apply && hasPendingActions) {
     console.log('\n[DRY-RUN] Pass --apply to execute the above actions.');
     return 1;
@@ -395,14 +437,16 @@ if (isMain) {
   const { values: args } = parseArgs({
     options: {
       'window-minutes': { type: 'string', default: '60' },
+      'max-new-flags': { type: 'string', default: '20' },
       apply: { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
   });
 
   if (args.help) {
-    console.log('Usage: node scripts/check-routing-rationale.mjs [--window-minutes N] [--apply]');
+    console.log('Usage: node scripts/check-routing-rationale.mjs [--window-minutes N] [--max-new-flags N] [--apply]');
     console.log('  --window-minutes N  Only check issues updated in last N minutes (default: 60)');
+    console.log('  --max-new-flags N   Cap new flags filed per run (default: 20, anti-flood guard)');
     console.log('  --apply             Execute changes (default: dry-run, exit 1 if actions pending)');
     process.exit(0);
   }
@@ -418,6 +462,7 @@ if (isMain) {
 
   main({
     windowMinutes: parseInt(args['window-minutes'], 10),
+    maxNewFlags: parseInt(args['max-new-flags'], 10),
     apply: args.apply,
     apiUrl: API_URL,
     apiKey: API_KEY,

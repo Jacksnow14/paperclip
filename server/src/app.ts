@@ -215,6 +215,12 @@ export async function createApp(
   api.use(inboxDismissalRoutes(db));
   api.use(instanceSettingsRoutes(db));
   api.use(gmailRoutes(db));
+  // Startup capability check — warn loudly so deploy logs surface misconfiguration early.
+  if (!process.env.GOOGLE_WORKSPACE_SA_KEY) {
+    logger.warn("GOOGLE_WORKSPACE_SA_KEY not set — Gmail API capability disabled (routes mounted, calls will return 422)");
+  } else {
+    logger.info("Gmail API capability: routes mounted and GOOGLE_WORKSPACE_SA_KEY present");
+  }
   if (opts.databaseBackupService) {
     api.use(instanceDatabaseBackupRoutes(opts.databaseBackupService));
   }

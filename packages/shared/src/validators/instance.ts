@@ -5,6 +5,7 @@ import {
   WEEKLY_RETENTION_PRESETS,
   MONTHLY_RETENTION_PRESETS,
   DEFAULT_BACKUP_RETENTION,
+  DEFAULT_ARTIFACT_RETENTION,
   DEFAULT_HOURLY_COUNT,
   DEFAULT_MAX_BYTES,
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -28,6 +29,41 @@ export const backupRetentionPolicySchema = z.object({
   maxBytes: z.number().int().min(0).default(DEFAULT_MAX_BYTES),
 });
 
+export const artifactRetentionDirRuleSchema = z.object({
+  path: z.string().min(1),
+  kind: z.enum([
+    "cache",
+    "run_output",
+    "debug",
+    "rotating_pool",
+    "log",
+    "build_artifact",
+    "deliverable_with_floor",
+  ]),
+  shape: z.enum(["subdir", "file"]),
+  pattern: z.string().optional(),
+  maxAgeDays: z.number().int().min(0).optional(),
+  maxCount: z.number().int().min(0).optional(),
+  maxBytes: z.number().int().min(0).optional(),
+  pressureOnly: z.boolean().optional(),
+  requireFile: z.string().optional(),
+  excludeIfFile: z.string().optional(),
+  requirePairedSiblings: z
+    .object({
+      dir: z.string().min(1),
+      pattern: z.string().min(1),
+      minCount: z.number().int().min(1),
+    })
+    .optional(),
+});
+
+export const artifactRetentionPolicySchema = z.object({
+  enabled: z.boolean().default(DEFAULT_ARTIFACT_RETENTION.enabled),
+  dirs: z.array(artifactRetentionDirRuleSchema).default([]),
+  excludeAlways: z.array(z.string().min(1)).default([]),
+  activeDirs: z.array(z.string().min(1)).default([]),
+});
+
 export const instanceGeneralSettingsSchema = z.object({
   censorUsernameInLogs: z.boolean().default(false),
   keyboardShortcuts: z.boolean().default(false),
@@ -35,6 +71,7 @@ export const instanceGeneralSettingsSchema = z.object({
     DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,
   ),
   backupRetention: backupRetentionPolicySchema.default(DEFAULT_BACKUP_RETENTION),
+  artifactRetention: artifactRetentionPolicySchema.default(DEFAULT_ARTIFACT_RETENTION),
 }).strict();
 
 export const patchInstanceGeneralSettingsSchema = instanceGeneralSettingsSchema.partial();

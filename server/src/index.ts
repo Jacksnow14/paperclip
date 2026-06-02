@@ -685,7 +685,12 @@ export async function startServer(): Promise<StartedServer> {
   }
 
   if (config.heartbeatSchedulerEnabled) {
-    const { isDiskPressureActive, updateDiskPressure, shouldFireCeoAlert, checkDisk, formatDiskReport } = await import("./services/disk-monitor.js");
+    const { isDiskPressureActive, updateDiskPressure, shouldFireCeoAlert, checkDisk, formatDiskReport, getArtifactDirFootprints } = await import("./services/disk-monitor.js");
+    const {
+      runArtifactRetention,
+      formatArtifactRetentionReport,
+    } = await import("./services/artifact-retention.js");
+    const { resolveArtifactRetentionPolicy } = await import("./services/artifact-retention-config.js");
 
     const DISK_CHECK_INTERVAL_MS = 60_000;
     const DISK_HEALTH_REPORT_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -697,8 +702,31 @@ export async function startServer(): Promise<StartedServer> {
       return rows[0]?.id;
     };
 
+    const artifactRetentionConfig = resolveArtifactRetentionPolicy();
+
     setInterval(() => {
       const result = updateDiskPressure(config.databaseBackupDir, config.databaseBackupDir);
+      // On disk pressure, run artifact-retention as a dry-run pass alongside
+      // backup pruning. Active deletion stays gated on `activeDirs` being
+      // explicitly populated by the operator (AUR-1722 hard safety gate).
+      if (result.act && artifactRetentionConfig.enabled) {
+        try {
+          const artifactReport = runArtifactRetention(artifactRetentionConfig, {
+            dryRun: artifactRetentionConfig.activeDirs.length === 0,
+            diskPressureActive: true,
+          });
+          logger.warn(
+            {
+              reclaimableBytes: artifactReport.totalReclaimableBytes,
+              reclaimedBytes: artifactReport.totalReclaimedBytes,
+              dirs: artifactReport.dirs.length,
+            },
+            `artifact-retention pressure pass:\n${formatArtifactRetentionReport(artifactReport)}`,
+          );
+        } catch (err) {
+          logger.warn({ err }, "artifact-retention: pressure pass failed");
+        }
+      }
       if (result.act && shouldFireCeoAlert()) {
         void (async () => {
           try {
@@ -736,12 +764,38 @@ export async function startServer(): Promise<StartedServer> {
             },
             `Daily health report: ${formatDiskReport(result)}`,
           );
+          // AUR-1722: per-dir artifact footprint + dry-run reclaimable estimate
+          let artifactSection = "";
+          if (artifactRetentionConfig.enabled) {
+            try {
+              const footprints = getArtifactDirFootprints(artifactRetentionConfig.dirs);
+              const dryRunReport = runArtifactRetention(artifactRetentionConfig, {
+                dryRun: true,
+                diskPressureActive: false,
+              });
+              const fmt = (b: number) =>
+                b < 1024 * 1024
+                  ? `${(b / 1024).toFixed(1)} KiB`
+                  : b < 1024 * 1024 * 1024
+                    ? `${(b / (1024 * 1024)).toFixed(1)} MiB`
+                    : `${(b / (1024 ** 3)).toFixed(2)} GiB`;
+              const rows = footprints
+                .filter((fp) => fp.totalEntries > 0)
+                .map((fp) => `| ${fp.path} | ${fp.kind} | ${fmt(fp.totalBytes)} | ${fp.totalEntries} |`)
+                .join("\n");
+              const totalReclaimable = fmt(dryRunReport.totalReclaimableBytes);
+              const totalActive = artifactRetentionConfig.activeDirs.length;
+              artifactSection = `\n\n### Artifact Retention (AUR-1722)\n\n${rows ? `| Path | Kind | Footprint | Entries |\n|---|---|---|---|\n${rows}\n` : "_no in-scope dirs present_\n"}\n**Dry-run reclaimable**: ${totalReclaimable}  ·  **Active dirs**: ${totalActive} (active deletion is gated; ${totalActive === 0 ? "currently dry-run only" : "see config"})`;
+            } catch (err) {
+              logger.warn({ err }, "daily health report: artifact section failed");
+            }
+          }
           const companyId = await getFirstCompanyId();
           if (companyId) {
             const today = new Date().toISOString().slice(0, 10);
             await issuesSvc.create(companyId, {
               title: `Daily disk health report — ${today}`,
-              description: `## Daily Health Report\n\n**Date:** ${new Date().toISOString()}\n\n| Metric | Value |\n|---|---|\n| Disk used | ${result.diskStats.usedPercent.toFixed(1)}% |\n| Disk free | ${freeGb} GiB |\n| Backup dir size | ${backupMb} MiB |\n| Backup files | ${result.backupDirStats.fileCount} |\n| Child processes | ${result.childProcessCount} |\n\n${result.warning ? `⚠️ Disk usage above ${result.thresholds.warnPercent}% warn threshold.` : "✅ Disk usage normal."}`,
+              description: `## Daily Health Report\n\n**Date:** ${new Date().toISOString()}\n\n| Metric | Value |\n|---|---|\n| Disk used | ${result.diskStats.usedPercent.toFixed(1)}% |\n| Disk free | ${freeGb} GiB |\n| Backup dir size | ${backupMb} MiB |\n| Backup files | ${result.backupDirStats.fileCount} |\n| Child processes | ${result.childProcessCount} |\n\n${result.warning ? `⚠️ Disk usage above ${result.thresholds.warnPercent}% warn threshold.` : "✅ Disk usage normal."}${artifactSection}`,
               status: "done",
               priority: "low",
               assigneeAgentId: CEO_AGENT_ID,

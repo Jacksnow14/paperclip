@@ -1,6 +1,7 @@
 import { statfsSync, readdirSync, statSync, existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { logger } from "../middleware/logger.js";
+import { type ArtifactDirRule, scanArtifactDir } from "./artifact-retention.js";
 
 export interface DiskStats {
   totalBytes: number;
@@ -53,6 +54,32 @@ export function getDiskStats(dir: string): DiskStats {
   const usedBytes = totalBytes - freeBytes;
   const usedPercent = totalBytes > 0 ? (usedBytes / totalBytes) * 100 : 0;
   return { totalBytes, freeBytes, usedBytes, usedPercent };
+}
+
+export interface ArtifactDirFootprint {
+  path: string;
+  kind: string;
+  totalBytes: number;
+  totalEntries: number;
+}
+
+/**
+ * Cheap per-directory footprint for the daily health report. Reuses
+ * `scanArtifactDir` so the report and the retention service see the same
+ * size accounting. Missing dirs report zero footprint.
+ */
+export function getArtifactDirFootprints(rules: ArtifactDirRule[]): ArtifactDirFootprint[] {
+  const out: ArtifactDirFootprint[] = [];
+  for (const rule of rules) {
+    const entries = scanArtifactDir(rule);
+    out.push({
+      path: rule.path,
+      kind: rule.kind,
+      totalBytes: entries.reduce((s, e) => s + e.sizeBytes, 0),
+      totalEntries: entries.length,
+    });
+  }
+  return out;
 }
 
 export function getBackupDirStats(backupDir: string, filenamePrefix = "paperclip"): BackupDirStats {

@@ -2065,10 +2065,56 @@ export async function runChildProcess(
           });
         }
 
+        // Track exit so we drop the registry entry, signal any descendants in
+        // the parent's process group, and detach pipe references as soon as
+        // the kernel reports the parent gone. Without this, the registry was
+        // only cleared on `close`, which can lag indefinitely if stdout/stderr
+        // pipes are kept open by an inherit-stdio descendant — leaving the
+        // ChildProcess pinned in memory and the kernel slot as a zombie.
+        let exitSeen = false;
+        const releaseChildResources = () => {
+          if (exitSeen) return;
+          exitSeen = true;
+          runningProcesses.delete(runId);
+          // The parent has exited. Send SIGTERM to its process group so any
+          // descendants exit too — they would otherwise pin our stdio pipes
+          // open and leak indefinitely. Escalate to SIGKILL after grace,
+          // mirroring the cancellation path's semantics. Safe because the
+          // child is its own group leader (detached: true on POSIX).
+          if (
+            process.platform !== "win32" &&
+            typeof processGroupId === "number" &&
+            processGroupId > 0
+          ) {
+            try {
+              process.kill(-processGroupId, "SIGTERM");
+            } catch {
+              // Group may already be empty — every descendant exited normally.
+            }
+            const killTimer = setTimeout(() => {
+              try {
+                process.kill(-processGroupId, "SIGKILL");
+              } catch {
+                // Group is empty; nothing to escalate.
+              }
+            }, Math.max(1, opts.graceSec) * 1000);
+            if (typeof killTimer.unref === "function") killTimer.unref();
+          }
+          // Forcibly close our ends of the child's stdio pipes. Once the
+          // parent-side pipe FDs are released, libuv can release the pidfd
+          // watcher and the kernel can finish reaping the zombie.
+          try { child.stdout?.destroy(); } catch { /* best effort */ }
+          try { child.stderr?.destroy(); } catch { /* best effort */ }
+          try { child.stdin?.destroy(); } catch { /* best effort */ }
+          // Release the libuv reference so this child no longer keeps the
+          // event loop alive once its registry entry is gone.
+          try { child.unref(); } catch { /* best effort */ }
+        };
+
         child.on("error", (err: Error) => {
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
-          runningProcesses.delete(runId);
+          releaseChildResources();
           void target.cleanup?.();
           const errno = (err as NodeJS.ErrnoException).code;
           const pathValue = mergedEnv.PATH ?? mergedEnv.Path ?? "";
@@ -2081,12 +2127,13 @@ export async function runChildProcess(
 
         child.on("exit", () => {
           maybeArmTerminalResultCleanup();
+          releaseChildResources();
         });
 
         child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
-          runningProcesses.delete(runId);
+          releaseChildResources();
           void logChain.finally(() => {
             void Promise.resolve()
               .then(() => target.cleanup?.())

@@ -668,7 +668,21 @@ export async function startServer(): Promise<StartedServer> {
     .catch((err) => {
       logger.error({ err }, "startup reconciliation of persisted runtime services failed");
     });
-  
+
+  // Backstop sweep for leaked child-process registry entries / kernel zombies
+  // (AUR-1714). Kept independent of heartbeatSchedulerEnabled so any server
+  // that spawns adapter children benefits, including instances that delegate
+  // scheduling elsewhere.
+  {
+    const { startProcessReaper } = await import("@paperclipai/adapter-utils/process-reaper");
+    startProcessReaper({
+      intervalMs: 60_000,
+      logger: {
+        warn: (obj, msg) => logger.warn(obj, msg),
+      },
+    });
+  }
+
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
     const routines = routineService(db as any, { pluginWorkerManager });

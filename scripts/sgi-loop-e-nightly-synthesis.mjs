@@ -83,12 +83,12 @@ async function captureSynthesis(title, body, metadata) {
     method: 'POST',
     body: JSON.stringify({
       title,
-      body,
-      kind: 'synthesis',
-      agentId: AGENT_ID || undefined,
-      issueId: undefined, // memory_records.issue_id expects a uuid; TASK_ID is one but keep the record project-agnostic
-      runId: RUN_ID || undefined,
+      content: body,
       metadata,
+      // Memory API requires `content` (string) + nested `source` object with a `kind` enum
+      // ('issue_comment'|'issue_document'|'issue'|'run'|'activity'|'manual_note'|'external_document').
+      // Org-scoped (no projectId) so the record stays project-agnostic.
+      source: { kind: 'issue', issueId: TASK_ID },
     }),
   });
 }

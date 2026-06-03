@@ -1,6 +1,8 @@
 import { Router } from "express";
 import { z } from "zod";
+import { eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { gmailIntakeRecords } from "@paperclipai/db";
 import { validate } from "../middleware/validate.js";
 import { assertCompanyAccess } from "./authz.js";
 import { badRequest, unprocessable } from "../errors.js";
@@ -195,6 +197,85 @@ export function gmailRoutes(db: Db) {
       assertGmailAvailable();
       const results = await intake.pollAllMailboxes(companyId);
       res.json({ results });
+    },
+  );
+
+  // Board-facing mail conversation dashboard — aggregates inbound threads.
+  router.get(
+    "/companies/:companyId/mail/conversations",
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertCompanyAccess(req, companyId);
+
+      const q = req.query as Record<string, unknown>;
+      const mailboxFilter = typeof q.mailbox === "string" ? q.mailbox : undefined;
+      const ownerFilter = typeof q.owner === "string" ? q.owner : undefined;
+      const statusFilter = typeof q.status === "string" ? q.status : undefined;
+
+      const records = await db
+        .select()
+        .from(gmailIntakeRecords)
+        .where(eq(gmailIntakeRecords.companyId, companyId));
+
+      // Group by mailbox+threadId, keeping the most recent inbound message per thread.
+      const threadMap = new Map<string, typeof records[0]>();
+      for (const r of records) {
+        const key = `${r.mailbox}:${r.gmailThreadId}`;
+        const existing = threadMap.get(key);
+        if (
+          !existing ||
+          (r.receivedAt &&
+            (!existing.receivedAt || r.receivedAt > existing.receivedAt))
+        ) {
+          threadMap.set(key, r);
+        }
+      }
+
+      type ConversationStatus = "needs-pickup" | "awaiting-reply" | "replied";
+      const conversations = Array.from(threadMap.values()).map((r) => ({
+        mailbox: `${r.mailbox}@tryauranode.com`,
+        threadId: r.gmailThreadId,
+        contact: r.sender ?? null,
+        owner: r.mailbox,
+        campaign: null as string | null,
+        lastOutbound: null as { subject: string | null; sentAt: string | null } | null,
+        lastInbound: {
+          subject: r.subject ?? null,
+          sender: r.sender ?? null,
+          receivedAt: r.receivedAt?.toISOString() ?? null,
+        },
+        whoReplied: null as string | null,
+        responseStatus: "needs-pickup" as ConversationStatus,
+      }));
+
+      const STATUS_ORDER: Record<ConversationStatus, number> = {
+        "needs-pickup": 0,
+        "awaiting-reply": 1,
+        replied: 2,
+      };
+
+      let filtered = conversations;
+      if (mailboxFilter) {
+        filtered = filtered.filter(
+          (c) => c.mailbox === mailboxFilter || c.mailbox.startsWith(`${mailboxFilter}@`),
+        );
+      }
+      if (ownerFilter) {
+        filtered = filtered.filter((c) => c.owner === ownerFilter);
+      }
+      if (statusFilter) {
+        filtered = filtered.filter((c) => c.responseStatus === statusFilter);
+      }
+
+      filtered.sort((a, b) => {
+        const od = STATUS_ORDER[a.responseStatus] - STATUS_ORDER[b.responseStatus];
+        if (od !== 0) return od;
+        const at = a.lastInbound?.receivedAt ?? a.lastOutbound?.sentAt ?? "";
+        const bt = b.lastInbound?.receivedAt ?? b.lastOutbound?.sentAt ?? "";
+        return bt < at ? -1 : bt > at ? 1 : 0;
+      });
+
+      res.json({ conversations: filtered });
     },
   );
 

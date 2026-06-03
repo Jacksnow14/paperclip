@@ -243,7 +243,7 @@ export function createGmailIntakeService(db: Db) {
           // (`todo`) so the assignee picks it up rather than letting it sit in
           // `backlog`.
           const assigneeAgentId = await resolveAssigneeAgentId(db, companyId, mailbox);
-          const issueTitle = buildIssueTitle(mailbox, parsed.subject);
+          const issueTitle = buildIssueTitle(mailbox, parsed.subject, parsed.from);
           const issueDescription = buildIssueDescription(mailbox, parsed);
 
           const issue = await isvc.create(companyId, {
@@ -332,8 +332,16 @@ export type GmailIntakeService = ReturnType<typeof createGmailIntakeService>;
 
 // --- Formatting helpers ---
 
-function buildIssueTitle(mailbox: GmailAlias, subject: string): string {
-  return `[${mailbox}@tryauranode.com] ${subject}`.slice(0, 255);
+function extractSenderLabel(from: string): string {
+  // "Display Name <email@example.com>" → "Display Name"
+  const match = from.match(/^([^<]+?)\s*<[^>]+>/);
+  if (match?.[1]) return match[1].trim().slice(0, 60);
+  return from.trim().slice(0, 60);
+}
+
+function buildIssueTitle(mailbox: GmailAlias, subject: string, from: string): string {
+  const senderLabel = extractSenderLabel(from);
+  return `[${mailbox}@] ${senderLabel} — ${subject}`.slice(0, 255);
 }
 
 function buildIssueDescription(mailbox: GmailAlias, parsed: ParsedMessage): string {

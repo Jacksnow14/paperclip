@@ -853,6 +853,28 @@ export async function startServer(): Promise<StartedServer> {
       onError: (err) => logger.error({ err }, "daily health scheduler: unhandled error"),
     }).start();
 
+    // AUR-1747: Gmail intake poller — automatically triage inbound emails on a
+    // schedule so they become findable issues without manual API calls.
+    if (config.gmailIntakePollerEnabled) {
+      if (!process.env.GOOGLE_WORKSPACE_SA_KEY) {
+        logger.info("Gmail intake poller: GOOGLE_WORKSPACE_SA_KEY not set — poller disabled (no-op)");
+      } else {
+        const { createGmailIntakeService } = await import("./services/gmail-intake.js");
+        const { createGmailIntakeScheduler } = await import("./services/gmail-intake-scheduler.js");
+        const intakeSvc = createGmailIntakeService(db as any);
+        createGmailIntakeScheduler({
+          getCompanyId: getFirstCompanyId,
+          intakeService: intakeSvc,
+          startupDelayMs: 60_000,
+          intervalMs: config.gmailIntakePollerIntervalMs,
+        }).start();
+        logger.info(
+          { intervalMs: config.gmailIntakePollerIntervalMs },
+          "Gmail intake poller: scheduled",
+        );
+      }
+    }
+
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager, isDiskPressureActive });
     const routines = routineService(db as any, { pluginWorkerManager });
   

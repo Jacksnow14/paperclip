@@ -120,7 +120,7 @@ describe("createGmailIntakeService.processMailbox", () => {
     const createCall = mockIssueCreate.mock.calls[0];
     expect(createCall[0]).toBe(COMPANY_ID);
     expect(createCall[1]).toMatchObject({
-      title: expect.stringContaining("[board@tryauranode.com]"),
+      title: expect.stringContaining("[board@]"),
       // Routed inbound issues must land in an actionable status, not backlog,
       // so the assignee actually picks them up.
       status: "todo",
@@ -295,7 +295,7 @@ describe("createGmailIntakeService.processMailbox", () => {
     const createCall = mockIssueCreate.mock.calls[0];
     const title = createCall[1].title as string;
     expect(title).not.toMatch(/[\r\n\0]/);
-    expect(title).toContain("[board@tryauranode.com]");
+    expect(title).toContain("[board@]");
   });
 
   it("sanitizes sender and subject stored in the DB insert at parse time", async () => {
@@ -356,6 +356,53 @@ describe("createGmailIntakeService.pollAllMailboxes", () => {
     expect(boardResult?.errors).toBe(1);
     const alexResult = results.find((r) => r.mailbox === "alex");
     expect(alexResult?.errors).toBe(0);
+  });
+});
+
+describe("buildIssueTitle — sender in title", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("includes display-name sender when From has 'Name <email>' format", async () => {
+    const msg = makeMessage("msg-sender1", "thread-s1", "Confirm your business email");
+    msg.payload.headers[0].value = "Facebook Business Manager <noreply@facebookmail.com>";
+    mockListMessages.mockResolvedValue({ messages: [{ id: "msg-sender1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([]);
+    mockCreateLabel.mockResolvedValue({ id: "lbl-x" });
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-s1" });
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    await svc.processMailbox(COMPANY_ID, "board");
+
+    const title = mockIssueCreate.mock.calls[0][1].title as string;
+    expect(title).toContain("[board@]");
+    expect(title).toContain("Facebook Business Manager");
+    expect(title).toContain("Confirm your business email");
+    expect(title).toMatch(/\[board@\] Facebook Business Manager — Confirm your business email/);
+  });
+
+  it("uses bare email address in title when From has no display name", async () => {
+    const msg = makeMessage("msg-sender2", "thread-s2", "Hello");
+    msg.payload.headers[0].value = "bare@example.com";
+    mockListMessages.mockResolvedValue({ messages: [{ id: "msg-sender2" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([]);
+    mockCreateLabel.mockResolvedValue({ id: "lbl-x" });
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-s2" });
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    await svc.processMailbox(COMPANY_ID, "board");
+
+    const title = mockIssueCreate.mock.calls[0][1].title as string;
+    expect(title).toContain("[board@]");
+    expect(title).toContain("bare@example.com");
+    expect(title).toContain("Hello");
   });
 });
 

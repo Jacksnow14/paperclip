@@ -217,9 +217,13 @@ export async function createApp(
   api.use(gmailRoutes(db));
   // Startup capability check — warn loudly so deploy logs surface misconfiguration early.
   if (!process.env.GOOGLE_WORKSPACE_SA_KEY) {
-    logger.warn("GOOGLE_WORKSPACE_SA_KEY not set — Gmail API capability disabled (routes mounted, calls will return 422)");
+    logger.warn("GOOGLE_WORKSPACE_SA_KEY not set — Gmail API capability disabled (routes mounted, calls will return 422); intake poller will not start");
   } else {
-    logger.info("Gmail API capability: routes mounted and GOOGLE_WORKSPACE_SA_KEY present");
+    const intakePollerEnabled = process.env.GMAIL_INTAKE_POLLER_ENABLED !== "false";
+    logger.info(
+      { gmailIntakePoller: intakePollerEnabled ? "will be scheduled" : "disabled" },
+      `Gmail API capability: routes mounted; intake poller ${intakePollerEnabled ? "will be scheduled" : "disabled (GMAIL_INTAKE_POLLER_ENABLED=false)"}`,
+    );
   }
   if (opts.databaseBackupService) {
     api.use(instanceDatabaseBackupRoutes(opts.databaseBackupService));

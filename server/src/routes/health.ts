@@ -143,6 +143,9 @@ export function healthRoutes(
       },
       capabilities: {
         gmail: !!process.env.GOOGLE_WORKSPACE_SA_KEY,
+        gmailIntakePoller:
+          !!process.env.GOOGLE_WORKSPACE_SA_KEY &&
+          process.env.GMAIL_INTAKE_POLLER_ENABLED !== "false",
       },
       ...(devServer ? { devServer } : {}),
     });

@@ -86,6 +86,7 @@ function buildTestConfig(overrides: Record<string, unknown> = {}) {
     feedbackExportBackendToken: "telemetry-token",
     heartbeatSchedulerEnabled: false,
     heartbeatSchedulerIntervalMs: 30000,
+    artifactRetentionProdDefault: false,
     companyDeletionEnabled: false,
     ...overrides,
   };

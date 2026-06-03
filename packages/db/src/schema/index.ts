@@ -76,3 +76,11 @@ export { pluginDatabaseNamespaces, pluginMigrations } from "./plugin_database.js
 export { pluginJobs, pluginJobRuns } from "./plugin_jobs.js";
 export { pluginWebhookDeliveries } from "./plugin_webhooks.js";
 export { pluginLogs } from "./plugin_logs.js";
+export { memoryRecords } from "./memory_records.js";
+export { backgroundJobs, backgroundJobRuns, backgroundJobEvents, backgroundJobCostEvents } from "./background_jobs.js";
+export { memoryBindings } from "./memory_bindings.js";
+export { memoryBindingTargets } from "./memory_binding_targets.js";
+export { memoryLocalRecords } from "./memory_local_records.js";
+export { memoryOperations } from "./memory_operations.js";
+export { memoryExtractionJobs } from "./memory_extraction_jobs.js";
+export { gmailIntakeRecords } from "./gmail_intake_records.js";

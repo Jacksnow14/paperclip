@@ -24,6 +24,7 @@ import { approvalRoutes } from "./routes/approvals.js";
 import { secretRoutes } from "./routes/secrets.js";
 import { costRoutes } from "./routes/costs.js";
 import { activityRoutes } from "./routes/activity.js";
+import { memoryRoutes } from "./routes/memory.js";
 import { dashboardRoutes } from "./routes/dashboard.js";
 import { userProfileRoutes } from "./routes/user-profiles.js";
 import { sidebarBadgeRoutes } from "./routes/sidebar-badges.js";
@@ -40,6 +41,7 @@ import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import { adapterRoutes } from "./routes/adapters.js";
+import { gmailRoutes } from "./routes/gmail.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { applyUiBranding } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
@@ -205,12 +207,24 @@ export async function createApp(
   api.use(secretRoutes(db));
   api.use(costRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(activityRoutes(db));
+  api.use(memoryRoutes(db));
   api.use(dashboardRoutes(db));
   api.use(userProfileRoutes(db));
   api.use(sidebarBadgeRoutes(db));
   api.use(sidebarPreferenceRoutes(db));
   api.use(inboxDismissalRoutes(db));
   api.use(instanceSettingsRoutes(db));
+  api.use(gmailRoutes(db));
+  // Startup capability check — warn loudly so deploy logs surface misconfiguration early.
+  if (!process.env.GOOGLE_WORKSPACE_SA_KEY) {
+    logger.warn("GOOGLE_WORKSPACE_SA_KEY not set — Gmail API capability disabled (routes mounted, calls will return 422); intake poller will not start");
+  } else {
+    const intakePollerEnabled = process.env.GMAIL_INTAKE_POLLER_ENABLED !== "false";
+    logger.info(
+      { gmailIntakePoller: intakePollerEnabled ? "will be scheduled" : "disabled" },
+      `Gmail API capability: routes mounted; intake poller ${intakePollerEnabled ? "will be scheduled" : "disabled (GMAIL_INTAKE_POLLER_ENABLED=false)"}`,
+    );
+  }
   if (opts.databaseBackupService) {
     api.use(instanceDatabaseBackupRoutes(opts.databaseBackupService));
   }

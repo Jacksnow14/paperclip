@@ -2,7 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { gmailIntakeRecords } from "@paperclipai/db";
+import { gmailIntakeRecords, gmailOutboundRecords } from "@paperclipai/db";
 import { validate } from "../middleware/validate.js";
 import { assertCompanyAccess } from "./authz.js";
 import { badRequest, unprocessable } from "../errors.js";
@@ -200,7 +200,7 @@ export function gmailRoutes(db: Db) {
     },
   );
 
-  // Board-facing mail conversation dashboard — aggregates inbound threads.
+  // Board-facing mail conversation dashboard — aggregates inbound + outbound threads.
   router.get(
     "/companies/:companyId/mail/conversations",
     async (req, res) => {
@@ -212,41 +212,76 @@ export function gmailRoutes(db: Db) {
       const ownerFilter = typeof q.owner === "string" ? q.owner : undefined;
       const statusFilter = typeof q.status === "string" ? q.status : undefined;
 
-      const records = await db
-        .select()
-        .from(gmailIntakeRecords)
-        .where(eq(gmailIntakeRecords.companyId, companyId));
+      const [inboundRecords, outboundRecords] = await Promise.all([
+        db.select().from(gmailIntakeRecords).where(eq(gmailIntakeRecords.companyId, companyId)),
+        db.select().from(gmailOutboundRecords).where(eq(gmailOutboundRecords.companyId, companyId)),
+      ]);
 
-      // Group by mailbox+threadId, keeping the most recent inbound message per thread.
-      const threadMap = new Map<string, typeof records[0]>();
-      for (const r of records) {
+      // Index latest inbound per thread.
+      type InboundRecord = typeof inboundRecords[0];
+      const latestInbound = new Map<string, InboundRecord>();
+      for (const r of inboundRecords) {
         const key = `${r.mailbox}:${r.gmailThreadId}`;
-        const existing = threadMap.get(key);
-        if (
-          !existing ||
-          (r.receivedAt &&
-            (!existing.receivedAt || r.receivedAt > existing.receivedAt))
-        ) {
-          threadMap.set(key, r);
+        const existing = latestInbound.get(key);
+        if (!existing || (r.receivedAt && (!existing.receivedAt || r.receivedAt > existing.receivedAt))) {
+          latestInbound.set(key, r);
         }
       }
 
+      // Index latest outbound per thread.
+      type OutboundRecord = typeof outboundRecords[0];
+      const latestOutbound = new Map<string, OutboundRecord>();
+      for (const r of outboundRecords) {
+        const key = `${r.mailbox}:${r.gmailThreadId}`;
+        const existing = latestOutbound.get(key);
+        if (!existing || (r.sentAt && (!existing.sentAt || r.sentAt > existing.sentAt))) {
+          latestOutbound.set(key, r);
+        }
+      }
+
+      // Collect all thread keys (union of inbound + outbound).
+      const allKeys = new Set([...latestInbound.keys(), ...latestOutbound.keys()]);
+
       type ConversationStatus = "needs-pickup" | "awaiting-reply" | "replied";
-      const conversations = Array.from(threadMap.values()).map((r) => ({
-        mailbox: `${r.mailbox}@tryauranode.com`,
-        threadId: r.gmailThreadId,
-        contact: r.sender ?? null,
-        owner: r.mailbox,
-        campaign: null as string | null,
-        lastOutbound: null as { subject: string | null; sentAt: string | null } | null,
-        lastInbound: {
-          subject: r.subject ?? null,
-          sender: r.sender ?? null,
-          receivedAt: r.receivedAt?.toISOString() ?? null,
-        },
-        whoReplied: null as string | null,
-        responseStatus: "needs-pickup" as ConversationStatus,
-      }));
+
+      function computeStatus(
+        inbound: InboundRecord | undefined,
+        outbound: OutboundRecord | undefined,
+      ): ConversationStatus {
+        if (!outbound) return "needs-pickup";
+        if (!inbound) return "awaiting-reply";
+        const inboundTime = inbound.receivedAt?.getTime() ?? 0;
+        const outboundTime = outbound.sentAt?.getTime() ?? 0;
+        if (outboundTime >= inboundTime) return "awaiting-reply";
+        return "replied";
+      }
+
+      const conversations = Array.from(allKeys).map((key) => {
+        const inbound = latestInbound.get(key);
+        const outbound = latestOutbound.get(key);
+        const mailboxAlias = (inbound ?? outbound)!.mailbox;
+        const threadId = (inbound ?? outbound)!.gmailThreadId;
+        const status = computeStatus(inbound, outbound);
+        return {
+          mailbox: `${mailboxAlias}@tryauranode.com`,
+          threadId,
+          contact: inbound?.sender ?? outbound?.recipient ?? null,
+          owner: mailboxAlias,
+          campaign: null as string | null,
+          lastOutbound: outbound
+            ? { subject: outbound.subject ?? null, sentAt: outbound.sentAt?.toISOString() ?? null }
+            : null,
+          lastInbound: inbound
+            ? {
+                subject: inbound.subject ?? null,
+                sender: inbound.sender ?? null,
+                receivedAt: inbound.receivedAt?.toISOString() ?? null,
+              }
+            : null,
+          whoReplied: outbound ? mailboxAlias : null,
+          responseStatus: status,
+        };
+      });
 
       const STATUS_ORDER: Record<ConversationStatus, number> = {
         "needs-pickup": 0,

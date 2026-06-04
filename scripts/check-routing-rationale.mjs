@@ -125,6 +125,37 @@ export function resolveCancelReason({ target, targetId, hasRecord }) {
   return null;
 }
 
+/**
+ * The CEO routes virtually all high/critical work, so it is the correct default
+ * owner for a routing-rationale gap when the target issue does not name an
+ * assigning agent.
+ */
+export const CEO_AGENT_ID = '3823a155-b4d4-4b06-b7d3-b3a55c6cbc1b';
+
+/**
+ * Resolve the agent that owes the routing/{id} rationale for a gap, i.e. the
+ * manager/router that assigned the underlying issue. Gap issues filed without
+ * an assignee become orphans that no agent ever picks up (AUR-1817/AUR-1818),
+ * so this MUST always return a non-null agentId.
+ *
+ * Preference order:
+ *   1. The target issue's creator (`createdByAgentId`) — the agent that filed
+ *      and routed it, hence owes its rationale.
+ *   2. The CEO — high/critical routing is almost always CEO-routed, and the
+ *      board fallback guarantees no orphan even when the creator is a user or
+ *      unknown.
+ *
+ * @param {{ createdByAgentId?: string|null, assigneeAgentId?: string|null }} issue
+ * @returns {{ agentId: string, source: string }}
+ */
+export function resolveGapOwner(issue) {
+  const creator = issue?.createdByAgentId;
+  if (typeof creator === 'string' && creator.length > 0) {
+    return { agentId: creator, source: 'target.createdByAgentId' };
+  }
+  return { agentId: CEO_AGENT_ID, source: 'fallback:CEO' };
+}
+
 // ── API helpers ───────────────────────────────────────────────────────────────
 
 function makeApiHelpers(API_URL, headers) {
@@ -401,15 +432,26 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
         ``,
         `exec.preflight: skip`,
       ].join('\n');
-      console.log(`  FILE: "${title}"`);
+      // Resolve a non-null owner so the gap issue is never orphaned
+      // (AUR-1817/AUR-1818). The owner is the router that owes the rationale —
+      // the target's creator, or the CEO as the high/critical-routing default.
+      const owner = resolveGapOwner(issue);
+      console.log(`  FILE: "${title}" → owner ${owner.agentId} (${owner.source})`);
       if (apply) {
         // File in `todo`, not the server default `backlog`: these flags are
         // actionable (a manager must add the routing record) and should be
         // visible in the working set by default. The filter above also covers
         // `backlog` defensively so pre-existing/manually-moved flags still
         // auto-resolve and dedup. See AUR-1581.
-        await apiPost(`/api/companies/${companyId}/issues`, { title, description, status: 'todo' });
-        console.log(`    → filed.`);
+        // assigneeAgentId is mandatory: an unassigned flag is an orphan the
+        // daily sweeper has to re-catch forever (AUR-1818).
+        await apiPost(`/api/companies/${companyId}/issues`, {
+          title,
+          description,
+          status: 'todo',
+          assigneeAgentId: owner.agentId,
+        });
+        console.log(`    → filed (assignee ${owner.agentId}).`);
       }
     }
     console.log();

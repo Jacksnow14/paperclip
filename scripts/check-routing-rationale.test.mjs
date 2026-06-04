@@ -5,6 +5,8 @@ import {
   FLAG_REGEX,
   isExempt,
   resolveCancelReason,
+  resolveGapOwner,
+  CEO_AGENT_ID,
   LIST_DESC_TRUNCATION,
   mayBeTruncated,
   ISSUE_STATUS_FILTER,
@@ -210,6 +212,29 @@ test('resolveCancelReason: valid open target without record → keep flag (null)
   assert.equal(reason, null);
 });
 
+// ── resolveGapOwner (AUR-1818: gap issues must never be orphaned) ─────────────
+
+test('resolveGapOwner: prefers the target issue creator (the router)', () => {
+  const owner = resolveGapOwner({ createdByAgentId: 'agent-router-9', assigneeAgentId: 'agent-1' });
+  assert.equal(owner.agentId, 'agent-router-9');
+  assert.equal(owner.source, 'target.createdByAgentId');
+});
+
+test('resolveGapOwner: falls back to CEO when creator is missing/null', () => {
+  assert.equal(resolveGapOwner({ createdByAgentId: null }).agentId, CEO_AGENT_ID);
+  assert.equal(resolveGapOwner({}).agentId, CEO_AGENT_ID);
+  assert.equal(resolveGapOwner({ createdByAgentId: '' }).agentId, CEO_AGENT_ID);
+  assert.equal(resolveGapOwner(undefined).source, 'fallback:CEO');
+});
+
+test('resolveGapOwner: never returns a null/empty assignee', () => {
+  for (const issue of [{}, { createdByAgentId: null }, { createdByAgentId: 'a' }, undefined]) {
+    const owner = resolveGapOwner(issue);
+    assert.ok(typeof owner.agentId === 'string' && owner.agentId.length > 0,
+      'owner.agentId must always be a non-empty string — no orphans');
+  }
+});
+
 // ── Dedup integration scenario (mocked fetch) ─────────────────────────────────
 
 test('dedup: skips filing flag when open flag already exists for target', async (t) => {
@@ -373,7 +398,7 @@ test('new flags are filed in todo, not the server-default backlog', async (t) =>
   const openIssues = [
     {
       id: 't500', identifier: 'AUR-500', status: 'in_progress', priority: 'high',
-      assigneeAgentId: 'a1', originKind: 'manual', updatedAt: now(),
+      assigneeAgentId: 'a1', createdByAgentId: 'router-77', originKind: 'manual', updatedAt: now(),
       title: 'Needs routing rationale', description: '',
     },
   ];
@@ -383,6 +408,41 @@ test('new flags are filed in todo, not the server-default backlog', async (t) =>
 
   assert.equal(calls.filed.length, 1, 'one new flag filed');
   assert.equal(calls.filed[0].body.status, 'todo', 'filed in todo so it is actionable + visible');
+});
+
+test('AUR-1818: filed gap issue carries a non-null assignee resolved from the router', async (t) => {
+  const openIssues = [
+    {
+      id: 't501', identifier: 'AUR-501', status: 'in_progress', priority: 'critical',
+      assigneeAgentId: 'worker-1', createdByAgentId: 'router-77', originKind: 'manual', updatedAt: now(),
+      title: 'Critical work missing rationale', description: '',
+    },
+  ];
+  const calls = mockApi(t, openIssues, () => []);
+
+  await main(runOpts);
+
+  assert.equal(calls.filed.length, 1, 'one new flag filed');
+  assert.equal(calls.filed[0].body.assigneeAgentId, 'router-77',
+    'gap issue must be assigned to the router (target creator), never orphaned');
+});
+
+test('AUR-1818: filed gap issue falls back to CEO when target has no creator agent', async (t) => {
+  const openIssues = [
+    {
+      id: 't502', identifier: 'AUR-502', status: 'in_progress', priority: 'high',
+      assigneeAgentId: 'worker-2', createdByAgentId: null, originKind: 'manual', updatedAt: now(),
+      title: 'High work missing rationale, user-created', description: '',
+    },
+  ];
+  const calls = mockApi(t, openIssues, () => []);
+
+  await main(runOpts);
+
+  assert.equal(calls.filed.length, 1, 'one new flag filed');
+  assert.equal(calls.filed[0].body.assigneeAgentId, CEO_AGENT_ID,
+    'gap issue must fall back to CEO when no creator agent — never null');
+  assert.ok(calls.filed[0].body.assigneeAgentId, 'assignee must be non-null (no orphan)');
 });
 
 test('main: sign-off gate is exempt (not filed) while a real coding task is still flagged', async (t) => {

@@ -3,7 +3,12 @@
  * check-routing-rationale.mjs
  *
  * Self-cleaning, deterministic watchdog for the routing-rationale convention
- * (AGENTS.md §12). Runs as a scheduled routine every 30 minutes with --apply.
+ * (AGENTS.md §12). Runs as a scheduled routine every 6 hours with --apply.
+ * The default --window-minutes MUST stay >= the firing cadence or issues
+ * updated between fires go unchecked (AUR-1816: 60-min default vs 6h cadence
+ * silently missed ~83% of issues). Default is 1440 (24h) to comfortably
+ * exceed the cadence; the watchdog is idempotent so a wide window only
+ * re-confirms already-clean issues.
  *
  * Lifecycle:
  *   Phase A — Auto-resolve stale flags (always runs, ignores window):
@@ -436,7 +441,7 @@ const isMain = process.argv[1] && import.meta.url.endsWith(
 if (isMain) {
   const { values: args } = parseArgs({
     options: {
-      'window-minutes': { type: 'string', default: '60' },
+      'window-minutes': { type: 'string', default: '1440' },
       'max-new-flags': { type: 'string', default: '20' },
       apply: { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
@@ -445,7 +450,7 @@ if (isMain) {
 
   if (args.help) {
     console.log('Usage: node scripts/check-routing-rationale.mjs [--window-minutes N] [--max-new-flags N] [--apply]');
-    console.log('  --window-minutes N  Only check issues updated in last N minutes (default: 60)');
+    console.log('  --window-minutes N  Only check issues updated in last N minutes (default: 1440 = 24h, must be >= routine firing cadence)');
     console.log('  --max-new-flags N   Cap new flags filed per run (default: 20, anti-flood guard)');
     console.log('  --apply             Execute changes (default: dry-run, exit 1 if actions pending)');
     process.exit(0);

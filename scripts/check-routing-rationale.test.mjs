@@ -122,6 +122,34 @@ test('isExempt: genuine engineering task that BUILDS a sign-off/approval feature
   }), false);
 });
 
+test('isExempt: self-assigned issue (assignee === creator) is exempt', () => {
+  // Creator kept the work — no candidate pool, no routing decision to document.
+  // Recurring false-positive class: AUR-869, AUR-1829, AUR-801/802 (AUR-1550).
+  assert.ok(isExempt({
+    title: 'CEO arbitrage research box',
+    description: 'Self-assigned watch task.',
+    assigneeAgentId: '3823a155-b4d4-4b06-b7d3-b3a55c6cbc1b',
+    createdByAgentId: '3823a155-b4d4-4b06-b7d3-b3a55c6cbc1b',
+  }));
+});
+
+test('isExempt: genuine delegation (assignee !== creator) stays flaggable', () => {
+  // AUR-1841: creator CEO → assignee CTO. Real delegation, real candidate pool.
+  assert.equal(isExempt({
+    title: 'Build the mail dashboard',
+    description: 'Delegated engineering work.',
+    createdByAgentId: '3823a155-b4d4-4b06-b7d3-b3a55c6cbc1b',
+    assigneeAgentId: '371a1b08-0286-4a12-a516-f587f42df5eb',
+  }), false);
+  // AUR-1846: creator CTO → assignee CEO. Reverse delegation, still flaggable.
+  assert.equal(isExempt({
+    title: 'Approve the budget for X',
+    description: 'Delegated decision.',
+    createdByAgentId: '371a1b08-0286-4a12-a516-f587f42df5eb',
+    assigneeAgentId: '3823a155-b4d4-4b06-b7d3-b3a55c6cbc1b',
+  }), false);
+});
+
 test('isExempt: not exempt when neither pattern matches', () => {
   assert.equal(isExempt({ title: 'Normal issue', description: 'Some work' }), false);
   assert.equal(isExempt({ title: 'Fix daily cron job', description: 'no brief here' }), false);

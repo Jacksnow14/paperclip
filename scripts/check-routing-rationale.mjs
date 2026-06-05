@@ -101,6 +101,11 @@ export function isExempt(issue) {
   // that merely BUILD such a feature ("Add approval gate to deploy pipeline",
   // "Implement sign-off flow") — those have no gate delimiter after the phrase.
   if (/\b(?:sign[-\s]?off|approval(?:\s+gate)?)\s*[:—]/i.test(title)) return true;
+  // Self-assigned issues (creator kept the work) involve no delegation and no
+  // candidate-routing decision, so a routing/{id} rationale carries no signal.
+  // Recurring false-positive class: AUR-869, AUR-1829, AUR-801/802 (AUR-1550).
+  if (issue.assigneeAgentId && issue.createdByAgentId &&
+      issue.assigneeAgentId === issue.createdByAgentId) return true;
   return false;
 }
 

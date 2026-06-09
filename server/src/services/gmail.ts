@@ -148,6 +148,13 @@ export function createGmailService() {
     return res.data;
   }
 
+  async function getAttachment(alias: GmailAlias, messageId: string, attachmentId: string) {
+    // attachmentId comes from getMessage(...).payload.parts[].body.attachmentId
+    const gmail = buildGmailClient(alias);
+    const res = await gmail.users.messages.attachments.get({ userId: "me", messageId, id: attachmentId });
+    return res.data; // { size, data: base64url }
+  }
+
   async function modifyMessageLabels(alias: GmailAlias, messageId: string, opts: GmailModifyLabelsOptions) {
     const gmail = buildGmailClient(alias);
     const res = await gmail.users.messages.modify({
@@ -189,6 +196,7 @@ export function createGmailService() {
   return {
     listMessages,
     getMessage,
+    getAttachment,
     sendMessage,
     listThreads,
     getThread,

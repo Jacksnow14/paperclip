@@ -5,6 +5,7 @@ const mockMessagesList = vi.fn();
 const mockMessagesGet = vi.fn();
 const mockMessagesSend = vi.fn();
 const mockMessagesModify = vi.fn();
+const mockAttachmentsGet = vi.fn();
 const mockThreadsList = vi.fn();
 const mockThreadsGet = vi.fn();
 const mockLabelsList = vi.fn();
@@ -18,6 +19,7 @@ const mockGmailFactory = vi.fn(() => ({
       get: mockMessagesGet,
       send: mockMessagesSend,
       modify: mockMessagesModify,
+      attachments: { get: mockAttachmentsGet },
     },
     threads: {
       list: mockThreadsList,
@@ -161,6 +163,21 @@ describe("createGmailService", () => {
       expect(mockMessagesList).toHaveBeenCalledWith(
         expect.objectContaining({ maxResults: 20 }),
       );
+    });
+  });
+
+  describe("getAttachment", () => {
+    it("calls gmail.users.messages.attachments.get with correct params", async () => {
+      mockAttachmentsGet.mockResolvedValue({ data: { size: 1234, data: "base64urlpayload" } });
+      const service = createGmailService();
+      const result = await service.getAttachment("board", "msg1", "att1");
+
+      expect(mockAttachmentsGet).toHaveBeenCalledWith({
+        userId: "me",
+        messageId: "msg1",
+        id: "att1",
+      });
+      expect(result).toEqual({ size: 1234, data: "base64urlpayload" });
     });
   });
 

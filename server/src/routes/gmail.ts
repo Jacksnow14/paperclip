@@ -144,6 +144,21 @@ export function gmailRoutes(db: Db) {
     },
   );
 
+  router.get(
+    "/companies/:companyId/gmail/mailboxes/:mailbox/messages/:messageId/attachments/:attachmentId",
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      const mailbox = req.params.mailbox as string;
+      const messageId = req.params.messageId as string;
+      const attachmentId = req.params.attachmentId as string;
+      assertCompanyAccess(req, companyId);
+      assertGmailAvailable();
+      if (!isSupportedGmailAlias(mailbox)) throw badRequest(`Unsupported mailbox: ${mailbox}`);
+      const data = await gmail.getAttachment(mailbox, messageId, attachmentId);
+      res.json(data);
+    },
+  );
+
   router.patch(
     "/companies/:companyId/gmail/mailboxes/:mailbox/messages/:messageId/labels",
     validate(modifyLabelsBodySchema),

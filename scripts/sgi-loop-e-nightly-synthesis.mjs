@@ -78,17 +78,14 @@ async function fetchRecords() {
   return Array.isArray(data) ? data : (data.records || []);
 }
 
-async function captureSynthesis(title, body, metadata) {
+async function captureSynthesis(title, content, metadata) {
   return apiFetch(`/api/companies/${COMPANY_ID}/memory/capture`, {
     method: 'POST',
     body: JSON.stringify({
       title,
-      body,
-      kind: 'synthesis',
-      agentId: AGENT_ID || undefined,
-      issueId: undefined, // memory_records.issue_id expects a uuid; TASK_ID is one but keep the record project-agnostic
-      runId: RUN_ID || undefined,
+      content,
       metadata,
+      source: { kind: 'issue', issueId: TASK_ID },
     }),
   });
 }

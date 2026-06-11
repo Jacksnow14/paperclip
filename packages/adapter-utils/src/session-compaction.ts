@@ -36,6 +36,22 @@ const ADAPTER_MANAGED_SESSION_POLICY: SessionCompactionPolicy = {
   maxSessionAgeHours: 0,
 };
 
+// claude_local pins the standard 200K context window (the Claude Code CLI is
+// prevented from auto-upgrading resumed sessions to the paid 1M-context beta;
+// see CLAUDE_CODE_DISABLE_1M_CONTEXT in the claude-local adapter). Because the
+// session can no longer silently grow past 200K, we MUST rotate it before the
+// raw input crosses that boundary — otherwise the resumed run would hit the
+// hard "prompt too long" wall instead. 150K leaves ~50K of headroom for the
+// next turn's input growth plus output, well under the 200K limit. This is the
+// safety net for (and complements) the CLI-side 1M lock: even if a future CLI
+// version changes its auto-upgrade behaviour, Paperclip rotates first.
+const CLAUDE_LOCAL_SESSION_POLICY: SessionCompactionPolicy = {
+  enabled: true,
+  maxSessionRuns: 200,
+  maxRawInputTokens: 150_000,
+  maxSessionAgeHours: 72,
+};
+
 export const LEGACY_SESSIONED_ADAPTER_TYPES = new Set([
   "acpx_local",
   "claude_local",
@@ -57,7 +73,7 @@ export const ADAPTER_SESSION_MANAGEMENT: Record<string, AdapterSessionManagement
   claude_local: {
     supportsSessionResume: true,
     nativeContextManagement: "confirmed",
-    defaultSessionCompaction: ADAPTER_MANAGED_SESSION_POLICY,
+    defaultSessionCompaction: CLAUDE_LOCAL_SESSION_POLICY,
   },
   codex_local: {
     supportsSessionResume: true,

@@ -509,18 +509,24 @@ describe("prioritizeProjectWorkspaceCandidatesForRun", () => {
 });
 
 describe("parseSessionCompactionPolicy", () => {
-  it("disables Paperclip-managed rotation by default for codex and claude local", () => {
+  it("disables Paperclip-managed rotation by default for codex local", () => {
     expect(parseSessionCompactionPolicy(buildAgent("codex_local"))).toEqual({
       enabled: true,
       maxSessionRuns: 0,
       maxRawInputTokens: 0,
       maxSessionAgeHours: 0,
     });
+  });
+
+  it("rotates claude local before the 200K standard-context wall (AUR-2092)", () => {
+    // claude_local pins the standard 200K window (the CLI is blocked from
+    // auto-upgrading to the paid 1M beta), so Paperclip must rotate the session
+    // before raw input crosses ~200K instead of relying on unbounded growth.
     expect(parseSessionCompactionPolicy(buildAgent("claude_local"))).toEqual({
       enabled: true,
-      maxSessionRuns: 0,
-      maxRawInputTokens: 0,
-      maxSessionAgeHours: 0,
+      maxSessionRuns: 200,
+      maxRawInputTokens: 150_000,
+      maxSessionAgeHours: 72,
     });
   });
 

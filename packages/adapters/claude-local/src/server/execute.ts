@@ -265,6 +265,13 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     if (typeof value === "string") env[key] = value;
   }
 
+  // AUR-2092: force the standard 200K context window unless an operator/host
+  // override is already present. See resolveDisable1mContextEnv() for why.
+  const disable1mContext = resolveDisable1mContextEnv(env, process.env);
+  if (disable1mContext !== null) {
+    env.CLAUDE_CODE_DISABLE_1M_CONTEXT = disable1mContext;
+  }
+
   if (!hasExplicitApiKey && authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
@@ -320,6 +327,33 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     graceSec,
     extraArgs,
   };
+}
+
+/**
+ * AUR-2092: pin the standard 200K context window for claude_local runs.
+ *
+ * The installed Claude Code CLI silently auto-upgrades a resumed session to the
+ * paid 1M-context beta (`context-1m-2025-08-07`) once context grows past ~200K.
+ * That beta requires usage credits; with credits OFF the request returns
+ * `subtype=success` with `API Error: Usage credits required for 1M context …`
+ * and the run is recorded as failed. Setting `CLAUDE_CODE_DISABLE_1M_CONTEXT`
+ * (truthy) disables BOTH the `[1m]` model-suffix path and the runtime
+ * auto-upgrade for opus-4.x — verified against the installed CLI (2.1.161):
+ *   E9H(){return BH(process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT)}
+ *   bZ(H){if(E9H())return!1; ...}          // [1m] suffix path → off
+ *   IHH(H){if(E9H())return!1; ...opus-4-7/4-8...}  // auto-upgrade → off
+ *
+ * Returns the value to set, or `null` when an explicit override is already
+ * present (adapter `config.env` — already merged into `env` — or a host env
+ * var). Operator/host intent always wins.
+ */
+export function resolveDisable1mContextEnv(
+  env: Record<string, string | undefined>,
+  processEnv: Record<string, string | undefined>,
+): string | null {
+  if (env.CLAUDE_CODE_DISABLE_1M_CONTEXT !== undefined) return null;
+  if (processEnv.CLAUDE_CODE_DISABLE_1M_CONTEXT !== undefined) return null;
+  return "1";
 }
 
 export async function runClaudeLogin(input: {

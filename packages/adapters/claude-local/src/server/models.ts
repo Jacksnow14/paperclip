@@ -3,6 +3,11 @@ import { models as DIRECT_MODELS } from "../index.js";
 
 /** AWS Bedrock model IDs — region-qualified identifiers required by the Bedrock API. */
 const BEDROCK_MODELS: AdapterModel[] = [
+  // NOTE: confirm the exact versioned Bedrock slug against the AWS Bedrock console before
+  // relying on Bedrock-mode Fable 5 — Anthropic Bedrock IDs sometimes carry a "-v1:0" suffix
+  // (cf. the sonnet/haiku entries below). The unsuffixed regional form is used here per the
+  // Anthropic docs; if Bedrock rejects it, append the console-confirmed version suffix.
+  { id: "us.anthropic.claude-fable-5", label: "Bedrock Fable 5" },
   { id: "us.anthropic.claude-opus-4-6-v1", label: "Bedrock Opus 4.6" },
   { id: "us.anthropic.claude-sonnet-4-5-20250929-v2:0", label: "Bedrock Sonnet 4.5" },
   { id: "us.anthropic.claude-haiku-4-5-20251001-v1:0", label: "Bedrock Haiku 4.5" },

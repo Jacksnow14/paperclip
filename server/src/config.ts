@@ -87,6 +87,7 @@ export interface Config {
   heartbeatSchedulerIntervalMs: number;
   gmailIntakePollerEnabled: boolean;
   gmailIntakePollerIntervalMs: number;
+  telegramBotToken: string | undefined;
   artifactRetentionProdDefault: boolean;
   companyDeletionEnabled: boolean;
   telemetryEnabled: boolean;
@@ -336,6 +337,7 @@ export function loadConfig(): Config {
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
     gmailIntakePollerEnabled: process.env.GMAIL_INTAKE_POLLER_ENABLED !== "false",
     gmailIntakePollerIntervalMs: Math.max(60_000, Number(process.env.GMAIL_INTAKE_POLLER_INTERVAL_MS) || 10 * 60 * 1000),
+    telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || undefined,
     // AUR-1735: opt-in switch that activates the AUR-1722 artifact-retention
     // policy when persisted instance settings are still dormant. Set on the
     // prod (default) deployment; leave unset on CI/dev so they stay dormant.

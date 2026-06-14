@@ -85,3 +85,4 @@ export { memoryOperations } from "./memory_operations.js";
 export { memoryExtractionJobs } from "./memory_extraction_jobs.js";
 export { gmailIntakeRecords } from "./gmail_intake_records.js";
 export { gmailOutboundRecords } from "./gmail_outbound_records.js";
+export { telegramIntakeRecords } from "./telegram_intake_records.js";

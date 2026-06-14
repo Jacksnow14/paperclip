@@ -16,8 +16,17 @@
  *   5. Post analysis comment on the issue.
  *   6. Mark the issue `done` — Telegram relay (AUR-2215) sends it to the user.
  *
+ * Retry behaviour (AUR-2363):
+ *   - Extraction failures are transient (IG rate-limiting). The issue stays
+ *     `todo` and is retried up to MAX_EXTRACTION_ATTEMPTS times across cycles.
+ *   - Attempt count is tracked via hidden <!-- extraction-attempt --> markers
+ *     in posted comments.
+ *   - Only after all attempts are exhausted is the issue marked `done`
+ *     (with a clear exhausted-retries message that Telegram will NOT relay,
+ *     since we filter success-only on relay — see AUR-2215).
+ *
  * Flags:
- *   --once   Process the current backlog once and exit (for cron/Paperclip routine use).
+ *   --once   Process the current backlog once and exit (for one-shot use).
  */
 
 import { spawnSync, execFileSync } from "node:child_process";
@@ -34,6 +43,13 @@ const POLL_INTERVAL_MS = Number(process.env.ANALYSIS_POLL_INTERVAL_MS ?? 60_000)
 const REEL_EXTRACT_PATH = process.env.REEL_EXTRACT_PATH ?? "/home/ievgen/outreach/reel_extract.py";
 const CLAUDE_PATH = process.env.CLAUDE_PATH ?? "/home/ievgen/.local/bin/claude";
 const RUN_ONCE = process.argv.includes("--once");
+// Rate-limit mitigation: space out yt-dlp calls and cap batch size
+const MAX_REELS_PER_CYCLE = Number(process.env.MAX_REELS_PER_CYCLE ?? 5);
+const INTER_REEL_DELAY_MS = Number(process.env.INTER_REEL_DELAY_MS ?? 8_000);
+// Retry: max extraction attempts before permanently giving up
+const MAX_EXTRACTION_ATTEMPTS = Number(process.env.MAX_EXTRACTION_ATTEMPTS ?? 4);
+// Cookies file for authenticated IG downloads (defeats rate-limiting)
+const IG_COOKIES_PATH = process.env.IG_COOKIES_PATH ?? "/home/ievgen/outreach/ig_cookies.txt";
 
 if (!API_KEY || !COMPANY_ID) {
   console.error("PAPERCLIP_API_KEY and PAPERCLIP_COMPANY_ID are required");
@@ -108,8 +124,12 @@ async function uploadFrame(issueId, framePath) {
 
 // ── Reel extraction ──────────────────────────────────────────────────────────
 function extractReel(url) {
-  const input = JSON.stringify({ url, max_frames: 3, whisper_model: "base" });
-  const result = spawnSync("python3", [REEL_EXTRACT_PATH, input], {
+  // Pass cookies explicitly if the file exists (auto-loaded by reel_extract.py
+  // anyway, but explicit is clearer and ensures the right path is used)
+  const cfg = { url, max_frames: 3, whisper_model: "base" };
+  if (existsSync(IG_COOKIES_PATH)) cfg.cookies = IG_COOKIES_PATH;
+
+  const result = spawnSync("python3", [REEL_EXTRACT_PATH, JSON.stringify(cfg)], {
     timeout: 300_000,
     encoding: "utf8",
   });
@@ -187,6 +207,15 @@ function alreadyAnalyzed(comments) {
   );
 }
 
+// Returns how many extraction attempts have already been made (tracked by
+// a hidden HTML comment marker in the posted retry notices).
+function countExtractionAttempts(comments) {
+  return comments.filter(c =>
+    c.authorType !== "system" &&
+    c.body?.includes("<!-- extraction-attempt -->")
+  ).length;
+}
+
 // ── Process a single reel-intake issue ──────────────────────────────────────
 async function processIssue(issue) {
   const { id: issueId, identifier } = issue;
@@ -197,7 +226,6 @@ async function processIssue(issue) {
   const comments = await getIssueComments(issueId);
   if (alreadyAnalyzed(comments)) {
     console.log(`${label} Already analyzed — skipping`);
-    // Make sure the issue isn't stuck in todo
     await updateIssue(issueId, { status: "done", comment: "Previously analyzed — marking done." });
     return;
   }
@@ -210,29 +238,54 @@ async function processIssue(issue) {
     return;
   }
 
-  // Step 1: Extract reel content
+  // Step 1: Extract reel content — with retry tracking
   console.log(`${label} Extracting reel: ${reelUrl}`);
   let manifest;
   try {
     manifest = extractReel(reelUrl);
   } catch (err) {
-    console.error(`${label} Extraction failed: ${err.message}`);
-    await postComment(
-      issueId,
-      `⚠️ **Reel extraction failed**\n\nURL: ${reelUrl}\nError: \`${err.message.slice(0, 400)}\`\n\nThe reel may be private or removed.`
-    );
-    await updateIssue(issueId, { status: "done", comment: "Extraction failed — marked done." });
+    const priorAttempts = countExtractionAttempts(comments);
+    const attemptNumber = priorAttempts + 1;
+    console.error(`${label} Extraction attempt ${attemptNumber}/${MAX_EXTRACTION_ATTEMPTS} failed: ${err.message}`);
+
+    if (attemptNumber >= MAX_EXTRACTION_ATTEMPTS) {
+      // All retries exhausted — give up permanently (kept short so relay skips it)
+      await postComment(
+        issueId,
+        `<!-- extraction-attempt --> ⚠️ Extraction exhausted ${MAX_EXTRACTION_ATTEMPTS} attempts — giving up. Last error: \`${err.message.slice(0, 150)}\``
+      );
+      await updateIssue(issueId, { status: "done", comment: `Extraction exhausted ${MAX_EXTRACTION_ATTEMPTS} attempts — giving up.` });
+    } else {
+      // Transient failure — leave as todo, retry next cycle (short comment, not relayed)
+      await postComment(
+        issueId,
+        `<!-- extraction-attempt --> ⏳ Attempt ${attemptNumber}/${MAX_EXTRACTION_ATTEMPTS} failed (transient, retrying next cycle). Error: \`${err.message.slice(0, 100)}\``
+      );
+      // Do NOT update status — issue stays `todo` and will be retried
+      console.log(`${label} Leaving as todo for retry (attempt ${attemptNumber}/${MAX_EXTRACTION_ATTEMPTS})`);
+    }
     return;
   }
 
   if (!manifest.ok) {
-    const errMsg = (manifest.error ?? "unknown").slice(0, 300);
-    console.error(`${label} Extraction not ok: ${errMsg}`);
-    await postComment(
-      issueId,
-      `⚠️ **Reel extraction error**\n\nURL: ${reelUrl}\nError: ${errMsg}`
-    );
-    await updateIssue(issueId, { status: "done", comment: "Extraction returned error — marked done." });
+    const priorAttempts = countExtractionAttempts(comments);
+    const attemptNumber = priorAttempts + 1;
+    const errMsg = (manifest.error ?? "unknown").slice(0, 150);
+    console.error(`${label} Extraction not ok (attempt ${attemptNumber}/${MAX_EXTRACTION_ATTEMPTS}): ${errMsg}`);
+
+    if (attemptNumber >= MAX_EXTRACTION_ATTEMPTS) {
+      await postComment(
+        issueId,
+        `<!-- extraction-attempt --> ⚠️ Extraction exhausted ${MAX_EXTRACTION_ATTEMPTS} attempts — giving up. Last error: ${errMsg}`
+      );
+      await updateIssue(issueId, { status: "done", comment: `Extraction exhausted ${MAX_EXTRACTION_ATTEMPTS} attempts — giving up.` });
+    } else {
+      await postComment(
+        issueId,
+        `<!-- extraction-attempt --> ⏳ Attempt ${attemptNumber}/${MAX_EXTRACTION_ATTEMPTS} returned error (retrying). Error: ${errMsg}`
+      );
+      console.log(`${label} Leaving as todo for retry (attempt ${attemptNumber}/${MAX_EXTRACTION_ATTEMPTS})`);
+    }
     return;
   }
 
@@ -298,8 +351,11 @@ async function processIssue(issue) {
 
 // ── Main loop ────────────────────────────────────────────────────────────────
 async function main() {
+  const cookiesStatus = existsSync(IG_COOKIES_PATH) ? `present (${IG_COOKIES_PATH})` : "absent";
   console.log(
-    `reel-analysis-worker starting (AUR-2216) — poll: ${POLL_INTERVAL_MS}ms, run-once: ${RUN_ONCE}`
+    `reel-analysis-worker starting (AUR-2216/AUR-2363) — poll: ${POLL_INTERVAL_MS}ms, ` +
+    `max-reels/cycle: ${MAX_REELS_PER_CYCLE}, inter-reel-delay: ${INTER_REEL_DELAY_MS}ms, ` +
+    `max-attempts: ${MAX_EXTRACTION_ATTEMPTS}, cookies: ${cookiesStatus}, run-once: ${RUN_ONCE}`
   );
 
   let iteration = 0;
@@ -307,13 +363,24 @@ async function main() {
     iteration++;
     console.log(`[poll #${iteration}] Checking for reel-intake issues...`);
     try {
-      const issues = await findReelIntakeIssues();
-      console.log(`[poll #${iteration}] Found ${issues.length} issue(s)`);
-      for (const issue of issues) {
+      const allIssues = await findReelIntakeIssues();
+      // Cap reels processed per cycle to avoid burst rate-limiting
+      const issues = allIssues.slice(0, MAX_REELS_PER_CYCLE);
+      if (allIssues.length > MAX_REELS_PER_CYCLE) {
+        console.log(`[poll #${iteration}] ${allIssues.length} pending, processing ${issues.length} this cycle (cap=${MAX_REELS_PER_CYCLE})`);
+      } else {
+        console.log(`[poll #${iteration}] Found ${issues.length} issue(s)`);
+      }
+      for (let i = 0; i < issues.length; i++) {
         try {
-          await processIssue(issue);
+          await processIssue(issues[i]);
         } catch (err) {
-          console.error(`Error processing ${issue.identifier}: ${err.message}`);
+          console.error(`Error processing ${issues[i].identifier}: ${err.message}`);
+        }
+        // Sleep between reels (except after the last one) to defeat IG rate-limiting
+        if (i < issues.length - 1) {
+          console.log(`[poll #${iteration}] Waiting ${INTER_REEL_DELAY_MS}ms before next reel...`);
+          await sleep(INTER_REEL_DELAY_MS);
         }
       }
     } catch (err) {

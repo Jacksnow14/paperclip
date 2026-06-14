@@ -79,17 +79,19 @@ async function fetchRecords() {
 }
 
 async function captureSynthesis(title, body, metadata) {
+  // Memory capture schema (packages/shared/src/validators/memory.ts, .strict()):
+  //   { title?, content: string(1..20000), metadata?, source: { kind, ... } }
+  // Old payload shape ({ body, kind:'synthesis', agentId, runId }) is now rejected.
+  // Bind the record to this automated run when we have a run id, else to the
+  // execution issue; either way scope defaults to {} so it stays org-wide /
+  // project-agnostic, which is what cross-project synthesis wants.
+  const source = RUN_ID
+    ? { kind: 'run', runId: RUN_ID }
+    : (TASK_ID ? { kind: 'issue', issueId: TASK_ID } : { kind: 'manual_note' });
+  const content = body.length > 20000 ? `${body.slice(0, 19980)}\n\n…[truncated]` : body;
   return apiFetch(`/api/companies/${COMPANY_ID}/memory/capture`, {
     method: 'POST',
-    body: JSON.stringify({
-      title,
-      body,
-      kind: 'synthesis',
-      agentId: AGENT_ID || undefined,
-      issueId: undefined, // memory_records.issue_id expects a uuid; TASK_ID is one but keep the record project-agnostic
-      runId: RUN_ID || undefined,
-      metadata,
-    }),
+    body: JSON.stringify({ title, content, metadata, source }),
   });
 }
 

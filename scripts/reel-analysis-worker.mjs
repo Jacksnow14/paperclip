@@ -135,8 +135,14 @@ function extractReel(url) {
   });
   if (result.error) throw new Error(`spawnSync error: ${result.error.message}`);
   if (result.status !== 0) {
-    const stderr = (result.stderr ?? "").slice(0, 500);
-    throw new Error(`reel_extract.py exited ${result.status}: ${stderr}`);
+    // reel_extract.py writes error details to stdout JSON, not stderr
+    let extractError = "";
+    try {
+      const j = JSON.parse((result.stdout ?? "").trim());
+      extractError = j.error ?? "";
+    } catch {}
+    const stderr = (result.stderr ?? "").slice(0, 300);
+    throw new Error(`reel_extract.py exited ${result.status}: ${extractError || stderr || "(no output)"}`);
   }
   const stdout = (result.stdout ?? "").trim();
   try {

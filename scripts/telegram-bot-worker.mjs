@@ -75,8 +75,19 @@ async function getUpdates(offset, timeoutSec = 30) {
   return tgCall("getUpdates", { offset, timeout: timeoutSec, allowed_updates: ["message"] });
 }
 
-async function sendMessage(chatId, text) {
-  return tgCall("sendMessage", { chat_id: chatId, text, parse_mode: "Markdown" });
+async function sendMessage(chatId, text, { markdown = false } = {}) {
+  const body = { chat_id: chatId, text };
+  if (markdown) body.parse_mode = "Markdown";
+  try {
+    return await tgCall("sendMessage", body);
+  } catch (err) {
+    // Telegram's legacy Markdown parser rejects unbalanced entities; retry as
+    // plain text so relayed analysis is never dropped on a formatting error.
+    if (markdown) {
+      return tgCall("sendMessage", { chat_id: chatId, text });
+    }
+    throw err;
+  }
 }
 
 // ── Paperclip helpers ────────────────────────────────────────────────────────
@@ -160,12 +171,16 @@ async function relayNewComments(state) {
         // Only relay non-system comments (agent/user authored).
         if (comment.authorType === "system") continue;
 
-        const author = comment.authorAgent?.displayName ?? comment.authorUser?.name ?? "Agent";
-        const body = (comment.body ?? "").slice(0, 3000);
-        if (!body.trim()) continue;
+        const body = (comment.body ?? "").trim();
+        if (!body) continue;
 
-        const relayText = `*[${author}]* ${body}`;
-        await sendMessage(entry.chatId, relayText);
+        // Relay only substantive analysis output, not internal status one-liners
+        // (e.g. the analysis worker's "Analysis complete — comment posted" PATCH
+        // comment). The analysis comment is a multi-line markdown block.
+        const isAnalysis = body.includes("## Reel Analysis") || body.length > 200;
+        if (!isAnalysis) continue;
+
+        await sendMessage(entry.chatId, body.slice(0, 4000));
         console.log(`relay → chat ${entry.chatId} from issue ${issueId}: ${body.slice(0, 80)}`);
       }
 
@@ -243,6 +258,7 @@ async function main() {
         await sendMessage(
           chatId,
           `✅ Issue created: *${issueRef}* — I'll send you the analysis when it's ready.`,
+          { markdown: true },
         );
         console.log(`created issue ${issue.id} for reel ${reelUrl}`);
       } catch (err) {

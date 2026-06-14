@@ -103,7 +103,10 @@ async function createIssue(title, description) {
     title,
     description,
     status: "todo",
-    priority: "medium",
+    // These are "saw something interesting, evaluate when you can" intakes, not
+    // urgent work — low priority so they queue behind real tasks. Override with
+    // TELEGRAM_INTAKE_PRIORITY if a batch needs bumping.
+    priority: process.env.TELEGRAM_INTAKE_PRIORITY ?? "low",
     originKind: "reel_intake",
     ...(ASSIGNEE_AGENT_ID ? { assigneeAgentId: ASSIGNEE_AGENT_ID } : {}),
   };

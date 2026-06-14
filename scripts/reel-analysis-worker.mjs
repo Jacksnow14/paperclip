@@ -134,7 +134,7 @@ function analyzeWithClaude(manifest) {
   const duration = manifest.duration ?? 0;
   const url = manifest.url ?? "";
 
-  const prompt = `You are a sharp business analyst reviewing an Instagram reel shared with Paperclip (we build AI agent workflow automation — agents that handle business tasks autonomously).
+  const prompt = `You are a sharp, skeptical business analyst reviewing an Instagram reel a teammate found interesting and forwarded to Paperclip (we build AI agent workflow automation — agents that handle business tasks autonomously). The point is NOT to act on it now — it's to evaluate the claim, judge whether it's actually true, and decide whether there's real value worth extracting for our business.
 
 Reel metadata:
 - Uploader: @${uploader}
@@ -147,17 +147,19 @@ ${caption}
 Transcript:
 ${transcript}
 
-Write a concise business analysis in EXACTLY this format (no extra prose before or after):
+Write a concise analysis in EXACTLY this format (no extra prose before or after):
 
-**Summary:** [1 sentence — what the reel is about]
+**Summary:** [1 sentence — what the reel is about and what it claims/advises]
 
-**Relevance to Paperclip:** [high/medium/low] — [1 sentence explaining why or why not]
+**Credibility:** [high/medium/low] — [1-2 sentences. Is the core claim actually true? Note unsupported hype, survivorship bias, sales/affiliate motive, or anything that needs independent verification. Be skeptical; "sounds good on video" is not evidence.]
 
-**Key Takeaway:** [1-2 sentences — the most actionable insight for our team]
+**Relevance to Paperclip:** [high/medium/low] — [1 sentence on whether this connects to our agent-automation business]
 
-**Tags:** [2-4 comma-separated tags from: strategy, AI, automation, marketing, competition, inspiration, tech, workflow, SaaS, productivity, social-media, other]
+**Value & Recommended Action:** [2-3 sentences — if there's a real, extractable opportunity for us (a tactic to test, a market signal, a tool, a content/marketing idea), name it and the concrete next step. If it's noise, say "No action — [why]" plainly.]
 
-Be direct. If the transcript is empty, base the analysis on the caption only.`;
+**Tags:** [2-4 comma-separated tags from: strategy, AI, automation, marketing, competition, inspiration, tech, workflow, SaaS, productivity, social-media, growth, sales, other]
+
+Be direct and honest — a "low credibility, no action" verdict is a valuable answer. If the transcript is empty, base the analysis on the caption only and say so.`;
 
   const result = spawnSync(CLAUDE_PATH, ["-p", prompt, "--output-format", "text"], {
     timeout: 60_000,

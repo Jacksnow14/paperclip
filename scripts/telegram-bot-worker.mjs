@@ -6,20 +6,23 @@
  *   TELEGRAM_BOT_TOKEN=... PAPERCLIP_API_URL=... PAPERCLIP_API_KEY=... \
  *   PAPERCLIP_COMPANY_ID=... node scripts/telegram-bot-worker.mjs
  *
- * Behaviour:
+ * Behaviour (AUR-2201 "no empty issues" redesign):
  *   1. Long-poll Telegram getUpdates (30s timeout).
  *   2. On a message containing an instagram.com/(reel|p)/ URL:
- *      - Create a Paperclip issue (reel-intake label) via the API.
- *      - Persist chatId→issueId in a local JSON state file so the relay
- *        worker can look it up across restarts.
- *   3. Every RELAY_POLL_INTERVAL_MS (default 60s) check tracked issues for
- *      new comments and relay the first analyst comment back to the originating
- *      Telegram chat.
+ *      - Drop a JSON job into REEL_QUEUE_DIR. We do NOT create a board issue
+ *        here — the analysis worker creates the issue only once it has a real
+ *        analysis, so a board card always means "something was analyzed".
+ *   3. Every RELAY_POLL_INTERVAL_MS (default 60s) scan REEL_RESULT_DIR for
+ *      finished jobs and relay the analysis (or a short failure notice) back to
+ *      the originating Telegram chat, then delete the result file.
  *
- * State file: ./telegram-bot-state.json (next to script, or set STATE_FILE env).
+ * State file: ./telegram-bot-state.json (only the Telegram update offset).
  */
 
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import {
+  readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, unlinkSync,
+} from "node:fs";
+import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -29,8 +32,9 @@ const API_KEY = process.env.PAPERCLIP_API_KEY;
 const COMPANY_ID = process.env.PAPERCLIP_COMPANY_ID;
 const STATE_FILE = process.env.STATE_FILE ?? new URL("telegram-bot-state.json", import.meta.url).pathname;
 const RELAY_POLL_INTERVAL_MS = Number(process.env.RELAY_POLL_INTERVAL_MS ?? 60_000);
-// Optional: set to a Paperclip agent ID to assign intake issues to that agent.
-const ASSIGNEE_AGENT_ID = process.env.TELEGRAM_INTAKE_ASSIGNEE_AGENT_ID ?? null;
+// Shared file queue with the analysis worker.
+const REEL_QUEUE_DIR = process.env.REEL_QUEUE_DIR ?? "/home/ievgen/paperclip-data/reel-queue";
+const REEL_RESULT_DIR = process.env.REEL_RESULT_DIR ?? "/home/ievgen/paperclip-data/reel-results";
 
 if (!BOT_TOKEN) {
   console.error("TELEGRAM_BOT_TOKEN is required");
@@ -41,18 +45,22 @@ if (!API_KEY || !COMPANY_ID) {
   process.exit(1);
 }
 
+mkdirSync(REEL_QUEUE_DIR, { recursive: true });
+mkdirSync(REEL_RESULT_DIR, { recursive: true });
+
 const TG_BASE = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const INSTAGRAM_REEL_RE = /https?:\/\/(?:www\.)?instagram\.com\/(?:reel|p)\/[\w-]+\/?[^\s]*/i;
 
 // ── State persistence ────────────────────────────────────────────────────────
-// state = { offset: number, tracked: { [issueId]: { chatId, lastSeenCommentIdx } } }
+// state = { offset: number }  (just the Telegram update cursor)
 function loadState() {
   if (existsSync(STATE_FILE)) {
     try {
-      return JSON.parse(readFileSync(STATE_FILE, "utf8"));
+      const s = JSON.parse(readFileSync(STATE_FILE, "utf8"));
+      return { offset: s.offset ?? 0 };
     } catch { /* corrupt → start fresh */ }
   }
-  return { offset: 0, tracked: {} };
+  return { offset: 0 };
 }
 
 function saveState(state) {
@@ -90,117 +98,57 @@ async function sendMessage(chatId, text, { markdown = false } = {}) {
   }
 }
 
-// ── Paperclip helpers ────────────────────────────────────────────────────────
-function pcHeaders() {
-  return {
-    "Authorization": `Bearer ${API_KEY}`,
-    "Content-Type": "application/json",
-  };
+// ── Intake queue ─────────────────────────────────────────────────────────────
+function enqueueReel({ reelUrl, chatId, messageId, receivedAt }) {
+  // Unique, idempotent per Telegram message so the same forward never queues twice.
+  const queueId = `${chatId}-${messageId}`;
+  const path = join(REEL_QUEUE_DIR, `${queueId}.json`);
+  writeFileSync(path, JSON.stringify({
+    queueId, reelUrl, chatId, messageId, receivedAt, attempts: 0,
+  }, null, 2));
+  return queueId;
 }
 
-async function createIssue(title, description) {
-  const body = {
-    title,
-    description,
-    status: "todo",
-    // These are "saw something interesting, evaluate when you can" intakes, not
-    // urgent work — low priority so they queue behind real tasks. Override with
-    // TELEGRAM_INTAKE_PRIORITY if a batch needs bumping.
-    priority: process.env.TELEGRAM_INTAKE_PRIORITY ?? "low",
-    originKind: "reel_intake",
-    ...(ASSIGNEE_AGENT_ID ? { assigneeAgentId: ASSIGNEE_AGENT_ID } : {}),
-  };
-  const res = await fetch(`${API_URL}/api/companies/${COMPANY_ID}/issues`, {
-    method: "POST",
-    headers: pcHeaders(),
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`createIssue HTTP ${res.status}: ${await res.text()}`);
-  return res.json();
-}
-
-async function getIssueComments(issueId) {
-  const res = await fetch(`${API_URL}/api/issues/${issueId}/comments?order=asc`, {
-    headers: { "Authorization": `Bearer ${API_KEY}` },
-  });
-  if (!res.ok) return [];
-  const data = await res.json();
-  return data.comments ?? data ?? [];
-}
-
-async function getIssueById(issueId) {
-  const res = await fetch(`${API_URL}/api/issues/${issueId}`, {
-    headers: { "Authorization": `Bearer ${API_KEY}` },
-  });
-  if (!res.ok) return null;
-  return res.json();
-}
-
-// ── Issue creation ───────────────────────────────────────────────────────────
-function buildIssueTitle(reelUrl) {
-  return `[reel-intake] ${reelUrl}`.slice(0, 255);
-}
-
-function buildIssueDescription(reelUrl, chatId, messageId, receivedAt) {
-  return [
-    `**Inbound reel shared via Telegram bot**`,
-    ``,
-    `- **Reel URL:** ${reelUrl}`,
-    `- **Telegram chat ID:** \`${chatId}\``,
-    `- **Telegram message ID:** \`${messageId}\``,
-    `- **Received:** ${new Date(receivedAt * 1000).toISOString()}`,
-    ``,
-    `exec.labels: reel-intake`,
-  ].join("\n");
-}
-
-// ── Relay: check tracked issues for new comments ─────────────────────────────
-async function relayNewComments(state) {
-  for (const [issueId, entry] of Object.entries(state.tracked)) {
+// ── Relay: forward finished analyses (and failures) back to chat ─────────────
+async function relayResults() {
+  let files;
+  try {
+    files = readdirSync(REEL_RESULT_DIR).filter(f => f.endsWith(".json"));
+  } catch {
+    return;
+  }
+  for (const f of files) {
+    const path = join(REEL_RESULT_DIR, f);
+    let result;
     try {
-      // Check if issue is done/cancelled — stop tracking it.
-      const issue = await getIssueById(issueId);
-      if (issue && (issue.status === "done" || issue.status === "cancelled")) {
-        // One final relay if there are unread comments, then drop tracking.
-      }
-
-      const comments = await getIssueComments(issueId);
-      // Relay comments that appeared after the ones we've already sent.
-      // lastSeenCommentIdx is an index into the sorted comments array.
-      const lastSeen = entry.lastSeenCommentIdx ?? 0;
-      const newComments = comments.slice(lastSeen);
-
-      for (const comment of newComments) {
-        // Only relay non-system comments (agent/user authored).
-        if (comment.authorType === "system") continue;
-
-        const body = (comment.body ?? "").trim();
-        if (!body) continue;
-
-        // Relay only successful analysis output — comments that include the
-        // "## Reel Analysis" heading. This explicitly excludes extraction-failure
-        // retries and exhausted-retry notices (AUR-2363: successes only to Telegram).
-        if (!body.includes("## Reel Analysis")) continue;
-
-        await sendMessage(entry.chatId, body.slice(0, 4000));
-        console.log(`relay → chat ${entry.chatId} from issue ${issueId}: ${body.slice(0, 80)}`);
-      }
-
-      entry.lastSeenCommentIdx = comments.length;
-
-      // Stop tracking resolved issues.
-      if (issue && (issue.status === "done" || issue.status === "cancelled")) {
-        delete state.tracked[issueId];
-      }
+      result = JSON.parse(readFileSync(path, "utf8"));
     } catch (err) {
-      console.warn(`relay check failed for issue ${issueId}:`, err.message);
+      console.warn(`Skipping unreadable result file ${f}: ${err.message}`);
+      continue;
+    }
+    try {
+      if (result.status === "done" && result.analysis) {
+        await sendMessage(result.chatId, result.analysis.slice(0, 4000));
+        console.log(`relay → chat ${result.chatId}: analysis for ${result.issueIdentifier ?? result.reelUrl}`);
+      } else if (result.status === "failed") {
+        await sendMessage(
+          result.chatId,
+          `⚠️ Couldn't analyze that reel after ${result.attempts ?? "several"} tries — it may be private, removed, or Instagram is rate-limiting. Try resending it later.\n${result.reelUrl ?? ""}`.trim(),
+        );
+        console.log(`relay → chat ${result.chatId}: failure for ${result.reelUrl}`);
+      }
+      // Delivered (or nothing to deliver) — clear the result file.
+      unlinkSync(path);
+    } catch (err) {
+      console.warn(`relay failed for ${f}:`, err.message);
+      // Leave the file in place to retry next cycle.
     }
   }
 }
 
 // ── Main loop ────────────────────────────────────────────────────────────────
 async function main() {
-  console.log("telegram-bot-worker: starting (AUR-2215)");
+  console.log("telegram-bot-worker: starting (AUR-2215/AUR-2201 queue mode)");
   const state = loadState();
 
   // Start relay polling in parallel (fire-and-forget interval).
@@ -208,8 +156,7 @@ async function main() {
     while (true) {
       await sleep(RELAY_POLL_INTERVAL_MS);
       try {
-        await relayNewComments(state);
-        saveState(state);
+        await relayResults();
       } catch (err) {
         console.warn("relay loop error:", err.message);
       }
@@ -244,29 +191,16 @@ async function main() {
       console.log(`received reel URL from chat ${chatId}: ${reelUrl}`);
 
       try {
-        await sendMessage(chatId, `Got it! Processing reel: ${reelUrl} 📥`);
-
-        const title = buildIssueTitle(reelUrl);
-        const description = buildIssueDescription(reelUrl, chatId, messageId, msg.date);
-        const issue = await createIssue(title, description);
-
-        state.tracked[issue.id] = {
-          chatId,
-          lastSeenCommentIdx: 0,
-        };
-        saveState(state);
-
-        const issueRef = issue.identifier ?? issue.id;
+        const queueId = enqueueReel({ reelUrl, chatId, messageId, receivedAt: msg.date });
         await sendMessage(
           chatId,
-          `✅ Issue created: *${issueRef}* — I'll send you the analysis when it's ready.`,
-          { markdown: true },
+          `Got it! Analyzing this reel — I'll send the analysis here when it's ready. 📥`,
         );
-        console.log(`created issue ${issue.id} for reel ${reelUrl}`);
+        console.log(`queued reel ${reelUrl} as ${queueId}`);
       } catch (err) {
-        console.error(`failed to create issue for reel ${reelUrl}:`, err.message);
+        console.error(`failed to queue reel ${reelUrl}:`, err.message);
         try {
-          await sendMessage(chatId, `⚠️ Something went wrong creating the intake issue. Please try again.`);
+          await sendMessage(chatId, `⚠️ Something went wrong queuing that reel. Please try again.`);
         } catch { /* best-effort */ }
       }
     }

@@ -1,0 +1,16 @@
+[Unit]
+Description=Reel Analysis Worker (AUR-2216)
+After=network.target paperclip.service
+Wants=paperclip.service
+
+[Service]
+Type=simple
+User=ievgen
+WorkingDirectory=/home/ievgen/paperclip
+EnvironmentFile=/home/ievgen/paperclip-data/reel-analysis-worker.env
+ExecStart=/usr/bin/node /home/ievgen/paperclip/scripts/reel-analysis-worker.mjs
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

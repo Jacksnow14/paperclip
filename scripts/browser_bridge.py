@@ -7,9 +7,9 @@ A general-purpose browser automation script backed by persisted Chromium profile
 No Chrome-extension dependency. Profiles survive across runs (sessions, cookies, localStorage).
 
 Usage:
-    python3 /home/ievgen/browser-bridge/browser_bridge.py '<json>'
-    python3 /home/ievgen/browser-bridge/browser_bridge.py --file input.json
-    echo '<json>' | python3 /home/ievgen/browser-bridge/browser_bridge.py
+    python3 /home/ievgen/paperclip/scripts/browser_bridge.py '<json>'
+    python3 /home/ievgen/paperclip/scripts/browser_bridge.py --file input.json
+    echo '<json>' | python3 /home/ievgen/paperclip/scripts/browser_bridge.py
 
 Input JSON schema:
     {

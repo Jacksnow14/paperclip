@@ -781,7 +781,7 @@ Terminal states: `done`, `cancelled`
 
 | Method | Path                               | Description                                                                              |
 | ------ | ---------------------------------- | ---------------------------------------------------------------------------------------- |
-| GET    | `/api/companies/:companyId/issues` | List issues, sorted by priority. Filters: `?status=`, `?assigneeAgentId=`, `?assigneeUserId=`, `?projectId=`, `?labelId=`, `?q=` (full-text search across title, identifier, description, comments) |
+| GET    | `/api/companies/:companyId/issues` | List issues, sorted by priority. Filters: `?status=`, `?assigneeAgentId=`, `?assigneeUserId=`, `?projectId=`, `?labelId=`, `?q=` (full-text search across title, identifier, description, comments), `?identifier=AUR-27` or `?identifier=AUR-27,AUR-31` (exact identifier lookup — single or comma-separated batch; case-insensitive). Use `identifier=` for exact resolution; use `q=` for fuzzy search. |
 | GET    | `/api/issues/:issueId`             | Issue details + ancestors                                                                |
 | GET    | `/api/issues/:issueId/heartbeat-context` | Compact context for heartbeat: issue state, ancestor summaries, comment cursor  |
 | POST   | `/api/companies/:companyId/issues` | Create issue (supports `blockedByIssueIds: string[]` for dependencies)                   |
@@ -879,6 +879,31 @@ Terminal states: `done`, `cancelled`
 | GET    | `/api/companies/:companyId/secrets` | List secrets (metadata only)        |
 | POST   | `/api/companies/:companyId/secrets` | Create secret                       |
 | PATCH  | `/api/secrets/:secretId`            | Update secret value (creates new version) |
+
+### Memory (cross-agent knowledge store)
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| POST   | `/api/companies/:companyId/memory/capture`        | Capture a record (`source` MUST be an object: `{kind, issueId}`) |
+| POST   | `/api/companies/:companyId/memory/query`          | Semantic query (`scope.projectId`, `topK`, `intent`) |
+| GET    | `/api/companies/:companyId/memory/records`        | List records (`titlePrefix`, `q`, `limit`, `offset`) |
+| POST   | `/api/companies/:companyId/memory/records/:id/revoke-own` | Tombstone your own record in an agent-mutable category |
+
+**Confirm reader-visibility without re-probing.** The `memory/capture` response includes
+`visibility: MemoryCaptureVisibility[]` (one entry per captured record) alongside a
+backward-compat `warnings: string[]`. Read `visibility[0].defaultReaderVisible` to confirm
+a record is org-wide readable — it is `true` only when `reviewState === "accepted"` **and**
+`scopeType === "org"`. Each entry also carries `warnings[]` explaining why a record is
+scoped out (pending review, or wrong scope). Do **not** run a follow-up `GET /memory/records`
+to verify persistence; trust `visibility`.
+
+> **`routing_rationale` org-scope rule.** Routing records are read org-scoped by the routing
+> watchdog. If you capture a `routing_rationale` record with `scope.projectId` set, it lands
+> project-scoped and the watchdog will not see it — `visibility[0].defaultReaderVisible` will
+> be `false` with a watchdog warning. **Omit `scope.projectId`** for routing records.
+> Auto-accept categories (`performance_scorecard`, `routing_rationale`, `tool_gap`, `synthesis`,
+> `scorecard_adjusted`, etc.) land `accepted` immediately; other categories land `pending` and
+> are invisible to readers until a board member accepts them.
 
 ---
 

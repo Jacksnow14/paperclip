@@ -75,6 +75,13 @@ Write tools:
 - `paperclipApprovalDecision`
 - `paperclipAddApprovalComment`
 
+Memory tools (retire the curl workaround — use these instead of raw curl for all memory ops):
+
+- `paperclipMemoryCapture` — `POST /memory/capture`; `source` must be an object `{ kind, issueId? }`, never a string; response includes `visibility[].defaultReaderVisible` and `warnings`
+- `paperclipMemoryQuery` — `POST /memory/query`; semantic search with optional scope/topK/intent
+- `paperclipMemoryListRecords` — `GET /memory/records`; supports `titlePrefix`, `q`, `limit`/`offset` pagination
+- `paperclipMemoryRevokeOwn` — `POST /memory/records/:recordId/revoke-own`; agent self-service revoke for allowlisted categories
+
 Escape hatch:
 
 - `paperclipApiRequest`

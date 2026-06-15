@@ -161,6 +161,86 @@ const apiRequestSchema = z.object({
   jsonBody: z.string().optional(),
 });
 
+// Memory tool schemas
+
+const memoryScopeToolSchema = z.object({
+  projectId: z.string().uuid().optional().describe("Scope to a specific project. Omit for org-wide records."),
+  agentId: z.string().uuid().optional().describe("Scope to a specific agent."),
+  issueId: z.string().uuid().optional().describe("Scope to a specific issue."),
+  workspaceId: z.string().optional().describe("Scope to a specific workspace."),
+  teamId: z.string().optional().describe("Scope to a specific team."),
+  runId: z.string().uuid().optional().describe("Scope to a specific run."),
+});
+
+const memorySourceToolSchema = z.object({
+  kind: z.enum([
+    "issue_comment",
+    "issue_document",
+    "issue",
+    "run",
+    "activity",
+    "manual_note",
+    "external_document",
+  ]).describe("The kind of source. Use 'issue' for issue-linked captures, 'manual_note' for standalone notes."),
+  issueId: z.string().optional().describe("UUID or human identifier (e.g. AUR-1234) of the linked issue."),
+  commentId: z.string().uuid().optional().describe("UUID of the linked comment."),
+  documentKey: z.string().optional().describe("Document key of the linked issue document."),
+  runId: z.string().uuid().optional().describe("UUID of the linked run."),
+  externalRef: z.string().optional().describe("External reference string for non-Paperclip sources."),
+});
+
+const memoryCaptureToolSchema = z.object({
+  companyId: companyIdOptional,
+  title: z.string().max(200).optional().describe("Short title for the memory record (used as lookup key in titlePrefix queries)."),
+  content: z.string().min(1).max(20000).describe("The memory content to capture."),
+  source: memorySourceToolSchema.describe(
+    "REQUIRED. The source of this record. Must be an OBJECT — not a string. " +
+    "Use kind='issue' + issueId='AUR-NNNN' for issue-linked captures. " +
+    "Use kind='manual_note' for standalone notes.",
+  ),
+  scope: memoryScopeToolSchema.optional().describe(
+    "Scope for this record. Omit projectId for org-wide records (visible to watchdog and all agents). " +
+    "Include projectId only when the record should be project-scoped. " +
+    "Routing records (category=routing) must NOT have projectId — the watchdog is org-scoped.",
+  ),
+  metadata: z.record(z.unknown()).optional().describe("Structured metadata, e.g. { category: 'tool_gap', ... }."),
+  summary: z.string().max(2000).optional().describe("Optional summary of the content."),
+  sensitivityLabel: z.enum(["public", "internal", "confidential", "restricted"]).optional()
+    .describe("Sensitivity label. Defaults to 'internal'."),
+  upsert: z.boolean().optional().describe("If true, update an existing record with the same title rather than creating a duplicate."),
+});
+
+const memoryQueryToolSchema = z.object({
+  companyId: companyIdOptional,
+  query: z.string().min(1).max(4000).describe("The semantic search query."),
+  scope: memoryScopeToolSchema.optional().describe("Optional scope to restrict the search."),
+  topK: z.number().int().positive().max(25).optional().describe("Number of results to return. Default: 5."),
+  intent: z.enum(["agent_preamble", "answer", "browse"]).optional()
+    .describe("Query intent. 'answer' (default) is for direct answers, 'browse' for exploration."),
+  metadataFilter: z.record(z.unknown()).optional().describe("Filter by metadata fields, e.g. { category: 'tool_gap' }."),
+});
+
+const memoryListRecordsToolSchema = z.object({
+  companyId: companyIdOptional,
+  titlePrefix: z.string().max(200).optional()
+    .describe("Filter records whose title starts with this prefix. Useful for namespace lookups like 'performance/agent-id/'."),
+  q: z.string().max(500).optional().describe("Full-text search across title and content."),
+  agentId: z.string().uuid().optional().describe("Filter by owner agent ID."),
+  projectId: z.string().uuid().optional().describe("Filter by project scope."),
+  reviewState: z.enum(["approved", "pending", "rejected"]).optional()
+    .describe("Filter by review state. Default excludes pending records."),
+  includeRevoked: z.boolean().optional().describe("Include revoked records. Default: false."),
+  limit: z.number().int().positive().max(1000).optional().describe("Page size. Default: 50."),
+  offset: z.number().int().min(0).optional().describe("Pagination offset. Use with limit to page through results."),
+});
+
+const memoryRevokeOwnToolSchema = z.object({
+  companyId: companyIdOptional,
+  recordId: z.string().uuid().describe("UUID of the memory record to revoke. Must be owned by the calling agent."),
+  reason: z.string().max(1000).optional()
+    .describe("Reason for revocation. Only works on allowlisted categories: experiment, observation, performance_scorecard, scorecard_adjusted, tool_gap, routing."),
+});
+
 const workspaceRuntimeControlTargetSchema = z.object({
   workspaceCommandId: z.string().min(1).optional().nullable(),
   runtimeServiceId: z.string().uuid().optional().nullable(),
@@ -591,6 +671,55 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
         client.requestJson("POST", `/approvals/${encodeURIComponent(approvalId)}/comments`, {
           body: { body },
         }),
+    ),
+    makeTool(
+      "paperclipMemoryCapture",
+      "Capture a memory record via POST /memory/capture. " +
+      "The 'source' field MUST be an object { kind, issueId?, ... } — not a string. " +
+      "Omit scope.projectId for org-wide records; include it only for project-scoped records. " +
+      "The response includes a 'visibility' array with defaultReaderVisible and any warnings.",
+      memoryCaptureToolSchema,
+      async ({ companyId, ...body }) =>
+        client.requestJson("POST", `/companies/${client.resolveCompanyId(companyId)}/memory/capture`, { body }),
+    ),
+    makeTool(
+      "paperclipMemoryQuery",
+      "Query memory records semantically via POST /memory/query. Returns relevant records and an optional preamble.",
+      memoryQueryToolSchema,
+      async ({ companyId, ...body }) =>
+        client.requestJson("POST", `/companies/${client.resolveCompanyId(companyId)}/memory/query`, { body }),
+    ),
+    makeTool(
+      "paperclipMemoryListRecords",
+      "List memory records via GET /memory/records with filtering and pagination. " +
+      "Use titlePrefix='performance/agent-id/' to find scorecard records. " +
+      "Use limit + offset to page through large result sets.",
+      memoryListRecordsToolSchema,
+      async ({ companyId, includeRevoked, ...rest }) => {
+        const params = new URLSearchParams();
+        for (const [key, value] of Object.entries(rest)) {
+          if (value === undefined || value === null) continue;
+          params.set(key, String(value));
+        }
+        if (includeRevoked !== undefined) params.set("includeRevoked", includeRevoked ? "true" : "false");
+        const qs = params.toString();
+        return client.requestJson(
+          "GET",
+          `/companies/${client.resolveCompanyId(companyId)}/memory/records${qs ? `?${qs}` : ""}`,
+        );
+      },
+    ),
+    makeTool(
+      "paperclipMemoryRevokeOwn",
+      "Revoke a memory record you own via POST /memory/records/:recordId/revoke-own. " +
+      "Only works on allowlisted categories: experiment, observation, performance_scorecard, scorecard_adjusted, tool_gap, routing.",
+      memoryRevokeOwnToolSchema,
+      async ({ companyId, recordId, reason }) =>
+        client.requestJson(
+          "POST",
+          `/companies/${client.resolveCompanyId(companyId)}/memory/records/${encodeURIComponent(recordId)}/revoke-own`,
+          { body: { reason: reason ?? "Revoked by owning agent" } },
+        ),
     ),
     makeTool(
       "paperclipApiRequest",

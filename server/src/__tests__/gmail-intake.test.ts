@@ -9,7 +9,7 @@ const mockCreateLabel = vi.fn();
 const mockModifyMessageLabels = vi.fn();
 
 vi.mock("../services/gmail.js", () => ({
-  GMAIL_SUPPORTED_ALIASES: ["board", "alex", "leo", "adrian"],
+  GMAIL_SUPPORTED_ALIASES: ["board", "alex", "leo", "adrian", "billing"],
   createGmailService: () => ({
     listMessages: mockListMessages,
     getMessage: mockGetMessage,
@@ -328,18 +328,19 @@ describe("createGmailIntakeService.pollAllMailboxes", () => {
     vi.clearAllMocks();
   });
 
-  it("polls all four mailboxes and returns per-mailbox results", async () => {
+  it("polls all five mailboxes and returns per-mailbox results", async () => {
     mockListMessages.mockResolvedValue({ messages: [] });
     const db = buildDbMock();
     const svc = createGmailIntakeService(db);
     const results = await svc.pollAllMailboxes(COMPANY_ID);
 
-    expect(results).toHaveLength(4);
+    expect(results).toHaveLength(5);
     const mailboxes = results.map((r) => r.mailbox);
     expect(mailboxes).toContain("board");
     expect(mailboxes).toContain("alex");
     expect(mailboxes).toContain("leo");
     expect(mailboxes).toContain("adrian");
+    expect(mailboxes).toContain("billing");
   });
 
   it("continues polling remaining mailboxes when one fails", async () => {
@@ -351,7 +352,7 @@ describe("createGmailIntakeService.pollAllMailboxes", () => {
     const svc = createGmailIntakeService(db);
     const results = await svc.pollAllMailboxes(COMPANY_ID);
 
-    expect(results).toHaveLength(4);
+    expect(results).toHaveLength(5);
     const boardResult = results.find((r) => r.mailbox === "board");
     expect(boardResult?.errors).toBe(1);
     const alexResult = results.find((r) => r.mailbox === "alex");
@@ -416,6 +417,7 @@ describe("routing: mailbox → agent role", () => {
     ["alex", "cmo"],
     ["leo", "cto"],
     ["adrian", "cfo"],
+    ["billing", "cfo"],
   ] as const)("%s mailbox resolves to %s agent role", async (mailbox, _role) => {
     const msg = makeMessage("msg-r", "thread-r");
     mockListMessages.mockResolvedValue({ messages: [{ id: "msg-r" }] });
@@ -449,6 +451,75 @@ describe("routing: mailbox → agent role", () => {
     expect(mockIssueCreate).toHaveBeenCalledWith(
       COMPANY_ID,
       expect.objectContaining({ assigneeAgentId: "agent-ceo-1" }),
+    );
+  });
+});
+
+describe("content-based routing: invoice subjects route to CFO", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function buildAgentLookupDb(agentId: string) {
+    let selectCallCount = 0;
+    return {
+      select: vi.fn(() => {
+        selectCallCount++;
+        // Calls 1-2: message/thread dedup → empty. Call 3: agent lookup → match.
+        const rows = selectCallCount >= 3 ? [{ id: agentId }] : [];
+        return {
+          from: vi.fn().mockReturnThis(),
+          where: vi.fn().mockReturnThis(),
+          limit: vi.fn().mockResolvedValue(rows),
+        };
+      }),
+      insert: vi.fn(() => ({ values: vi.fn().mockResolvedValue(undefined) })),
+    } as unknown as Db;
+  }
+
+  it.each([
+    "[INVOICE-TEST] Acme Supplies invoice #INV-1234",
+    "Your receipt from Stripe",
+    "INV-5678 — payment due 2026-07-01",
+    "Monthly bill for cloud hosting",
+    "VAT invoice attached",
+    "Billing statement for May 2026",
+    "Payment due: hosting renewal",
+  ])("subject '%s' on alex@ routes to CFO, not CMO", async (subject) => {
+    const msg = makeMessage("msg-inv", "thread-inv", subject);
+    mockListMessages.mockResolvedValue({ messages: [{ id: "msg-inv" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([]);
+    mockCreateLabel.mockResolvedValue({ id: "lbl-x" });
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-inv" });
+
+    const db = buildAgentLookupDb("agent-cfo-override");
+    const svc = createGmailIntakeService(db);
+    await svc.processMailbox(COMPANY_ID, "alex");
+
+    expect(mockIssueCreate).toHaveBeenCalledWith(
+      COMPANY_ID,
+      expect.objectContaining({ assigneeAgentId: "agent-cfo-override" }),
+    );
+  });
+
+  it("non-invoice subject on alex@ still routes to CMO (default)", async () => {
+    const msg = makeMessage("msg-mktg", "thread-mktg", "Q3 marketing campaign draft");
+    mockListMessages.mockResolvedValue({ messages: [{ id: "msg-mktg" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([]);
+    mockCreateLabel.mockResolvedValue({ id: "lbl-x" });
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-mktg" });
+
+    const db = buildAgentLookupDb("agent-cmo-default");
+    const svc = createGmailIntakeService(db);
+    await svc.processMailbox(COMPANY_ID, "alex");
+
+    expect(mockIssueCreate).toHaveBeenCalledWith(
+      COMPANY_ID,
+      expect.objectContaining({ assigneeAgentId: "agent-cmo-default" }),
     );
   });
 });

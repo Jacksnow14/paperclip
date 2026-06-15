@@ -12,7 +12,13 @@ const MAILBOX_ROLE: Record<GmailAlias, string> = {
   alex: "cmo",
   leo: "cto",
   adrian: "cfo",
+  billing: "cfo",
 };
+
+// Subject patterns that signal invoice/billing content.
+// When matched, the message routes to CFO regardless of which mailbox received it.
+const INVOICE_SUBJECT_RE =
+  /invoice|receipt|\bINV-|\bbill\b|\[INVOICE-|payment\s+due|\bVAT\b|billing\s+statement/i;
 
 // Gmail label names applied by the intake pipeline.
 export const INTAKE_LABELS = {
@@ -109,12 +115,19 @@ function parseMessage(
   return { from, subject, dateMs, bodySnippet, gmailThreadId, gmailMessageId };
 }
 
+function isInvoiceContent(parsed: ParsedMessage): boolean {
+  return INVOICE_SUBJECT_RE.test(parsed.subject);
+}
+
 async function resolveAssigneeAgentId(
   db: Pick<Db, "select">,
   companyId: string,
   mailbox: GmailAlias,
+  parsed?: ParsedMessage,
 ): Promise<string | null> {
-  const role = MAILBOX_ROLE[mailbox];
+  // Content-based override: invoices route to CFO regardless of mailbox.
+  const role =
+    parsed && isInvoiceContent(parsed) ? "cfo" : MAILBOX_ROLE[mailbox];
   const rows = await db
     .select({ id: agents.id })
     .from(agents)
@@ -242,7 +255,7 @@ export function createGmailIntakeService(db: Db) {
           // New thread — create a new issue in an actionable, routed status
           // (`todo`) so the assignee picks it up rather than letting it sit in
           // `backlog`.
-          const assigneeAgentId = await resolveAssigneeAgentId(db, companyId, mailbox);
+          const assigneeAgentId = await resolveAssigneeAgentId(db, companyId, mailbox, parsed);
           const issueTitle = buildIssueTitle(mailbox, parsed.subject, parsed.from);
           const issueDescription = buildIssueDescription(mailbox, parsed);
 

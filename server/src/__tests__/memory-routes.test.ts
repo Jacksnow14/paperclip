@@ -686,6 +686,241 @@ describe("memory routes", () => {
     });
   });
 
+  // ── Part A: Pagination ────────────────────────────────────────────────────
+
+  it("passes offset to listRecords for paginated queries", async () => {
+    mockMemoryService.listRecords.mockResolvedValue([]);
+    const app = createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      companyIds: [companyA],
+      isInstanceAdmin: false,
+    });
+
+    const res = await request(app)
+      .get(`/api/companies/${companyA}/memory/records`)
+      .query({ limit: "50", offset: "100" })
+      .set("Origin", "http://localhost:3100");
+
+    expect(res.status).toBe(200);
+    expect(mockMemoryService.listRecords).toHaveBeenCalledWith(
+      companyA,
+      expect.objectContaining({ limit: 50, offset: 100 }),
+      expect.objectContaining({ actorType: "user", userId: "board-user" }),
+    );
+  });
+
+  it("defaults offset to 0 when not provided", async () => {
+    mockMemoryService.listRecords.mockResolvedValue([]);
+    const app = createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      companyIds: [companyA],
+      isInstanceAdmin: false,
+    });
+
+    const res = await request(app)
+      .get(`/api/companies/${companyA}/memory/records`)
+      .query({ limit: "50" })
+      .set("Origin", "http://localhost:3100");
+
+    expect(res.status).toBe(200);
+    expect(mockMemoryService.listRecords).toHaveBeenCalledWith(
+      companyA,
+      expect.objectContaining({ offset: 0 }),
+      expect.anything(),
+    );
+  });
+
+  // ── Part B: Agent self-service revoke ─────────────────────────────────────
+
+  describe("POST /companies/:companyId/memory/records/:recordId/revoke-own", () => {
+    const recordId = "44444444-4444-4444-8444-444444444444";
+    const agentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const otherAgent = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+    function makeRoutingRecord(overrides: Record<string, unknown> = {}) {
+      return {
+        id: recordId,
+        owner: { type: "agent", id: agentId },
+        metadata: { category: "routing" },
+        scopeType: "agent",
+        scope: { agentId },
+        reviewState: "accepted",
+        content: "routing/AUR-2066 decision",
+        ...overrides,
+      };
+    }
+
+    const revokeResult = {
+      operations: [],
+      revokedRecordIds: [recordId],
+    };
+
+    it("allows an agent to revoke its own routing record", async () => {
+      mockMemoryService.getRecord.mockResolvedValue(makeRoutingRecord());
+      mockMemoryService.revoke.mockResolvedValue(revokeResult);
+      const app = createApp({ type: "agent", agentId, companyId: companyA });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/records/${recordId}/revoke-own`)
+        .send({ reason: "Duplicate routing entry" });
+
+      expect(res.status).toBe(200);
+      expect(res.body.revokedRecordIds).toEqual([recordId]);
+      expect(mockMemoryService.revoke).toHaveBeenCalledWith(
+        companyA,
+        { selector: { recordIds: [recordId] }, reason: "Duplicate routing entry" },
+        expect.objectContaining({ actorType: "agent", agentId }),
+      );
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "memory.revoked", details: expect.objectContaining({ selfService: true }) }),
+      );
+    });
+
+    it("returns 403 when agent tries to revoke a record owned by another agent", async () => {
+      mockMemoryService.getRecord.mockResolvedValue(makeRoutingRecord({ owner: { type: "agent", id: otherAgent } }));
+      const app = createApp({ type: "agent", agentId, companyId: companyA });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/records/${recordId}/revoke-own`)
+        .send({ reason: "Testing non-owner revoke" });
+
+      expect(res.status).toBe(403);
+      expect(res.body).toEqual({ error: "Agent can only revoke memory records it owns" });
+      expect(mockMemoryService.revoke).not.toHaveBeenCalled();
+    });
+
+    it("returns 403 when agent tries to revoke its own record with off-allowlist category", async () => {
+      mockMemoryService.getRecord.mockResolvedValue(makeRoutingRecord({ metadata: { category: "lesson" } }));
+      const app = createApp({ type: "agent", agentId, companyId: companyA });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/records/${recordId}/revoke-own`)
+        .send({ reason: "Testing off-allowlist revoke" });
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toMatch(/lesson/);
+      expect(mockMemoryService.revoke).not.toHaveBeenCalled();
+    });
+
+    it("returns 403 when a board user tries to use the revoke-own endpoint", async () => {
+      mockMemoryService.getRecord.mockResolvedValue(makeRoutingRecord());
+      const app = createApp({
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        companyIds: [companyA],
+        isInstanceAdmin: false,
+      });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/records/${recordId}/revoke-own`)
+        .set("Origin", "http://localhost:3100")
+        .send({ reason: "Testing board user revoke-own" });
+
+      expect(res.status).toBe(403);
+      expect(mockMemoryService.revoke).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── Part C: Capture visibility warnings ───────────────────────────────────
+
+  describe("POST /companies/:companyId/memory/capture — visibility warnings", () => {
+    const captureBody = {
+      source: { kind: "issue", issueId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" },
+      content: "Test capture content",
+    };
+
+    it("returns non-empty warnings when captured record is pending review", async () => {
+      mockMemoryService.capture.mockResolvedValue({
+        operation: { id: "op-1", bindingId: bindingId, source: { kind: "issue" } },
+        records: [{
+          id: "dd000000-0000-4000-8000-000000000000",
+          reviewState: "pending",
+          scopeType: "org",
+          scope: {},
+        }],
+      });
+      const app = createApp({
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        companyIds: [companyA],
+        isInstanceAdmin: false,
+      });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send(captureBody);
+
+      expect(res.status).toBe(201);
+      expect(res.body.warnings).toBeInstanceOf(Array);
+      expect(res.body.warnings.length).toBeGreaterThan(0);
+      expect(res.body.warnings[0]).toMatch(/pending review/);
+    });
+
+    it("returns no warnings for an auto-accepted org-scoped record", async () => {
+      mockMemoryService.capture.mockResolvedValue({
+        operation: { id: "op-2", bindingId: bindingId, source: { kind: "issue" } },
+        records: [{
+          id: "ee000000-0000-4000-8000-000000000000",
+          reviewState: "accepted",
+          scopeType: "org",
+          scope: {},
+        }],
+      });
+      const app = createApp({
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        companyIds: [companyA],
+        isInstanceAdmin: false,
+      });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send(captureBody);
+
+      expect(res.status).toBe(201);
+      expect(res.body.warnings).toEqual([]);
+    });
+
+    it("returns a warning when captured record is project-scoped", async () => {
+      const projectId = "77777777-7777-4777-8777-777777777777";
+      mockMemoryService.capture.mockResolvedValue({
+        operation: { id: "op-3", bindingId: bindingId, source: { kind: "issue" } },
+        records: [{
+          id: "ff000000-0000-4000-8000-000000000000",
+          reviewState: "accepted",
+          scopeType: "project",
+          scope: { projectId },
+        }],
+      });
+      const app = createApp({
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        companyIds: [companyA],
+        isInstanceAdmin: false,
+      });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...captureBody, scope: { projectId } });
+
+      expect(res.status).toBe(201);
+      expect(res.body.warnings).toBeInstanceOf(Array);
+      expect(res.body.warnings.some((w: string) => w.includes("project-scoped"))).toBe(true);
+    });
+  });
+
   it("starts memory refresh jobs through the memory service and logs activity", async () => {
     mockMemoryService.startRefreshJob.mockResolvedValue({
       job: {

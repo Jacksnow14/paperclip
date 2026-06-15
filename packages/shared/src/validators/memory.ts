@@ -226,6 +226,7 @@ export const memoryCaptureSchema = z
     summary: z.string().trim().max(2000).nullable().optional(),
     metadata: z.record(z.unknown()).optional(),
     reviewState: z.enum(MEMORY_REVIEW_STATES).optional(),
+    upsert: z.boolean().optional().default(false),
   })
   .strict();
 
@@ -349,8 +350,15 @@ export const memoryListRecordsQuerySchema = z
     includeRevoked: queryBooleanSchema.optional().default(false),
     includeExpired: queryBooleanSchema.optional().default(false),
     includeSuperseded: queryBooleanSchema.optional().default(false),
-    limit: z.coerce.number().int().positive().max(200).optional().default(50),
+    limit: z.coerce.number().int().positive().max(1000).optional().default(50),
+    offset: z.coerce.number().int().min(0).optional().default(0),
     count: z.enum(["only"]).optional(),
+  })
+  .strict();
+
+export const memoryRevokeOwnSchema = z
+  .object({
+    reason: z.string().trim().min(1).max(1000).optional().default("Revoked by owning agent"),
   })
   .strict();
 
@@ -445,3 +453,4 @@ export type MemoryListExtractionJobsQuery = z.infer<typeof memoryListExtractionJ
 export type MemoryRefreshJob = z.infer<typeof memoryRefreshJobSchema>;
 export type MemorySynthesisJob = z.infer<typeof memorySynthesisJobSchema>;
 export type MemoryAgentUpdate = z.infer<typeof memoryAgentUpdateSchema>;
+export type MemoryRevokeOwn = z.infer<typeof memoryRevokeOwnSchema>;

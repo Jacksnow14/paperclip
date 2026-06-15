@@ -341,4 +341,54 @@ describe("paperclip MCP tools", () => {
 
     expect(response.content[0]?.text).toContain("must not contain '..'");
   });
+
+  // AUR-2410: memory tools retire the raw-curl workaround. These assert the
+  // request shape the server's .strict() validators require — most importantly
+  // that `source` is sent as an OBJECT (the AUR-2008/AUR-1672 footgun) and that
+  // list-records pages via `offset`.
+  it("memory_capture POSTs an object source to the company memory endpoint", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ record: { id: "rec-1" }, visibility: [{ defaultReaderVisible: true }] }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipMemoryCapture");
+    const response = await tool.execute({
+      content: "tool-gap note",
+      source: { kind: "issue", issueId: "AUR-2410" },
+      metadata: { category: "tool_gap" },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe(
+      "http://localhost:3100/api/companies/11111111-1111-1111-1111-111111111111/memory/capture",
+    );
+    expect(init.method).toBe("POST");
+    const body = JSON.parse(init.body as string);
+    // source must be an object, not a string — the whole point of the tool schema.
+    expect(typeof body.source).toBe("object");
+    expect(body.source).toEqual({ kind: "issue", issueId: "AUR-2410" });
+    expect(response.content[0]?.text).toContain("defaultReaderVisible");
+  });
+
+  it("memory_list_records pages through results with limit + offset", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse({ records: [] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipMemoryListRecords");
+    await tool.execute({ titlePrefix: "performance/agent-x/", limit: 50, offset: 50 });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url] = fetchMock.mock.calls[0] as [string];
+    const parsed = new URL(String(url));
+    expect(parsed.pathname).toBe(
+      "/api/companies/11111111-1111-1111-1111-111111111111/memory/records",
+    );
+    expect(parsed.searchParams.get("titlePrefix")).toBe("performance/agent-x/");
+    expect(parsed.searchParams.get("limit")).toBe("50");
+    expect(parsed.searchParams.get("offset")).toBe("50");
+    // companyId is consumed for the path and must not leak into the query string.
+    expect(parsed.searchParams.get("companyId")).toBeNull();
+  });
 });

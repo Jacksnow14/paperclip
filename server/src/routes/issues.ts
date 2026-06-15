@@ -636,13 +636,16 @@ function queueResolvedInteractionContinuationWakeup(input: {
   };
   actor: { actorType: "user" | "agent"; actorId: string };
   source: string;
+  /** Skip the accept-only policy guard; used when the issue is being returned to the creator agent on reject. */
+  forceWake?: boolean;
 }) {
   if (
     input.interaction.continuationPolicy !== "wake_assignee"
     && input.interaction.continuationPolicy !== "wake_assignee_on_accept"
   ) return;
   if (
-    input.interaction.continuationPolicy === "wake_assignee_on_accept"
+    !input.forceWake
+    && input.interaction.continuationPolicy === "wake_assignee_on_accept"
     && input.interaction.status !== "accepted"
   ) return;
   if (input.interaction.status === "expired") return;
@@ -4033,6 +4036,30 @@ export function issueRoutes(
     res.json(comments);
   });
 
+  function assertCanResolveInteraction(
+    req: Request,
+    issue: { assigneeAgentId?: string | null },
+    interaction: { createdByAgentId?: string | null },
+  ) {
+    if (req.actor.type === "board") return;
+    if (req.actor.type === "agent") {
+      if (!req.actor.agentId || issue.assigneeAgentId !== req.actor.agentId) {
+        throw forbidden("Only the issue assignee agent may resolve this interaction");
+      }
+      if (
+        interaction.createdByAgentId != null
+        && interaction.createdByAgentId === req.actor.agentId
+      ) {
+        throw forbidden("Agent cannot resolve its own interaction");
+      }
+      if (!req.actor.runId?.trim()) {
+        throw unauthorized("Agent run id required");
+      }
+      return;
+    }
+    throw forbidden("Board access required");
+  }
+
   router.get("/issues/:id/interactions", async (req, res) => {
     const id = req.params.id as string;
     const issue = await svc.getById(id);
@@ -4103,7 +4130,12 @@ export function issueRoutes(
         return;
       }
       assertCompanyAccess(req, issue.companyId);
-      assertBoard(req);
+      const interactionForAuthz = await issueThreadInteractionService(db).getByIdForIssue(issue.id, issue.companyId, interactionId);
+      if (!interactionForAuthz) {
+        res.status(404).json({ error: "Interaction not found" });
+        return;
+      }
+      assertCanResolveInteraction(req, issue, interactionForAuthz);
 
       const actor = getActorInfo(req);
       const { interaction, createdIssues, continuationIssue } = await issueThreadInteractionService(db).acceptInteraction(issue, interactionId, req.body, {
@@ -4200,13 +4232,19 @@ export function issueRoutes(
         return;
       }
       assertCompanyAccess(req, issue.companyId);
-      assertBoard(req);
+      const interactionForAuthz = await issueThreadInteractionService(db).getByIdForIssue(issue.id, issue.companyId, interactionId);
+      if (!interactionForAuthz) {
+        res.status(404).json({ error: "Interaction not found" });
+        return;
+      }
+      assertCanResolveInteraction(req, issue, interactionForAuthz);
 
       const actor = getActorInfo(req);
-      const interaction = await issueThreadInteractionService(db).rejectInteraction(issue, interactionId, req.body, {
+      const { interaction, continuationIssue } = await issueThreadInteractionService(db).rejectInteraction(issue, interactionId, req.body, {
         agentId: actor.agentId,
         userId: actor.actorType === "user" ? actor.actorId : null,
       });
+      const continuationWakeIssue = continuationIssue ?? issue;
 
       await logActivity(db, {
         companyId: issue.companyId,
@@ -4232,12 +4270,39 @@ export function issueRoutes(
         },
       });
 
+      if (continuationIssue) {
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          action: "issue.updated",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            identifier: issue.identifier,
+            status: continuationIssue.status,
+            assigneeAgentId: continuationIssue.assigneeAgentId ?? null,
+            assigneeUserId: continuationIssue.assigneeUserId ?? null,
+            source: "request_confirmation_reject",
+            interactionId: interaction.id,
+            _previous: {
+              status: issue.status,
+              assigneeAgentId: issue.assigneeAgentId ?? null,
+              assigneeUserId: issue.assigneeUserId ?? null,
+            },
+          },
+        });
+      }
+
       queueResolvedInteractionContinuationWakeup({
         heartbeat,
-        issue,
+        issue: continuationWakeIssue,
         interaction,
         actor,
         source: "issue.interaction.reject",
+        forceWake: continuationIssue != null,
       });
 
       res.json(interaction);

@@ -921,6 +921,57 @@ describe("memory routes", () => {
     });
   });
 
+  // ── Part D: Upsert-by-title ───────────────────────────────────────────────
+
+  describe("POST /companies/:companyId/memory/capture — upsert flag", () => {
+    const issueId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const upsertBody = {
+      source: { kind: "issue", issueId },
+      title: "performance/agent-123/feature/2026-06-15",
+      content: "Updated scorecard content",
+      metadata: { category: "performance_scorecard" },
+      upsert: true,
+    };
+
+    it("passes upsert=true to the capture service", async () => {
+      mockMemoryService.capture.mockResolvedValue({
+        operation: { id: "op-upsert", bindingId, source: { kind: "issue" } },
+        records: [{ id: "rec-001", reviewState: "accepted", scopeType: "org", scope: {} }],
+      });
+      const app = createApp({ type: "agent", agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", companyId: companyA });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .send(upsertBody);
+
+      expect(res.status).toBe(201);
+      expect(mockMemoryService.capture).toHaveBeenCalledWith(
+        companyA,
+        expect.objectContaining({ upsert: true, title: upsertBody.title }),
+        expect.anything(),
+      );
+    });
+
+    it("passes upsert=false by default when omitted", async () => {
+      mockMemoryService.capture.mockResolvedValue({
+        operation: { id: "op-insert", bindingId, source: { kind: "issue" } },
+        records: [{ id: "rec-002", reviewState: "accepted", scopeType: "org", scope: {} }],
+      });
+      const app = createApp({ type: "agent", agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", companyId: companyA });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .send({ source: { kind: "issue", issueId }, content: "New content" });
+
+      expect(res.status).toBe(201);
+      expect(mockMemoryService.capture).toHaveBeenCalledWith(
+        companyA,
+        expect.objectContaining({ upsert: false }),
+        expect.anything(),
+      );
+    });
+  });
+
   it("starts memory refresh jobs through the memory service and logs activity", async () => {
     mockMemoryService.startRefreshJob.mockResolvedValue({
       job: {

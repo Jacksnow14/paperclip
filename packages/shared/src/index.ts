@@ -602,6 +602,7 @@ export type {
   PluginManagedSkillDeclaration,
   PluginManagedSkillFileDeclaration,
   PluginLocalFolderDeclaration,
+  PluginMemoryProviderDeclaration,
   PluginManagedAgentResolution,
   PluginManagedProjectResolution,
   PluginManagedRoutineResolution,

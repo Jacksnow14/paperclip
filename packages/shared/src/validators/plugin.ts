@@ -233,6 +233,20 @@ export const pluginLocalFolderDeclarationSchema = z.object({
 
 export type PluginLocalFolderDeclarationInput = z.infer<typeof pluginLocalFolderDeclarationSchema>;
 
+export const pluginMemoryProviderDeclarationSchema = z.object({
+  key: z.string().min(1).max(100),
+  displayName: z.string().min(1).max(200),
+  description: z.string().max(500).optional(),
+  capabilities: z.object({
+    browse: z.boolean().optional(),
+    correction: z.boolean().optional(),
+    asyncIngestion: z.boolean().optional(),
+    providerManagedExtraction: z.boolean().optional(),
+  }).optional(),
+  configSchema: z.record(z.unknown()).nullable().optional(),
+  configMetadata: z.record(z.unknown()).nullable().optional(),
+});
+
 export const pluginManagedSkillFileDeclarationSchema = z.object({
   path: pluginLocalFolderRelativePathSchema.refine(
     (value) => value.toLowerCase() !== "skill.md",
@@ -627,6 +641,7 @@ export const pluginManifestV1Schema = z.object({
   routines: z.array(pluginManagedRoutineDeclarationSchema).optional(),
   skills: z.array(pluginManagedSkillDeclarationSchema).optional(),
   localFolders: z.array(pluginLocalFolderDeclarationSchema).optional(),
+  memoryProviders: z.array(pluginMemoryProviderDeclarationSchema).optional(),
   launchers: z.array(pluginLauncherDeclarationSchema).optional(),
   ui: z.object({
     slots: z.array(pluginUiSlotDeclarationSchema).min(1).optional(),

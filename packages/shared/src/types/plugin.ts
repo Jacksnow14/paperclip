@@ -28,6 +28,7 @@ import type {
 } from "../constants.js";
 import type { Agent } from "./agent.js";
 import type { CompanySkill } from "./company-skill.js";
+import type { MemoryProviderCapabilities, MemoryProviderConfigMetadata } from "./memory.js";
 import type { Project } from "./project.js";
 import type { Routine, RoutineTrigger, RoutineVariable } from "./routine.js";
 
@@ -480,6 +481,28 @@ export interface PluginApiRouteDeclaration {
 }
 
 // ---------------------------------------------------------------------------
+// Plugin Memory Provider Declaration
+// ---------------------------------------------------------------------------
+
+/**
+ * Declares a memory provider contributed by the plugin.
+ */
+export interface PluginMemoryProviderDeclaration {
+  /** Stable provider key, unique within the plugin. */
+  key: string;
+  /** Human-readable name shown in the UI. */
+  displayName: string;
+  /** Optional description. */
+  description?: string;
+  /** Capabilities this provider supports. */
+  capabilities?: Partial<MemoryProviderCapabilities>;
+  /** JSON Schema for per-binding config (optional). */
+  configSchema?: Record<string, unknown> | null;
+  /** Structured config field metadata for the UI (optional). */
+  configMetadata?: MemoryProviderConfigMetadata | null;
+}
+
+// ---------------------------------------------------------------------------
 // Plugin Manifest V1
 // ---------------------------------------------------------------------------
 
@@ -545,6 +568,8 @@ export interface PaperclipPluginManifestV1 {
   skills?: PluginManagedSkillDeclaration[];
   /** Trusted local folders this plugin can configure and access by stable key. */
   localFolders?: PluginLocalFolderDeclaration[];
+  /** Memory providers this plugin contributes. */
+  memoryProviders?: PluginMemoryProviderDeclaration[];
   /**
    * Legacy top-level launcher declarations.
    * Prefer `ui.launchers` for new manifests.

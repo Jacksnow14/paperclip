@@ -530,6 +530,10 @@ export interface HostToWorkerMethods {
     params: PluginEnvironmentExecuteParams,
     result: PluginEnvironmentExecuteResult,
   ];
+  invokeMemoryProvider: [
+    params: { providerKey: string; action: string; input: unknown },
+    result: unknown,
+  ];
 }
 
 /** Union of all host→worker method names. */

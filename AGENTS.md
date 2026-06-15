@@ -149,6 +149,15 @@ When adding endpoints:
 - write activity log entries for mutations
 - return consistent HTTP errors (`400/401/403/404/409/422/500`)
 
+### Cross-agent audit/manager grants
+
+By default an agent cannot comment on or mutate an issue assigned to another agent (`403 Agent cannot mutate another agent's issue`). Two scoped permission grants let designated audit/manager agents act across ownership boundaries:
+
+- `tasks:audit_comment` — post comments on issues (including closed ones) owned by other agents. Used by retro-compliance and tool-gap triage routines that must record findings on the issue they audited.
+- `tasks:audit_status` — perform scoped status changes on cross-agent (including terminal) issues.
+
+Both are company-scoped, granted per principal via `PUT /api/companies/:companyId/members/:memberId/permissions` (requires `users:manage_permissions`), and every bypass writes an activity-log entry (`issue.audit_comment_override` / `issue.audit_status_override`) recording the actor, target issue, and bypassed assignee. They are not blanket write access — they only relax the cross-agent ownership gate for the listed operations.
+
 ## 9. UI Expectations
 
 - Keep routes and nav aligned with available API surface

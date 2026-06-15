@@ -477,4 +477,70 @@ describe("agent issue mutation checkout ownership", () => {
       title: "Claimable update",
     });
   });
+
+  describe("tasks:audit_comment permission", () => {
+    it("allows agent WITH tasks:audit_comment to post comment on a closed issue owned by another agent", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "done", assigneeAgentId: ownerAgentId }));
+      mockAccessService.hasPermission.mockImplementation(async (
+        _companyId: string,
+        _principalType: string,
+        principalId: string,
+        permissionKey: string,
+      ) => principalId === peerAgentId && permissionKey === "tasks:audit_comment");
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Retrospective note" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalled();
+    });
+
+    it("rejects agent WITHOUT tasks:audit_comment from posting comment on a closed issue owned by another agent", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "done", assigneeAgentId: ownerAgentId }));
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Unauthorized note" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("tasks:audit_status permission", () => {
+    it("allows agent WITH tasks:audit_status to PATCH status on a cross-agent issue", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "done", assigneeAgentId: ownerAgentId }));
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...makeIssue({ status: "done", assigneeAgentId: ownerAgentId }),
+        ...patch,
+      }));
+      mockAccessService.hasPermission.mockImplementation(async (
+        _companyId: string,
+        _principalType: string,
+        principalId: string,
+        permissionKey: string,
+      ) => principalId === peerAgentId && permissionKey === "tasks:audit_status");
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Triage close" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalled();
+    });
+
+    it("rejects agent WITHOUT tasks:audit_status from PATCHing status on a cross-agent issue", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "done", assigneeAgentId: ownerAgentId }));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done", comment: "Unauthorized triage" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+  });
 });

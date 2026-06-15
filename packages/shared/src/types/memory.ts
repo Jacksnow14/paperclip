@@ -333,9 +333,19 @@ export interface MemoryQueryResult {
   preamble: string | null;
 }
 
+export interface MemoryCaptureVisibility {
+  recordId: string;
+  reviewState: MemoryReviewState;
+  scopeType: MemoryScopeType;
+  scopeId: string | null;
+  defaultReaderVisible: boolean;
+  warnings: string[];
+}
+
 export interface MemoryCaptureResult {
   operation: MemoryOperation;
   records: MemoryRecord[];
+  visibility: MemoryCaptureVisibility[];
 }
 
 export interface MemoryForgetResult {

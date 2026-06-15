@@ -2545,7 +2545,39 @@ export function memoryService(
       if (!isDedup) {
         records = await attachCreatedByOperation(companyId, records, operation.id);
       }
-      return { operation, records } satisfies MemoryCaptureResult;
+
+      // Categories that the org-scoped routing watchdog reads. Records in these
+      // categories must be org-scoped to be visible to the watchdog.
+      const ORG_READER_CATEGORIES = new Set(["routing_rationale"]);
+
+      const visibility = records.map((record) => {
+        const defaultReaderVisible = record.reviewState === "accepted" && record.scopeType === "org";
+        const visWarnings: string[] = [];
+        if (record.reviewState !== "accepted") {
+          visWarnings.push(
+            "Record landed reviewState=pending; invisible to memory/query readers until a board member accepts it " +
+            "(PATCH /memory/records/:id/review).",
+          );
+        }
+        const category = typeof record.metadata?.category === "string" ? record.metadata.category : null;
+        if (category && ORG_READER_CATEGORIES.has(category) && record.scopeType !== "org") {
+          visWarnings.push(
+            `Category '${category}' is read org-scoped by the routing watchdog, but this record is ` +
+            `${record.scopeType}-scoped (scopeId=${record.scopeId ?? "null"}); ` +
+            "the watchdog will not see it. Omit scope.projectId to capture it org-scoped.",
+          );
+        }
+        return {
+          recordId: record.id,
+          reviewState: record.reviewState,
+          scopeType: record.scopeType,
+          scopeId: record.scopeId,
+          defaultReaderVisible,
+          warnings: visWarnings,
+        };
+      });
+
+      return { operation, records, visibility } satisfies MemoryCaptureResult;
     },
 
     forget: async (companyId: string, data: MemoryForget, actor: ActorInfo, triggerKind: MemoryOperation["triggerKind"] = "manual") => {

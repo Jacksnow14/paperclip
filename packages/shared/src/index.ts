@@ -1183,6 +1183,7 @@ export type {
   MemoryBindingTarget,
   MemoryAgentUpdateResult,
   MemoryCaptureResult,
+  MemoryCaptureVisibility,
   MemoryCitation,
   MemoryCorrectResult,
   MemoryExtractionJob,

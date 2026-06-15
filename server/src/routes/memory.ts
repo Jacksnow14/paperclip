@@ -12,9 +12,11 @@
  *   Returns 403 for non-owner or off-allowlist categories.
  *
  * Capture visibility warnings (POST /memory/capture):
- *   The response includes a non-breaking `warnings: string[]` field when the captured
- *   record(s) won't appear in the default GET /memory/records or memory/query response
- *   (e.g. reviewState=pending, project-scoped, or agent-scoped to a different agent).
+ *   The response includes a `warnings: string[]` field (backward-compat) and a typed
+ *   `visibility: MemoryCaptureVisibility[]` array (one entry per record) that confirms
+ *   reader-visibility and warns on the scoped-out footgun. Read `visibility[0].defaultReaderVisible`
+ *   to confirm org-wide visibility without a re-probe. For `routing_rationale` records,
+ *   omit scope.projectId; project-scoped routing records are invisible to the org-scoped watchdog.
  */
 import { Router } from "express";
 import type { Db } from "@paperclipai/db";

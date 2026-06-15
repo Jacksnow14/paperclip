@@ -972,6 +972,117 @@ describe("memory routes", () => {
     });
   });
 
+  // ── Part E: Capture visibility field (AUR-2406) ──────────────────────────────
+
+  describe("POST /companies/:companyId/memory/capture — visibility field", () => {
+    const baseSource = { kind: "issue", issueId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" };
+
+    it("visibility[0] is accepted + defaultReaderVisible=true for org-scoped performance_scorecard", async () => {
+      mockMemoryService.capture.mockResolvedValue({
+        operation: { id: "op-vis-1", bindingId, source: { kind: "issue" } },
+        records: [{
+          id: "vis-rec-001",
+          reviewState: "accepted",
+          scopeType: "org",
+          scopeId: null,
+          scope: {},
+          metadata: { category: "performance_scorecard" },
+        }],
+        visibility: [{
+          recordId: "vis-rec-001",
+          reviewState: "accepted",
+          scopeType: "org",
+          scopeId: null,
+          defaultReaderVisible: true,
+          warnings: [],
+        }],
+      });
+      const app = createApp({ type: "board", userId: "board-user", source: "session", companyIds: [companyA], isInstanceAdmin: false });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ source: baseSource, content: "scorecard content", metadata: { category: "performance_scorecard" } });
+
+      expect(res.status).toBe(201);
+      expect(res.body.visibility).toBeInstanceOf(Array);
+      expect(res.body.visibility[0].reviewState).toBe("accepted");
+      expect(res.body.visibility[0].defaultReaderVisible).toBe(true);
+      expect(res.body.visibility[0].warnings).toEqual([]);
+    });
+
+    it("visibility[0] shows defaultReaderVisible=false and watchdog warning for routing_rationale with projectId", async () => {
+      const projectId = "88888888-8888-4888-8888-888888888888";
+      mockMemoryService.capture.mockResolvedValue({
+        operation: { id: "op-vis-2", bindingId, source: { kind: "issue" } },
+        records: [{
+          id: "vis-rec-002",
+          reviewState: "accepted",
+          scopeType: "project",
+          scopeId: projectId,
+          scope: { projectId },
+          metadata: { category: "routing_rationale" },
+        }],
+        visibility: [{
+          recordId: "vis-rec-002",
+          reviewState: "accepted",
+          scopeType: "project",
+          scopeId: projectId,
+          defaultReaderVisible: false,
+          warnings: [
+            `Category 'routing_rationale' is read org-scoped by the routing watchdog, but this record is project-scoped (scopeId=${projectId}); the watchdog will not see it. Omit scope.projectId to capture it org-scoped.`,
+          ],
+        }],
+      });
+      const app = createApp({ type: "board", userId: "board-user", source: "session", companyIds: [companyA], isInstanceAdmin: false });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ source: baseSource, content: "routing content", scope: { projectId }, metadata: { category: "routing_rationale" } });
+
+      expect(res.status).toBe(201);
+      expect(res.body.visibility).toBeInstanceOf(Array);
+      expect(res.body.visibility[0].defaultReaderVisible).toBe(false);
+      expect(res.body.visibility[0].warnings.some((w: string) => /org-scoped|watchdog/.test(w))).toBe(true);
+    });
+
+    it("visibility[0] shows reviewState=pending and pending warning for non-auto-accept category", async () => {
+      mockMemoryService.capture.mockResolvedValue({
+        operation: { id: "op-vis-3", bindingId, source: { kind: "issue" } },
+        records: [{
+          id: "vis-rec-003",
+          reviewState: "pending",
+          scopeType: "org",
+          scopeId: null,
+          scope: {},
+          metadata: { category: "manual_note" },
+        }],
+        visibility: [{
+          recordId: "vis-rec-003",
+          reviewState: "pending",
+          scopeType: "org",
+          scopeId: null,
+          defaultReaderVisible: false,
+          warnings: [
+            "Record landed reviewState=pending; invisible to memory/query readers until a board member accepts it (PATCH /memory/records/:id/review).",
+          ],
+        }],
+      });
+      const app = createApp({ type: "board", userId: "board-user", source: "session", companyIds: [companyA], isInstanceAdmin: false });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ source: baseSource, content: "manual note", metadata: { category: "manual_note" } });
+
+      expect(res.status).toBe(201);
+      expect(res.body.visibility).toBeInstanceOf(Array);
+      expect(res.body.visibility[0].reviewState).toBe("pending");
+      expect(res.body.visibility[0].warnings.some((w: string) => /pending/i.test(w))).toBe(true);
+    });
+  });
+
   it("starts memory refresh jobs through the memory service and logs activity", async () => {
     mockMemoryService.startRefreshJob.mockResolvedValue({
       job: {

@@ -1073,6 +1073,23 @@ export function issueRoutes(
     return false;
   }
 
+  async function hasCrossIssueCommentPermission(actorAgentId: string, companyId: string): Promise<boolean> {
+    const allowedByGrant = await access.hasPermission(companyId, "agent", actorAgentId, "tasks:comment_cross_issue");
+    if (allowedByGrant) return true;
+    const actorAgent = await agentsSvc.getById(actorAgentId);
+    return actorAgent !== null && actorAgent.role === "ceo" && actorAgent.companyId === companyId;
+  }
+
+  async function wouldOwnershipGateReject(
+    actorAgentId: string,
+    issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null },
+  ): Promise<boolean> {
+    if (issue.assigneeAgentId === null) return false;
+    if (issue.assigneeAgentId === actorAgentId) return false;
+    if (await hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, issue.assigneeAgentId)) return false;
+    return true;
+  }
+
   async function assertAgentIssueMutationAllowed(
     req: Request,
     res: Response,
@@ -4502,6 +4519,47 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
+
+    // Cross-issue coordination bypass: an agent with tasks:comment_cross_issue (or role ceo)
+    // may post a coordination-only comment on any issue it does not own, including closed and
+    // in_progress ones. The comment is inert — no reopen, no wakeup, no status mutation.
+    if (
+      req.actor.type === "agent" &&
+      req.actor.agentId &&
+      req.body.reopen !== true &&
+      req.body.resume !== true &&
+      req.body.interrupt !== true &&
+      (await wouldOwnershipGateReject(req.actor.agentId, issue)) &&
+      (await hasCrossIssueCommentPermission(req.actor.agentId, issue.companyId))
+    ) {
+      const actorX = getActorInfo(req);
+      const crossComment = await svc.addComment(id, req.body.body, {
+        agentId: actorX.agentId ?? undefined,
+        userId: undefined,
+        runId: actorX.runId,
+      }, { authorType: "agent" });
+      await issueReferencesSvc.syncComment(crossComment.id);
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actorX.actorType,
+        actorId: actorX.actorId,
+        agentId: actorX.agentId,
+        runId: actorX.runId,
+        action: "issue.comment_added",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          commentId: crossComment.id,
+          bodySnippet: crossComment.body.slice(0, 120),
+          identifier: issue.identifier,
+          issueTitle: issue.title,
+          crossIssue: true,
+        },
+      });
+      res.status(201).json(crossComment);
+      return;
+    }
+
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!assertStructuredCommentFieldsAllowed(req, res, {
       presentation: req.body.presentation,

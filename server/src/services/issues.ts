@@ -234,6 +234,7 @@ export interface IssueFilters {
   includeBlockedBy?: boolean;
   includeBlockedInboxAttention?: boolean;
   q?: string;
+  identifier?: string;
   limit?: number;
   offset?: number;
 }
@@ -328,6 +329,9 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
 }
 
 const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
+// Mirrors the reaper threshold in heartbeat.ts so a crashed-but-still-"running" run is treated as stale
+// without waiting for the reaper to flip its status.
+const STALE_RUN_LOCK_MS = 5 * 60 * 1000;
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 
@@ -3258,12 +3262,17 @@ export function issueService(db: Db) {
 
   async function isTerminalOrMissingHeartbeatRun(runId: string) {
     const run = await db
-      .select({ status: heartbeatRuns.status })
+      .select({ status: heartbeatRuns.status, updatedAt: heartbeatRuns.updatedAt })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     if (!run) return true;
-    return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+    if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return true;
+    // A non-terminal run whose last DB touch is older than the reaper window is effectively
+    // orphaned (crashed without reconciling). Treat it as stale so callers can adopt/release
+    // the lock without waiting for the next reaper cycle.
+    if (run.updatedAt && Date.now() - new Date(run.updatedAt).getTime() > STALE_RUN_LOCK_MS) return true;
+    return false;
   }
 
   async function adoptStaleCheckoutRun(input: {
@@ -3500,6 +3509,11 @@ export function issueService(db: Db) {
             commentContainsMatch,
           )!,
         );
+      }
+      if (filters?.identifier) {
+        const identifiers = filters.identifier.split(",").map((id) => id.trim().toUpperCase()).filter(Boolean);
+        if (identifiers.length === 0) return [];
+        conditions.push(identifiers.length === 1 ? eq(issues.identifier, identifiers[0]!) : inArray(issues.identifier, identifiers));
       }
       if (filters?.excludeRoutineExecutions && !filters?.originKind && !filters?.originId) {
         conditions.push(ne(issues.originKind, "routine_execution"));

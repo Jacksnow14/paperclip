@@ -1504,6 +1504,7 @@ export function issueRoutes(
       includeBlockedInboxAttention:
         req.query.includeBlockedInboxAttention === "true" || req.query.includeBlockedInboxAttention === "1",
       q: req.query.q as string | undefined,
+      identifier: req.query.identifier as string | undefined,
       limit,
       offset,
     });

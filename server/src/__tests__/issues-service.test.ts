@@ -564,6 +564,65 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
   it("returns null instead of throwing for malformed non-uuid issue refs", async () => {
     await expect(svc.getById("not-a-uuid")).resolves.toBeNull();
   });
+
+  it("filters issues by exact identifier and supports comma-separated batch lookup", async () => {
+    const companyId = randomUUID();
+    const issueAId = randomUUID();
+    const issueBId = randomUUID();
+    const issueCId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values([
+      {
+        id: issueAId,
+        companyId,
+        issueNumber: 10,
+        identifier: "AUR-10",
+        title: "Issue A",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: issueBId,
+        companyId,
+        issueNumber: 11,
+        identifier: "AUR-11",
+        title: "Issue B",
+        status: "todo",
+        priority: "medium",
+      },
+      {
+        id: issueCId,
+        companyId,
+        issueNumber: 12,
+        identifier: "AUR-12",
+        title: "Issue C",
+        status: "todo",
+        priority: "medium",
+      },
+    ]);
+
+    const single = await svc.list(companyId, { identifier: "AUR-10" });
+    expect(single.map((i) => i.id)).toEqual([issueAId]);
+
+    const batch = await svc.list(companyId, { identifier: "AUR-10,AUR-12" });
+    expect(batch.map((i) => i.id).sort()).toEqual([issueAId, issueCId].sort());
+
+    // Case-insensitive normalisation
+    const lower = await svc.list(companyId, { identifier: "aur-11" });
+    expect(lower.map((i) => i.id)).toEqual([issueBId]);
+
+    // No cross-contamination from fuzzy q= prefix match (AUR-1 would touch AUR-10/11/12 via contains)
+    const fuzzyVsExact = await svc.list(companyId, { identifier: "AUR-1" });
+    expect(fuzzyVsExact).toHaveLength(0);
+  });
+
   it("filters issues by execution workspace id", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();

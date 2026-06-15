@@ -151,11 +151,23 @@ function shouldReturnAcceptedConfirmationToCreatorAgent(args: {
 }) {
   if (args.current.kind !== "request_confirmation") return false;
   if (!args.current.createdByAgentId) return false;
-  if (!args.actor.userId) return false;
-  if (!args.issue.assigneeUserId) return false;
-  if (args.issue.assigneeAgentId) return false;
   if (isTerminalIssueStatus(args.issue.status)) return false;
-  return true;
+
+  // Human reviewer path: board user reviewing an agent-created confirmation on a user-assigned issue
+  if (args.actor.userId && args.issue.assigneeUserId && !args.issue.assigneeAgentId) {
+    return true;
+  }
+
+  // Agent reviewer path: a different assignee agent resolves the creator agent's confirmation
+  if (
+    args.actor.agentId
+    && args.issue.assigneeAgentId === args.actor.agentId
+    && args.actor.agentId !== args.current.createdByAgentId
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 function buildTaskCreationOrder(tasks: ReadonlyArray<SuggestTasksInteraction["payload"]["tasks"][number]>) {
@@ -559,13 +571,13 @@ export function issueThreadInteractionService(db: Db) {
     current: IssueThreadInteractionRow;
     input: RejectIssueThreadInteraction;
     actor: InteractionActor;
-  }): Promise<IssueThreadInteraction> {
+  }): Promise<{ interaction: IssueThreadInteraction; continuationIssue: IssueWakeTarget | null }> {
     const expired = await expireStaleRequestConfirmationTarget(db, {
       row: args.current,
       actor: args.actor,
     });
     if (expired) {
-      return expired;
+      return { interaction: expired, continuationIssue: null };
     }
 
     const interaction = hydrateInteraction(args.current) as RequestConfirmationInteraction;
@@ -575,31 +587,80 @@ export function issueThreadInteractionService(db: Db) {
     }
 
     const now = new Date();
-    const [updated] = await db
-      .update(issueThreadInteractions)
-      .set({
-        status: "rejected",
-        result: {
-          version: 1,
-          outcome: "rejected",
-          reason: reason || null,
-        },
-        resolvedByAgentId: args.actor.agentId ?? null,
-        resolvedByUserId: args.actor.userId ?? null,
-        resolvedAt: now,
-        updatedAt: now,
-      })
-      .where(and(
-        eq(issueThreadInteractions.id, args.current.id),
-        eq(issueThreadInteractions.status, "pending"),
-      ))
-      .returning();
+    return db.transaction(async (tx) => {
+      const [updated] = await tx
+        .update(issueThreadInteractions)
+        .set({
+          status: "rejected",
+          result: {
+            version: 1,
+            outcome: "rejected",
+            reason: reason || null,
+          },
+          resolvedByAgentId: args.actor.agentId ?? null,
+          resolvedByUserId: args.actor.userId ?? null,
+          resolvedAt: now,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(issueThreadInteractions.id, args.current.id),
+          eq(issueThreadInteractions.status, "pending"),
+        ))
+        .returning();
 
-    if (!updated) {
-      throw conflict("Interaction has already been resolved");
-    }
-    await touchIssue(db, args.issue.id);
-    return hydrateInteraction(updated);
+      if (!updated) {
+        throw conflict("Interaction has already been resolved");
+      }
+
+      const issueContext = await tx
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
+        })
+        .from(issues)
+        .where(eq(issues.id, args.issue.id))
+        .then((rows: IssueResolutionContext[]) => rows[0] ?? null);
+
+      if (!issueContext || issueContext.companyId !== args.issue.companyId) {
+        throw notFound("Issue not found");
+      }
+
+      let continuationIssue: IssueWakeTarget | null = null;
+      if (shouldReturnAcceptedConfirmationToCreatorAgent({
+        issue: issueContext,
+        current: args.current,
+        actor: args.actor,
+      }) && args.actor.agentId) {
+        // Agent-reviewer path: reassign back to the creator agent
+        const returnStatus = issueContext.status === "blocked" ? "blocked" : "todo";
+        const returnedIssue = await issueService(db).update(args.issue.id, {
+          status: returnStatus,
+          assigneeAgentId: args.current.createdByAgentId,
+          assigneeUserId: null,
+          actorAgentId: args.actor.agentId ?? null,
+          actorUserId: args.actor.userId ?? null,
+        }, tx);
+
+        if (returnedIssue) {
+          continuationIssue = {
+            id: returnedIssue.id,
+            assigneeAgentId: returnedIssue.assigneeAgentId ?? null,
+            assigneeUserId: returnedIssue.assigneeUserId ?? null,
+            status: returnedIssue.status,
+          };
+        }
+      } else {
+        await touchIssue(tx, args.issue.id);
+      }
+
+      return {
+        interaction: hydrateInteraction(updated),
+        continuationIssue,
+      };
+    });
   }
 
   return {
@@ -618,6 +679,20 @@ export function issueThreadInteractionService(db: Db) {
         .select()
         .from(issueThreadInteractions)
         .where(eq(issueThreadInteractions.id, interactionId))
+        .then((rows) => rows[0] ?? null);
+
+      return row ? hydrateInteraction(row) : null;
+    },
+
+    getByIdForIssue: async (issueId: string, companyId: string, interactionId: string) => {
+      const row = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(and(
+          eq(issueThreadInteractions.id, interactionId),
+          eq(issueThreadInteractions.issueId, issueId),
+          eq(issueThreadInteractions.companyId, companyId),
+        ))
         .then((rows) => rows[0] ?? null);
 
       return row ? hydrateInteraction(row) : null;
@@ -903,12 +978,14 @@ export function issueThreadInteractionService(db: Db) {
       interactionId: string,
       input: RejectIssueThreadInteraction,
       actor: InteractionActor,
-    ) => {
+    ): Promise<{ interaction: IssueThreadInteraction; continuationIssue: IssueWakeTarget | null }> => {
       const data = rejectIssueThreadInteractionSchema.parse(input);
       const current = await getPendingInteractionForResolution({ issue, interactionId });
       switch (current.kind) {
-        case "suggest_tasks":
-          return issueThreadInteractionService(db).rejectSuggestedTasks(issue, interactionId, data, actor, current);
+        case "suggest_tasks": {
+          const interaction = await issueThreadInteractionService(db).rejectSuggestedTasks(issue, interactionId, data, actor, current);
+          return { interaction, continuationIssue: null };
+        }
         case "request_confirmation":
           return rejectRequestConfirmation({
             issue,

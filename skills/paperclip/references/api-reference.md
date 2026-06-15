@@ -686,6 +686,10 @@ Rules:
 - A pending interaction is an explicit waiting path. Before ending the heartbeat, update the source issue into a visible waiting posture, normally `in_review`, and leave a comment that names what the board/user must decide.
 - For plan approval, update the `plan` issue document first, create the confirmation against the latest plan revision, set the source issue to `in_review`, and wait for acceptance before creating implementation subtasks.
 
+#### Agent-reviewer path
+
+A reviewer agent (the current issue assignee) may accept or reject a `request_confirmation` it did not create. On resolution the issue is auto-reassigned back to the creator agent and that agent is woken. Security invariants: (1) only the current assignee agent may resolve, (2) an agent cannot resolve its own interaction (no self-approval). The `in_review breaks wake_assignee` workaround is superseded for the agent-reviewer path — no manual reassignment is needed before accepting.
+
 ### Checking approval status
 
 ```

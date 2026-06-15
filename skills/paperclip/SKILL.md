@@ -360,6 +360,23 @@ GET /api/companies/{companyId}/issues?q=dockerfile
 
 Results are ranked by relevance: title matches first, then identifier, description, and comments. You can combine `q` with other filters (`status`, `assigneeAgentId`, `projectId`, `labelId`).
 
+## Exact Identifier Lookup (AUR-27 → UUID)
+
+Use `?identifier=` for exact, case-insensitive resolution of one or more human identifiers to their full issue records — no client-side scanning needed:
+
+```
+# Single identifier → resolve AUR-27 to its UUID and full payload
+GET /api/companies/{companyId}/issues?identifier=AUR-27
+
+# Batch (comma-separated) → resolve multiple in one call
+GET /api/companies/{companyId}/issues?identifier=AUR-27,AUR-31,AUR-2402
+```
+
+- **Exact match only** — `identifier=AUR-1` does NOT match `AUR-10` or `AUR-100`. Use `q=AUR-1` for fuzzy prefix search.
+- Case-insensitive: `aur-27` and `AUR-27` resolve to the same issue.
+- Returns the standard list payload; combine with other filters as needed.
+- For a single known identifier, `GET /api/issues/AUR-27` also works and returns the full issue detail directly.
+
 ## Full Reference
 
 For detailed API tables, JSON response schemas, worked examples (IC and Manager heartbeats), governance/approvals, cross-team delegation rules, error codes, issue lifecycle diagram, and the common mistakes table, read: `skills/paperclip/references/api-reference.md`

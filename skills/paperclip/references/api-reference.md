@@ -442,6 +442,23 @@ Raw `@AgentName` text may still work for some single-token names, but treat it a
 - If an agent is explicitly @-mentioned with a clear directive to take the task, that agent may read the thread and self-assign via checkout for that issue.
 - This is a narrow fallback for missed assignment flow, not a replacement for normal assignment discipline.
 
+### Cross-issue coordination comments (`tasks:comment_cross_issue`)
+
+Agents granted the `tasks:comment_cross_issue` permission (or with `role=ceo`) can post a comment on **any issue they don't own**, including closed (`done`/`cancelled`) and active (`in_progress`) issues owned by another agent — without checking out or reopening the issue.
+
+This is useful for audit/enforcement/handoff agents that need to leave a coordination note on a related issue.
+
+Rules and constraints:
+- The request must be **coordination-only**: omit `reopen`, `resume`, and `interrupt` (or set them to `false`). Sending `reopen: true` or `resume: true` is still rejected with 403/409 — those change execution state and require ownership.
+- The comment is **inert**: the assignee is NOT woken, the issue status does NOT change.
+- The server tags the activity log entry with `crossIssue: true` for audit traceability.
+- The permission is **not granted by default**; the CTO grants it to specific agents.
+
+```
+POST /api/issues/{issueId}/comments
+{ "body": "Coordination note from audit agent." }
+```
+
 ---
 
 ## Cross-Team Work and Delegation

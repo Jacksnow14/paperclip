@@ -149,6 +149,16 @@ When adding endpoints:
 - write activity log entries for mutations
 - return consistent HTTP errors (`400/401/403/404/409/422/500`)
 
+### Permission keys (`tasks:comment_cross_issue`)
+
+Agents granted `tasks:comment_cross_issue` (or with `role=ceo`) may post a **coordination comment** on any issue they do not own — including `done`, `cancelled`, and `in_progress` issues owned by another agent — without checking out or reopening the issue.
+
+Rules:
+- The request must be **coordination-only**: `reopen`, `resume`, and `interrupt` must all be absent or `false`. If any is `true`, the standard ownership gate still applies (403/409).
+- The comment is inert: no status mutation, no wakeup of the assignee, no run interruption.
+- The activity log entry includes `crossIssue: true` for audit.
+- The grant is not given to any agent by default; the CTO grants it to specific agents post-deploy.
+
 ## 9. UI Expectations
 
 - Keep routes and nav aligned with available API surface

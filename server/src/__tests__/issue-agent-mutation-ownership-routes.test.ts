@@ -477,4 +477,88 @@ describe("agent issue mutation checkout ownership", () => {
       title: "Claimable update",
     });
   });
+
+  // --- tasks:comment_cross_issue tests ---
+
+  it("(a) rejects cross-issue comment from agent WITHOUT tasks:comment_cross_issue on a done issue", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "done", assigneeAgentId: ownerAgentId }));
+    // hasPermission always returns false (default setup)
+    mockAgentService.list.mockResolvedValue([makeAgent(ownerAgentId), makeAgent(peerAgentId)]);
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "coordination note" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("(b) allows agent WITH tasks:comment_cross_issue to post an inert comment on a done issue owned by another agent; status stays done", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "done", assigneeAgentId: ownerAgentId }));
+    mockAgentService.list.mockResolvedValue([makeAgent(ownerAgentId), makeAgent(peerAgentId)]);
+    mockAccessService.hasPermission.mockImplementation(async (
+      _companyId: string,
+      _principalType: string,
+      principalId: string,
+      permissionKey: string,
+    ) => principalId === peerAgentId && permissionKey === "tasks:comment_cross_issue");
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "cross-issue coordination" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issueId,
+      "cross-issue coordination",
+      expect.objectContaining({ agentId: peerAgentId }),
+      expect.objectContaining({ authorType: "agent" }),
+    );
+    // Issue status must not be mutated (no reopen)
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("(c) allows agent WITH tasks:comment_cross_issue to post an inert comment on an in_progress issue; run is NOT interrupted", async () => {
+    // Issue is in_progress owned by ownerAgentId (default makeIssue)
+    mockAgentService.list.mockResolvedValue([makeAgent(ownerAgentId), makeAgent(peerAgentId)]);
+    mockAccessService.hasPermission.mockImplementation(async (
+      _companyId: string,
+      _principalType: string,
+      principalId: string,
+      permissionKey: string,
+    ) => principalId === peerAgentId && permissionKey === "tasks:comment_cross_issue");
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "heads up on dependency" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalled();
+    // No status mutation — issue stays in_progress
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["reopen", { reopen: true }],
+    ["resume", { resume: true }],
+  ])("(d) agent WITH tasks:comment_cross_issue with %s:true on non-owned issue is still rejected", async (_flag, extras) => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "done", assigneeAgentId: ownerAgentId }));
+    mockAgentService.list.mockResolvedValue([makeAgent(ownerAgentId), makeAgent(peerAgentId)]);
+    mockAccessService.hasPermission.mockImplementation(async (
+      _companyId: string,
+      _principalType: string,
+      principalId: string,
+      permissionKey: string,
+    ) => principalId === peerAgentId && permissionKey === "tasks:comment_cross_issue");
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "attempting reopen", ...extras });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
 });

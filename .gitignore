@@ -49,6 +49,12 @@ diagnostics/
 # Doc maintenance cursor
 .doc-review-cursor
 
+# Secret vault — host-side encrypted store; never commit key material or ciphertext
+secret-vault/
+vault.key
+secrets.json.enc
+vault-audit.log
+
 # Playwright
 tests/e2e/test-results/
 tests/e2e/playwright-report/

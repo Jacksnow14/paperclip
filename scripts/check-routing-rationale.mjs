@@ -1,0 +1,526 @@
+#!/usr/bin/env node
+/**
+ * check-routing-rationale.mjs
+ *
+ * Self-cleaning, deterministic watchdog for the routing-rationale convention
+ * (AGENTS.md §12). Runs as a scheduled routine every 6 hours with --apply.
+ * The default --window-minutes MUST stay >= the firing cadence or issues
+ * updated between fires go unchecked (AUR-1816: 60-min default vs 6h cadence
+ * silently missed ~83% of issues). Default is 1440 (24h) to comfortably
+ * exceed the cadence; the watchdog is idempotent so a wide window only
+ * re-confirms already-clean issues.
+ *
+ * Lifecycle:
+ *   Phase A — Auto-resolve stale flags (always runs, ignores window):
+ *     Cancel open flag issues whose target is done/cancelled, already has a
+ *     routing/{id} memory record, or is now exempt. Posts a one-line reason.
+ *
+ *   Phase B — Detect + file (within --window-minutes):
+ *     Flag high/critical assigned manual issues updated in the window that are
+ *     still missing routing/{id} records, deduplicating against Phase A's
+ *     remaining open flags.
+ *
+ * Usage:
+ *   node scripts/check-routing-rationale.mjs [--window-minutes N] [--apply]
+ *
+ *   Without --apply: dry-run — prints full plan, writes nothing.
+ *   With --apply:    executes cancellations and files new flags (idempotent).
+ *
+ * Env vars required:
+ *   PAPERCLIP_API_URL    Base URL (e.g. http://localhost:3000)
+ *   PAPERCLIP_API_KEY    Bearer token
+ *   PAPERCLIP_COMPANY_ID Company UUID
+ *
+ * Exemption rules (no flag filed; existing open flags auto-resolved):
+ *   1. Issue description contains token `exec.routing-rationale: skip`
+ *   2. Issue title matches /content slot/i (and content-pipeline children)
+ *   3. Recurring daily-brief publication tasks
+ *   4. Single-owner role-routed approval/sign-off gates (title framed as
+ *      "{subject} sign-off: ..." / "... approval gate — ...") — no candidate
+ *      pool, so no routing decision to document (AUR-1632)
+ *
+ * Exit codes:
+ *   0 — clean (nothing to do, or all actions applied)
+ *   1 — dry-run with pending actions (apply to execute)
+ *   2 — configuration/API error
+ *   3 — BLOCKED: Memory API unavailable (watchdog cannot run this cycle)
+ */
+
+import { parseArgs } from 'node:util';
+
+// ── Exported core utilities (used in tests) ──────────────────────────────────
+
+/** Matches both flag title formats produced in the wild. */
+export const FLAG_REGEX = /routing-rationale[- ]gap:\s*(AUR-\d+)/i;
+
+/**
+ * The issues LIST endpoint truncates `description` to this many chars
+ * (server: ISSUE_LIST_DESCRIPTION_MAX_CHARS in services/issues.ts). The
+ * `exec.routing-rationale: skip` exemption token can sit past this boundary,
+ * so a list-fetched description at or above this length may be truncated and
+ * must be re-fetched in full before evaluating exemption.
+ */
+export const LIST_DESC_TRUNCATION = 1200;
+
+/** A list-fetched description this long may be truncated — fetch the full issue. */
+export function mayBeTruncated(description) {
+  return (description ?? '').length >= LIST_DESC_TRUNCATION;
+}
+
+/**
+ * Returns true if an issue is exempt from the routing-rationale convention.
+ * Exempt issues are never flagged and any existing open flags are auto-resolved.
+ */
+export function isExempt(issue) {
+  if (issue.description && issue.description.includes('exec.routing-rationale: skip')) return true;
+  if (/content slot/i.test(issue.title ?? '')) return true;
+  // Recurring daily-brief publication tasks (e.g. "Post 2026-05-29 daily AI brief
+  // to AUR-27") are content publication, not technical-routing decisions, so a
+  // routing/{id} rationale is meaningless. They recur daily and would otherwise be
+  // flagged-then-auto-resolved every day — a known false-positive class (AUR-1550).
+  if (/daily\b.*\bbrief/i.test(issue.title ?? '')) return true;
+  // Content-pipeline children (Content Slot → "Write script" → "Render & Upload")
+  // are short-form video production tasks, not technical-routing decisions, so a
+  // routing/{id} rationale is meaningless. Their Content-Slot parents match
+  // /content slot/i above, but the generated children carry plain titles and slip
+  // through, recurring every slot. Pair each child title with a content-pipeline
+  // marker in the description so genuine technical tasks (e.g. "Write script to
+  // migrate DB") are NOT exempted (AUR-1595, AUR-1550 false-positive class).
+  const title = issue.title ?? '';
+  const description = issue.description ?? '';
+  if (/^\s*write script\b/i.test(title) && /workflow signal/i.test(description)) return true;
+  if (/^\s*render & upload\b/i.test(title) && /video editor render task/i.test(description)) return true;
+  // Single-owner role-routed approval/sign-off gates (e.g. "CFO sign-off: Standard
+  // ~$160/mo subscription tier", "Legal approval gate — vendor X") route to the sole
+  // owner of a role. There is no candidate pool to compare via performance
+  // scorecards, so a routing/{id} rationale is meaningless — filing one would be
+  // no-signal DB spam (AUR-1632, false-positive class of AUR-1630/AUR-1631).
+  // Anchor on the gate framing: "sign-off" / "approval" (optionally "approval gate")
+  // immediately followed by a ':' or '—' separator. This matches the "{subject}
+  // sign-off: {what}" gate title form while NOT exempting genuine engineering tasks
+  // that merely BUILD such a feature ("Add approval gate to deploy pipeline",
+  // "Implement sign-off flow") — those have no gate delimiter after the phrase.
+  if (/\b(?:sign[-\s]?off|approval(?:\s+gate)?)\s*[:—]/i.test(title)) return true;
+  // Self-assigned issues (creator kept the work) involve no delegation and no
+  // candidate-routing decision, so a routing/{id} rationale carries no signal.
+  // Recurring false-positive class: AUR-869, AUR-1829, AUR-801/802 (AUR-1550).
+  if (issue.assigneeAgentId && issue.createdByAgentId &&
+      issue.assigneeAgentId === issue.createdByAgentId) return true;
+  return false;
+}
+
+/**
+ * Returns a cancel reason string if the flag should be resolved, or null if
+ * the flag is still valid and should remain open.
+ *
+ * @param {{ target: object|null, hasRecord: boolean }} opts
+ */
+export function resolveCancelReason({ target, targetId, hasRecord }) {
+  if (!target || ['done', 'cancelled'].includes(target.status)) {
+    return target
+      ? `Auto-resolved by routing-rationale-watchdog: ${targetId} is ${target.status} — routing rationale moot.`
+      : `Auto-resolved by routing-rationale-watchdog: ${targetId} not found among open issues — routing rationale moot.`;
+  }
+  if (isExempt(target)) {
+    return `Auto-resolved by routing-rationale-watchdog: ${targetId} is exempt from routing rationale (exec.routing-rationale: skip, content-slot, daily-brief, or single-owner sign-off/approval gate).`;
+  }
+  if (hasRecord) {
+    return `Auto-resolved by routing-rationale-watchdog: routing/${targetId} record now exists.`;
+  }
+  return null;
+}
+
+/**
+ * The CEO routes virtually all high/critical work, so it is the correct default
+ * owner for a routing-rationale gap when the target issue does not name an
+ * assigning agent.
+ */
+export const CEO_AGENT_ID = '3823a155-b4d4-4b06-b7d3-b3a55c6cbc1b';
+
+/**
+ * Resolve the agent that owes the routing/{id} rationale for a gap, i.e. the
+ * manager/router that assigned the underlying issue. Gap issues filed without
+ * an assignee become orphans that no agent ever picks up (AUR-1817/AUR-1818),
+ * so this MUST always return a non-null agentId.
+ *
+ * Preference order:
+ *   1. The target issue's creator (`createdByAgentId`) — the agent that filed
+ *      and routed it, hence owes its rationale.
+ *   2. The CEO — high/critical routing is almost always CEO-routed, and the
+ *      board fallback guarantees no orphan even when the creator is a user or
+ *      unknown.
+ *
+ * @param {{ createdByAgentId?: string|null, assigneeAgentId?: string|null }} issue
+ * @returns {{ agentId: string, source: string }}
+ */
+export function resolveGapOwner(issue) {
+  const creator = issue?.createdByAgentId;
+  if (typeof creator === 'string' && creator.length > 0) {
+    return { agentId: creator, source: 'target.createdByAgentId' };
+  }
+  return { agentId: CEO_AGENT_ID, source: 'fallback:CEO' };
+}
+
+// ── API helpers ───────────────────────────────────────────────────────────────
+
+function makeApiHelpers(API_URL, headers) {
+  async function apiGet(path) {
+    const res = await fetch(`${API_URL}${path}`, { headers });
+    if (!res.ok) throw new Error(`GET ${path} → ${res.status} ${res.statusText}`);
+    return res.json();
+  }
+
+  /**
+   * Probe an endpoint for availability. Returns { available: false } on 404
+   * (Memory routes not mounted). Throws for all other non-ok statuses.
+   */
+  async function apiProbe(path) {
+    const res = await fetch(`${API_URL}${path}`, { headers });
+    if (res.status === 404) return { available: false };
+    if (!res.ok) throw new Error(`GET ${path} → ${res.status} ${res.statusText}`);
+    return { available: true };
+  }
+
+  async function apiPatch(path, body) {
+    const res = await fetch(`${API_URL}${path}`, {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`PATCH ${path} → ${res.status} ${res.statusText}`);
+    return res.json();
+  }
+
+  async function apiPost(path, body) {
+    const res = await fetch(`${API_URL}${path}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`POST ${path} → ${res.status} ${res.statusText}`);
+    return res.json();
+  }
+
+  return { apiGet, apiProbe, apiPatch, apiPost };
+}
+
+// ── Main routine ──────────────────────────────────────────────────────────────
+
+/**
+ * Status filter for the working-issue fetch. MUST include `backlog`: flags
+ * filed by Phase B (and any other issue) default to `backlog` status server-side
+ * (services/issues.ts: `status: values.status ?? "backlog"`). If `backlog` is
+ * omitted here, Phase A never sees stale backlog flags (they never auto-resolve)
+ * and Phase B never counts them as open (it files duplicates). See AUR-1581.
+ */
+export const ISSUE_STATUS_FILTER = 'backlog,todo,in_progress,in_review,blocked';
+
+export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, maxNewFlags = 20 }) {
+  const windowStart = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
+
+  const headers = {
+    Authorization: `Bearer ${apiKey}`,
+    'Content-Type': 'application/json',
+  };
+  const { apiGet, apiProbe, apiPatch, apiPost } = makeApiHelpers(apiUrl, headers);
+
+  // The issues LIST endpoint truncates descriptions, which can hide the
+  // exemption token. Re-fetch the full issue (cached) only when the
+  // list-fetched description is long enough to possibly be truncated.
+  const fullDescCache = new Map();
+  async function withFullDescription(issue) {
+    if (!mayBeTruncated(issue.description)) return issue;
+    const key = issue.id ?? issue.identifier;
+    if (!fullDescCache.has(key)) {
+      const full = await apiGet(`/api/issues/${key}`);
+      fullDescCache.set(key, full?.description ?? issue.description ?? '');
+    }
+    return { ...issue, description: fullDescCache.get(key) };
+  }
+
+  if (!apply) {
+    console.log('[DRY-RUN] No changes will be written. Pass --apply to execute.\n');
+  }
+
+  // ── Memory API availability probe (must pass before any mutation) ──────────
+  // A 404 here means the server process is stale and /memory routes are not
+  // mounted. Abort immediately — proceeding would either crash mid-Phase-A or
+  // silently skip all checks and exit 0 (false "clean"). Exit 3 so the
+  // routine/heartbeat surfaces an honest BLOCKED signal.
+  const memProbe = await apiProbe(`/api/companies/${companyId}/memory/records?limit=1`);
+  if (!memProbe.available) {
+    console.error('BLOCKED: Memory API unavailable — watchdog cannot run.');
+    console.error('  /api/companies/:id/memory/records → 404 Not Found');
+    console.error('  Root cause: stale server process without memory routes mounted.');
+    console.error('  Resolution: operator must rebuild and restart the Paperclip server.');
+    return 3;
+  }
+
+  // Fetch all open issues once — used by both phases
+  const issuesBatch = await apiGet(
+    `/api/companies/${companyId}/issues?status=${ISSUE_STATUS_FILTER}&limit=500`
+  );
+  const rawIssues = Array.isArray(issuesBatch) ? issuesBatch : (issuesBatch.issues ?? []);
+
+  // Build lookup by identifier
+  const issueByIdentifier = new Map();
+  for (const issue of rawIssues) {
+    if (issue.identifier) issueByIdentifier.set(issue.identifier, issue);
+  }
+
+  // ── Phase A: Auto-resolve stale flags ──────────────────────────────────────
+  console.log('── Phase A: Auto-resolve stale flags ──');
+
+  const flagIssues = rawIssues.filter(issue => FLAG_REGEX.test(issue.title ?? ''));
+  const openFlagTargets = new Set(); // target identifiers with still-valid open flags
+
+  const toCancel = [];
+
+  for (const flag of flagIssues) {
+    const match = FLAG_REGEX.exec(flag.title);
+    if (!match) continue;
+    const targetId = match[1];
+    const rawTarget = issueByIdentifier.get(targetId) ?? null;
+    const target = rawTarget ? await withFullDescription(rawTarget) : null;
+
+    // Check routing record only when target is open and non-exempt
+    let hasRecord = false;
+    if (target && !['done', 'cancelled'].includes(target.status) && !isExempt(target)) {
+      const records = await apiGet(
+        `/api/companies/${companyId}/memory/records?titlePrefix=routing/${targetId}&limit=1`
+      );
+      hasRecord = Array.isArray(records)
+        ? records.length > 0
+        : (records?.records?.length ?? 0) > 0;
+    }
+
+    const cancelReason = resolveCancelReason({ target, targetId, hasRecord });
+
+    if (cancelReason) {
+      toCancel.push({ flag, targetId, reason: cancelReason });
+    } else {
+      openFlagTargets.add(targetId);
+    }
+  }
+
+  if (toCancel.length === 0) {
+    console.log('  No stale flags to resolve.\n');
+  } else {
+    for (const { flag, targetId, reason } of toCancel) {
+      const flagId = flag.id ?? flag.identifier;
+      console.log(`  CANCEL ${flag.identifier ?? flagId} → ${targetId}: ${reason}`);
+      if (apply) {
+        await apiPatch(`/api/issues/${flagId}`, { status: 'cancelled' });
+        await apiPost(`/api/issues/${flagId}/comments`, { body: reason });
+        console.log(`    → cancelled + commented.`);
+      }
+    }
+    console.log();
+  }
+
+  if (openFlagTargets.size > 0) {
+    console.log(`  Keeping ${openFlagTargets.size} flag(s) still valid: ${[...openFlagTargets].join(', ')}\n`);
+  }
+
+  // ── Phase B: Detect + file ─────────────────────────────────────────────────
+  console.log('── Phase B: Detect and file new flags ──');
+
+  // Pool of issues subject to §12, then hydrate full descriptions so the
+  // exemption token is not missed due to list-endpoint truncation.
+  const pool = await Promise.all(
+    rawIssues
+      .filter(issue =>
+        ['high', 'critical'].includes(issue.priority) &&
+        issue.assigneeAgentId &&
+        (!issue.originKind || issue.originKind === 'manual'))
+      .map(withFullDescription)
+  );
+
+  const exemptIssues = pool.filter(isExempt);
+
+  const seen = new Set();
+  const candidates = pool.filter(issue => {
+    if (isExempt(issue)) return false;
+    const key = issue.id ?? issue.identifier;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    const updated = issue.updatedAt ?? issue.assignedAt;
+    if (!updated) return true;
+    return new Date(updated) >= new Date(windowStart);
+  });
+
+  if (exemptIssues.length > 0) {
+    console.log(`  EXEMPT (${exemptIssues.length}):`);
+    for (const issue of exemptIssues) {
+      console.log(`    - ${issue.identifier ?? issue.id}: ${issue.title}`);
+    }
+    console.log();
+  }
+
+  if (candidates.length === 0) {
+    console.log(`  No high/critical assigned manual issues updated in the last ${windowMinutes} minutes.\n`);
+  }
+
+  const toFile = [];
+  const skippedDedup = [];
+  const skippedHasRecord = [];
+
+  await Promise.all(candidates.map(async (issue) => {
+    const id = issue.identifier ?? issue.id;
+
+    // Dedup: an open flag for this target already exists (Phase A kept it)
+    if (openFlagTargets.has(id)) {
+      skippedDedup.push(issue);
+      return;
+    }
+
+    const records = await apiGet(
+      `/api/companies/${companyId}/memory/records?titlePrefix=routing/${id}&limit=1`
+    );
+    const hasRecord = Array.isArray(records)
+      ? records.length > 0
+      : (records?.records?.length ?? 0) > 0;
+
+    if (hasRecord) {
+      skippedHasRecord.push(issue);
+    } else {
+      toFile.push(issue);
+    }
+  }));
+
+  if (skippedDedup.length > 0) {
+    console.log(`  SKIPPED-DEDUP — open flag exists (${skippedDedup.length}):`);
+    for (const issue of skippedDedup) {
+      console.log(`    - ${issue.identifier ?? issue.id}: ${issue.title}`);
+    }
+    console.log();
+  }
+
+  if (skippedHasRecord.length > 0) {
+    console.log(`  HAS RECORD — routing rationale present (${skippedHasRecord.length}):`);
+    for (const issue of skippedHasRecord) {
+      console.log(`    - ${issue.identifier ?? issue.id}: ${issue.title}`);
+    }
+    console.log();
+  }
+
+  // Anti-flood cap: after a Memory outage, every legitimate gap will be missing
+  // its routing/{id} record, so Phase B could file dozens of flags at once.
+  // Cap new filings per run and log deferred ones so the backlog drains
+  // gradually over subsequent runs rather than flooding the board.
+  const toFileThisRun = toFile.slice(0, maxNewFlags);
+  const deferred = toFile.slice(maxNewFlags);
+
+  if (deferred.length > 0) {
+    console.log(`  DEFERRED — cap reached (max-new-flags=${maxNewFlags}), held back ${deferred.length}:`);
+    for (const issue of deferred) {
+      console.log(`    - ${issue.identifier ?? issue.id}: ${issue.title}`);
+    }
+    console.log(`  Re-run the watchdog to process the remainder.\n`);
+  }
+
+  if (toFileThisRun.length === 0) {
+    console.log('  No new flags to file.\n');
+  } else {
+    for (const issue of toFileThisRun) {
+      const id = issue.identifier ?? issue.id;
+      const assignee = issue.assigneeAgentId ?? 'unknown';
+      const title = `routing-rationale gap: ${id} missing routing/${id} record`;
+      const description = [
+        `## Routing rationale gap detected`,
+        ``,
+        `Issue **${id}** ("${issue.title}") is \`${issue.priority}\` priority, assigned to agent \`${assignee}\`, but is missing a \`routing/${id}\` rationale record in Paperclip Memory.`,
+        ``,
+        `The manager that assigned this issue must capture a routing rationale record per AGENTS.md §12.`,
+        ``,
+        `**Required record key:** \`routing/${id}\``,
+        ``,
+        `exec.preflight: skip`,
+      ].join('\n');
+      // Resolve a non-null owner so the gap issue is never orphaned
+      // (AUR-1817/AUR-1818). The owner is the router that owes the rationale —
+      // the target's creator, or the CEO as the high/critical-routing default.
+      const owner = resolveGapOwner(issue);
+      console.log(`  FILE: "${title}" → owner ${owner.agentId} (${owner.source})`);
+      if (apply) {
+        // File in `todo`, not the server default `backlog`: these flags are
+        // actionable (a manager must add the routing record) and should be
+        // visible in the working set by default. The filter above also covers
+        // `backlog` defensively so pre-existing/manually-moved flags still
+        // auto-resolve and dedup. See AUR-1581.
+        // assigneeAgentId is mandatory: an unassigned flag is an orphan the
+        // daily sweeper has to re-catch forever (AUR-1818).
+        await apiPost(`/api/companies/${companyId}/issues`, {
+          title,
+          description,
+          status: 'todo',
+          assigneeAgentId: owner.agentId,
+        });
+        console.log(`    → filed (assignee ${owner.agentId}).`);
+      }
+    }
+    console.log();
+  }
+
+  // ── Summary ────────────────────────────────────────────────────────────────
+  console.log('── Summary ──');
+  console.log(`  Resolved:      ${toCancel.length}`);
+  console.log(`  Filed:         ${toFileThisRun.length}`);
+  console.log(`  Deferred:      ${deferred.length}`);
+  console.log(`  Skipped-dedup: ${skippedDedup.length}`);
+  console.log(`  Exempt:        ${exemptIssues.length}`);
+
+  const hasPendingActions = toCancel.length > 0 || toFileThisRun.length > 0;
+  if (!apply && hasPendingActions) {
+    console.log('\n[DRY-RUN] Pass --apply to execute the above actions.');
+    return 1;
+  }
+  return 0;
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+// Run only when invoked directly (not imported by tests)
+const isMain = process.argv[1] && import.meta.url.endsWith(
+  process.argv[1].replace(/\\/g, '/').split('/').pop()
+);
+
+if (isMain) {
+  const { values: args } = parseArgs({
+    options: {
+      'window-minutes': { type: 'string', default: '1440' },
+      'max-new-flags': { type: 'string', default: '20' },
+      apply: { type: 'boolean', default: false },
+      help: { type: 'boolean', short: 'h', default: false },
+    },
+  });
+
+  if (args.help) {
+    console.log('Usage: node scripts/check-routing-rationale.mjs [--window-minutes N] [--max-new-flags N] [--apply]');
+    console.log('  --window-minutes N  Only check issues updated in last N minutes (default: 1440 = 24h, must be >= routine firing cadence)');
+    console.log('  --max-new-flags N   Cap new flags filed per run (default: 20, anti-flood guard)');
+    console.log('  --apply             Execute changes (default: dry-run, exit 1 if actions pending)');
+    process.exit(0);
+  }
+
+  const API_URL = process.env.PAPERCLIP_API_URL;
+  const API_KEY = process.env.PAPERCLIP_API_KEY;
+  const COMPANY_ID = process.env.PAPERCLIP_COMPANY_ID;
+
+  if (!API_URL || !API_KEY || !COMPANY_ID) {
+    console.error('ERROR: PAPERCLIP_API_URL, PAPERCLIP_API_KEY, and PAPERCLIP_COMPANY_ID must be set.');
+    process.exit(2);
+  }
+
+  main({
+    windowMinutes: parseInt(args['window-minutes'], 10),
+    maxNewFlags: parseInt(args['max-new-flags'], 10),
+    apply: args.apply,
+    apiUrl: API_URL,
+    apiKey: API_KEY,
+    companyId: COMPANY_ID,
+  }).then(code => process.exit(code)).catch(err => {
+    console.error('FATAL:', err.message);
+    process.exit(2);
+  });
+}

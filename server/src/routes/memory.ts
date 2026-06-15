@@ -1,3 +1,21 @@
+/**
+ * Memory API — pagination, agent self-service revoke, and capture visibility warnings.
+ *
+ * Pagination (GET /memory/records):
+ *   Use ?limit=200&offset=0 then ?limit=200&offset=200 to page through large result sets.
+ *   Use ?count=only with the same filters to get the total count for determining page boundaries.
+ *
+ * Agent self-service revoke (POST /memory/records/:id/revoke-own):
+ *   Agents may revoke their own records when the record's metadata.category is in
+ *   AGENT_MUTABLE_CATEGORIES (experiment, experiment_conclusion, hypothesis, observation,
+ *   performance_scorecard, scorecard_adjusted, tool_gap, routing).
+ *   Returns 403 for non-owner or off-allowlist categories.
+ *
+ * Capture visibility warnings (POST /memory/capture):
+ *   The response includes a non-breaking `warnings: string[]` field when the captured
+ *   record(s) won't appear in the default GET /memory/records or memory/query response
+ *   (e.g. reviewState=pending, project-scoped, or agent-scoped to a different agent).
+ */
 import { Router } from "express";
 import type { Db } from "@paperclipai/db";
 import {
@@ -14,6 +32,7 @@ import {
   memoryRetentionSweepSchema,
   memoryReviewSchema,
   memoryRevokeSchema,
+  memoryRevokeOwnSchema,
   setAgentMemoryBindingSchema,
   setCompanyMemoryBindingSchema,
   setProjectMemoryBindingSchema,
@@ -247,6 +266,33 @@ export function memoryRoutes(
       payload.source = { ...payload.source, issueId: resolvedId };
     }
     const result = await memory.capture(companyId, payload, actorInfoFromReq(req));
+    const warnings: string[] = [];
+    const firstRecord = result.records[0];
+    if (firstRecord) {
+      if (firstRecord.reviewState === "pending") {
+        warnings.push(
+          "Record is pending review; it won't appear in the default GET /memory/records or memory/query response. " +
+          "Read it back with ?reviewState=pending.",
+        );
+      }
+      if (firstRecord.scopeType === "project") {
+        warnings.push(
+          `Record is project-scoped (projectId=${firstRecord.scope.projectId ?? "unknown"}); ` +
+          "invisible to org-wide reads without ?projectId=<id>.",
+        );
+      }
+      if (
+        req.actor.type === "agent" &&
+        firstRecord.scopeType === "agent" &&
+        firstRecord.scope.agentId &&
+        firstRecord.scope.agentId !== req.actor.agentId
+      ) {
+        warnings.push(
+          `Record is agent-scoped to ${firstRecord.scope.agentId}, not the calling agent; ` +
+          "it won't appear in default agent-scoped reads for this caller.",
+        );
+      }
+    }
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId,
@@ -262,7 +308,7 @@ export function memoryRoutes(
         sourceKind: result.operation.source?.kind ?? null,
       },
     });
-    res.status(201).json(result);
+    res.status(201).json({ ...result, warnings });
   });
 
   router.post("/companies/:companyId/memory/forget", validate(memoryForgetSchema), async (req, res) => {
@@ -305,7 +351,8 @@ export function memoryRoutes(
     res.json(record);
   });
 
-  // Categories that agents are permitted to update on their own records.
+  // Categories that agents are permitted to update (PATCH) or revoke-own on their own records.
+  // "routing" is included so agents can deduplicate stale routing/* records via revoke-own.
   const AGENT_MUTABLE_CATEGORIES = new Set([
     "experiment",
     "experiment_conclusion",
@@ -314,6 +361,7 @@ export function memoryRoutes(
     "performance_scorecard",
     "scorecard_adjusted",
     "tool_gap",
+    "routing",
   ]);
 
   router.patch(
@@ -357,6 +405,57 @@ export function memoryRoutes(
         details: {
           recordId: result.record.id,
           updatedFields: Object.keys(req.body as Record<string, unknown>),
+        },
+      });
+      res.json(result);
+    },
+  );
+
+  router.post(
+    "/companies/:companyId/memory/records/:recordId/revoke-own",
+    validate(memoryRevokeOwnSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertCompanyAccess(req, companyId);
+
+      if (req.actor.type !== "agent") {
+        throw forbidden("Only agents can use revoke-own; board users should use POST /memory/revoke");
+      }
+
+      const recordId = req.params.recordId as string;
+      const record = await memory.getRecord(companyId, recordId, actorInfoFromReq(req));
+      if (!record) throw notFound("Memory record not found");
+
+      if (record.owner?.type !== "agent" || record.owner.id !== req.actor.agentId) {
+        throw forbidden("Agent can only revoke memory records it owns");
+      }
+
+      const category = typeof record.metadata?.category === "string" ? record.metadata.category : null;
+      if (!category || !AGENT_MUTABLE_CATEGORIES.has(category)) {
+        throw forbidden(
+          `Agent cannot revoke records with category '${category ?? "(none)"}'. Allowed: ${[...AGENT_MUTABLE_CATEGORIES].join(", ")}`,
+        );
+      }
+
+      const { reason } = req.body as { reason: string };
+      const result = await memory.revoke(
+        companyId,
+        { selector: { recordIds: [recordId] }, reason },
+        actorInfoFromReq(req),
+      );
+      const actor = getActorInfo(req);
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        action: "memory.revoked",
+        entityType: "memory_record",
+        entityId: recordId,
+        details: {
+          revokedRecordIds: result.revokedRecordIds,
+          reason,
+          selfService: true,
         },
       });
       res.json(result);

@@ -1040,6 +1040,7 @@ export function memoryService(
       summary?: string | null;
       metadata?: Record<string, unknown>;
       reviewState?: MemoryRecord["reviewState"];
+      upsert?: boolean;
     },
     operationId: string | null,
   ): Promise<{ records: MemoryRecord[]; dedup: boolean }> {
@@ -1047,6 +1048,45 @@ export function memoryService(
     const scopeId = input.scopeId ?? normalizeScopeId(binding.companyId, scopeType, scope);
     const createdBy = actorPrincipal(input.actor);
     const owner = normalizePrincipal(input.owner, createdBy);
+
+    // Upsert-by-title: when caller requests upsert and provides a title, find the latest
+    // non-revoked, non-deleted record with the same title and owner and update it in-place.
+    if (input.upsert && input.title) {
+      const existing = await db
+        .select()
+        .from(memoryLocalRecords)
+        .where(
+          and(
+            eq(memoryLocalRecords.companyId, binding.companyId),
+            eq(memoryLocalRecords.title, input.title),
+            eq(memoryLocalRecords.ownerType, owner.type),
+            eq(memoryLocalRecords.ownerId, owner.id),
+            isNull(memoryLocalRecords.revokedAt),
+            isNull(memoryLocalRecords.supersededByRecordId),
+            isNull(memoryLocalRecords.deletedAt),
+          ),
+        )
+        .orderBy(desc(memoryLocalRecords.createdAt))
+        .limit(1);
+      if (existing.length > 0) {
+        const updatedAt = new Date();
+        const mergedMetadata =
+          input.metadata !== undefined
+            ? { ...(existing[0].metadata ?? {}), ...input.metadata }
+            : existing[0].metadata;
+        const [updated] = await db
+          .update(memoryLocalRecords)
+          .set({
+            content: input.content,
+            summary: input.summary ?? existing[0].summary,
+            metadata: mergedMetadata,
+            updatedAt,
+          })
+          .where(eq(memoryLocalRecords.id, existing[0].id))
+          .returning();
+        return { records: [mapRecord(updated)], dedup: true };
+      }
+    }
 
     // Idempotent dedup for tool_gap captures: same title + owner within window → return existing record
     if (input.metadata?.category === "tool_gap" && input.title) {
@@ -1362,7 +1402,8 @@ export function memoryService(
       .from(memoryLocalRecords)
       .where(and(...conditions))
       .orderBy(desc(memoryLocalRecords.createdAt))
-      .limit(filters.limit);
+      .limit(filters.limit)
+      .offset(filters.offset ?? 0);
     return rows.map((row) => mapRecord(row));
   }
 
@@ -2435,6 +2476,7 @@ export function memoryService(
             summary: data.summary ?? null,
             metadata: data.metadata ?? {},
             reviewState: data.reviewState,
+            upsert: data.upsert ?? false,
           },
           null,
         );

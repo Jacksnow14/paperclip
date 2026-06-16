@@ -245,6 +245,58 @@ describe("createGmailIntakeService.processMailbox", () => {
     );
   });
 
+  it("excludes the invoicing@ alias from the Gmail poll query", async () => {
+    mockListMessages.mockResolvedValue({ messages: [] });
+    const db = buildDbMock();
+    const svc = createGmailIntakeService(db);
+    await svc.processMailbox(COMPANY_ID, "leo");
+
+    const query = mockListMessages.mock.calls[0][1].query as string;
+    expect(query).toContain("newer_than:2d");
+    expect(query).toContain("-to:invoicing@tryauranode.com");
+    expect(query).toContain("-deliveredto:invoicing@tryauranode.com");
+  });
+
+  it("does NOT create a generic issue for mail delivered to the invoicing@ alias", async () => {
+    // Simulates an invoicing@ message that slipped past the query exclusion
+    // (e.g. alias only in Delivered-To). The dedicated invoicing-intake worker
+    // owns this message; the generic poller must skip it, not duplicate it.
+    const msg = makeMessage("msg-inv-alias", "thread-inv-alias", "Invoice INV-9001 due");
+    msg.payload.headers.push({ name: "Delivered-To", value: "invoicing@tryauranode.com" });
+    mockListMessages.mockResolvedValue({ messages: [{ id: "msg-inv-alias" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-should-not-exist" });
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "leo");
+
+    expect(mockIssueCreate).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(result.processed).toBe(0);
+  });
+
+  it("still creates an issue for a normal To header on the polled mailbox", async () => {
+    const msg = makeMessage("msg-normal-to", "thread-normal-to");
+    msg.payload.headers.push({ name: "To", value: "leo@tryauranode.com" });
+    mockListMessages.mockResolvedValue({ messages: [{ id: "msg-normal-to" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-normal" });
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "leo");
+
+    expect(mockIssueCreate).toHaveBeenCalledOnce();
+    expect(result.created).toBe(1);
+  });
+
   it("records errors and does not throw when listMessages fails", async () => {
     mockListMessages.mockRejectedValue(new Error("network error"));
     const db = buildDbMock();

@@ -20,6 +20,21 @@ const MAILBOX_ROLE: Record<GmailAlias, string> = {
 const INVOICE_SUBJECT_RE =
   /invoice|receipt|\bINV-|\bbill\b|\[INVOICE-|payment\s+due|\bVAT\b|billing\s+statement/i;
 
+// Alias addresses handled by a dedicated intake worker rather than the generic
+// poller. `invoicing@tryauranode.com` is a free alias that delivers to the
+// polled `leo@` mailbox; the invoicing-intake worker processes that mail into
+// Accountant-owned issues WITH the source PDF attached. Without suppression the
+// generic poller sees the same Gmail message and creates a duplicate generic
+// issue on the CFO/leo@ queue (no attachment, wrong owner). See AUR-2494.
+const DELEGATED_ALIAS_RECIPIENTS = ["invoicing@tryauranode.com"] as const;
+
+// Gmail search exclusions so delegated-alias mail never enters the generic poll
+// in the first place (no fetch, no issue). Defense-in-depth header guard below
+// catches the rare case where the alias only appears in Delivered-To.
+const DELEGATED_ALIAS_QUERY_EXCLUSION = DELEGATED_ALIAS_RECIPIENTS.map(
+  (addr) => `-to:${addr} -deliveredto:${addr}`,
+).join(" ");
+
 // Gmail label names applied by the intake pipeline.
 export const INTAKE_LABELS = {
   TRIAGED: "paperclip/triaged",
@@ -37,6 +52,9 @@ interface ParsedMessage {
   bodySnippet: string;
   gmailThreadId: string;
   gmailMessageId: string;
+  // Lowercased To/Cc/Delivered-To recipients, used to detect mail that belongs
+  // to a dedicated intake worker (see DELEGATED_ALIAS_RECIPIENTS).
+  recipients: string;
 }
 
 function extractHeader(
@@ -112,11 +130,27 @@ function parseMessage(
   const bodyText = msg.payload ? extractTextBody(msg.payload) : "";
   const bodySnippet = (bodyText || msg.snippet || "").slice(0, SNIPPET_MAX_CHARS);
 
-  return { from, subject, dateMs, bodySnippet, gmailThreadId, gmailMessageId };
+  // Collect every recipient header so delegated-alias mail can be detected even
+  // when the alias appears only in Delivered-To (alias delivery record).
+  const recipients = [
+    extractHeader(headers, "to"),
+    extractHeader(headers, "cc"),
+    extractHeader(headers, "delivered-to"),
+  ]
+    .join(" ")
+    .toLowerCase();
+
+  return { from, subject, dateMs, bodySnippet, gmailThreadId, gmailMessageId, recipients };
 }
 
 function isInvoiceContent(parsed: ParsedMessage): boolean {
   return INVOICE_SUBJECT_RE.test(parsed.subject);
+}
+
+// True when the message is addressed/delivered to an alias owned by a dedicated
+// intake worker, so the generic poller must NOT create a duplicate issue.
+function isDelegatedAliasMail(parsed: ParsedMessage): boolean {
+  return DELEGATED_ALIAS_RECIPIENTS.some((addr) => parsed.recipients.includes(addr));
 }
 
 async function resolveAssigneeAgentId(
@@ -168,9 +202,11 @@ export function createGmailIntakeService(db: Db) {
 
     let listData: Awaited<ReturnType<typeof gmail.listMessages>>;
     try {
-      // Poll for messages received in the last 2 days, including already-read ones.
+      // Poll for messages received in the last 2 days, including already-read
+      // ones. Exclude mail handled by a dedicated intake worker (e.g. the
+      // invoicing@ alias) so the generic poller never duplicates it (AUR-2494).
       listData = await gmail.listMessages(mailbox, {
-        query: "newer_than:2d",
+        query: `newer_than:2d ${DELEGATED_ALIAS_QUERY_EXCLUSION}`.trim(),
         maxResults: 50,
       });
     } catch (err) {
@@ -216,6 +252,16 @@ export function createGmailIntakeService(db: Db) {
 
       const parsed = parseMessage(msg);
       if (!parsed) {
+        skipped++;
+        continue;
+      }
+
+      // Defense-in-depth: even if the Gmail query exclusion misses (e.g. the
+      // alias appears only in Delivered-To), do not create a generic issue for
+      // mail owned by a dedicated intake worker. The worker creates the
+      // authoritative issue WITH the source attachment; a generic duplicate
+      // lands on the wrong queue without it (AUR-2493/AUR-2494).
+      if (isDelegatedAliasMail(parsed)) {
         skipped++;
         continue;
       }

@@ -216,7 +216,11 @@ async function requestApp(
   }
 }
 
-describe("POST /companies/:companyId/gmail/mailboxes/:mailbox/messages — guard", () => {
+// Route-integration tests spin up a real node:http server per case after
+// vi.resetModules(); the first one pays a cold-start (express + fresh module
+// import) that can exceed the 5s default on a loaded CI box. Bump the suite
+// timeout so the gate is deterministically green. (AUR-2525 review fix.)
+describe("POST /companies/:companyId/gmail/mailboxes/:mailbox/messages — guard", { timeout: 30000 }, () => {
   beforeEach(() => {
     vi.clearAllMocks();
     dbApprovalRow = null;

@@ -1,23 +1,30 @@
 import { Router } from "express";
 import { z } from "zod";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { gmailIntakeRecords } from "@paperclipai/db";
+import { approvals, gmailIntakeRecords } from "@paperclipai/db";
 import { validate } from "../middleware/validate.js";
 import { assertCompanyAccess } from "./authz.js";
-import { badRequest, unprocessable } from "../errors.js";
+import { badRequest, forbidden, unprocessable } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 import {
   createGmailService,
   isSupportedGmailAlias,
   GMAIL_SUPPORTED_ALIASES,
 } from "../services/gmail.js";
 import { createGmailIntakeService } from "../services/gmail-intake.js";
+import { issueService } from "../services/index.js";
+import {
+  classifyGmailOutbound,
+  GmailOutboundBlockedError,
+} from "../services/gmail-outbound-guard.js";
 
 const sendMessageBodySchema = z.object({
   to: z.string().email(),
   subject: z.string().min(1),
   body: z.string().min(1),
   replyToMessageId: z.string().optional(),
+  ceoApprovalId: z.string().optional(),
 });
 
 const modifyLabelsBodySchema = z.object({
@@ -98,6 +105,68 @@ export function gmailRoutes(db: Db) {
       assertGmailAvailable();
       if (!isSupportedGmailAlias(mailbox)) throw badRequest(`Unsupported mailbox: ${mailbox}`);
       const body = req.body as z.infer<typeof sendMessageBodySchema>;
+
+      // AUR-2525: Gate outbound fraud/abuse/legal/chargeback reports.
+      // This is the path that fired the 2026-06-16 First Mile takeover cascade.
+      const decision = classifyGmailOutbound({
+        to: body.to,
+        subject: body.subject,
+        text: body.body,
+      });
+
+      if (decision.gated) {
+        const approvalId = body.ceoApprovalId?.trim();
+        let approvalValid = false;
+
+        if (approvalId) {
+          const approval = await db
+            .select()
+            .from(approvals)
+            .where(and(eq(approvals.id, approvalId), eq(approvals.companyId, companyId)))
+            .then((rows) => rows[0] ?? null);
+          approvalValid = approval?.status === 'approved';
+        }
+
+        if (!approvalValid) {
+          // Log a blocked-send incident issue for the caller agent (fire-and-forget).
+          const callerAgentId =
+            req.actor.type === 'agent' ? (req.actor.agentId ?? null) : null;
+          if (callerAgentId) {
+            issueService(db)
+              .create(companyId, {
+                title: `BLOCKED: outbound ${decision.category ?? 'report'} from ${mailbox}@ to ${body.to}`,
+                description:
+                  `## Gmail outbound guardrail triggered (AUR-2525)\n\n` +
+                  `**Mailbox:** ${mailbox}@tryauranode.com\n` +
+                  `**To:** ${body.to}\n` +
+                  `**Subject:** ${body.subject}\n` +
+                  `**Classification:** ${decision.category}\n` +
+                  `**Signals:** ${decision.reasons.join(', ')}\n\n` +
+                  `The send was hard-blocked. To proceed:\n` +
+                  `1. Verify this is a legitimate report (check memory / prior board decisions).\n` +
+                  `2. Create a board approval via \`POST /api/companies/{co}/approvals\` with type \`request_board_approval\`.\n` +
+                  `3. After CEO approves, re-send with \`ceoApprovalId\` in the request body.`,
+                priority: 'high',
+                status: 'todo',
+                assigneeAgentId: callerAgentId,
+              })
+              .catch((err: unknown) => {
+                logger.error(
+                  { err, mailbox, to: body.to },
+                  'gmail-guard: failed to create blocked-send incident issue',
+                );
+              });
+          }
+
+          throw forbidden(new GmailOutboundBlockedError(decision).message);
+        }
+
+        logger.info(
+          { mailbox, to: body.to, approvalId, category: decision.category },
+          'gmail-guard: gated send allowed with CEO approval',
+        );
+      }
+
       const data = await gmail.sendMessage(mailbox, body);
       res.status(201).json(data);
     },

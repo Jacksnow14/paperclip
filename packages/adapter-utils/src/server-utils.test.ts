@@ -352,6 +352,34 @@ describe("runChildProcess", () => {
     expect(result.stdout).toContain('"type":"result"');
   });
 
+  it("strips GOOGLE_WORKSPACE_SA_KEY from child process environment (LAR-254)", async () => {
+    const sentinel = "GOOGLE_WORKSPACE_SA_KEY_VALUE_IN_CHILD";
+    const originalValue = process.env.GOOGLE_WORKSPACE_SA_KEY;
+    process.env.GOOGLE_WORKSPACE_SA_KEY = sentinel;
+    try {
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        ["-e", "process.stdout.write(process.env.GOOGLE_WORKSPACE_SA_KEY ?? 'UNDEFINED');"],
+        {
+          cwd: process.cwd(),
+          env: {},
+          timeoutSec: 5,
+          graceSec: 1,
+          onLog: async () => {},
+        },
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe("UNDEFINED");
+    } finally {
+      if (originalValue === undefined) {
+        delete process.env.GOOGLE_WORKSPACE_SA_KEY;
+      } else {
+        process.env.GOOGLE_WORKSPACE_SA_KEY = originalValue;
+      }
+    }
+  });
+
   it.skipIf(process.platform === "win32")(
     "kills descendant process group when parent exits (AUR-1714 zombie-leak fix)",
     async () => {

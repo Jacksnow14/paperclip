@@ -1934,6 +1934,11 @@ export async function runChildProcess(
       delete rawMerged[key];
     }
 
+    // Strip control-plane secrets that must never leak to agent child processes.
+    // GOOGLE_WORKSPACE_SA_KEY allows direct Gmail API access, bypassing outbound
+    // guards — see LAR-227 / AUR-2525.
+    delete rawMerged.GOOGLE_WORKSPACE_SA_KEY;
+
     const mergedEnv = ensurePathInEnv(rawMerged);
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,

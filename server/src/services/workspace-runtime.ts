@@ -291,6 +291,7 @@ export function sanitizeRuntimeServiceBaseEnv(baseEnv: NodeJS.ProcessEnv): NodeJ
     }
   }
   delete env.DATABASE_URL;
+  delete env.GOOGLE_WORKSPACE_SA_KEY;
   delete env.npm_config_tailscale_auth;
   delete env.npm_config_authenticated_private;
   return env;

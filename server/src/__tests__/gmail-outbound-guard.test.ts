@@ -6,29 +6,31 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
   classifyGmailOutbound,
   GmailOutboundBlockedError,
+  BLOCKED_RECIPIENT_DOMAINS,
 } from "../services/gmail-outbound-guard.js";
 
 describe("classifyGmailOutbound — pure classifier", () => {
   describe("gated cases (strong signals)", () => {
-    it("flags report@bunq.com with 'account takeover' body", () => {
+    it("flags report@bunq.com with 'account takeover' body (domain blocklist wins)", () => {
       const d = classifyGmailOutbound({
         to: "report@bunq.com",
         subject: "URGENT fraud report",
         text: "We have confirmed an account takeover on our merchant account.",
       });
       expect(d.gated).toBe(true);
-      expect(d.category).toBe("fraud_report");
+      // Domain blocklist takes absolute priority over content-pattern detection
+      expect(d.category).toBe("blocked_domain");
       expect(d.external).toBe(true);
     });
 
-    it("flags Shopify abuse recipient alone (no body content needed)", () => {
+    it("flags Shopify abuse recipient alone — domain blocklist fires before content patterns", () => {
       const d = classifyGmailOutbound({
         to: "abuse@shopify.com",
         subject: "Hello",
         text: "Some text",
       });
       expect(d.gated).toBe(true);
-      expect(d.category).toBe("fraud_report");
+      expect(d.category).toBe("blocked_domain");
     });
 
     it("flags 'we are reporting' strong signal even without report recipient", () => {
@@ -125,6 +127,93 @@ describe("classifyGmailOutbound — pure classifier", () => {
       expect(err.decision).toBe(d);
       expect(err.message).toContain("AUR-2525");
     });
+  });
+});
+
+describe("classifyGmailOutbound — recipient domain blocklist (LAR-255)", () => {
+  it("BLOCKED_RECIPIENT_DOMAINS contains the four required domains", () => {
+    expect(BLOCKED_RECIPIENT_DOMAINS.has("bunq.com")).toBe(true);
+    expect(BLOCKED_RECIPIENT_DOMAINS.has("shopify.com")).toBe(true);
+    expect(BLOCKED_RECIPIENT_DOMAINS.has("cert.gov.ua")).toBe(true);
+    expect(BLOCKED_RECIPIENT_DOMAINS.has("shopifylegal.zendesk.com")).toBe(true);
+  });
+
+  it("blocks send to any @bunq.com address with benign content", () => {
+    const d = classifyGmailOutbound({
+      to: "support@bunq.com",
+      subject: "Hello",
+      text: "Just saying hi.",
+    });
+    expect(d.gated).toBe(true);
+    expect(d.category).toBe("blocked_domain");
+    expect(d.external).toBe(true);
+    expect(d.reasons).toContain("blocked-domain:bunq.com");
+  });
+
+  it("blocks send to any @shopify.com address with benign content", () => {
+    const d = classifyGmailOutbound({
+      to: "hello@shopify.com",
+      subject: "Partnership",
+      text: "We would like to discuss a partnership.",
+    });
+    expect(d.gated).toBe(true);
+    expect(d.category).toBe("blocked_domain");
+    expect(d.reasons).toContain("blocked-domain:shopify.com");
+  });
+
+  it("blocks send to any @cert.gov.ua address", () => {
+    const d = classifyGmailOutbound({
+      to: "contact@cert.gov.ua",
+      subject: "Inquiry",
+      text: "General inquiry.",
+    });
+    expect(d.gated).toBe(true);
+    expect(d.category).toBe("blocked_domain");
+    expect(d.reasons).toContain("blocked-domain:cert.gov.ua");
+  });
+
+  it("blocks send to any @shopifylegal.zendesk.com address", () => {
+    const d = classifyGmailOutbound({
+      to: "tickets@shopifylegal.zendesk.com",
+      subject: "Question",
+      text: "Routine question.",
+    });
+    expect(d.gated).toBe(true);
+    expect(d.category).toBe("blocked_domain");
+    expect(d.reasons).toContain("blocked-domain:shopifylegal.zendesk.com");
+  });
+
+  it("blocks when a blocklisted domain appears in CC (not just To)", () => {
+    const d = classifyGmailOutbound({
+      to: "internal@tryauranode.com",
+      cc: ["legal@shopify.com"],
+      subject: "FYI",
+      text: "See attached.",
+    });
+    expect(d.gated).toBe(true);
+    expect(d.category).toBe("blocked_domain");
+  });
+
+  it("does NOT block a non-blocklisted external domain with benign content", () => {
+    const d = classifyGmailOutbound({
+      to: "contact@partner.com",
+      subject: "Partnership",
+      text: "We would like to discuss a partnership.",
+    });
+    expect(d.gated).toBe(false);
+    expect(d.category).toBeNull();
+  });
+
+  it("GmailOutboundBlockedError message for blocked_domain uses descriptive text", () => {
+    const d = classifyGmailOutbound({
+      to: "fraud@bunq.com",
+      subject: "Hello",
+      text: "Benign content.",
+    });
+    const err = new GmailOutboundBlockedError(d);
+    expect(err.message).toContain("BLOCKED");
+    expect(err.message).toContain("blocklisted recipient domain");
+    expect(err.message).toContain("AUR-2525");
   });
 });
 

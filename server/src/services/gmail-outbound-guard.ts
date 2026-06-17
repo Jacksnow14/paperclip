@@ -16,7 +16,8 @@ export type GmailOutboundCategory =
   | 'abuse_report'
   | 'legal_threat'
   | 'chargeback'
-  | 'law_enforcement';
+  | 'law_enforcement'
+  | 'blocked_domain';
 
 export interface GmailOutboundCheckInput {
   to: string;
@@ -33,6 +34,17 @@ export interface GmailOutboundDecision {
 }
 
 const INTERNAL_DOMAIN = 'tryauranode.com';
+
+// Absolute recipient domain blocklist (LAR-255 / 9227 First Mile case).
+// All sends to these domains are blocked regardless of content or recipient type.
+// The only override is an explicit CEO board approval (ceoApprovalId).
+// Add new entries here to extend the blocklist.
+export const BLOCKED_RECIPIENT_DOMAINS: ReadonlySet<string> = new Set([
+  'bunq.com',
+  'shopify.com',
+  'cert.gov.ua',
+  'shopifylegal.zendesk.com',
+]);
 
 const REPORT_RECIPIENT_RE =
   /\b(report|reports|fraud|abuse|phish|phishing|spoof|legal|security|trust|safety|compliance|complaints?)@/i;
@@ -85,6 +97,17 @@ export function classifyGmailOutbound(input: GmailOutboundCheckInput): GmailOutb
   const haystack = `${input.subject ?? ''}\n${input.text ?? ''}`;
   const rcpts = recipients(input);
 
+  // Absolute domain blocklist — checked before any content-pattern logic.
+  // No content bypass; only a CEO board approval can override.
+  for (const r of rcpts) {
+    const at = r.lastIndexOf('@');
+    if (at === -1) continue;
+    const domain = r.slice(at + 1);
+    if (BLOCKED_RECIPIENT_DOMAINS.has(domain)) {
+      return { category: 'blocked_domain', external: true, gated: true, reasons: [`blocked-domain:${domain}`] };
+    }
+  }
+
   const external = rcpts.some((r) => isExternal(r));
   const hasReportRecipient = rcpts.some((r) => REPORT_RECIPIENT_RE.test(r));
   const hasGroupTarget = rcpts.some((r) => GROUP_TARGET_RE.test(r));
@@ -123,8 +146,12 @@ export function classifyGmailOutbound(input: GmailOutboundCheckInput): GmailOutb
 export class GmailOutboundBlockedError extends Error {
   readonly decision: GmailOutboundDecision;
   constructor(decision: GmailOutboundDecision) {
+    const categoryDesc =
+      decision.category === 'blocked_domain'
+        ? 'send to a blocklisted recipient domain'
+        : `outbound ${decision.category}`;
     super(
-      `BLOCKED: Gmail outbound ${decision.category} to a third party requires explicit CEO approval ` +
+      `BLOCKED: Gmail ${categoryDesc} to a third party requires explicit CEO approval ` +
         `(AUR-2525 guardrail). Signals: ${decision.reasons.join(', ')}. ` +
         `Obtain board approval via request_board_approval and attach the returned approvalId as ` +
         `ceoApprovalId in the request body.`,

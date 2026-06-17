@@ -34,6 +34,8 @@ const { createGmailIntakeService, INTAKE_LABELS } = await import(
 );
 
 // Minimal Drizzle-like db mock that supports select/insert chaining.
+// leftJoin and orderBy are added to support the cross-thread sender+subject
+// dedupe query (AUR-2674) which uses .leftJoin(issues, ...).orderBy(desc(...)).
 function buildDbMock(
   overrides: {
     selectRows?: Record<string, unknown>[];
@@ -42,7 +44,9 @@ function buildDbMock(
   const selectRows = overrides.selectRows ?? [];
   const selectChain = {
     from: vi.fn().mockReturnThis(),
+    leftJoin: vi.fn().mockReturnThis(),
     where: vi.fn().mockReturnThis(),
+    orderBy: vi.fn().mockReturnThis(),
     limit: vi.fn().mockResolvedValue(selectRows),
   };
   const insertChain = {
@@ -168,6 +172,7 @@ describe("createGmailIntakeService.processMailbox", () => {
 
     // First select (message-level dedup): no record → proceed.
     // Second select (thread-level lookup): return an existing issue ID.
+    // (Cross-thread sender+subject lookup is inside the else branch, not reached when thread match found.)
     let selectCallCount = 0;
     const db = {
       select: vi.fn(() => {
@@ -177,7 +182,9 @@ describe("createGmailIntakeService.processMailbox", () => {
           : [{ issueId: "issue-existing-1" }];
         return {
           from: vi.fn().mockReturnThis(),
+          leftJoin: vi.fn().mockReturnThis(),
           where: vi.fn().mockReturnThis(),
+          orderBy: vi.fn().mockReturnThis(),
           limit: vi.fn().mockResolvedValue(rows),
         };
       }),
@@ -375,6 +382,248 @@ describe("createGmailIntakeService.processMailbox", () => {
   });
 });
 
+describe("cross-thread sender+subject dedupe (AUR-2674)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function makeMessageWithHeaders(
+    id: string,
+    threadId: string,
+    subject: string,
+    extraHeaders: Array<{ name: string; value: string }> = [],
+  ) {
+    const msg = makeMessage(id, threadId, subject);
+    msg.payload.headers.push(...extraHeaders);
+    return msg;
+  }
+
+  // Build a db mock that tracks call count and returns different rows per call.
+  // The select chain must include leftJoin and orderBy for the dedupe query.
+  function buildCountingDb(rowsByCall: Record<number, unknown[]>) {
+    let selectCallCount = 0;
+    return {
+      select: vi.fn(() => {
+        selectCallCount++;
+        const rows = rowsByCall[selectCallCount] ?? [];
+        return {
+          from: vi.fn().mockReturnThis(),
+          leftJoin: vi.fn().mockReturnThis(),
+          where: vi.fn().mockReturnThis(),
+          orderBy: vi.fn().mockReturnThis(),
+          limit: vi.fn().mockResolvedValue(rows),
+        };
+      }),
+      insert: vi.fn(() => ({ values: vi.fn().mockResolvedValue(undefined) })),
+    } as unknown as Db;
+  }
+
+  it("folds N identical acks across different thread IDs into exactly ONE issue with N-1 comments", async () => {
+    const msgs = [
+      makeMessage("ack1", "thread-ack-1", "We received your notification"),
+      makeMessage("ack2", "thread-ack-2", "We received your notification"),
+      makeMessage("ack3", "thread-ack-3", "We received your notification"),
+    ];
+
+    mockListMessages.mockResolvedValue({ messages: [{ id: "ack1" }, { id: "ack2" }, { id: "ack3" }] });
+    mockGetMessage
+      .mockResolvedValueOnce(msgs[0])
+      .mockResolvedValueOnce(msgs[1])
+      .mockResolvedValueOnce(msgs[2]);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "ack-issue-1" });
+    mockAddComment.mockResolvedValue({});
+
+    // ack1: calls 1(dedup)→empty, 2(thread)→empty, 3(sender+subj)→empty, 4(agent)→agent
+    // ack2: calls 5(dedup)→empty, 6(thread)→empty, 7(sender+subj)→open match
+    // ack3: calls 8(dedup)→empty, 9(thread)→empty, 10(sender+subj)→open match
+    const openMatch = [{ issueId: "ack-issue-1", issueStatus: "todo" }];
+    const db = buildCountingDb({
+      4: [{ id: "agent-1" }],
+      7: openMatch,
+      10: openMatch,
+    });
+
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockIssueCreate).toHaveBeenCalledTimes(1);
+    expect(result.created).toBe(1);
+    expect(result.updated).toBe(2);
+    // 1 reference comment for the new issue + 2 fold comments
+    expect(mockAddComment).toHaveBeenCalledTimes(3);
+  });
+
+  it("creates a fresh issue when the matched issue is closed (no reopen) for non-auto-reply", async () => {
+    const msgs = [
+      makeMessage("closed-1", "thread-c1", "Notification"),
+      makeMessage("closed-2", "thread-c2", "Notification"),
+    ];
+
+    mockListMessages.mockResolvedValue({ messages: [{ id: "closed-1" }, { id: "closed-2" }] });
+    mockGetMessage.mockResolvedValueOnce(msgs[0]).mockResolvedValueOnce(msgs[1]);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "fresh-issue-1" });
+    mockAddComment.mockResolvedValue({});
+
+    // closed-1: call 3 sender+subj → closed match (no match via INNER JOIN semantics — db returns empty)
+    //           call 4 agent → agent
+    // closed-2: call 7 sender+subj → fresh-issue-1 now open
+    const db = buildCountingDb({
+      4: [{ id: "agent-1" }],
+      7: [{ issueId: "fresh-issue-1", issueStatus: "todo" }],
+    });
+
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockIssueCreate).toHaveBeenCalledTimes(1);
+    expect(result.created).toBe(1);
+    expect(result.updated).toBe(1);
+  });
+
+  it("skips creating a new issue when auto-reply matches a closed issue", async () => {
+    const msg = makeMessageWithHeaders("ar-1", "thread-ar-1", "We received your report", [
+      { name: "Auto-Submitted", value: "auto-replied" },
+    ]);
+
+    mockListMessages.mockResolvedValue({ messages: [{ id: "ar-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "should-not-be-called" });
+    mockAddComment.mockResolvedValue({});
+
+    // call 1 dedup → empty; call 2 thread → empty; call 3 sender+subj → closed match
+    const db = buildCountingDb({
+      3: [{ issueId: "old-closed-issue", issueStatus: "done" }],
+    });
+
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockIssueCreate).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect(result.created).toBe(0);
+    expect(result.updated).toBe(0);
+    expect(result.skipped).toBe(1);
+  });
+
+  it("detects Auto-Submitted: auto-generated as auto-reply", async () => {
+    const msg = makeMessageWithHeaders("ag-1", "thread-ag-1", "Auto ack", [
+      { name: "Auto-Submitted", value: "auto-generated" },
+    ]);
+    mockListMessages.mockResolvedValue({ messages: [{ id: "ag-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "x" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildCountingDb({
+      3: [{ issueId: "closed-iss", issueStatus: "cancelled" }],
+    });
+
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockIssueCreate).not.toHaveBeenCalled();
+    expect(result.skipped).toBe(1);
+  });
+
+  it("detects Precedence: bulk as auto-reply", async () => {
+    const msg = makeMessageWithHeaders("bulk-1", "thread-bulk-1", "Newsletter", [
+      { name: "Precedence", value: "bulk" },
+    ]);
+    mockListMessages.mockResolvedValue({ messages: [{ id: "bulk-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "y" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildCountingDb({
+      3: [{ issueId: "closed-iss", issueStatus: "done" }],
+    });
+
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockIssueCreate).not.toHaveBeenCalled();
+    expect(result.skipped).toBe(1);
+  });
+
+  it("does NOT skip auto-reply when there is no historical match (first occurrence)", async () => {
+    const msg = makeMessageWithHeaders("ar-new", "thread-ar-new", "First ack", [
+      { name: "Auto-Submitted", value: "auto-replied" },
+    ]);
+    mockListMessages.mockResolvedValue({ messages: [{ id: "ar-new" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([]);
+    mockCreateLabel.mockResolvedValue({ id: "lbl-x" });
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "first-ar-issue" });
+    mockAddComment.mockResolvedValue({});
+
+    // call 1 dedup → empty; call 2 thread → empty; call 3 sender+subj → empty (no history)
+    // call 4 agent → agent
+    const db = buildCountingDb({ 4: [{ id: "agent-1" }] });
+
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockIssueCreate).toHaveBeenCalledTimes(1);
+    expect(result.created).toBe(1);
+  });
+
+  it("stores normalized subject in the intake record (strips Re: prefix)", async () => {
+    const msg = makeMessage("re-1", "thread-re-1", "Re: We received your notification");
+    mockListMessages.mockResolvedValue({ messages: [{ id: "re-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([]);
+    mockCreateLabel.mockResolvedValue({ id: "lbl-x" });
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "re-issue-1" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    await svc.processMailbox(COMPANY_ID, "board");
+
+    const insertValues = (db as ReturnType<typeof buildDbMock>)._insertChain.values.mock.calls[0][0] as Record<string, unknown>;
+    const storedSubject = insertValues.subject as string;
+    // Normalized: no "Re: " prefix, lowercase
+    expect(storedSubject).not.toMatch(/^re\s*:/i);
+    expect(storedSubject).toBe("we received your notification");
+  });
+
+  it("same-thread folding is unchanged (existing thread-ID path still works)", async () => {
+    const msg = makeMessage("same-thread-2", "thread-existing", "Re: Hello");
+    mockListMessages.mockResolvedValue({ messages: [{ id: "same-thread-2" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockAddComment.mockResolvedValue({});
+
+    // call 1 message dedup → empty (proceed); call 2 thread lookup → existing issue
+    const db = buildCountingDb({
+      2: [{ issueId: "thread-issue-1" }],
+    });
+
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockIssueCreate).not.toHaveBeenCalled();
+    expect(mockAddComment).toHaveBeenCalledOnce();
+    const commentBody = mockAddComment.mock.calls[0][1] as string;
+    expect(commentBody).toContain("New reply in Gmail thread");
+    expect(result.updated).toBe(1);
+    expect(result.created).toBe(0);
+  });
+});
+
 describe("createGmailIntakeService.pollAllMailboxes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -479,18 +728,19 @@ describe("routing: mailbox → agent role", () => {
     mockModifyMessageLabels.mockResolvedValue({});
     mockIssueCreate.mockResolvedValue({ id: "issue-r" });
 
-    // Simulate agent lookup returning an id
+    // Simulate agent lookup returning an id.
+    // Call order (after AUR-2674 dedupe): 1=msg-dedup, 2=thread-lookup,
+    // 3=sender+subject-lookup (returns {id} no issueId → no match), 4=agent-lookup.
     let selectCallCount = 0;
     const db = {
       select: vi.fn(() => {
         selectCallCount++;
-        // First call: message-level dedup → no record
-        // Second call: thread-level lookup → no record
-        // Third call: agent role lookup → return an agent
         const rows = selectCallCount >= 3 ? [{ id: "agent-ceo-1" }] : [];
         return {
           from: vi.fn().mockReturnThis(),
+          leftJoin: vi.fn().mockReturnThis(),
           where: vi.fn().mockReturnThis(),
+          orderBy: vi.fn().mockReturnThis(),
           limit: vi.fn().mockResolvedValue(rows),
         };
       }),
@@ -517,11 +767,13 @@ describe("content-based routing: invoice subjects route to CFO", () => {
     return {
       select: vi.fn(() => {
         selectCallCount++;
-        // Calls 1-2: message/thread dedup → empty. Call 3: agent lookup → match.
+        // Call 1=msg-dedup, 2=thread-lookup, 3=sender+subject-lookup (returns {id} no issueId → no match), 4=agent-lookup.
         const rows = selectCallCount >= 3 ? [{ id: agentId }] : [];
         return {
           from: vi.fn().mockReturnThis(),
+          leftJoin: vi.fn().mockReturnThis(),
           where: vi.fn().mockReturnThis(),
+          orderBy: vi.fn().mockReturnThis(),
           limit: vi.fn().mockResolvedValue(rows),
         };
       }),

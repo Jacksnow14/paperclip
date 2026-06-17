@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq, gte, isNotNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, gmailIntakeRecords, issues } from "@paperclipai/db";
 import type { IssueCommentMetadata } from "@paperclipai/shared";
@@ -55,6 +55,10 @@ interface ParsedMessage {
   // Lowercased To/Cc/Delivered-To recipients, used to detect mail that belongs
   // to a dedicated intake worker (see DELEGATED_ALIAS_RECIPIENTS).
   recipients: string;
+  // True when RFC 3834 Auto-Submitted header or Precedence: bulk is present.
+  // Auto-replies are low-signal; the dedupe logic skips creating a new issue
+  // when a historical match (even closed) exists for the same sender+subject.
+  isAutoReply: boolean;
 }
 
 function extractHeader(
@@ -140,7 +144,27 @@ function parseMessage(
     .join(" ")
     .toLowerCase();
 
-  return { from, subject, dateMs, bodySnippet, gmailThreadId, gmailMessageId, recipients };
+  const autoSubmitted = extractHeader(headers, "auto-submitted").toLowerCase();
+  const precedence = extractHeader(headers, "precedence").toLowerCase();
+  const isAutoReply =
+    autoSubmitted === "auto-replied" ||
+    autoSubmitted === "auto-generated" ||
+    precedence === "bulk";
+
+  return { from, subject, dateMs, bodySnippet, gmailThreadId, gmailMessageId, recipients, isAutoReply };
+}
+
+// Strip leading Re:/Fwd:/Fw: prefixes (repeatedly), collapse whitespace, lowercase.
+// The result is stored in gmail_intake_records.subject and used as the dedupe key
+// for the sender+subject cross-thread flood-prevention lookup (AUR-2674).
+function normalizeSubject(subject: string): string {
+  let s = subject;
+  let prev = "";
+  while (s !== prev) {
+    prev = s;
+    s = s.replace(/^(?:re|fwd|fw)\s*:\s*/i, "");
+  }
+  return s.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
 function isInvoiceContent(parsed: ParsedMessage): boolean {
@@ -284,7 +308,8 @@ export function createGmailIntakeService(db: Db) {
 
         const existingIssueId = existingThreadRecord[0]?.issueId ?? null;
 
-        let issueId: string;
+        // null only for the auto-reply+closed-issue skip path; the schema column is nullable.
+        let issueId: string | null = null;
 
         if (existingIssueId) {
           // Existing issue for this thread — add a comment carrying the Gmail
@@ -298,31 +323,75 @@ export function createGmailIntakeService(db: Db) {
           issueId = existingIssueId;
           updated++;
         } else {
-          // New thread — create a new issue in an actionable, routed status
-          // (`todo`) so the assignee picks it up rather than letting it sit in
-          // `backlog`.
-          const assigneeAgentId = await resolveAssigneeAgentId(db, companyId, mailbox, parsed);
-          const issueTitle = buildIssueTitle(mailbox, parsed.subject, parsed.from);
-          const issueDescription = buildIssueDescription(mailbox, parsed);
+          // Cross-thread sender+subject dedupe (AUR-2674): fold same-sender same-subject
+          // auto-ack floods (e.g. bunq acknowledgment replies) into one issue even across
+          // different Gmail threads. We normalize the subject (strip Re:/Fwd:, lowercase)
+          // so "Re: Notification" and "Notification" match. We left-join with issues to
+          // distinguish open vs closed matches within a 14-day recency window.
+          const normalizedSubj = normalizeSubject(parsed.subject).slice(0, 512);
+          const cutoff = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
 
-          const issue = await isvc.create(companyId, {
-            title: issueTitle,
-            description: issueDescription,
-            status: "todo",
-            priority: "medium",
-            originKind: "inbound_email",
-            ...(assigneeAgentId ? { assigneeAgentId } : {}),
-          });
-          issueId = issue.id;
+          const senderSubjRecord = await db
+            .select({ issueId: gmailIntakeRecords.issueId, issueStatus: issues.status })
+            .from(gmailIntakeRecords)
+            .leftJoin(issues, eq(gmailIntakeRecords.issueId, issues.id))
+            .where(
+              and(
+                eq(gmailIntakeRecords.companyId, companyId),
+                eq(gmailIntakeRecords.mailbox, mailbox),
+                eq(gmailIntakeRecords.sender, parsed.from.slice(0, 512)),
+                eq(gmailIntakeRecords.subject, normalizedSubj),
+                gte(gmailIntakeRecords.createdAt, cutoff),
+                isNotNull(gmailIntakeRecords.issueId),
+              ),
+            )
+            .orderBy(desc(gmailIntakeRecords.createdAt))
+            .limit(1);
 
-          // Attach the Gmail thread/message refs as a first-class structured
-          // metadata comment on the new issue so the reply workflow has a
-          // reliable, issue-visible contract (not brittle prose parsing).
-          await isvc.addComment(issueId, buildReferenceCommentBody(mailbox), {}, {
-            authorType: "system",
-            metadata: buildGmailReferenceMetadata(mailbox, parsed, { includeSubject: true }),
-          });
-          created++;
+          const senderSubjIssueId = senderSubjRecord[0]?.issueId ?? null;
+          const senderSubjIssueStatus = senderSubjRecord[0]?.issueStatus ?? null;
+          const isClosed = senderSubjIssueStatus === "done" || senderSubjIssueStatus === "cancelled";
+          const isOpenMatch = senderSubjIssueId !== null && !isClosed;
+
+          if (isOpenMatch) {
+            // Fold into the existing open issue as a comment.
+            const commentBody = buildUpdateCommentBody(mailbox, parsed);
+            await isvc.addComment(senderSubjIssueId!, commentBody, {}, {
+              authorType: "system",
+              metadata: buildGmailReferenceMetadata(mailbox, parsed),
+            });
+            issueId = senderSubjIssueId!;
+            updated++;
+          } else if (senderSubjIssueId !== null && isClosed && parsed.isAutoReply) {
+            // Auto-reply against a historically closed issue: skip creating a new issue.
+            // issueId stays null; the bottom insert records the intake to prevent
+            // reprocessing without linking to any issue.
+            skipped++;
+          } else {
+            // No match or closed match without auto-reply header — create a new issue.
+            const assigneeAgentId = await resolveAssigneeAgentId(db, companyId, mailbox, parsed);
+            const issueTitle = buildIssueTitle(mailbox, parsed.subject, parsed.from);
+            const issueDescription = buildIssueDescription(mailbox, parsed);
+
+            const issue = await isvc.create(companyId, {
+              title: issueTitle,
+              description: issueDescription,
+              status: "todo",
+              priority: "medium",
+              originKind: "inbound_email",
+              ...(assigneeAgentId ? { assigneeAgentId } : {}),
+            });
+            issueId = issue.id;
+
+            // Attach the Gmail thread/message refs as a first-class structured
+            // metadata comment on the new issue so the reply workflow has a
+            // reliable, issue-visible contract (not brittle prose parsing).
+            await isvc.addComment(issueId, buildReferenceCommentBody(mailbox), {}, {
+              authorType: "system",
+              metadata: buildGmailReferenceMetadata(mailbox, parsed, { includeSubject: true }),
+            });
+            created++;
+          }
         }
 
         // Record the intake so we don't process this message again.
@@ -333,7 +402,7 @@ export function createGmailIntakeService(db: Db) {
           gmailMessageId: parsed.gmailMessageId,
           issueId,
           sender: parsed.from.slice(0, 512),
-          subject: parsed.subject.slice(0, 512),
+          subject: normalizeSubject(parsed.subject).slice(0, 512),
           snippet: parsed.bodySnippet.slice(0, 512),
           receivedAt: parsed.dateMs ? new Date(parsed.dateMs) : null,
         });

@@ -167,7 +167,11 @@ export function gmailRoutes(db: Db) {
         );
       }
 
-      const data = await gmail.sendMessage(mailbox, body);
+      // The route has already classified and (for gated sends) verified an
+      // approved CEO board approval above. Tell the service-layer chokepoint
+      // (AUR-2682) the approval was verified so the gated-but-approved send
+      // proceeds; non-gated sends are unaffected either way.
+      const data = await gmail.sendMessage(mailbox, body, { approvalVerified: true });
       res.status(201).json(data);
     },
   );

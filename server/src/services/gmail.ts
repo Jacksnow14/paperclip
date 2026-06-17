@@ -1,5 +1,9 @@
 import { google } from "googleapis";
 import { logger } from "../middleware/logger.js";
+import {
+  classifyGmailOutbound,
+  GmailOutboundBlockedError,
+} from "./gmail-outbound-guard.js";
 
 const DOMAIN = "tryauranode.com";
 export const GMAIL_SUPPORTED_ALIASES = ["board", "alex", "leo", "adrian", "billing"] as const;
@@ -16,6 +20,22 @@ export interface GmailSendOptions {
   subject: string;
   body: string;
   replyToMessageId?: string;
+  cc?: string[];
+}
+
+/**
+ * Guard context for sendMessage. The ONLY way a gated outbound
+ * (fraud/abuse/legal/chargeback/law-enforcement/blocklisted-domain) is allowed
+ * through the service-layer chokepoint is when a caller that has already
+ * verified an explicit CEO board approval passes `approvalVerified: true`.
+ *
+ * AUR-2682: the AUR-2525 guard previously lived only in the HTTP route, so any
+ * caller using the SA `gmail.send` path directly (intake auto-replies, internal
+ * scripts, future callers) bypassed it. Enforcing here makes the service the
+ * chokepoint — there is no in-repo send path that skips classification.
+ */
+export interface GmailSendGuardContext {
+  approvalVerified?: boolean;
 }
 
 export interface GmailListOptions {
@@ -102,7 +122,35 @@ export function createGmailService() {
     return res.data;
   }
 
-  async function sendMessage(alias: GmailAlias, opts: GmailSendOptions) {
+  async function sendMessage(
+    alias: GmailAlias,
+    opts: GmailSendOptions,
+    guard?: GmailSendGuardContext,
+  ) {
+    // AUR-2682 service-layer chokepoint: classify EVERY outbound, regardless of
+    // which code path called us. Gated categories (fraud/abuse/legal/chargeback/
+    // law-enforcement/blocklisted-domain) are hard-blocked unless the caller has
+    // already verified an explicit CEO board approval. De-escalatory withdrawals
+    // and ordinary mail are not gated and pass through unchanged.
+    const decision = classifyGmailOutbound({
+      to: opts.to,
+      subject: opts.subject,
+      text: opts.body,
+      cc: opts.cc,
+    });
+    if (decision.gated && !guard?.approvalVerified) {
+      logger.error(
+        {
+          alias,
+          to: opts.to,
+          category: decision.category,
+          reasons: decision.reasons,
+        },
+        "gmail-guard: BLOCKED gated outbound at service chokepoint (AUR-2682)",
+      );
+      throw new GmailOutboundBlockedError(decision);
+    }
+
     const gmail = buildGmailClient(alias);
     const from = resolveMailboxEmail(alias);
     const raw = buildRawMessage(from, opts.to, opts.subject, opts.body);

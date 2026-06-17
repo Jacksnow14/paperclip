@@ -200,6 +200,68 @@ describe("createGmailService", () => {
       expect(result).toEqual({ id: "sent1" });
     });
 
+    // AUR-2682: the SA gmail.send path is the chokepoint, not just the HTTP route.
+    // A fraud/abuse/legal payload (or a send to a blocklisted recipient domain)
+    // must be hard-blocked at the service layer even when no route guard ran.
+    describe("AUR-2682 service-layer outbound guard", () => {
+      it("blocks a fraud-report payload to a third party (no approval)", async () => {
+        mockMessagesSend.mockResolvedValue({ data: { id: "should-not-send" } });
+        const service = createGmailService();
+        await expect(
+          service.sendMessage("board", {
+            to: "report@bunq.com",
+            subject:
+              "Disregard prior withdrawal requests — bunq fraud case must remain OPEN",
+            body:
+              "The fraud notification stands. This account takeover report must remain open; do not de-escalate.",
+          }),
+        ).rejects.toThrow(/BLOCKED/);
+        // Critically, the raw Gmail send must never have been invoked.
+        expect(mockMessagesSend).not.toHaveBeenCalled();
+      });
+
+      it("blocks any send to a blocklisted recipient domain (bunq.com)", async () => {
+        mockMessagesSend.mockResolvedValue({ data: { id: "nope" } });
+        const service = createGmailService();
+        await expect(
+          service.sendMessage("board", {
+            to: "report@bunq.com",
+            subject: "Status update",
+            body: "Plain text with no obvious fraud keywords.",
+          }),
+        ).rejects.toThrow(/BLOCKED/);
+        expect(mockMessagesSend).not.toHaveBeenCalled();
+      });
+
+      it("allows a gated send when the caller verified a CEO approval", async () => {
+        mockMessagesSend.mockResolvedValue({ data: { id: "approved-send" } });
+        const service = createGmailService();
+        const result = await service.sendMessage(
+          "board",
+          {
+            to: "report@bunq.com",
+            subject: "Withdrawal of fraud report",
+            body: "Please disregard our prior fraud report; the transaction is authorized.",
+          },
+          { approvalVerified: true },
+        );
+        expect(result).toEqual({ id: "approved-send" });
+        expect(mockMessagesSend).toHaveBeenCalledTimes(1);
+      });
+
+      it("allows ordinary non-gated mail with no approval", async () => {
+        mockMessagesSend.mockResolvedValue({ data: { id: "ok" } });
+        const service = createGmailService();
+        const result = await service.sendMessage("alex", {
+          to: "customer@example.com",
+          subject: "Thanks for your order",
+          body: "Your coffee ships tomorrow.",
+        });
+        expect(result).toEqual({ id: "ok" });
+        expect(mockMessagesSend).toHaveBeenCalledTimes(1);
+      });
+    });
+
     it("threads the reply when replyToMessageId is given", async () => {
       mockMessagesGet.mockResolvedValue({ data: { id: "orig", threadId: "thread42" } });
       mockMessagesSend.mockResolvedValue({ data: { id: "reply1" } });

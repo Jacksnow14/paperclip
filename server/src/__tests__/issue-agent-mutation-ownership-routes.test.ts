@@ -23,6 +23,7 @@ const mockIssueService = vi.hoisted(() => ({
   removeAttachment: vi.fn(),
   update: vi.fn(),
   findMentionedAgents: vi.fn(),
+  wasAgentMentionedInThread: vi.fn(),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -269,6 +270,7 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.removeAttachment.mockReset();
     mockIssueService.update.mockReset();
     mockIssueService.findMentionedAgents.mockReset();
+    mockIssueService.wasAgentMentionedInThread.mockReset();
     mockDocumentService.upsertIssueDocument.mockReset();
     mockWorkProductService.getById.mockReset();
     mockWorkProductService.update.mockReset();
@@ -296,6 +298,7 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
+    mockIssueService.wasAgentMentionedInThread.mockResolvedValue(false);
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...makeIssue(),
       ...patch,
@@ -541,6 +544,100 @@ describe("agent issue mutation checkout ownership", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(403);
       expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
       expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("mention-scoped reply comments", () => {
+    it("allows mention-eligible non-owner to reply on an open issue and tags metadata.mentionReply", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId }));
+      mockIssueService.wasAgentMentionedInThread.mockResolvedValue(true);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "77777777-7777-4777-8777-777777777777",
+        issueId,
+        companyId,
+        body: "reply",
+        metadata: { version: 1, mentionReply: true, mentionRepliedByAgentId: peerAgentId },
+      });
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "reply" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalled();
+      expect(res.body.metadata).toMatchObject({
+        mentionReply: true,
+        mentionRepliedByAgentId: peerAgentId,
+      });
+    });
+
+    it("allows mention-eligible non-owner to reply on a closed issue without reopening it", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "done", assigneeAgentId: ownerAgentId }));
+      mockIssueService.wasAgentMentionedInThread.mockResolvedValue(true);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "77777777-7777-4777-8777-777777777777",
+        issueId,
+        companyId,
+        body: "reply on closed",
+        metadata: { version: 1, mentionReply: true, mentionRepliedByAgentId: peerAgentId },
+      });
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "reply on closed" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.update).not.toHaveBeenCalledWith(issueId, expect.objectContaining({ status: "todo" }));
+    });
+
+    it("rejects non-mentioned non-owner with 403", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
+      mockIssueService.wasAgentMentionedInThread.mockResolvedValue(false);
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "not mentioned" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    it("ignores reopen:true from a mention-reply actor — issue stays closed", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "done", assigneeAgentId: ownerAgentId }));
+      mockIssueService.wasAgentMentionedInThread.mockResolvedValue(true);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "77777777-7777-4777-8777-777777777777",
+        issueId,
+        companyId,
+        body: "trying to reopen",
+        metadata: { version: 1, mentionReply: true, mentionRepliedByAgentId: peerAgentId },
+      });
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "trying to reopen", reopen: true });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.update).not.toHaveBeenCalledWith(issueId, expect.objectContaining({ status: "todo" }));
+    });
+
+    it("preserves tasks:audit_comment grant path (does not regress)", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "done", assigneeAgentId: ownerAgentId }));
+      mockAccessService.hasPermission.mockImplementation(async (
+        _companyId: string,
+        _principalType: string,
+        principalId: string,
+        permissionKey: string,
+      ) => principalId === peerAgentId && permissionKey === "tasks:audit_comment");
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Audit comment" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalled();
+      expect(mockIssueService.wasAgentMentionedInThread).not.toHaveBeenCalled();
     });
   });
 });

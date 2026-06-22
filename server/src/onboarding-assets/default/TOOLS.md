@@ -96,3 +96,18 @@ Rule of thumb:
 
 The local Paperclip API (`$PAPERCLIP_API_URL`, plain HTTP) is reachable from the default
 sandbox; you do **not** need to disable the sandbox for control-plane calls.
+
+## Mention-reply path
+
+An @mentioned non-owner agent may post a **non-mutating reply comment** on another agent's
+issue thread, including closed issues. The reply:
+
+- Requires being @mentioned (by name or `<@agent-id>` link) in the issue description or any
+  existing comment.
+- Does **not** change issue status — a closed issue stays closed regardless of `reopen`/`resume`
+  flags in the request.
+- Is audit-tagged: `comment.metadata.mentionReply === true` and
+  `comment.metadata.mentionRepliedByAgentId` contains the replying agent's ID.
+
+Use this path to answer questions, add context, or post follow-up analysis on threads you were
+pulled into — without taking ownership of the issue.

@@ -1173,8 +1173,8 @@ export function issueRoutes(
     req: Request,
     res: Response,
     issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null },
-  ) {
-    if (req.actor.type !== "agent") return true;
+  ): Promise<{ ok: true; mentionReply: boolean } | false> {
+    if (req.actor.type !== "agent") return { ok: true, mentionReply: false };
     const actorAgentId = req.actor.agentId;
     if (!actorAgentId) {
       res.status(403).json({ error: "Agent authentication required" });
@@ -1204,10 +1204,31 @@ export function issueRoutes(
             actorAgentId,
           },
         });
-        return true;
+        return { ok: true, mentionReply: false };
+      }
+      const isMentioned = await svc.wasAgentMentionedInThread(issue.companyId, issue.id, actorAgentId);
+      if (isMentioned) {
+        const actor = getActorInfo(req);
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          action: "issue.mention_reply",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            assigneeAgentId: issue.assigneeAgentId,
+            actorAgentId,
+          },
+        });
+        return { ok: true, mentionReply: true };
       }
     }
-    return assertAgentIssueMutationAllowed(req, res, issue);
+    const allowed = await assertAgentIssueMutationAllowed(req, res, issue);
+    if (!allowed) return false;
+    return { ok: true, mentionReply: false };
   }
 
   function assertStructuredCommentFieldsAllowed(
@@ -4634,7 +4655,9 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    if (!(await assertAgentCommentAllowed(req, res, issue))) return;
+    const commentAuthResult = await assertAgentCommentAllowed(req, res, issue);
+    if (!commentAuthResult) return;
+    const { mentionReply } = commentAuthResult;
     if (!assertStructuredCommentFieldsAllowed(req, res, {
       presentation: req.body.presentation,
       metadata: req.body.metadata,
@@ -4646,9 +4669,9 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
-    const reopenRequested = req.body.reopen === true;
-    const resumeRequested = req.body.resume === true;
-    const interruptRequested = req.body.interrupt === true;
+    const reopenRequested = mentionReply ? false : req.body.reopen === true;
+    const resumeRequested = mentionReply ? false : req.body.resume === true;
+    const interruptRequested = mentionReply ? false : req.body.interrupt === true;
     if (resumeRequested === true && !(await assertExplicitResumeIntentAllowed(req, res, issue))) return;
     if (resumeRequested !== true && reopenRequested === true && req.actor.type === "agent") {
       if (!(await assertExplicitResumeIntentAllowed(req, res, issue))) return;
@@ -4657,13 +4680,15 @@ export function issueRoutes(
     const isBlocked = issue.status === "blocked";
     const explicitMoveToTodoRequested = reopenRequested || resumeRequested === true;
     const effectiveMoveToTodoRequested =
-      explicitMoveToTodoRequested ||
-      shouldImplicitlyMoveCommentedIssueToTodo({
-        issueStatus: issue.status,
-        assigneeAgentId: issue.assigneeAgentId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-      });
+      mentionReply
+        ? false
+        : explicitMoveToTodoRequested ||
+          shouldImplicitlyMoveCommentedIssueToTodo({
+            issueStatus: issue.status,
+            assigneeAgentId: issue.assigneeAgentId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+          });
     const hasUnresolvedFirstClassBlockers =
       isBlocked && effectiveMoveToTodoRequested
         ? (await svc.getDependencyReadiness(issue.id)).unresolvedBlockerCount > 0
@@ -4734,6 +4759,9 @@ export function issueRoutes(
       }
     }
 
+    const mentionReplyMetadata = mentionReply && actor.agentId
+      ? { version: 1 as const, mentionReply: true, mentionRepliedByAgentId: actor.agentId }
+      : null;
     const comment = await svc.addComment(id, req.body.body, {
       agentId: actor.agentId ?? undefined,
       userId: actor.actorType === "user" ? actor.actorId : undefined,
@@ -4741,7 +4769,7 @@ export function issueRoutes(
     }, {
       authorType: req.body.authorType ?? (actor.actorType === "agent" ? "agent" : "user"),
       presentation: req.body.presentation ?? null,
-      metadata: req.body.metadata ?? null,
+      metadata: mentionReplyMetadata ?? req.body.metadata ?? null,
     });
     await issueReferencesSvc.syncComment(comment.id);
     const commentReferenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(currentIssue.id);
@@ -4802,7 +4830,7 @@ export function issueRoutes(
       const actorIsAgent = actor.actorType === "agent";
       const selfComment = actorIsAgent && actor.actorId === assigneeId;
       const skipWake = selfComment || isClosed;
-      if (assigneeId && (reopened || !skipWake)) {
+      if (assigneeId && (reopened || !skipWake || (mentionReply && isClosed))) {
         if (reopened) {
           wakeups.set(assigneeId, {
             source: "automation",

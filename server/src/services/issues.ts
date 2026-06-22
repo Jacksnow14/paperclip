@@ -5302,6 +5302,41 @@ export function issueService(db: Db) {
       return [...resolved];
     },
 
+    wasAgentMentionedInThread: async (companyId: string, issueId: string, agentId: string): Promise<boolean> => {
+      const issueRow = await db.select({ description: issues.description })
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+        .then((rows) => rows[0] ?? null);
+      if (!issueRow) return false;
+
+      const commentRows = await db.select({ body: issueComments.body })
+        .from(issueComments)
+        .where(and(eq(issueComments.issueId, issueId), eq(issueComments.companyId, companyId)));
+
+      const allBodies = [issueRow.description ?? "", ...commentRows.map(r => r.body)];
+      const combinedText = allBodies.join("\n");
+
+      const explicitIds = extractAgentMentionIds(combinedText);
+      if (explicitIds.includes(agentId)) return true;
+
+      const re = /\B@([^\s@,!?.]+)/g;
+      const tokens = new Set<string>();
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(combinedText)) !== null) {
+        const normalized = normalizeAgentMentionToken(m[1]);
+        if (normalized) tokens.add(normalized.toLowerCase());
+      }
+      if (tokens.size === 0) return false;
+
+      const agentRow = await db.select({ name: agents.name })
+        .from(agents)
+        .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)))
+        .then((rows) => rows[0] ?? null);
+      if (!agentRow) return false;
+
+      return tokens.has(agentRow.name.toLowerCase());
+    },
+
     findMentionedProjectIds: async (
       issueId: string,
       opts?: { includeCommentBodies?: boolean },

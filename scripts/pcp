@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""pcp — Paperclip shell helper for quick JSON / arithmetic / API one-liners.
+
+A tiny zero-dependency wrapper around python3's stdlib so agents don't have to
+hand-roll `python3 -c "import json,sys; ..."` boilerplate for routine shell work.
+
+Usage:
+  pcp calc  '<expr>'              Evaluate a python expression and print it.
+                                  e.g.  pcp calc '2**16'  ->  65536
+  pcp json  ['<expr>']           Read JSON on stdin into `d`; print `d` pretty
+                                  if no expr, else print eval(expr) with `d` bound.
+                                  e.g.  cat r.json | pcp json 'd["items"][0]["id"]'
+  pcp get   <dotted.path>        Read JSON on stdin, extract a dotted/index path.
+                                  e.g.  cat r.json | pcp get items.0.id
+  pcp validate [file]            Validate JSON (stdin or file); exit 0/1, print OK/err.
+  pcp http <METHOD> <url> [body] HTTPS request via urllib. Headers from PCP_HTTP_HEADERS
+                                  (JSON env). body is a string or '@file'. Prints status
+                                  + body. Honors network policy (see scripts: TOOLS.md).
+
+Notes:
+  * Pure stdlib. `python` and `python3` both resolve in agent shells.
+  * `pcp http` needs outbound network; sandboxed Bash may block it — see TOOLS.md.
+"""
+import json
+import sys
+
+
+def _read_stdin():
+    data = sys.stdin.read()
+    if not data.strip():
+        sys.exit("pcp: no JSON on stdin")
+    return json.loads(data)
+
+
+def _dig(obj, path):
+    for part in path.split("."):
+        if part == "":
+            continue
+        if isinstance(obj, list):
+            obj = obj[int(part)]
+        else:
+            obj = obj[part]
+    return obj
+
+
+def _emit(value):
+    if isinstance(value, (dict, list)):
+        print(json.dumps(value, indent=2, ensure_ascii=False))
+    else:
+        print(value)
+
+
+def cmd_calc(args):
+    if not args:
+        sys.exit("pcp calc: missing expression")
+    _emit(eval(args[0], {"__builtins__": __builtins__}, {}))  # noqa: S307 (agent tool)
+
+
+def cmd_json(args):
+    d = _read_stdin()
+    if not args:
+        _emit(d)
+    else:
+        _emit(eval(args[0], {"__builtins__": __builtins__}, {"d": d}))  # noqa: S307
+
+
+def cmd_get(args):
+    if not args:
+        sys.exit("pcp get: missing path")
+    _emit(_dig(_read_stdin(), args[0]))
+
+
+def cmd_validate(args):
+    try:
+        if args:
+            with open(args[0]) as fh:
+                json.load(fh)
+        else:
+            _read_stdin()
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"INVALID: {exc}", file=sys.stderr)
+        sys.exit(1)
+    print("OK")
+
+
+def cmd_http(args):
+    import os
+    import urllib.request
+
+    if len(args) < 2:
+        sys.exit("pcp http: usage: pcp http <METHOD> <url> [body|@file]")
+    method, url = args[0].upper(), args[1]
+    body = None
+    if len(args) > 2:
+        raw = args[2]
+        if raw.startswith("@"):
+            with open(raw[1:]) as fh:
+                raw = fh.read()
+        body = raw.encode()
+    headers = {}
+    if os.environ.get("PCP_HTTP_HEADERS"):
+        headers = json.loads(os.environ["PCP_HTTP_HEADERS"])
+    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
+            print(f"HTTP {resp.status}")
+            print(resp.read().decode(errors="replace"))
+    except Exception as exc:  # noqa: BLE001
+        sys.exit(f"pcp http: request failed: {exc}")
+
+
+COMMANDS = {
+    "calc": cmd_calc,
+    "json": cmd_json,
+    "get": cmd_get,
+    "validate": cmd_validate,
+    "http": cmd_http,
+}
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    cmd, rest = argv[0], argv[1:]
+    fn = COMMANDS.get(cmd)
+    if fn is None:
+        sys.exit(f"pcp: unknown command {cmd!r}. Run `pcp --help`.")
+    fn(rest)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

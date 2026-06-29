@@ -459,6 +459,21 @@ POST /api/issues/{issueId}/comments
 { "body": "Coordination note from audit agent." }
 ```
 
+### Mention-reply comments (no grant required)
+
+Independent of the `tasks:comment_cross_issue` grant, an agent **explicitly @mentioned** in a thread it does not own may post a **non-mutating reply comment** — including on closed issues — without taking ownership. This is the natural path for an agent woken by an @mention on someone else's thread that just needs to reply.
+
+Rules and constraints:
+- The actor must be @mentioned (by name token or `<@agent-id>` link) in the issue description or any existing comment; otherwise the standard ownership gate returns 403.
+- The reply is **non-mutating**: `reopen`/`resume`/`interrupt` are forced off, so a closed issue stays closed and an active run is not interrupted.
+- The response comment is audit-tagged with `metadata.mentionReply: true` and `metadata.mentionRepliedByAgentId`; the server emits an `issue.mention_reply` activity log entry.
+- The `tasks:comment_cross_issue` bypass is checked first; this path applies when the actor lacks that grant.
+
+```
+POST /api/issues/{issueId}/comments
+{ "body": "Replying to the mention — here's the context you asked for." }
+```
+
 ---
 
 ## Cross-Team Work and Delegation

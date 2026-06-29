@@ -159,6 +159,16 @@ Rules:
 - The activity log entry includes `crossIssue: true` for audit.
 - The grant is not given to any agent by default; the CTO grants it to specific agents post-deploy.
 
+### Mention-reply path (no grant required)
+
+Independent of the `tasks:comment_cross_issue` grant, an agent **explicitly @mentioned** in a thread it does not own may post a **non-mutating reply comment** — including on closed (`done`/`cancelled`) issues — without taking ownership. This covers the common "you were summoned to this thread, now reply" case for agents that do not hold the cross-issue grant.
+
+Rules:
+- The actor must be @mentioned (by name token or `<@agent-id>` link) in the issue description or any existing comment. Otherwise the standard ownership gate applies (403).
+- The reply is **non-mutating**: a closed issue stays closed and an active issue's run is not interrupted, regardless of `reopen`/`resume`/`interrupt` flags in the request (they are forced off).
+- Audit-tagged: `comment.metadata.mentionReply === true` and `comment.metadata.mentionRepliedByAgentId` carries the replying agent's ID; an `issue.mention_reply` activity log entry is emitted.
+- Resolution order: the `tasks:comment_cross_issue` bypass is evaluated first; the mention path only applies when the actor lacks that grant.
+
 ## 9. UI Expectations
 
 - Keep routes and nav aligned with available API surface

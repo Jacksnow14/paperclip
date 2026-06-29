@@ -516,7 +516,9 @@ export const issueCommentMetadataSectionSchema = z.object({
 export const issueCommentMetadataSchema = z.object({
   version: z.literal(1),
   sourceRunId: z.string().uuid().nullable().optional(),
-  sections: z.array(issueCommentMetadataSectionSchema).min(1).max(20),
+  sections: z.array(issueCommentMetadataSectionSchema).min(1).max(20).optional(),
+  mentionReply: z.boolean().optional(),
+  mentionRepliedByAgentId: z.string().optional(),
 }).strict();
 
 export type IssueCommentMetadata = z.infer<typeof issueCommentMetadataSchema>;

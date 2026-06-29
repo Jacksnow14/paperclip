@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Pre-push hook: verify GitHub App token can be minted before git attempts the push.
+# On failure, aborts with the exact rotation command so engineers know exactly what to do.
+#
+# Install: cp scripts/git-hooks/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+#  (or use the provision-worktree.sh helper which copies this automatically)
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+TOKEN_SCRIPT="${REPO_ROOT}/scripts/github_app_token.py"
+
+# Only run freshness check when pushing to GitHub (skip local / non-GitHub remotes).
+REMOTE_URL="${1:-}"
+if [[ -n "$REMOTE_URL" ]] && [[ "$REMOTE_URL" != *"github.com"* ]]; then
+    exit 0
+fi
+
+# Read the remote URL from the second argument (the remote name) if not provided.
+if [[ -z "$REMOTE_URL" ]]; then
+    REMOTE_NAME="${1:-origin}"
+    REMOTE_URL="$(git remote get-url "$REMOTE_NAME" 2>/dev/null || true)"
+fi
+
+if [[ "$REMOTE_URL" != *"github.com"* ]]; then
+    exit 0
+fi
+
+if [[ ! -f "$TOKEN_SCRIPT" ]]; then
+    echo "⚠  pre-push: github_app_token.py not found at $TOKEN_SCRIPT — skipping freshness check" >&2
+    exit 0
+fi
+
+echo "🔑 pre-push: verifying GitHub App token freshness …" >&2
+
+ROTATION_CMD="python3 scripts/secret_vault.py seed github-app-key --scopes contents:write pull_requests:write
+rm -f /home/ievgen/secret-vault/.github-app-token-cache"
+
+if ! python3 "$TOKEN_SCRIPT" --git-credential >/dev/null 2>&1; then
+    echo "" >&2
+    echo "❌ PUSH ABORTED — GitHub App token mint failed." >&2
+    echo "" >&2
+    echo "   The App private key may be revoked, rotated, or the vault entry missing." >&2
+    echo "   Run the rotation command to re-seed:" >&2
+    echo "" >&2
+    echo "   $ROTATION_CMD" >&2
+    echo "" >&2
+    echo "   After re-seeding, retry your push." >&2
+    exit 1
+fi
+
+echo "✅ pre-push: token valid — proceeding with push." >&2
+exit 0

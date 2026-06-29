@@ -1,0 +1,5 @@
+{
+  "_comment": "App ID and Installation ID are not secret — seed after human bootstrap (AUR-3033).",
+  "app_id": "",
+  "installation_id": ""
+}

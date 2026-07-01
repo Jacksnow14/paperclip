@@ -2,7 +2,7 @@ import { google } from "googleapis";
 import { logger } from "../middleware/logger.js";
 
 const DOMAIN = "tryauranode.com";
-export const GMAIL_SUPPORTED_ALIASES = ["board", "alex", "leo", "adrian"] as const;
+export const GMAIL_SUPPORTED_ALIASES = ["board", "alex"] as const;
 export type GmailAlias = (typeof GMAIL_SUPPORTED_ALIASES)[number];
 
 const GMAIL_SCOPES = [

@@ -8,8 +8,10 @@
  * Agent self-service revoke (POST /memory/records/:id/revoke-own):
  *   Agents may revoke their own records when the record's metadata.category is in
  *   AGENT_MUTABLE_CATEGORIES (experiment, experiment_conclusion, hypothesis, observation,
- *   performance_scorecard, scorecard_adjusted, tool_gap, routing).
+ *   performance_scorecard, scorecard_adjusted, tool_gap, routing, synthesis).
  *   Returns 403 for non-owner or off-allowlist categories.
+ *   `synthesis` is agent-mutable (AUR-3072) so SGI loops that author synthesis records
+ *   (Loop E nightly, Loop H quarterly) can PATCH-upsert / revoke-own their own duplicates.
  *
  * Capture visibility warnings (POST /memory/capture):
  *   The response includes a non-breaking `warnings: string[]` field when the captured
@@ -362,6 +364,9 @@ export function memoryRoutes(
     "scorecard_adjusted",
     "tool_gap",
     "routing",
+    // synthesis: agent-authored + auto-accepted; owning SGI loops must be able to
+    // PATCH-upsert / revoke-own their own duplicate synthesis records (AUR-3072).
+    "synthesis",
   ]);
 
   router.patch(

@@ -807,6 +807,24 @@ describe("memory routes", () => {
       expect(mockMemoryService.revoke).not.toHaveBeenCalled();
     });
 
+    it("allows an agent to revoke its own synthesis record (AUR-3072)", async () => {
+      mockMemoryService.getRecord.mockResolvedValue(makeRoutingRecord({ metadata: { category: "synthesis" } }));
+      mockMemoryService.revoke.mockResolvedValue(revokeResult);
+      const app = createApp({ type: "agent", agentId, companyId: companyA });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/records/${recordId}/revoke-own`)
+        .send({ reason: "AUR-3072 dedup" });
+
+      expect(res.status).toBe(200);
+      expect(res.body.revokedRecordIds).toEqual([recordId]);
+      expect(mockMemoryService.revoke).toHaveBeenCalledWith(
+        companyA,
+        { selector: { recordIds: [recordId] }, reason: "AUR-3072 dedup" },
+        expect.objectContaining({ actorType: "agent", agentId }),
+      );
+    });
+
     it("returns 403 when a board user tries to use the revoke-own endpoint", async () => {
       mockMemoryService.getRecord.mockResolvedValue(makeRoutingRecord());
       const app = createApp({

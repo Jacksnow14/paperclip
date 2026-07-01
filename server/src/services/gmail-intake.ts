@@ -10,8 +10,6 @@ import { issueService } from "./issues.js";
 const MAILBOX_ROLE: Record<GmailAlias, string> = {
   board: "ceo",
   alex: "cmo",
-  leo: "cto",
-  adrian: "cfo",
 };
 
 // Gmail label names applied by the intake pipeline.

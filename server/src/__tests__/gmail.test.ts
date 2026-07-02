@@ -55,11 +55,13 @@ const FAKE_SA_KEY = JSON.stringify({
 });
 
 describe("GMAIL_SUPPORTED_ALIASES", () => {
-  it("includes the four tryauranode.com mailboxes", () => {
+  it("includes only the alias-safe tryauranode.com mailboxes (board, alex)", () => {
     expect(GMAIL_SUPPORTED_ALIASES).toContain("board");
     expect(GMAIL_SUPPORTED_ALIASES).toContain("alex");
-    expect(GMAIL_SUPPORTED_ALIASES).toContain("leo");
-    expect(GMAIL_SUPPORTED_ALIASES).toContain("adrian");
+    // leo@/adrian@ became free aliases (AUR-3080/AUR-3079); aliases have no
+    // mailbox, so DWD cannot impersonate them — they must not be polled.
+    expect(GMAIL_SUPPORTED_ALIASES).not.toContain("leo");
+    expect(GMAIL_SUPPORTED_ALIASES).not.toContain("adrian");
   });
 });
 
@@ -168,7 +170,7 @@ describe("createGmailService", () => {
     it("calls gmail.users.messages.get with full format", async () => {
       mockMessagesGet.mockResolvedValue({ data: { id: "msg1", threadId: "t1" } });
       const service = createGmailService();
-      const result = await service.getMessage("leo", "msg1");
+      const result = await service.getMessage("alex", "msg1");
 
       expect(mockMessagesGet).toHaveBeenCalledWith({
         userId: "me",
@@ -220,7 +222,7 @@ describe("createGmailService", () => {
     it("calls gmail.users.threads.list", async () => {
       mockThreadsList.mockResolvedValue({ data: { threads: [] } });
       const service = createGmailService();
-      await service.listThreads("adrian", { query: "label:inbox" });
+      await service.listThreads("alex", { query: "label:inbox" });
 
       expect(mockThreadsList).toHaveBeenCalledWith(
         expect.objectContaining({ userId: "me", q: "label:inbox" }),

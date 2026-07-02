@@ -9,7 +9,7 @@ const mockCreateLabel = vi.fn();
 const mockModifyMessageLabels = vi.fn();
 
 vi.mock("../services/gmail.js", () => ({
-  GMAIL_SUPPORTED_ALIASES: ["board", "alex", "leo", "adrian"],
+  GMAIL_SUPPORTED_ALIASES: ["board", "alex"],
   createGmailService: () => ({
     listMessages: mockListMessages,
     getMessage: mockGetMessage,
@@ -215,10 +215,10 @@ describe("createGmailIntakeService.processMailbox", () => {
 
     const db = buildDbMock({ selectRows: [] });
     const svc = createGmailIntakeService(db);
-    await svc.processMailbox(COMPANY_ID, "leo");
+    await svc.processMailbox(COMPANY_ID, "alex");
 
     expect(mockModifyMessageLabels).toHaveBeenCalledWith(
-      "leo",
+      "alex",
       "msg3",
       expect.objectContaining({ addLabelIds: ["lbl-t"] }),
     );
@@ -328,18 +328,18 @@ describe("createGmailIntakeService.pollAllMailboxes", () => {
     vi.clearAllMocks();
   });
 
-  it("polls all four mailboxes and returns per-mailbox results", async () => {
+  it("polls alex and board mailboxes only (leo/adrian dropped when aliases)", async () => {
     mockListMessages.mockResolvedValue({ messages: [] });
     const db = buildDbMock();
     const svc = createGmailIntakeService(db);
     const results = await svc.pollAllMailboxes(COMPANY_ID);
 
-    expect(results).toHaveLength(4);
+    expect(results).toHaveLength(2);
     const mailboxes = results.map((r) => r.mailbox);
     expect(mailboxes).toContain("board");
     expect(mailboxes).toContain("alex");
-    expect(mailboxes).toContain("leo");
-    expect(mailboxes).toContain("adrian");
+    expect(mailboxes).not.toContain("leo");
+    expect(mailboxes).not.toContain("adrian");
   });
 
   it("continues polling remaining mailboxes when one fails", async () => {
@@ -351,7 +351,7 @@ describe("createGmailIntakeService.pollAllMailboxes", () => {
     const svc = createGmailIntakeService(db);
     const results = await svc.pollAllMailboxes(COMPANY_ID);
 
-    expect(results).toHaveLength(4);
+    expect(results).toHaveLength(2);
     const boardResult = results.find((r) => r.mailbox === "board");
     expect(boardResult?.errors).toBe(1);
     const alexResult = results.find((r) => r.mailbox === "alex");
@@ -414,8 +414,6 @@ describe("routing: mailbox → agent role", () => {
   it.each([
     ["board", "ceo"],
     ["alex", "cmo"],
-    ["leo", "cto"],
-    ["adrian", "cfo"],
   ] as const)("%s mailbox resolves to %s agent role", async (mailbox, _role) => {
     const msg = makeMessage("msg-r", "thread-r");
     mockListMessages.mockResolvedValue({ messages: [{ id: "msg-r" }] });

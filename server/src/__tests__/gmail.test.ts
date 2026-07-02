@@ -139,17 +139,19 @@ describe("createGmailService", () => {
       );
     });
 
-    it("throws when private_key is malformed (systemd backslash stripping — AUR-3118)", async () => {
-      // Reproduces the incident: unquoted EnvironmentFile turned \n → n, so the
-      // PEM lost its newlines. JSON.parse still succeeds; OpenSSL later fails with
-      // a cryptic DECODER error. The loader must fail fast with a clear message.
-      process.env.GOOGLE_WORKSPACE_SA_KEY = JSON.stringify({
+    it("throws when private_key has literal n instead of newlines (systemd backslash stripping)", async () => {
+      // Simulate what systemd does to an unquoted EnvironmentFile value:
+      // strips backslashes, so \n becomes n in the JSON string.
+      const strippedKey = JSON.stringify({
+        type: "service_account",
         client_email: "test-sa@project.iam.gserviceaccount.com",
-        private_key: "-----BEGIN RSA PRIVATE KEY-----nfakenn-----END RSA PRIVATE KEY-----n",
+        private_key: "-----BEGIN RSA PRIVATE KEY-----nfaken-----END RSA PRIVATE KEY-----n",
+        client_id: "116336860548037885070",
       });
+      process.env.GOOGLE_WORKSPACE_SA_KEY = strippedKey;
       const service = createGmailService();
       await expect(service.listMessages("board")).rejects.toThrow(
-        /private_key is malformed/,
+        "GOOGLE_WORKSPACE_SA_KEY private_key is malformed",
       );
     });
   });

@@ -11,8 +11,20 @@ import type { GmailIntakeService } from "./gmail-intake.js";
 import { logger } from "../middleware/logger.js";
 
 export interface GmailIntakeSchedulerOptions {
-  /** Async function that returns the primary company ID, or undefined when none exists. */
-  getCompanyId: () => Promise<string | undefined>;
+  /**
+   * AUR-3118: Async function that returns ALL company IDs to poll each cycle.
+   * This is the correct multi-tenant resolver — a single shared server hosts
+   * more than one company, and every company's mailboxes must be polled. When
+   * provided, it takes precedence over the legacy single-company `getCompanyId`.
+   */
+  getCompanyIds?: () => Promise<string[]>;
+  /**
+   * @deprecated Legacy single-company resolver. Only consulted when
+   * `getCompanyIds` is absent. Backed by `SELECT ... LIMIT 1` (no ORDER BY),
+   * which silently starves every company but one in a multi-tenant deployment —
+   * the root cause of AUR-3118's post-restart intake gap. Prefer `getCompanyIds`.
+   */
+  getCompanyId?: () => Promise<string | undefined>;
   intakeService: GmailIntakeService;
   /** Delay before the first poll fires after start() (lets the process settle). */
   startupDelayMs?: number;
@@ -25,15 +37,34 @@ export function createGmailIntakeScheduler(opts: GmailIntakeSchedulerOptions): D
     startupDelayMs: opts.startupDelayMs ?? 60_000,
     intervalMs: opts.intervalMs,
     run: async () => {
-      const companyId = await opts.getCompanyId();
-      if (!companyId) return;
-      const results = await opts.intakeService.pollAllMailboxes(companyId);
-      const totalCreated = results.reduce((s, r) => s + r.created, 0);
-      const totalUpdated = results.reduce((s, r) => s + r.updated, 0);
-      const totalErrors = results.reduce((s, r) => s + r.errors, 0);
+      let companyIds: string[];
+      if (opts.getCompanyIds) {
+        companyIds = (await opts.getCompanyIds()) ?? [];
+      } else if (opts.getCompanyId) {
+        const one = await opts.getCompanyId();
+        companyIds = one ? [one] : [];
+      } else {
+        companyIds = [];
+      }
+      if (companyIds.length === 0) return;
+
+      let totalCreated = 0;
+      let totalUpdated = 0;
+      let totalErrors = 0;
+      for (const companyId of companyIds) {
+        try {
+          const results = await opts.intakeService.pollAllMailboxes(companyId);
+          totalCreated += results.reduce((s, r) => s + r.created, 0);
+          totalUpdated += results.reduce((s, r) => s + r.updated, 0);
+          totalErrors += results.reduce((s, r) => s + r.errors, 0);
+        } catch (err) {
+          totalErrors += 1;
+          logger.error({ err, companyId }, "gmail-intake: company poll failed");
+        }
+      }
       if (totalCreated > 0 || totalUpdated > 0 || totalErrors > 0) {
         logger.info(
-          { totalCreated, totalUpdated, totalErrors },
+          { totalCreated, totalUpdated, totalErrors, companies: companyIds.length },
           "gmail-intake: poll cycle complete",
         );
       }

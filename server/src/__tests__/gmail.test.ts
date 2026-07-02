@@ -138,6 +138,22 @@ describe("createGmailService", () => {
         "GOOGLE_WORKSPACE_SA_KEY is not valid JSON",
       );
     });
+
+    it("throws when private_key has literal n instead of newlines (systemd backslash stripping)", async () => {
+      // Simulate what systemd does to an unquoted EnvironmentFile value:
+      // strips backslashes, so \n becomes n in the JSON string.
+      const strippedKey = JSON.stringify({
+        type: "service_account",
+        client_email: "test-sa@project.iam.gserviceaccount.com",
+        private_key: "-----BEGIN RSA PRIVATE KEY-----nfaken-----END RSA PRIVATE KEY-----n",
+        client_id: "116336860548037885070",
+      });
+      process.env.GOOGLE_WORKSPACE_SA_KEY = strippedKey;
+      const service = createGmailService();
+      await expect(service.listMessages("board")).rejects.toThrow(
+        "GOOGLE_WORKSPACE_SA_KEY private_key is malformed",
+      );
+    });
   });
 
   describe("listMessages", () => {

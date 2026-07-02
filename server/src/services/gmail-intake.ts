@@ -12,6 +12,17 @@ const MAILBOX_ROLE: Record<GmailAlias, string> = {
   alex: "cmo",
 };
 
+// Sender-based routing overrides: emails from these senders bypass the default
+// mailbox→role routing and go directly to the specified role+forward target.
+const SENDER_ROUTES: Array<{
+  senderMatch: string;
+  targetRole: string;
+  forwardTo?: string;
+}> = [
+  { senderMatch: "payments-noreply@google.com", targetRole: "cfo", forwardTo: "adrian@tryauranode.com" },
+  { senderMatch: "workspace-noreply@google.com", targetRole: "cfo", forwardTo: "adrian@tryauranode.com" },
+];
+
 // Gmail label names applied by the intake pipeline.
 export const INTAKE_LABELS = {
   TRIAGED: "paperclip/triaged",
@@ -107,12 +118,20 @@ function parseMessage(
   return { from, subject, dateMs, bodySnippet, gmailThreadId, gmailMessageId };
 }
 
+function matchSenderRoute(from: string): (typeof SENDER_ROUTES)[number] | null {
+  const fromLower = from.toLowerCase();
+  return SENDER_ROUTES.find((r) => fromLower.includes(r.senderMatch)) ?? null;
+}
+
 async function resolveAssigneeAgentId(
   db: Pick<Db, "select">,
   companyId: string,
   mailbox: GmailAlias,
+  parsed?: ParsedMessage | null,
 ): Promise<string | null> {
-  const role = MAILBOX_ROLE[mailbox];
+  // Sender-based override: specific senders route to a different role.
+  const senderRoute = parsed ? matchSenderRoute(parsed.from) : null;
+  const role = senderRoute?.targetRole ?? MAILBOX_ROLE[mailbox];
   const rows = await db
     .select({ id: agents.id })
     .from(agents)
@@ -240,7 +259,7 @@ export function createGmailIntakeService(db: Db) {
           // New thread — create a new issue in an actionable, routed status
           // (`todo`) so the assignee picks it up rather than letting it sit in
           // `backlog`.
-          const assigneeAgentId = await resolveAssigneeAgentId(db, companyId, mailbox);
+          const assigneeAgentId = await resolveAssigneeAgentId(db, companyId, mailbox, parsed);
           const issueTitle = buildIssueTitle(mailbox, parsed.subject, parsed.from);
           const issueDescription = buildIssueDescription(mailbox, parsed);
 
@@ -285,6 +304,27 @@ export function createGmailIntakeService(db: Db) {
             });
           } catch (err) {
             logger.warn({ err, mailbox, messageId: parsed.gmailMessageId }, "gmail-intake: failed to apply triaged label");
+          }
+        }
+
+        // Forward to target mailbox when a sender route has a forwardTo.
+        const route = matchSenderRoute(parsed.from);
+        if (route?.forwardTo) {
+          try {
+            await gmail.sendMessage(mailbox, {
+              to: route.forwardTo,
+              subject: `Fwd: ${parsed.subject}`,
+              body: `---------- Forwarded message ----------\nFrom: ${parsed.from}\nDate: ${parsed.dateMs ? new Date(parsed.dateMs).toISOString() : "unknown"}\nSubject: ${parsed.subject}\n\n${parsed.bodySnippet}`,
+            });
+            logger.info(
+              { mailbox, to: route.forwardTo, messageId: parsed.gmailMessageId },
+              "gmail-intake: forwarded sender-routed email",
+            );
+          } catch (err) {
+            logger.warn(
+              { err, mailbox, to: route.forwardTo, messageId: parsed.gmailMessageId },
+              "gmail-intake: failed to forward sender-routed email",
+            );
           }
         }
       } catch (err) {

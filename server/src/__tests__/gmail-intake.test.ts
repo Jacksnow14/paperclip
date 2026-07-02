@@ -7,6 +7,7 @@ const mockGetMessage = vi.fn();
 const mockListLabels = vi.fn();
 const mockCreateLabel = vi.fn();
 const mockModifyMessageLabels = vi.fn();
+const mockSendMessage = vi.fn();
 
 vi.mock("../services/gmail.js", () => ({
   GMAIL_SUPPORTED_ALIASES: ["board", "alex"],
@@ -16,6 +17,7 @@ vi.mock("../services/gmail.js", () => ({
     listLabels: mockListLabels,
     createLabel: mockCreateLabel,
     modifyMessageLabels: mockModifyMessageLabels,
+    sendMessage: mockSendMessage,
   }),
 }));
 
@@ -448,5 +450,139 @@ describe("routing: mailbox → agent role", () => {
       COMPANY_ID,
       expect.objectContaining({ assigneeAgentId: "agent-ceo-1" }),
     );
+  });
+});
+
+describe("sender-based routing: Google Payments → CFO", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSendMessage.mockResolvedValue({ id: "fwd-1" });
+  });
+
+  function makeGooglePaymentsMessage(id: string, threadId: string) {
+    return {
+      id,
+      threadId,
+      snippet: "Вам выставлен ежемесячный счет",
+      payload: {
+        headers: [
+          { name: "From", value: "Google Payments <payments-noreply@google.com>" },
+          { name: "Subject", value: "Google Workspace: вам выставлен счет за использование домена tryauranode.com" },
+          { name: "Date", value: "Tue, 01 Jul 2026 22:00:00 +0000" },
+        ],
+        mimeType: "text/plain",
+        body: { data: Buffer.from("Monthly invoice for Google Workspace.").toString("base64url") },
+        parts: null,
+      },
+    };
+  }
+
+  function makeAgentLookupDb() {
+    let selectCallCount = 0;
+    return {
+      select: vi.fn(() => {
+        selectCallCount++;
+        const rows = selectCallCount >= 3 ? [{ id: "agent-cfo-1" }] : [];
+        return {
+          from: vi.fn().mockReturnThis(),
+          where: vi.fn().mockReturnThis(),
+          limit: vi.fn().mockResolvedValue(rows),
+        };
+      }),
+      insert: vi.fn(() => ({ values: vi.fn().mockResolvedValue(undefined) })),
+    } as unknown as Db;
+  }
+
+  it("routes payments-noreply@google.com emails to CFO role", async () => {
+    const msg = makeGooglePaymentsMessage("msg-gp1", "thread-gp1");
+    mockListMessages.mockResolvedValue({ messages: [{ id: "msg-gp1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([]);
+    mockCreateLabel.mockResolvedValue({ id: "lbl-x" });
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-gp1" });
+
+    const db = makeAgentLookupDb();
+    const svc = createGmailIntakeService(db);
+    await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockIssueCreate).toHaveBeenCalledWith(
+      COMPANY_ID,
+      expect.objectContaining({ assigneeAgentId: "agent-cfo-1" }),
+    );
+  });
+
+  it("routes workspace-noreply@google.com emails to CFO role", async () => {
+    const msg = makeGooglePaymentsMessage("msg-gw1", "thread-gw1");
+    msg.payload.headers[0].value = "Google Workspace <workspace-noreply@google.com>";
+    mockListMessages.mockResolvedValue({ messages: [{ id: "msg-gw1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([]);
+    mockCreateLabel.mockResolvedValue({ id: "lbl-x" });
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-gw1" });
+
+    const db = makeAgentLookupDb();
+    const svc = createGmailIntakeService(db);
+    await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockIssueCreate).toHaveBeenCalledWith(
+      COMPANY_ID,
+      expect.objectContaining({ assigneeAgentId: "agent-cfo-1" }),
+    );
+  });
+
+  it("forwards the email to adrian@ when sender matches a route with forwardTo", async () => {
+    const msg = makeGooglePaymentsMessage("msg-fwd1", "thread-fwd1");
+    mockListMessages.mockResolvedValue({ messages: [{ id: "msg-fwd1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-fwd1" });
+
+    const db = makeAgentLookupDb();
+    const svc = createGmailIntakeService(db);
+    await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockSendMessage).toHaveBeenCalledWith(
+      "board",
+      expect.objectContaining({
+        to: "adrian@tryauranode.com",
+        subject: expect.stringContaining("Fwd:"),
+      }),
+    );
+  });
+
+  it("does not forward when sender does not match any route", async () => {
+    const msg = makeMessage("msg-nofwd", "thread-nofwd");
+    mockListMessages.mockResolvedValue({ messages: [{ id: "msg-nofwd" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([]);
+    mockCreateLabel.mockResolvedValue({ id: "lbl-x" });
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-nofwd" });
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockSendMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not crash when forwarding fails", async () => {
+    const msg = makeGooglePaymentsMessage("msg-fwdfail", "thread-fwdfail");
+    mockListMessages.mockResolvedValue({ messages: [{ id: "msg-fwdfail" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-fwdfail" });
+    mockSendMessage.mockRejectedValueOnce(new Error("send failed"));
+
+    const db = makeAgentLookupDb();
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(result.created).toBe(1);
+    expect(result.errors).toBe(0);
   });
 });

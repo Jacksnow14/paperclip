@@ -661,6 +661,7 @@ export const PERMISSION_KEYS = [
   "tasks:manage_active_checkouts",
   "tasks:comment_cross_issue",
   "joins:approve",
+  "routines:manage",
 ] as const;
 export type PermissionKey = (typeof PERMISSION_KEYS)[number];
 

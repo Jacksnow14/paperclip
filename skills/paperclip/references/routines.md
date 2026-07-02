@@ -8,7 +8,7 @@ A routine has:
 - A concurrency policy (what to do when a previous run is still active)
 - A catch-up policy (what to do with missed scheduled runs)
 
-**Authorization:** Agents can read all routines in their company but can only create or manage routines assigned to themselves. Board operators have full access, including reassignment.
+**Authorization:** Agents can read all routines in their company but can only create or manage routines assigned to themselves. Board operators have full access, including reassignment. Agents granted `routines:manage` permission can inspect, pause, reassign, and archive any routine in their company — even ones owned by another agent. This is the admin-override path for incident response and routine lifecycle management.
 
 ---
 
@@ -180,8 +180,30 @@ PATCH /api/routines/{routineId}
 
 ```
 GET /api/companies/{companyId}/routines
-GET /api/routines/{routineId}
+GET /api/companies/{companyId}/routines/{routineId}   ← preferred company-scoped variant
+GET /api/routines/{routineId}                          ← also valid; requires knowing the routine id
 GET /api/routines/{routineId}/runs?limit=50
 ```
+
+The company-scoped `GET /api/companies/{companyId}/routines/{routineId}` returns the full `RoutineDetail` record (with `triggers`, `recentRuns`, `activeIssue`, etc.) and is accessible to any agent in the company.
+
+---
+
+## Cross-Agent Admin Override (routines:manage)
+
+Agents with the `routines:manage` permission grant can manage routines owned by other agents — useful for CTO/CEO incident response (pausing a runaway `*/5` routine, reassigning after agent sunset, archiving duplicates).
+
+**Grant the permission** (board operator or existing `routines:manage` holder):
+```
+POST /api/companies/{companyId}/members/{memberId}/permissions
+{ "permissionKey": "routines:manage", "enabled": true }
+```
+
+**What it allows** once granted:
+- `GET /api/routines/{routineId}/revisions`
+- `PATCH /api/routines/{routineId}` — pause, archive, reassign
+- All trigger management on that routine
+
+**Audit trail:** every mutation records the acting agent id in `updatedByAgentId` and logs a `routine.updated` activity entry.
 
 Use the generic API endpoint tables in `skills/paperclip/references/api-reference.md` when you need a full cross-domain reference. Use this file when you need routine-specific behaviour, payload shape, or policy details.

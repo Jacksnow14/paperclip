@@ -574,11 +574,7 @@ describe("claude execute", () => {
     }
   });
 
-  // QUARANTINED 2026-07-06: times out on every environment tested (local VPS and
-  // GitHub-hosted runners) — the sandbox callback bridge never completes under
-  // the local sandbox runner. Broken independently of any recent change
-  // (reproduces on untouched master). Un-skip after fixing the bridge startup.
-  it.skip("injects bridge env into sandbox-managed remote runs", async () => {
+  it("injects bridge env into sandbox-managed remote runs", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-sandbox-"));
     const localWorkspace = path.join(root, "workspace");
     const remoteWorkspace = path.join(root, "sandbox-$HOME");

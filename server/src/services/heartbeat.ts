@@ -6069,10 +6069,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const wakeCommentId = deriveCommentId(context, null);
-    const isInteractionWake = allowsIssueInteractionWake(context);
     const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
     const wakeReason = readNonEmptyString(context.wakeReason);
     const retryReason = readNonEmptyString(context.retryReason) ?? run.scheduledRetryReason ?? null;
+
+    // Only an explicit mention-scoped reply wake, verified against a real comment and its
+    // actual requester, may keep a queued run alive across an assignee or review-participant
+    // change. Generic issue_commented/issue_reopened_via_comment follow-ups are addressed to
+    // "whoever currently owns this issue" and stop being meaningful once ownership moves on,
+    // even when the underlying comment itself is genuine (see AUR-3217/AUR-3245).
+    const isVerifiedMentionReplyWake =
+      wakeReason === "issue_comment_mentioned" &&
+      (await isVerifiedIssueTreeControlInteractionWake(db, {
+        companyId: run.companyId,
+        issueId,
+        agentId: run.agentId,
+        runId: run.id,
+        wakeupRequestId: run.wakeupRequestId,
+        contextSnapshot: context,
+      }));
 
     if (
       issue.status === "in_progress" &&
@@ -6103,7 +6118,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
-    if (issue.assigneeAgentId !== run.agentId && !isInteractionWake) {
+    if (issue.assigneeAgentId !== run.agentId && !isVerifiedMentionReplyWake) {
       return {
         stale: true,
         errorCode: "issue_assignee_changed",
@@ -6157,7 +6172,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (currentParticipant) {
         const participantMatches =
           currentParticipant.type === "agent" && currentParticipant.agentId === run.agentId;
-        if (!participantMatches && !wakeCommentId) {
+        if (!participantMatches && !isVerifiedMentionReplyWake) {
           return {
             stale: true,
             errorCode: "issue_review_participant_changed",

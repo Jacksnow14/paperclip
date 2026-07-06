@@ -8,6 +8,7 @@ import {
   appendWithByteCap,
   buildInvocationEnvForLogs,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+  ensureCommandResolvable,
   materializePaperclipSkillCopy,
   refreshPaperclipWorkspaceEnvForExecution,
   renderPaperclipWakePrompt,
@@ -946,6 +947,52 @@ describe("refreshPaperclipWorkspaceEnvForExecution", () => {
         workspaceId: "workspace-2",
       },
     ]);
+  });
+});
+
+describe.skipIf(process.platform === "win32")("ensureCommandResolvable", () => {
+  async function withTempBinDir<T>(fn: (binDir: string) => Promise<T>): Promise<T> {
+    const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-command-resolve-"));
+    try {
+      return await fn(binDir);
+    } finally {
+      await fs.rm(binDir, { recursive: true, force: true });
+    }
+  }
+
+  it("resolves immediately when the command is already on PATH", async () => {
+    await withTempBinDir(async (binDir) => {
+      const commandPath = path.join(binDir, "aur3302-tool");
+      await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
+      await expect(
+        ensureCommandResolvable("aur3302-tool", process.cwd(), { PATH: binDir }),
+      ).resolves.toBeUndefined();
+    });
+  });
+
+  it("survives a symlink-swap race by retrying before failing", async () => {
+    await withTempBinDir(async (binDir) => {
+      const commandPath = path.join(binDir, "aur3302-tool");
+
+      // Simulate a self-update briefly removing the binary (e.g. mid version
+      // install) and then reinstating it a little later.
+      setTimeout(() => {
+        void fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      }, 150);
+
+      await expect(
+        ensureCommandResolvable("aur3302-tool", process.cwd(), { PATH: binDir }),
+      ).resolves.toBeUndefined();
+    });
+  });
+
+  it('throws "Command not found in PATH" after retries are exhausted', async () => {
+    await withTempBinDir(async (binDir) => {
+      await expect(
+        ensureCommandResolvable("aur3302-missing-tool", process.cwd(), { PATH: binDir }),
+      ).rejects.toThrow('Command not found in PATH: "aur3302-missing-tool"');
+    });
   });
 });
 

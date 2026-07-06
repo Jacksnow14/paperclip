@@ -19,10 +19,12 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import {
+  ADAPTER_CLI_UNRESOLVABLE_ERROR_CODE,
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
   heartbeatService,
+  isTransientAdapterLaunchFailureMessage,
 } from "../services/heartbeat.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -1336,5 +1338,145 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect((wakeupRequest?.payload as Record<string, unknown> | null)?.transientRetryNotBefore).toBe(
       retryNotBefore.toISOString(),
     );
+  });
+
+  describe("transient CLI-launch failure classification (AUR-3302)", () => {
+    it('classifies "Command not found in PATH" and related launch errors as transient, not arbitrary failures', () => {
+      expect(isTransientAdapterLaunchFailureMessage('Command not found in PATH: "claude"')).toBe(true);
+      expect(
+        isTransientAdapterLaunchFailureMessage('Command is not executable: "claude" (resolved: "/x/claude")'),
+      ).toBe(true);
+      expect(isTransientAdapterLaunchFailureMessage("spawn claude ENOENT")).toBe(true);
+
+      expect(isTransientAdapterLaunchFailureMessage("adapter exited with code 1")).toBe(false);
+      expect(isTransientAdapterLaunchFailureMessage(null)).toBe(false);
+      expect(isTransientAdapterLaunchFailureMessage(undefined)).toBe(false);
+    });
+
+    it("schedules a bounded transient retry (not a terminal-only failure) for a CLI-unresolvable launch failure", async () => {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      const now = new Date("2026-07-06T09:20:00.000Z");
+
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId,
+        now,
+        errorCode: ADAPTER_CLI_UNRESOLVABLE_ERROR_CODE,
+        adapterType: "claude_local",
+        resultJson: {
+          errorFamily: "transient_upstream",
+          errorMessage: 'Command not found in PATH: "claude"',
+        },
+      });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        random: () => 0.5,
+      });
+
+      expect(scheduled.outcome).toBe("scheduled");
+      if (scheduled.outcome !== "scheduled") return;
+
+      const retryRun = await db
+        .select({ status: heartbeatRuns.status, scheduledRetryReason: heartbeatRuns.scheduledRetryReason })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, scheduled.run.id))
+        .then((rows) => rows[0] ?? null);
+      expect(retryRun).toMatchObject({ status: "scheduled_retry", scheduledRetryReason: "transient_failure" });
+    });
+
+    it("never repoints a done issue's execution lock onto a scheduled retry for a CLI-unresolvable failure", async () => {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const issueId = randomUUID();
+      const sourceRunId = randomUUID();
+      const now = new Date("2026-07-06T09:30:00.000Z");
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "ClaudeCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: {
+          heartbeat: {
+            wakeOnDemand: true,
+            maxConcurrentRuns: 1,
+          },
+        },
+        permissions: {},
+      });
+
+      await db.insert(heartbeatRuns).values({
+        id: sourceRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "failed",
+        error: 'Command not found in PATH: "claude"',
+        errorCode: ADAPTER_CLI_UNRESOLVABLE_ERROR_CODE,
+        finishedAt: now,
+        resultJson: {
+          errorFamily: "transient_upstream",
+          errorMessage: 'Command not found in PATH: "claude"',
+        },
+        contextSnapshot: {
+          issueId,
+          wakeReason: "issue_assigned",
+        },
+        updatedAt: now,
+        createdAt: now,
+      });
+
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Already-done issue hit by a transient CLI-unresolvable retry",
+        status: "done",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        executionRunId: sourceRunId,
+        executionAgentNameKey: "claudecoder",
+        executionLockedAt: now,
+        issueNumber: 1,
+        identifier: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}-1`,
+      });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(sourceRunId, {
+        now,
+        random: () => 0.5,
+      });
+
+      expect(scheduled.outcome).toBe("not_scheduled");
+      if (scheduled.outcome !== "not_scheduled") return;
+      expect(scheduled.errorCode).toBe("issue_terminal_status");
+
+      const scheduledRetryRows = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.retryOfRunId, sourceRunId), eq(heartbeatRuns.status, "scheduled_retry")));
+      expect(scheduledRetryRows).toHaveLength(0);
+
+      const issue = await db
+        .select({ status: issues.status, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(issue?.status).toBe("done");
+      expect(issue?.executionRunId).toBe(sourceRunId);
+    });
   });
 });

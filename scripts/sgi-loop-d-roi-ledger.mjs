@@ -109,7 +109,7 @@ async function resolveIssueProjects(identifiers) {
     if (data._notFound) continue;
     for (const issue of asArray(data, 'issues')) {
       const projectName = issue.project && typeof issue.project === 'object' ? issue.project.name : null;
-      out.set(issue.identifier, { projectId: issue.projectId || null, projectName });
+      out.set(issue.identifier, { projectId: issue.projectId || null, projectName, priority: issue.priority || null });
     }
   }
   return out;
@@ -180,7 +180,32 @@ function latestRevenueByProject(all) {
   return map;
 }
 
-function computeRoi(all, issueProjects) {
+/**
+ * Value derivation (AUR-1734 interim). Agents almost always leave
+ * value_signal at its default of 1, which collapses the ledger into a
+ * completion counter: every finished task "earns" the same value no matter
+ * how important it was or whether it even succeeded. Until real revenue is
+ * wired, derive value from what the work itself declares:
+ *
+ *   value = priorityWeight(issue.priority) × outcomeWeight(scorecard)
+ *
+ * An explicit non-default value_signal (anything other than missing/0/1) is
+ * an agent making a deliberate claim — respected as-is.
+ */
+export const PRIORITY_VALUE_WEIGHTS = { urgent: 3, high: 2, medium: 1, low: 0.5 };
+
+export function deriveValueSignal(f, issueInfo) {
+  const explicit = num(f.value_signal);
+  if (explicit && explicit !== 1) {
+    return { value: explicit, basis: 'explicit' };
+  }
+  const priorityWeight = PRIORITY_VALUE_WEIGHTS[issueInfo && issueInfo.priority] ?? 1;
+  const outcome = String(f.outcome || '').toLowerCase();
+  const outcomeWeight = outcome === 'failure' ? 0.15 : f.rework_required === true ? 0.6 : 1;
+  return { value: priorityWeight * outcomeWeight, basis: 'derived_priority_outcome' };
+}
+
+export function computeRoi(all, issueProjects) {
   const revenue = latestRevenueByProject(all);
   const projects = new Map(); // projectId -> aggregate
   let unscoped = { adjustedValue: 0, tokenCost: 0, samples: 0 };
@@ -191,15 +216,17 @@ function computeRoi(all, issueProjects) {
     const ident = f.issue_id;
     const resolved = ident ? issueProjects.get(ident) : null;
     const pid = resolved && resolved.projectId;
-    const value = num(f.value_signal);
+    const derived = deriveValueSignal(f, resolved);
+    const value = derived.value;
     const quality = num(f.quality_signal) || 3; // default mid-quality if missing
     const adjValue = value * (Math.min(Math.max(quality, 0), 5) / 5);
     const tok = num(f.token_cost);
     if (!pid) { unscoped.adjustedValue += adjValue; unscoped.tokenCost += tok; unscoped.samples += 1; continue; }
     let p = projects.get(pid);
-    if (!p) p = projects.set(pid, { projectId: pid, projectName: resolved.projectName || null, adjustedValue: 0, tokenCost: 0, valueSignal: 0, samples: 0, agents: new Set(), issues: new Set() }).get(pid);
+    if (!p) p = projects.set(pid, { projectId: pid, projectName: resolved.projectName || null, adjustedValue: 0, tokenCost: 0, valueSignal: 0, samples: 0, explicitValueSamples: 0, agents: new Set(), issues: new Set() }).get(pid);
     p.adjustedValue += adjValue;
     p.valueSignal += value;
+    if (derived.basis === 'explicit') p.explicitValueSamples += 1;
     p.tokenCost += tok;
     p.samples += 1;
     if (f.agent_id) p.agents.add(f.agent_id);
@@ -311,6 +338,7 @@ async function main() {
       prev_band: prior ? prior.band : null,
       value_per_ktok: Number(row.vpt.toFixed(6)), company_median_vpt: Number(ref.toFixed(6)),
       adjusted_value: Number(row.adjustedValue.toFixed(3)), value_signal: row.valueSignal,
+      explicit_value_samples: row.explicitValueSamples ?? 0,
       revenue_usd: row.revenueUsd, token_cost: row.tokenCost,
       samples: row.samples, agents: row.agents, issues: row.issues.slice(0, 40),
       thresholds: { flag: ROI_FLAG, profit_seeking: ROI_PROFIT, min_tokens: ROI_MIN_TOKENS },
@@ -365,9 +393,11 @@ async function main() {
   return { date: TODAY, baseline: isBaseline, projects: rows.length, scorecards: adjusted.length, unscopedSamples: unscoped.samples, boardActions: boardActions.length, approvalId, ref: Number(ref.toFixed(6)), written };
 }
 
-main().then(result => {
-  console.log(JSON.stringify({ status: 'ok', ...result }, null, 2));
-}).catch(err => {
-  console.error('SGI Loop D error:', err.message);
-  process.exit(1);
-});
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().then(result => {
+    console.log(JSON.stringify({ status: 'ok', ...result }, null, 2));
+  }).catch(err => {
+    console.error('SGI Loop D error:', err.message);
+    process.exit(1);
+  });
+}

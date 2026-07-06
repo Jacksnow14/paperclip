@@ -117,6 +117,7 @@ const mockRoutineService = vi.hoisted(() => ({
 
 const mockAccessService = vi.hoisted(() => ({
   canUser: vi.fn(),
+  hasPermission: vi.fn(),
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
@@ -204,6 +205,7 @@ describe("routine routes", () => {
       status: "issue_created",
     });
     mockAccessService.canUser.mockResolvedValue(false);
+    mockAccessService.hasPermission.mockResolvedValue(false);
     mockLogActivity.mockResolvedValue(undefined);
   });
 
@@ -466,5 +468,96 @@ describe("routine routes", () => {
       runId: null,
     });
     expect(mockTrackRoutineCreated).toHaveBeenCalledWith(expect.anything());
+  });
+
+  it("returns routine detail via company-scoped GET /companies/:companyId/routines/:routineId", async () => {
+    mockRoutineService.getDetail.mockResolvedValue({ ...routine, project: null, assignee: null, parentIssue: null, triggers: [], recentRuns: [], activeIssue: null, managedByPlugin: null });
+    const app = await createApp({
+      type: "agent",
+      agentId: otherAgentId,
+      companyId,
+    });
+
+    const res = await request(app).get(`/api/companies/${companyId}/routines/${routineId}`);
+
+    expect(res.status).toBe(200);
+    expect(mockRoutineService.getDetail).toHaveBeenCalledWith(routineId);
+    expect(res.body.id).toBe(routineId);
+  });
+
+  it("returns 404 for company-scoped GET when routine belongs to a different company", async () => {
+    const otherCompanyId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    mockRoutineService.getDetail.mockResolvedValue({ ...routine, companyId: otherCompanyId, project: null, assignee: null, parentIssue: null, triggers: [], recentRuns: [], activeIssue: null, managedByPlugin: null });
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+    });
+
+    const res = await request(app).get(`/api/companies/${companyId}/routines/${routineId}`);
+
+    expect(res.status).toBe(404);
+  });
+
+  it("allows an agent with routines:manage to read revisions of another agent's routine", async () => {
+    mockAccessService.hasPermission.mockResolvedValue(true);
+    const app = await createApp({
+      type: "agent",
+      agentId: otherAgentId,
+      companyId,
+    });
+
+    const res = await request(app).get(`/api/routines/${routineId}/revisions`);
+
+    expect(res.status).toBe(200);
+    expect(mockAccessService.hasPermission).toHaveBeenCalledWith(companyId, "agent", otherAgentId, "routines:manage");
+  });
+
+  it("allows an agent with routines:manage to pause another agent's routine", async () => {
+    mockAccessService.hasPermission.mockResolvedValue(true);
+    const app = await createApp({
+      type: "agent",
+      agentId: otherAgentId,
+      companyId,
+    });
+
+    const res = await request(app)
+      .patch(`/api/routines/${routineId}`)
+      .send({ status: "paused" });
+
+    expect(res.status).toBe(200);
+    expect(mockRoutineService.update).toHaveBeenCalledWith(routineId, expect.objectContaining({ status: "paused" }), expect.anything());
+  });
+
+  it("allows an agent with routines:manage to reassign another agent's routine", async () => {
+    mockAccessService.hasPermission.mockResolvedValue(true);
+    const app = await createApp({
+      type: "agent",
+      agentId: otherAgentId,
+      companyId,
+    });
+
+    const res = await request(app)
+      .patch(`/api/routines/${routineId}`)
+      .send({ assigneeAgentId: otherAgentId });
+
+    expect(res.status).toBe(200);
+    expect(mockRoutineService.update).toHaveBeenCalledWith(routineId, expect.objectContaining({ assigneeAgentId: otherAgentId }), expect.anything());
+  });
+
+  it("blocks an agent without routines:manage from managing another agent's routine", async () => {
+    mockAccessService.hasPermission.mockResolvedValue(false);
+    const app = await createApp({
+      type: "agent",
+      agentId: otherAgentId,
+      companyId,
+    });
+
+    const res = await request(app)
+      .patch(`/api/routines/${routineId}`)
+      .send({ status: "paused" });
+
+    expect(res.status).toBe(403);
+    expect(mockRoutineService.update).not.toHaveBeenCalled();
   });
 });

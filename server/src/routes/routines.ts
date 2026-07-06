@@ -198,7 +198,11 @@ export function routineRoutes(
       req.body.assigneeAgentId !== undefined &&
       req.body.assigneeAgentId !== req.actor.agentId
     ) {
-      const hasManage = await agentHasRoutinesManage(req.actor.agentId, routine.companyId);
+      // An agent actor without an agentId can never hold routines:manage.
+      const actorAgentId = req.actor.agentId;
+      const hasManage = actorAgentId
+        ? await agentHasRoutinesManage(actorAgentId, routine.companyId)
+        : false;
       if (!hasManage) {
         throw forbidden("Agents can only assign routines to themselves");
       }

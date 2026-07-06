@@ -1491,7 +1491,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
           latestRunStatus: "failed",
           adapterResult: { exitCode: 0, errorMessage: null, timedOut: false },
         }),
-      ).toEqual({ outcome: "succeeded", reclaimedFromStaleFailure: true });
+      ).toEqual({ outcome: "succeeded", reclaimedFromStaleFailure: true, failedOnTransientLaunch: false });
     });
 
     it("keeps a pre-existing failed status when the adapter also failed", () => {
@@ -1500,7 +1500,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
           latestRunStatus: "failed",
           adapterResult: { exitCode: 1, errorMessage: "boom", timedOut: false },
         }),
-      ).toEqual({ outcome: "failed", reclaimedFromStaleFailure: false });
+      ).toEqual({ outcome: "failed", reclaimedFromStaleFailure: false, failedOnTransientLaunch: false });
     });
 
     it("never overrides a cancellation or timeout with adapter success", () => {
@@ -1509,13 +1509,13 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
           latestRunStatus: "cancelled",
           adapterResult: { exitCode: 0, errorMessage: null, timedOut: false },
         }),
-      ).toEqual({ outcome: "cancelled", reclaimedFromStaleFailure: false });
+      ).toEqual({ outcome: "cancelled", reclaimedFromStaleFailure: false, failedOnTransientLaunch: false });
       expect(
         resolveAdapterRunOutcome({
           latestRunStatus: "timed_out",
           adapterResult: { exitCode: 0, errorMessage: null, timedOut: false },
         }),
-      ).toEqual({ outcome: "timed_out", reclaimedFromStaleFailure: false });
+      ).toEqual({ outcome: "timed_out", reclaimedFromStaleFailure: false, failedOnTransientLaunch: false });
     });
 
     it("resolves non-terminal statuses from the adapter result alone", () => {
@@ -1524,19 +1524,19 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
           latestRunStatus: "running",
           adapterResult: { exitCode: 0, errorMessage: null, timedOut: false },
         }),
-      ).toEqual({ outcome: "succeeded", reclaimedFromStaleFailure: false });
+      ).toEqual({ outcome: "succeeded", reclaimedFromStaleFailure: false, failedOnTransientLaunch: false });
       expect(
         resolveAdapterRunOutcome({
           latestRunStatus: "running",
           adapterResult: { exitCode: 0, errorMessage: null, timedOut: true },
         }),
-      ).toEqual({ outcome: "timed_out", reclaimedFromStaleFailure: false });
+      ).toEqual({ outcome: "timed_out", reclaimedFromStaleFailure: false, failedOnTransientLaunch: false });
       expect(
         resolveAdapterRunOutcome({
           latestRunStatus: null,
           adapterResult: { exitCode: 2, errorMessage: "exit 2", timedOut: false },
         }),
-      ).toEqual({ outcome: "failed", reclaimedFromStaleFailure: false });
+      ).toEqual({ outcome: "failed", reclaimedFromStaleFailure: false, failedOnTransientLaunch: false });
     });
 
     it("does not treat a missing exit code with an error message as success", () => {
@@ -1545,7 +1545,36 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
           latestRunStatus: "failed",
           adapterResult: { exitCode: null, errorMessage: "Adapter failed", timedOut: false },
         }),
-      ).toEqual({ outcome: "failed", reclaimedFromStaleFailure: false });
+      ).toEqual({ outcome: "failed", reclaimedFromStaleFailure: false, failedOnTransientLaunch: false });
+    });
+
+    it("flags CLI-launch failures returned as adapter results (not thrown) as transient", () => {
+      // Observed in production 2026-07-06 16:10 UTC: the launch failure came
+      // back as adapterResult.errorMessage, bypassing the executeRun catch
+      // blocks that AUR-3302 classified — so no bounded retry was scheduled.
+      expect(
+        resolveAdapterRunOutcome({
+          latestRunStatus: "running",
+          adapterResult: {
+            exitCode: null,
+            errorMessage: 'Command not found in PATH: "claude"',
+            timedOut: false,
+          },
+        }),
+      ).toEqual({ outcome: "failed", reclaimedFromStaleFailure: false, failedOnTransientLaunch: true });
+      expect(
+        resolveAdapterRunOutcome({
+          latestRunStatus: "running",
+          adapterResult: { exitCode: null, errorMessage: "spawn claude ENOENT", timedOut: false },
+        }),
+      ).toEqual({ outcome: "failed", reclaimedFromStaleFailure: false, failedOnTransientLaunch: true });
+      // Non-launch failures are not flagged.
+      expect(
+        resolveAdapterRunOutcome({
+          latestRunStatus: "running",
+          adapterResult: { exitCode: 1, errorMessage: "assertion failed", timedOut: false },
+        }),
+      ).toEqual({ outcome: "failed", reclaimedFromStaleFailure: false, failedOnTransientLaunch: false });
     });
 
     it("cancels pending ghost retries of a reclaimed source run and repoints the issue lock", async () => {

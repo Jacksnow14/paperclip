@@ -914,11 +914,32 @@ export async function startSandboxCallbackBridgeServer(input: {
       [
         `mkdir -p ${shellQuote(directories.requestsDir)} ${shellQuote(directories.responsesDir)} ${shellQuote(directories.logsDir)}`,
         `rm -f ${shellQuote(directories.readyFile)} ${shellQuote(directories.pidFile)}`,
-        `nohup env ${Object.entries(env).map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ")} ` +
+        // setsid detaches the daemon into its own session so it survives the
+        // process-group SIGTERM the host sends when this launcher shell exits
+        // (AUR-1714). nohup alone keeps the daemon in the doomed group.
+        "if command -v setsid >/dev/null 2>&1; then",
+        `  nohup setsid env ${Object.entries(env).map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ")} ` +
           `${shellQuote(nodeCommand)} ${shellQuote(remoteEntrypoint)} ` +
           `>> ${shellQuote(directories.logFile)} 2>&1 < /dev/null &`,
+        "else",
+        `  nohup env ${Object.entries(env).map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ")} ` +
+          `${shellQuote(nodeCommand)} ${shellQuote(remoteEntrypoint)} ` +
+          `>> ${shellQuote(directories.logFile)} 2>&1 < /dev/null &`,
+        "fi",
         "pid=$!",
         `printf '%s\\n' \"$pid\" > ${shellQuote(directories.pidFile)}`,
+        // Hold this launcher shell open until the daemon reports ready (or
+        // dies). The host reaps the launcher's process group the moment it
+        // exits; setsid moves the daemon out of that group, but only after
+        // the forked child actually reaches its setsid() call — exiting
+        // immediately loses that race and the daemon is killed mid-startup.
+        "i=0",
+        `while [ \"$i\" -lt 200 ]; do`,
+        `  if [ -s ${shellQuote(directories.readyFile)} ]; then break; fi`,
+        "  if ! kill -0 \"$pid\" 2>/dev/null; then break; fi",
+        "  i=$((i + 1))",
+        "  sleep 0.05",
+        "done",
         "printf '{\"pid\":%s}\\n' \"$pid\"",
       ].join("\n"),
     ),

@@ -49,6 +49,9 @@ jobs:
           node-version: 20
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # Several server tests import @paperclipai/plugin-sdk by its dist entry;
+      # a fresh install has no dist, so build it first (mirrors test:run:general).
+      - run: pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
       - run: pnpm test:run
         env:
           NODE_OPTIONS: --max-old-space-size=6144

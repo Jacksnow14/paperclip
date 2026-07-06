@@ -1271,6 +1271,37 @@ export function ensurePathInEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return { ...env, PATH: defaultPathForPlatform() };
 }
 
+/**
+ * Prepends standard user-local binary directories (e.g. ~/.local/bin) to PATH
+ * when they are not already present. The Paperclip server process often starts
+ * without a fully-sourced user shell, which means user-installed CLI tools in
+ * those directories are invisible to adapter command resolution. Calling this
+ * before ensureAdapterExecutionTargetCommandResolvable ensures tools like the
+ * Claude CLI that are installed via standard user-local paths are discoverable.
+ *
+ * Supports an optional `homeDir` override for testing; falls back to os.homedir().
+ * No-op on Windows and when no home directory can be determined.
+ */
+export function augmentPathWithUserLocalDirs(
+  env: NodeJS.ProcessEnv,
+  homeDir?: string,
+): NodeJS.ProcessEnv {
+  if (process.platform === "win32") return env;
+  const home = homeDir ?? os.homedir();
+  if (!home) return env;
+
+  const candidates = [path.join(home, ".local", "bin")];
+  const currentPath = env.PATH ?? env.Path ?? "";
+  const existing = new Set(currentPath.split(path.delimiter).filter(Boolean));
+  const toAdd = candidates.filter((dir) => !existing.has(dir));
+  if (toAdd.length === 0) return env;
+
+  return {
+    ...env,
+    PATH: [...toAdd, currentPath].filter(Boolean).join(path.delimiter),
+  };
+}
+
 export async function ensureAbsoluteDirectory(
   cwd: string,
   opts: { createIfMissing?: boolean } = {},

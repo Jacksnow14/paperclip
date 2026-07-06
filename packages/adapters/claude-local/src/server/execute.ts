@@ -36,6 +36,7 @@ import {
   joinPromptSections,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
+  augmentPathWithUserLocalDirs,
   ensurePathInEnv,
   refreshPaperclipWorkspaceEnvForExecution,
   renderTemplate,
@@ -276,6 +277,15 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     env.PAPERCLIP_API_KEY = authToken;
   }
 
+  // Augment PATH with user-local bin dirs (e.g. ~/.local/bin) and propagate the
+  // result into `env` so the subprocess (merged from process.env + env inside
+  // runChildProcess) also receives it. Without this, command resolution via
+  // runtimeEnv would pass but the spawned process would fail to find `claude`
+  // because it inherits the server's unaugmented PATH at spawn time.
+  const augmentedForRuntime = augmentPathWithUserLocalDirs({ ...process.env, ...env });
+  if (typeof augmentedForRuntime.PATH === "string") {
+    env.PATH = augmentedForRuntime.PATH;
+  }
   const runtimeEnv = Object.fromEntries(
     Object.entries(ensurePathInEnv({ ...process.env, ...env })).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",

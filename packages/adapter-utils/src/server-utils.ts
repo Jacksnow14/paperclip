@@ -1873,6 +1873,11 @@ export async function removeMaintainerOnlySkillSymlinks(
   }
 }
 
+// A CLI self-update can briefly swap the resolved binary's symlink out from
+// under us (e.g. `claude` mid-version-install). Retry a few times over a
+// sub-second window before treating a miss as a real resolution failure.
+const COMMAND_RESOLVE_RETRY_DELAYS_MS = [100, 250, 500];
+
 export async function ensureCommandResolvable(
   command: string,
   cwd: string,
@@ -1886,7 +1891,11 @@ export async function ensureCommandResolvable(
     if (resolvedSsh) return;
     throw new Error('Command not found in PATH: "ssh"');
   }
-  const resolved = await resolveCommandPath(command, cwd, env);
+  let resolved = await resolveCommandPath(command, cwd, env);
+  for (let attempt = 0; !resolved && attempt < COMMAND_RESOLVE_RETRY_DELAYS_MS.length; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, COMMAND_RESOLVE_RETRY_DELAYS_MS[attempt]));
+    resolved = await resolveCommandPath(command, cwd, env);
+  }
   if (resolved) return;
   if (command.includes("/") || command.includes("\\")) {
     const absolute = path.isAbsolute(command) ? command : path.resolve(cwd, command);

@@ -290,6 +290,28 @@ function readTransientRecoveryContractFromRun(
     : null;
 }
 
+// Adapter CLI binaries (e.g. `claude`) can become transiently unresolvable
+// while a self-update swaps their symlink out from under us. These errors
+// come from ensureCommandResolvable/ensureAdapterExecutionTargetCommandResolvable
+// in packages/adapter-utils (thrown before the adapter process ever launches)
+// or from Node's own ENOENT when spawning a command that briefly vanished.
+// Recognize them so a run that fails this way is retried as transient infra
+// flakiness rather than terminated as a real work failure.
+export const ADAPTER_CLI_UNRESOLVABLE_ERROR_CODE = "adapter_cli_unresolvable";
+
+export function isTransientAdapterLaunchFailureMessage(message: string | null | undefined): boolean {
+  if (!message) return false;
+  if (/Command not found in PATH:/i.test(message)) return true;
+  if (/Command is not executable:/i.test(message)) return true;
+  if (/^spawn\s+\S+\s+ENOENT/i.test(message)) return true;
+  return false;
+}
+
+function isTransientAdapterLaunchFailure(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : typeof err === "string" ? err : null;
+  return isTransientAdapterLaunchFailureMessage(message);
+}
+
 function mergeAdapterRecoveryMetadata(input: {
   resultJson: Record<string, unknown> | null | undefined;
   errorFamily?: string | null;
@@ -5363,6 +5385,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             };
           }
         }
+      } else if (issueId) {
+        // Non-max-turn bounded retries (e.g. the transient CLI-launch-failure
+        // path) don't hold the issue's execution lock the way max-turn
+        // continuations do, but we still must not repoint executionRunId at a
+        // new scheduled_retry row for an issue that has already reached a
+        // terminal status — that would hold a phantom execution lock open
+        // against completed/cancelled work. Row-lock and re-check here since
+        // evaluateScheduledRetryGate's equivalent check only runs at promotion
+        // time, leaving a window between schedule and promotion otherwise.
+        await tx.execute(sql`select id from issues where company_id = ${run.companyId} and id = ${issueId} for update`);
+        const lockedIssue = await tx
+          .select({ id: issues.id, status: issues.status })
+          .from(issues)
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+          .then((rows) => rows[0] ?? null);
+
+        if (lockedIssue && (lockedIssue.status === "cancelled" || lockedIssue.status === "done")) {
+          return {
+            outcome: "not_scheduled",
+            reason: `Scheduled retry suppressed because issue reached terminal status (${lockedIssue.status})`,
+            errorCode: lockedIssue.status === "cancelled" ? "issue_cancelled" : "issue_terminal_status",
+            issueId,
+            details: { issueId, currentStatus: lockedIssue.status },
+          };
+        }
       }
 
       const wakeupRequest = await tx
@@ -7974,11 +8021,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       await finalizeAgentStatus(agent.id, outcome);
     } catch (err) {
+      const isTransientLaunchFailure = isTransientAdapterLaunchFailure(err);
       const message = redactCurrentUserText(
         err instanceof Error ? err.message : "Unknown adapter failure",
         await getCurrentUserRedactionOptions(),
       );
-      logger.error({ err, runId }, "heartbeat execution failed");
+      logger.error({ err, runId, isTransientLaunchFailure }, "heartbeat execution failed");
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
       if (handle) {
@@ -7996,13 +8044,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logger.warn({ err: flushErr, runId }, "failed to flush run output progress after error");
       });
 
+      const failedRunErrorCode = isTransientLaunchFailure ? ADAPTER_CLI_UNRESOLVABLE_ERROR_CODE : "adapter_failed";
       const failedRun = await setRunStatus(run.id, "failed", {
         error: message,
-        errorCode: "adapter_failed",
+        errorCode: failedRunErrorCode,
         finishedAt: new Date(),
         resultJson: mergeRunStopMetadataForAgent(agent, "failed", {
-          errorCode: "adapter_failed",
+          errorCode: failedRunErrorCode,
           errorMessage: message,
+          ...(isTransientLaunchFailure ? { errorFamily: "transient_upstream" } : {}),
         }),
         stdoutExcerpt,
         stderrExcerpt,
@@ -8024,6 +8074,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
         const livenessRun = await classifyAndPersistRunLiveness(failedRun) ?? failedRun;
         await refreshContinuationSummaryForRun(livenessRun, agent);
+        if (isTransientLaunchFailure && readTransientRecoveryContractFromRun(livenessRun)) {
+          await scheduleBoundedRetryForRun(livenessRun, agent);
+        }
         await finalizeIssueCommentPolicy(livenessRun, agent);
         await releaseIssueExecutionAndPromote(livenessRun);
 
@@ -8055,17 +8108,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     } catch (outerErr) {
           // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
           // The inner catch did not fire, so we must record the failure here.
+          const isTransientLaunchFailure = isTransientAdapterLaunchFailure(outerErr);
           const message = outerErr instanceof Error ? outerErr.message : "Unknown setup failure";
-          logger.error({ err: outerErr, runId }, "heartbeat execution setup failed");
+          logger.error({ err: outerErr, runId, isTransientLaunchFailure }, "heartbeat execution setup failed");
           const setupFailureAgent = await getAgent(run.agentId).catch(() => null);
+          const setupFailureErrorCode = isTransientLaunchFailure ? ADAPTER_CLI_UNRESOLVABLE_ERROR_CODE : "adapter_failed";
           await setRunStatus(runId, "failed", {
             error: message,
-            errorCode: "adapter_failed",
+            errorCode: setupFailureErrorCode,
             finishedAt: new Date(),
             ...(setupFailureAgent ? {
               resultJson: mergeRunStopMetadataForAgent(setupFailureAgent, "failed", {
-                errorCode: "adapter_failed",
+                errorCode: setupFailureErrorCode,
                 errorMessage: message,
+                ...(isTransientLaunchFailure ? { errorFamily: "transient_upstream" } : {}),
               }),
             } : {}),
           }).catch(() => undefined);
@@ -8087,6 +8143,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             const failedAgent = setupFailureAgent ?? await getAgent(run.agentId).catch(() => null);
             if (failedAgent) {
               await refreshContinuationSummaryForRun(livenessRun, failedAgent).catch(() => undefined);
+              if (isTransientLaunchFailure && readTransientRecoveryContractFromRun(livenessRun)) {
+                await scheduleBoundedRetryForRun(livenessRun, failedAgent).catch(() => undefined);
+              }
               await finalizeIssueCommentPolicy(livenessRun, failedAgent).catch(() => undefined);
             }
             await releaseIssueExecutionAndPromote(livenessRun).catch(() => undefined);

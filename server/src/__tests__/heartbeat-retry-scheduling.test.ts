@@ -23,8 +23,10 @@ import {
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
+  SUPERSEDED_BY_SOURCE_SUCCESS_ERROR_CODE,
   heartbeatService,
   isTransientAdapterLaunchFailureMessage,
+  resolveAdapterRunOutcome,
 } from "../services/heartbeat.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -288,8 +290,10 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       retryOfRunId: sourceRunId,
       scheduledRetryAttempt: 1,
       scheduledRetryReason: "transient_failure",
-      contextSnapshot: expect.objectContaining({ modelProfile: "cheap" }),
     });
+    // Recovery no longer force-pins a cheap model profile (AUR-2248) — the
+    // hint helper is a no-op, so the retry context must NOT carry one.
+    expect((retryRun?.contextSnapshot as Record<string, unknown>)?.modelProfile).toBeUndefined();
     expect(retryRun?.scheduledRetryAt?.toISOString()).toBe(expectedDueAt.toISOString());
 
     const earlyPromotion = await heartbeat.promoteDueScheduledRetries(new Date("2026-04-20T12:01:59.000Z"));
@@ -1477,6 +1481,208 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         .then((rows) => rows[0] ?? null);
       expect(issue?.status).toBe("done");
       expect(issue?.executionRunId).toBe(sourceRunId);
+    });
+  });
+
+  describe("reclaimed false failures (stale terminal status vs adapter success)", () => {
+    it("reclaims a run marked failed mid-flight when the adapter returns a clean success", () => {
+      expect(
+        resolveAdapterRunOutcome({
+          latestRunStatus: "failed",
+          adapterResult: { exitCode: 0, errorMessage: null, timedOut: false },
+        }),
+      ).toEqual({ outcome: "succeeded", reclaimedFromStaleFailure: true });
+    });
+
+    it("keeps a pre-existing failed status when the adapter also failed", () => {
+      expect(
+        resolveAdapterRunOutcome({
+          latestRunStatus: "failed",
+          adapterResult: { exitCode: 1, errorMessage: "boom", timedOut: false },
+        }),
+      ).toEqual({ outcome: "failed", reclaimedFromStaleFailure: false });
+    });
+
+    it("never overrides a cancellation or timeout with adapter success", () => {
+      expect(
+        resolveAdapterRunOutcome({
+          latestRunStatus: "cancelled",
+          adapterResult: { exitCode: 0, errorMessage: null, timedOut: false },
+        }),
+      ).toEqual({ outcome: "cancelled", reclaimedFromStaleFailure: false });
+      expect(
+        resolveAdapterRunOutcome({
+          latestRunStatus: "timed_out",
+          adapterResult: { exitCode: 0, errorMessage: null, timedOut: false },
+        }),
+      ).toEqual({ outcome: "timed_out", reclaimedFromStaleFailure: false });
+    });
+
+    it("resolves non-terminal statuses from the adapter result alone", () => {
+      expect(
+        resolveAdapterRunOutcome({
+          latestRunStatus: "running",
+          adapterResult: { exitCode: 0, errorMessage: null, timedOut: false },
+        }),
+      ).toEqual({ outcome: "succeeded", reclaimedFromStaleFailure: false });
+      expect(
+        resolveAdapterRunOutcome({
+          latestRunStatus: "running",
+          adapterResult: { exitCode: 0, errorMessage: null, timedOut: true },
+        }),
+      ).toEqual({ outcome: "timed_out", reclaimedFromStaleFailure: false });
+      expect(
+        resolveAdapterRunOutcome({
+          latestRunStatus: null,
+          adapterResult: { exitCode: 2, errorMessage: "exit 2", timedOut: false },
+        }),
+      ).toEqual({ outcome: "failed", reclaimedFromStaleFailure: false });
+    });
+
+    it("does not treat a missing exit code with an error message as success", () => {
+      expect(
+        resolveAdapterRunOutcome({
+          latestRunStatus: "failed",
+          adapterResult: { exitCode: null, errorMessage: "Adapter failed", timedOut: false },
+        }),
+      ).toEqual({ outcome: "failed", reclaimedFromStaleFailure: false });
+    });
+
+    it("cancels pending ghost retries of a reclaimed source run and repoints the issue lock", async () => {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const sourceRunId = randomUUID();
+      const ghostRetryRunId = randomUUID();
+      const startedRetryRunId = randomUUID();
+      const issueId = randomUUID();
+      const wakeupRequestId = randomUUID();
+      const now = new Date("2026-04-20T12:00:00.000Z");
+      const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "ClaudeCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      });
+      // Source run: reaped mid-flight (failed/process_lost) while the adapter kept executing.
+      await db.insert(heartbeatRuns).values({
+        id: sourceRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status: "failed",
+        error: "Run process lost; retrying once",
+        errorCode: "process_lost",
+        finishedAt: now,
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+        updatedAt: now,
+        createdAt: now,
+      });
+      await db.insert(agentWakeupRequests).values({
+        id: wakeupRequestId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "process_lost_retry",
+        payload: { issueId, retryOfRunId: sourceRunId },
+        status: "queued",
+        requestedByActorType: "system",
+        updatedAt: now,
+      });
+      // Ghost retry: queued by the reaper, has not started.
+      await db.insert(heartbeatRuns).values({
+        id: ghostRetryRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId,
+        retryOfRunId: sourceRunId,
+        processLossRetryCount: 1,
+        contextSnapshot: { issueId, wakeReason: "process_lost_retry", retryReason: "process_lost" },
+        updatedAt: now,
+        createdAt: now,
+      });
+      // A retry that already started running must never be cancelled by the reclaim.
+      await db.insert(heartbeatRuns).values({
+        id: startedRetryRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "running",
+        retryOfRunId: sourceRunId,
+        contextSnapshot: { issueId, wakeReason: "process_lost_retry" },
+        updatedAt: now,
+        createdAt: now,
+      });
+      // The reaper repointed the issue's execution lock at the ghost retry.
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Reclaimed false failure",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        executionRunId: ghostRetryRunId,
+        executionAgentNameKey: "claudecoder",
+        executionLockedAt: now,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      });
+
+      const cancelled = await heartbeat.cancelSupersededRetryRunsForSourceRun(sourceRunId, now);
+
+      expect(cancelled).toHaveLength(1);
+      expect(cancelled[0]?.id).toBe(ghostRetryRunId);
+
+      const ghostRetry = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, ghostRetryRunId))
+        .then((rows) => rows[0] ?? null);
+      expect(ghostRetry?.status).toBe("cancelled");
+      expect(ghostRetry?.errorCode).toBe(SUPERSEDED_BY_SOURCE_SUCCESS_ERROR_CODE);
+
+      const startedRetry = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, startedRetryRunId))
+        .then((rows) => rows[0] ?? null);
+      expect(startedRetry?.status).toBe("running");
+
+      const wakeup = await db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId))
+        .then((rows) => rows[0] ?? null);
+      expect(wakeup?.status).toBe("cancelled");
+
+      const issue = await db
+        .select({ executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(issue?.executionRunId).toBe(sourceRunId);
+    });
+
+    it("is a no-op for a source run with no pending retries", async () => {
+      const cancelled = await heartbeat.cancelSupersededRetryRunsForSourceRun(randomUUID());
+      expect(cancelled).toHaveLength(0);
     });
   });
 });

@@ -573,10 +573,16 @@ export interface IssueCommentMetadataSection {
   rows: IssueCommentMetadataRow[];
 }
 
+// Keep in sync with issueCommentMetadataSchema in validators/issue.ts —
+// comment metadata is zod-parsed, so the runtime shape is the schema's:
+// sections is optional there (mention-reply markers carry no sections) and
+// the mention-reply fields exist since the verified-mention work.
 export interface IssueCommentMetadata {
   version: 1;
   sourceRunId?: string | null;
-  sections: IssueCommentMetadataSection[];
+  sections?: IssueCommentMetadataSection[];
+  mentionReply?: boolean;
+  mentionRepliedByAgentId?: string;
 }
 
 export interface IssueCommentPresentation {

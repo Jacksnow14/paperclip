@@ -372,8 +372,9 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       issueId,
       clearReason: "max_attempts_exhausted",
       maxAttempts: 1,
-      modelProfile: "cheap",
     });
+    // Recovery no longer force-pins a cheap model profile (AUR-2248).
+    expect((wakeup?.payload as Record<string, unknown>)?.modelProfile).toBeUndefined();
 
     const activity = await db
       .select()
@@ -415,7 +416,8 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(recoveryIssue).toMatchObject({
       parentId: issueId,
       priority: "high",
-      assigneeAdapterOverrides: { modelProfile: "cheap" },
+      // Recovery no longer force-pins a cheap model profile (AUR-2248).
+      assigneeAdapterOverrides: {},
     });
     expect(["todo", "in_progress"]).toContain(recoveryIssue?.status);
   });

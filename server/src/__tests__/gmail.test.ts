@@ -232,6 +232,179 @@ describe("createGmailService", () => {
       const callArgs = mockMessagesSend.mock.calls[0][0];
       expect(callArgs.requestBody.threadId).toBe("thread42");
     });
+
+    it("sets In-Reply-To/References headers and prefixes subject with Re: when replying", async () => {
+      mockMessagesGet.mockResolvedValue({
+        data: {
+          id: "orig",
+          threadId: "thread42",
+          payload: {
+            headers: [
+              { name: "Message-ID", value: "<orig-msg-id@mail.gmail.com>" },
+              { name: "References", value: "<earlier@mail.gmail.com>" },
+            ],
+          },
+        },
+      });
+      mockMessagesSend.mockResolvedValue({ data: { id: "reply1" } });
+      const service = createGmailService();
+      await service.sendMessage("board", {
+        to: "user@example.com",
+        subject: "Hello",
+        body: "Replying",
+        replyToMessageId: "orig",
+      });
+
+      const callArgs = mockMessagesSend.mock.calls[0][0];
+      const decoded = Buffer.from(callArgs.requestBody.raw, "base64url").toString("utf-8");
+      expect(decoded).toContain("In-Reply-To: <orig-msg-id@mail.gmail.com>");
+      expect(decoded).toContain("References: <earlier@mail.gmail.com> <orig-msg-id@mail.gmail.com>");
+      expect(decoded).toContain("Subject: Re: Hello");
+    });
+
+    it("does not double-prefix Re: when the subject already has it", async () => {
+      mockMessagesGet.mockResolvedValue({
+        data: {
+          id: "orig",
+          threadId: "thread42",
+          payload: {
+            headers: [{ name: "Message-ID", value: "<orig-msg-id@mail.gmail.com>" }],
+          },
+        },
+      });
+      mockMessagesSend.mockResolvedValue({ data: { id: "reply1" } });
+      const service = createGmailService();
+      await service.sendMessage("board", {
+        to: "user@example.com",
+        subject: "Re: Hello",
+        body: "Replying",
+        replyToMessageId: "orig",
+      });
+
+      const callArgs = mockMessagesSend.mock.calls[0][0];
+      const decoded = Buffer.from(callArgs.requestBody.raw, "base64url").toString("utf-8");
+      expect(decoded).toContain("Subject: Re: Hello");
+      expect(decoded).not.toContain("Subject: Re: Re: Hello");
+    });
+
+    it("uses the original Message-ID alone as References when the original has none", async () => {
+      mockMessagesGet.mockResolvedValue({
+        data: {
+          id: "orig",
+          threadId: "thread42",
+          payload: {
+            headers: [{ name: "Message-ID", value: "<orig-msg-id@mail.gmail.com>" }],
+          },
+        },
+      });
+      mockMessagesSend.mockResolvedValue({ data: { id: "reply1" } });
+      const service = createGmailService();
+      await service.sendMessage("board", {
+        to: "user@example.com",
+        subject: "Hello",
+        body: "Replying",
+        replyToMessageId: "orig",
+      });
+
+      const callArgs = mockMessagesSend.mock.calls[0][0];
+      const decoded = Buffer.from(callArgs.requestBody.raw, "base64url").toString("utf-8");
+      expect(decoded).toContain("References: <orig-msg-id@mail.gmail.com>");
+    });
+  });
+
+  describe("replyInThread", () => {
+    it("resolves the given message, replies to its sender, and threads the reply", async () => {
+      mockMessagesGet.mockResolvedValue({
+        data: {
+          id: "msg1",
+          threadId: "thread42",
+          payload: {
+            headers: [
+              { name: "Message-ID", value: "<orig-msg-id@mail.gmail.com>" },
+              { name: "Subject", value: "Question about pricing" },
+              { name: "From", value: "Jane Customer <jane@example.com>" },
+            ],
+          },
+        },
+      });
+      mockMessagesSend.mockResolvedValue({ data: { id: "reply1", threadId: "thread42" } });
+      const service = createGmailService();
+      const result = await service.replyInThread("board", {
+        replyToMessageId: "msg1",
+        body: "Thanks for reaching out!",
+      });
+
+      const callArgs = mockMessagesSend.mock.calls[0][0];
+      expect(callArgs.requestBody.threadId).toBe("thread42");
+      const decoded = Buffer.from(callArgs.requestBody.raw, "base64url").toString("utf-8");
+      expect(decoded).toContain("To: Jane Customer <jane@example.com>");
+      expect(decoded).toContain("Subject: Re: Question about pricing");
+      expect(decoded).toContain("In-Reply-To: <orig-msg-id@mail.gmail.com>");
+      expect(result).toEqual({ id: "reply1", threadId: "thread42" });
+    });
+
+    it("resolves the latest message of a thread when threadId is given", async () => {
+      mockThreadsGet.mockResolvedValue({
+        data: {
+          id: "thread42",
+          messages: [
+            { id: "msg1", threadId: "thread42" },
+            { id: "msg2", threadId: "thread42" },
+          ],
+        },
+      });
+      mockMessagesGet.mockResolvedValue({
+        data: {
+          id: "msg2",
+          threadId: "thread42",
+          payload: {
+            headers: [
+              { name: "Message-ID", value: "<msg2@mail.gmail.com>" },
+              { name: "Subject", value: "Question about pricing" },
+              { name: "From", value: "jane@example.com" },
+            ],
+          },
+        },
+      });
+      mockMessagesSend.mockResolvedValue({ data: { id: "reply1" } });
+      const service = createGmailService();
+      await service.replyInThread("board", { threadId: "thread42", body: "Following up" });
+
+      expect(mockMessagesGet).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "msg2" }),
+      );
+    });
+
+    it("prefers Reply-To over From when present", async () => {
+      mockMessagesGet.mockResolvedValue({
+        data: {
+          id: "msg1",
+          threadId: "thread42",
+          payload: {
+            headers: [
+              { name: "Message-ID", value: "<orig@mail.gmail.com>" },
+              { name: "Subject", value: "Hi" },
+              { name: "From", value: "noreply@example.com" },
+              { name: "Reply-To", value: "support@example.com" },
+            ],
+          },
+        },
+      });
+      mockMessagesSend.mockResolvedValue({ data: { id: "reply1" } });
+      const service = createGmailService();
+      await service.replyInThread("board", { replyToMessageId: "msg1", body: "Reply" });
+
+      const callArgs = mockMessagesSend.mock.calls[0][0];
+      const decoded = Buffer.from(callArgs.requestBody.raw, "base64url").toString("utf-8");
+      expect(decoded).toContain("To: support@example.com");
+    });
+
+    it("throws when neither replyToMessageId nor threadId is given", async () => {
+      const service = createGmailService();
+      await expect(
+        service.replyInThread("board", { body: "Reply" } as never),
+      ).rejects.toThrow("replyInThread requires replyToMessageId or threadId");
+    });
   });
 
   describe("listThreads", () => {

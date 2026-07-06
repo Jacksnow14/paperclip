@@ -213,6 +213,59 @@ describe("claude remote execution", () => {
     }));
   });
 
+  it("propagates augmented PATH (including ~/.local/bin) into the subprocess env for local execution", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-path-local-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+
+    // Strip ~/.local/bin from the test-process PATH to simulate a Paperclip
+    // server started without a fully-sourced user shell.
+    const localBin = path.join(os.homedir(), ".local", "bin");
+    const originalPath = process.env.PATH;
+    process.env.PATH = (process.env.PATH ?? "")
+      .split(path.delimiter)
+      .filter((dir) => dir !== localBin)
+      .join(path.delimiter);
+
+    try {
+      await execute({
+        runId: "run-path-local",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: { command: "claude" },
+        context: {
+          paperclipWorkspace: {
+            cwd: workspaceDir,
+            source: "project_primary",
+          },
+        },
+        onLog: async () => {},
+      });
+    } finally {
+      process.env.PATH = originalPath;
+    }
+
+    expect(runChildProcess).toHaveBeenCalledTimes(1);
+    const call = runChildProcess.mock.calls[0] as unknown as
+      | [string, string, string[], { env: Record<string, string> }]
+      | undefined;
+    const subprocessPath = call?.[3].env.PATH ?? "";
+    const segments = subprocessPath.split(path.delimiter).filter(Boolean);
+    expect(segments[0]).toBe(localBin);
+  });
+
   it("does not resume saved Claude sessions for remote SSH execution without a matching remote identity", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-remote-resume-"));
     cleanupDirs.push(rootDir);

@@ -20,6 +20,16 @@ const sendMessageBodySchema = z.object({
   replyToMessageId: z.string().optional(),
 });
 
+const replyBodySchema = z
+  .object({
+    replyToMessageId: z.string().optional(),
+    threadId: z.string().optional(),
+    body: z.string().min(1),
+  })
+  .refine((v) => Boolean(v.replyToMessageId || v.threadId), {
+    message: "replyToMessageId or threadId is required",
+  });
+
 const modifyLabelsBodySchema = z.object({
   addLabelIds: z.array(z.string()).optional(),
   removeLabelIds: z.array(z.string()).optional(),
@@ -99,6 +109,21 @@ export function gmailRoutes(db: Db) {
       if (!isSupportedGmailAlias(mailbox)) throw badRequest(`Unsupported mailbox: ${mailbox}`);
       const body = req.body as z.infer<typeof sendMessageBodySchema>;
       const data = await gmail.sendMessage(mailbox, body);
+      res.status(201).json(data);
+    },
+  );
+
+  router.post(
+    "/companies/:companyId/gmail/mailboxes/:mailbox/reply",
+    validate(replyBodySchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      const mailbox = req.params.mailbox as string;
+      assertCompanyAccess(req, companyId);
+      assertGmailAvailable();
+      if (!isSupportedGmailAlias(mailbox)) throw badRequest(`Unsupported mailbox: ${mailbox}`);
+      const body = req.body as z.infer<typeof replyBodySchema>;
+      const data = await gmail.replyInThread(mailbox, body);
       res.status(201).json(data);
     },
   );

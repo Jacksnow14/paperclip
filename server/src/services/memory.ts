@@ -3442,6 +3442,7 @@ export function memoryService(
             {
               bindingId: resolved.binding.id,
               limit: 1,
+              offset: 0,
               includeDeleted: false,
               includeRevoked: false,
               includeExpired: false,

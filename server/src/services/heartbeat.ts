@@ -2105,6 +2105,51 @@ function isHeartbeatRunTerminalStatus(
   );
 }
 
+export const RECLAIMED_FALSE_FAILURE_EVENT_MESSAGE =
+  "Reclaimed run from stale terminal failure: adapter completed successfully";
+export const SUPERSEDED_BY_SOURCE_SUCCESS_ERROR_CODE = "superseded_by_source_success";
+
+/**
+ * Resolve the final outcome for a run whose adapter execution just returned.
+ *
+ * A pre-existing terminal DB status normally wins (a cancellation, timeout, or
+ * competing finalizer already recorded the result). One exception: the recovery
+ * machinery (e.g. reapOrphanedRuns) can mark an in-flight run failed
+ * (process_lost) while the adapter is still executing. When the adapter then
+ * returns a clean success, the recorded failure is a false positive — trust the
+ * adapter result and reclaim the run as succeeded. Cancelled and timed_out are
+ * still adopted as-is because they encode deliberate control-plane/user intent.
+ */
+export function resolveAdapterRunOutcome(input: {
+  latestRunStatus: string | null | undefined;
+  adapterResult: {
+    timedOut?: boolean | null;
+    exitCode?: number | null;
+    errorMessage?: string | null;
+  };
+}): {
+  outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
+  reclaimedFromStaleFailure: boolean;
+} {
+  const adapterSucceeded =
+    !input.adapterResult.timedOut &&
+    (input.adapterResult.exitCode ?? 0) === 0 &&
+    !input.adapterResult.errorMessage;
+  if (isHeartbeatRunTerminalStatus(input.latestRunStatus)) {
+    if (input.latestRunStatus === "failed" && adapterSucceeded) {
+      return { outcome: "succeeded", reclaimedFromStaleFailure: true };
+    }
+    return { outcome: input.latestRunStatus, reclaimedFromStaleFailure: false };
+  }
+  if (input.adapterResult.timedOut) {
+    return { outcome: "timed_out", reclaimedFromStaleFailure: false };
+  }
+  if (adapterSucceeded) {
+    return { outcome: "succeeded", reclaimedFromStaleFailure: false };
+  }
+  return { outcome: "failed", reclaimedFromStaleFailure: false };
+}
+
 export function buildPaperclipTaskMarkdown(input: {
   issue: {
     id: string;
@@ -4756,6 +4801,97 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return queued;
   }
 
+  /**
+   * Cancel not-yet-started retry runs spawned off a source run that turned out
+   * to have completed successfully (a reclaimed false failure). Without this,
+   * a run reaped mid-flight enqueues a process-loss/bounded retry that re-does
+   * already-finished work — the amplification mechanism behind false-failure
+   * storms. Only pending retries are touched; a retry that already started
+   * running is left alone. If the issue's execution lock was repointed at a
+   * cancelled ghost retry, it is repointed back at the successful source run.
+   */
+  async function cancelSupersededRetryRunsForSourceRun(sourceRunId: string, now = new Date()) {
+    const pendingRetries = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.retryOfRunId, sourceRunId),
+          inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+        ),
+      );
+    const cancelled: (typeof heartbeatRuns.$inferSelect)[] = [];
+    for (const retry of pendingRetries) {
+      // Guarded update: a scheduled retry may be promoted to running between
+      // the select above and this write — never cancel a started retry here.
+      const updated = await db
+        .update(heartbeatRuns)
+        .set({
+          status: "cancelled",
+          error: "Superseded: source run completed successfully after being marked failed mid-flight",
+          errorCode: SUPERSEDED_BY_SOURCE_SUCCESS_ERROR_CODE,
+          finishedAt: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(heartbeatRuns.id, retry.id),
+            inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+          ),
+        )
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!updated) continue;
+      cancelled.push(updated);
+      publishLiveEvent({
+        companyId: updated.companyId,
+        type: "heartbeat.run.status",
+        payload: {
+          runId: updated.id,
+          agentId: updated.agentId,
+          status: updated.status,
+          invocationSource: updated.invocationSource,
+          triggerDetail: updated.triggerDetail,
+          error: updated.error ?? null,
+          errorCode: updated.errorCode ?? null,
+          startedAt: updated.startedAt ? new Date(updated.startedAt).toISOString() : null,
+          finishedAt: updated.finishedAt ? new Date(updated.finishedAt).toISOString() : null,
+        },
+      });
+      publishRunLifecyclePluginEvent(updated);
+      await setWakeupStatus(updated.wakeupRequestId, "cancelled", {
+        finishedAt: now,
+        error: "Superseded by source run success",
+      });
+      const retryIssueId = readNonEmptyString(parseObject(updated.contextSnapshot).issueId);
+      if (retryIssueId) {
+        await db
+          .update(issues)
+          .set({
+            executionRunId: sourceRunId,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.id, retryIssueId),
+              eq(issues.companyId, updated.companyId),
+              eq(issues.executionRunId, updated.id),
+            ),
+          );
+      }
+      await appendRunEvent(updated, await nextRunEventSeq(updated.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Cancelled: superseded by source run success (reclaimed false failure)",
+        payload: {
+          sourceRunId,
+        },
+      });
+    }
+    return cancelled;
+  }
+
   type ScheduledRetryGate =
     | { allowed: true }
     | {
@@ -6069,10 +6205,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const wakeCommentId = deriveCommentId(context, null);
-    const isInteractionWake = allowsIssueInteractionWake(context);
     const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
     const wakeReason = readNonEmptyString(context.wakeReason);
     const retryReason = readNonEmptyString(context.retryReason) ?? run.scheduledRetryReason ?? null;
+
+    // Only an explicit mention-scoped reply wake, verified against a real comment and its
+    // actual requester, may keep a queued run alive across an assignee or review-participant
+    // change. Generic issue_commented/issue_reopened_via_comment follow-ups are addressed to
+    // "whoever currently owns this issue" and stop being meaningful once ownership moves on,
+    // even when the underlying comment itself is genuine (see AUR-3217/AUR-3245).
+    const isVerifiedMentionReplyWake =
+      wakeReason === "issue_comment_mentioned" &&
+      (await isVerifiedIssueTreeControlInteractionWake(db, {
+        companyId: run.companyId,
+        issueId,
+        agentId: run.agentId,
+        runId: run.id,
+        wakeupRequestId: run.wakeupRequestId,
+        contextSnapshot: context,
+      }));
 
     if (
       issue.status === "in_progress" &&
@@ -6103,7 +6254,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
-    if (issue.assigneeAgentId !== run.agentId && !isInteractionWake) {
+    if (issue.assigneeAgentId !== run.agentId && !isVerifiedMentionReplyWake) {
       return {
         stale: true,
         errorCode: "issue_assignee_changed",
@@ -6157,7 +6308,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (currentParticipant) {
         const participantMatches =
           currentParticipant.type === "agent" && currentParticipant.agentId === run.agentId;
-        if (!participantMatches && !wakeCommentId) {
+        if (!participantMatches && !isVerifiedMentionReplyWake) {
           return {
             stale: true,
             errorCode: "issue_review_participant_changed",
@@ -7812,17 +7963,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       const normalizedUsage = sessionUsageResolution.normalizedUsage;
 
-      let outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
       const latestRun = await getRun(run.id);
-      if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
-        outcome = latestRun.status;
-      } else if (adapterResult.timedOut) {
-        outcome = "timed_out";
-      } else if ((adapterResult.exitCode ?? 0) === 0 && !adapterResult.errorMessage) {
-        outcome = "succeeded";
-      } else {
-        outcome = "failed";
-      }
+      const resolvedOutcome = resolveAdapterRunOutcome({
+        latestRunStatus: latestRun?.status,
+        adapterResult,
+      });
+      const outcome = resolvedOutcome.outcome;
       const runErrorMessage =
         outcome === "cancelled"
           ? (latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
@@ -7938,6 +8084,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             exitCode: adapterResult.exitCode,
           },
         });
+        if (resolvedOutcome.reclaimedFromStaleFailure) {
+          await appendRunEvent(finalizedRun, seq++, {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message: RECLAIMED_FALSE_FAILURE_EVENT_MESSAGE,
+            payload: {
+              priorStatus: latestRun?.status ?? null,
+              priorErrorCode: latestRun?.errorCode ?? null,
+              priorError: latestRun?.error ?? null,
+            },
+          });
+          await cancelSupersededRetryRunsForSourceRun(finalizedRun.id, new Date());
+        }
         const livenessRun = finalizedRun;
         await refreshContinuationSummaryForRun(livenessRun, agent);
         const skipRunIssueComment = parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
@@ -9818,6 +9978,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     promoteDueScheduledRetries,
     retryScheduledRetryNow,
+    cancelSupersededRetryRunsForSourceRun,
 
     resumeQueuedRuns,
 

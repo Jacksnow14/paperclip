@@ -28,6 +28,7 @@ import type {
 } from "../constants.js";
 import type { Agent } from "./agent.js";
 import type { CompanySkill } from "./company-skill.js";
+import type { MemoryProviderDescriptor } from "./memory.js";
 import type { Project } from "./project.js";
 import type { Routine, RoutineTrigger, RoutineVariable } from "./routine.js";
 
@@ -545,6 +546,12 @@ export interface PaperclipPluginManifestV1 {
   skills?: PluginManagedSkillDeclaration[];
   /** Trusted local folders this plugin can configure and access by stable key. */
   localFolders?: PluginLocalFolderDeclaration[];
+  /**
+   * Memory providers this plugin contributes. Registered with the host's
+   * plugin memory-provider dispatcher; invoked over the worker RPC method
+   * `invokeMemoryProvider` with actions `query` | `capture` | `forget`.
+   */
+  memoryProviders?: MemoryProviderDescriptor[];
   /**
    * Legacy top-level launcher declarations.
    * Prefer `ui.launchers` for new manifests.

@@ -218,6 +218,9 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     contextExtras?: Record<string, unknown>;
     invocationSource?: "assignment" | "automation";
     scheduledRetryReason?: string | null;
+    requestedByActorType?: "user" | "agent" | "system";
+    requestedByActorId?: string;
+    wakeupCommentId?: string;
   }) {
     const wakeupRequestId = randomUUID();
     const runId = randomUUID();
@@ -228,8 +231,13 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       source: input.invocationSource ?? "assignment",
       triggerDetail: "system",
       reason: input.wakeReason,
-      payload: { issueId: input.issueId },
+      payload: {
+        issueId: input.issueId,
+        ...(input.wakeupCommentId ? { commentId: input.wakeupCommentId } : {}),
+      },
       status: "queued",
+      requestedByActorType: input.requestedByActorType ?? null,
+      requestedByActorId: input.requestedByActorId ?? null,
     });
     await db.insert(heartbeatRuns).values({
       id: runId,
@@ -640,7 +648,10 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(countExecuteCallsForRun(runId)).toBe(0);
   });
 
-  it("still runs comment-driven wakes on in_review issues even when the agent is no longer the current participant", async () => {
+  it("cancels generic comment-driven wakes on in_review issues when the agent is no longer the current participant", async () => {
+    // A plain issue_commented wake is addressed to "whoever currently owns this issue", not to
+    // this specific agent by name. Even though the underlying comment is real, it must not keep
+    // a non-participant's queued run alive once review ownership has moved elsewhere (AUR-3245).
     const { companyId, agentId } = await seedCompanyAndAgent();
     const otherAgentId = randomUUID();
     await db.insert(agents).values({
@@ -685,16 +696,123 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       body: "Review feedback comment",
     });
 
-    const { runId } = await seedQueuedRun({
+    const { runId, wakeupRequestId } = await seedQueuedRun({
       companyId,
       agentId,
       issueId,
       wakeReason: "issue_commented",
       invocationSource: "automation",
+      requestedByActorType: "agent",
+      requestedByActorId: otherAgentId,
+      wakeupCommentId: commentId,
       contextExtras: {
         commentId,
         wakeCommentId: commentId,
         source: "issue.comment",
+      },
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "cancelled";
+    });
+
+    const [run, wakeup] = await Promise.all([
+      db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId))
+        .then((rows) => rows[0] ?? null),
+    ]);
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("issue_review_participant_changed");
+    expect(wakeup?.status).toBe("skipped");
+    expect(countExecuteCallsForRun(runId)).toBe(0);
+  });
+
+  it("still runs a verified mention-scoped reply wake on in_review issues even when the agent is not the current participant", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const otherAgentId = randomUUID();
+    const mentionedAgentId = randomUUID();
+    await db.insert(agents).values([
+      {
+        id: otherAgentId,
+        companyId,
+        name: "ReviewerAgent",
+        role: "qa",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+      {
+        id: mentionedAgentId,
+        companyId,
+        name: "MentionedAgent",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      },
+    ]);
+
+    const issueId = randomUUID();
+    const commentId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "In-review task with an explicit mention",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      executionState: {
+        status: "pending",
+        currentStageId: randomUUID(),
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: otherAgentId, userId: null },
+        returnAssignee: { type: "agent", agentId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId,
+      authorAgentId: otherAgentId,
+      body: "@MentionedAgent can you double check this?",
+    });
+
+    const { runId } = await seedQueuedRun({
+      companyId,
+      agentId: mentionedAgentId,
+      issueId,
+      wakeReason: "issue_comment_mentioned",
+      invocationSource: "automation",
+      requestedByActorType: "agent",
+      requestedByActorId: otherAgentId,
+      wakeupCommentId: commentId,
+      contextExtras: {
+        commentId,
+        wakeCommentId: commentId,
+        source: "comment.mention",
       },
     });
 
@@ -716,6 +834,95 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       .then((rows) => rows[0] ?? null);
     expect(run?.status).toBe("succeeded");
     expect(run?.errorCode).toBeNull();
+  });
+
+  it("cancels a queued issue_commented follow-up for the old assignee once the issue is reassigned before the run starts (AUR-3217 timeline)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "OriginalCoder" });
+    const replacementAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: replacementAgentId,
+      companyId,
+      name: "ReplacementCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    const issueId = randomUUID();
+    const commentId = randomUUID();
+    // The issue is already handed off to the replacement by the time the queued run is
+    // evaluated, mirroring the Fast -> CTO -> Max handoff from AUR-3217/AUR-3243: the queued
+    // follow-up run was created while `agentId` still owned the issue, but the reassignment
+    // landed before the queued run could start.
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Reassigned after a genuine human comment",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: replacementAgentId,
+    });
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId,
+      authorUserId: "human-founder",
+      body: "Following up on this while Fast still owns it.",
+    });
+
+    const { runId, wakeupRequestId } = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_commented",
+      invocationSource: "automation",
+      requestedByActorType: "user",
+      requestedByActorId: "human-founder",
+      wakeupCommentId: commentId,
+      contextExtras: {
+        commentId,
+        wakeCommentId: commentId,
+        source: "issue.comment",
+      },
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "cancelled";
+    });
+
+    const [run, wakeup] = await Promise.all([
+      db
+        .select({
+          status: heartbeatRuns.status,
+          errorCode: heartbeatRuns.errorCode,
+          resultJson: heartbeatRuns.resultJson,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ status: agentWakeupRequests.status, error: agentWakeupRequests.error })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId))
+        .then((rows) => rows[0] ?? null),
+    ]);
+
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("issue_assignee_changed");
+    expect(run?.resultJson).toMatchObject({ stopReason: "issue_assignee_changed" });
+    expect(wakeup?.status).toBe("skipped");
+    expect(wakeup?.error).toContain("assignee changed");
+    expect(countExecuteCallsForRun(runId)).toBe(0);
   });
 
   it("baseline: runs queued runs when the issue is in_progress with the same assignee", async () => {

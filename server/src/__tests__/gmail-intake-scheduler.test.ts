@@ -92,6 +92,54 @@ describe("createGmailIntakeScheduler", () => {
     scheduler.stop();
   });
 
+  it("AUR-3118: polls every company returned by getCompanyIds each cycle", async () => {
+    vi.useFakeTimers();
+    const svc = makeIntakeSvc([
+      { mailbox: "board", processed: 1, created: 1, updated: 0, skipped: 0, errors: 0 },
+    ]);
+    const getCompanyIds = vi.fn().mockResolvedValue(["company-a", "company-b"]);
+
+    const scheduler = createGmailIntakeScheduler({
+      getCompanyIds,
+      intakeService: svc as any,
+      startupDelayMs: 1_000,
+      intervalMs: 10 * 60 * 1000,
+    });
+    scheduler.start();
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(getCompanyIds).toHaveBeenCalledTimes(1);
+    expect(svc.pollAllMailboxes).toHaveBeenCalledTimes(2);
+    expect(svc.pollAllMailboxes).toHaveBeenNthCalledWith(1, "company-a");
+    expect(svc.pollAllMailboxes).toHaveBeenNthCalledWith(2, "company-b");
+
+    scheduler.stop();
+  });
+
+  it("AUR-3118: one company's poll failure does not abort the others", async () => {
+    vi.useFakeTimers();
+    const svc = makeIntakeSvc();
+    svc.pollAllMailboxes
+      .mockRejectedValueOnce(new Error("boom"))
+      .mockResolvedValueOnce([
+        { mailbox: "board", processed: 1, created: 1, updated: 0, skipped: 0, errors: 0 },
+      ]);
+    const getCompanyIds = vi.fn().mockResolvedValue(["company-a", "company-b"]);
+
+    const scheduler = createGmailIntakeScheduler({
+      getCompanyIds,
+      intakeService: svc as any,
+      startupDelayMs: 1_000,
+      intervalMs: 10 * 60 * 1000,
+    });
+    scheduler.start();
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(svc.pollAllMailboxes).toHaveBeenCalledTimes(2); // second company still polled
+
+    scheduler.stop();
+  });
+
   it("stop() prevents further ticks from firing", async () => {
     vi.useFakeTimers();
     const svc = makeIntakeSvc();

@@ -809,6 +809,151 @@ async function createDirectCostEvent(
   return event.id;
 }
 
+// ---- Memory synthesis (AUR-948) ------------------------------------------
+// Pure clustering/gating helpers are exported so the consolidation logic can
+// be unit-tested without a database.
+
+const SYNTHESIS_STOP_WORDS = new Set([
+  "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "has",
+  "have", "in", "into", "is", "it", "its", "of", "on", "or", "that", "the",
+  "their", "this", "to", "was", "were", "with",
+]);
+
+export interface SynthesisObservation {
+  id: string;
+  title: string | null;
+  content: string;
+  metadata: Record<string, unknown>;
+  agentKey: string | null;
+  sensitivityLabel: MemorySensitivityLabel;
+  createdAt: Date;
+}
+
+export function tokenizeForSynthesis(text: string): Set<string> {
+  const tokens = new Set<string>();
+  for (const raw of text.toLowerCase().replace(/[^a-z0-9\s]+/g, " ").split(/\s+/)) {
+    if (raw.length < 3) continue;
+    if (SYNTHESIS_STOP_WORDS.has(raw)) continue;
+    tokens.add(raw);
+  }
+  return tokens;
+}
+
+export function synthesisSimilarity(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let intersection = 0;
+  for (const token of a) {
+    if (b.has(token)) intersection += 1;
+  }
+  const union = a.size + b.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+
+export interface SynthesisCluster<T extends SynthesisObservation = SynthesisObservation> {
+  members: T[];
+  tokens: Set<string>;
+}
+
+/**
+ * Greedy single-pass clustering over observations ordered oldest-first.
+ * Each observation joins the first existing cluster whose token profile is at
+ * least `similarityThreshold` similar (Jaccard over title+content tokens), or
+ * starts a new cluster. Deterministic for a given input order.
+ */
+export function clusterSynthesisObservations<T extends SynthesisObservation>(
+  observations: T[],
+  similarityThreshold: number,
+): SynthesisCluster<T>[] {
+  const ordered = [...observations].sort(
+    (left, right) => left.createdAt.getTime() - right.createdAt.getTime() || left.id.localeCompare(right.id),
+  );
+  const clusters: SynthesisCluster<T>[] = [];
+  for (const observation of ordered) {
+    const tokens = tokenizeForSynthesis(`${observation.title ?? ""} ${observation.content}`);
+    let best: SynthesisCluster<T> | null = null;
+    let bestScore = 0;
+    for (const cluster of clusters) {
+      const score = synthesisSimilarity(tokens, cluster.tokens);
+      if (score >= similarityThreshold && score > bestScore) {
+        best = cluster;
+        bestScore = score;
+      }
+    }
+    if (best) {
+      best.members.push(observation);
+      for (const token of tokens) best.tokens.add(token);
+    } else {
+      clusters.push({ members: [observation], tokens });
+    }
+  }
+  return clusters;
+}
+
+export interface SynthesisGateInput {
+  minSupport: number;
+  minDistinctAgents: number;
+  minObservationAgeDays: number;
+  now: Date;
+}
+
+export type SynthesisGateVerdict =
+  | { pass: true }
+  | { pass: false; reason: "minSupport" | "minDistinctAgents" | "minObservationAge" };
+
+export function evaluateSynthesisClusterGates(
+  cluster: SynthesisCluster,
+  gates: SynthesisGateInput,
+): SynthesisGateVerdict {
+  if (cluster.members.length < gates.minSupport) {
+    return { pass: false, reason: "minSupport" };
+  }
+  const distinctAgents = new Set(
+    cluster.members.map((member) => member.agentKey).filter((key): key is string => key !== null && key.length > 0),
+  );
+  if (distinctAgents.size < gates.minDistinctAgents) {
+    return { pass: false, reason: "minDistinctAgents" };
+  }
+  // The pattern must have persisted: its earliest observation has to be at
+  // least minObservationAgeDays old, so one burst of same-day chatter does
+  // not immediately mint a durable memory.
+  const earliest = cluster.members.reduce(
+    (min, member) => (member.createdAt < min ? member.createdAt : min),
+    cluster.members[0]!.createdAt,
+  );
+  const minAgeMs = gates.minObservationAgeDays * 24 * 60 * 60 * 1000;
+  if (gates.now.getTime() - earliest.getTime() < minAgeMs) {
+    return { pass: false, reason: "minObservationAge" };
+  }
+  return { pass: true };
+}
+
+export function renderSynthesisCandidate(cluster: SynthesisCluster, window: { since: Date; until: Date }): {
+  title: string;
+  content: string;
+  summary: string;
+} {
+  const themeTokens = [...cluster.tokens].slice(0, 6).join(" ");
+  const first = cluster.members[0]!;
+  const theme = (first.title ?? first.content.slice(0, 80)).trim();
+  const distinctAgents = new Set(cluster.members.map((m) => m.agentKey).filter(Boolean)).size;
+  const lines = cluster.members
+    .slice(0, 12)
+    .map((member) => `- ${(member.title ?? member.content.slice(0, 120)).trim()} (${member.createdAt.toISOString().slice(0, 10)})`);
+  const content = [
+    `Consolidated observation synthesized from ${cluster.members.length} accepted memory record(s) captured between ${window.since.toISOString().slice(0, 10)} and ${window.until.toISOString().slice(0, 10)} by ${distinctAgents} distinct agent(s).`,
+    "",
+    `Recurring theme: ${theme}`,
+    "",
+    "Supporting observations:",
+    ...lines,
+  ].join("\n");
+  return {
+    title: `synthesis: ${theme.slice(0, 120)}`,
+    summary: `Recurring pattern (${cluster.members.length}× / ${distinctAgents} agents): ${themeTokens}`.slice(0, 300),
+    content: content.length > 20000 ? `${content.slice(0, 19980)}\n…[truncated]` : content,
+  };
+}
+
 export function memoryService(
   db: Db,
   opts?: {
@@ -2185,6 +2330,213 @@ export function memoryService(
     return { run, recordCount };
   }
 
+  function emptySynthesisSummary(window: { since: Date; until: Date }): MemorySynthesisRunSummary {
+    return {
+      lookbackWindow: { since: window.since.toISOString(), until: window.until.toISOString() },
+      sourceRecordCount: 0,
+      clusterCount: 0,
+      candidateCount: 0,
+      skipped: {
+        minSupport: 0,
+        minDistinctAgents: 0,
+        minObservationAge: 0,
+        maxSensitivity: 0,
+        recentlyRejected: 0,
+      },
+    };
+  }
+
+  async function executeSynthesisJob(input: {
+    companyId: string;
+    runId: string;
+    binding: typeof memoryBindings.$inferSelect;
+    request: MemorySynthesisJob;
+    actor: ActorInfo;
+  }): Promise<{
+    run: Awaited<ReturnType<typeof backgroundJobsSvc.completeRun>>;
+    summary: MemorySynthesisRunSummary;
+    candidateRecordIds: string[];
+  }> {
+    await backgroundJobsSvc.startRun(input.runId);
+    const until = new Date();
+    const since = new Date(until.getTime() - input.request.lookbackDays * 24 * 60 * 60 * 1000);
+    const summary = emptySynthesisSummary({ since, until });
+    const candidateRecordIds: string[] = [];
+
+    const rows = await db
+      .select()
+      .from(memoryLocalRecords)
+      .where(
+        and(
+          eq(memoryLocalRecords.companyId, input.companyId),
+          eq(memoryLocalRecords.bindingId, input.binding.id),
+          isNull(memoryLocalRecords.deletedAt),
+          isNull(memoryLocalRecords.revokedAt),
+          eq(memoryLocalRecords.retentionState, "active"),
+          eq(memoryLocalRecords.reviewState, "accepted"),
+          gte(memoryLocalRecords.createdAt, since),
+        ),
+      )
+      .orderBy(asc(memoryLocalRecords.createdAt))
+      .limit(input.request.sourceLimit);
+
+    const maxSensitivityRank = SENSITIVITY_RANK[input.request.maxSensitivityLabel];
+    const observations: SynthesisObservation[] = [];
+    for (const row of rows) {
+      const category = typeof row.metadata?.category === "string" ? row.metadata.category : null;
+      // Never re-synthesize synthesis outputs.
+      if (category === "synthesis" || row.metadata?.generated_by === "memory.synthesis") continue;
+      if (SENSITIVITY_RANK[row.sensitivityLabel] > maxSensitivityRank) {
+        summary.skipped.maxSensitivity += 1;
+        continue;
+      }
+      observations.push({
+        id: row.id,
+        title: row.title,
+        content: row.content,
+        metadata: row.metadata ?? {},
+        agentKey: row.scopeAgentId ?? (row.createdByActorType === "agent" ? row.createdByActorId : null),
+        sensitivityLabel: row.sensitivityLabel,
+        createdAt: row.createdAt,
+      });
+    }
+    summary.sourceRecordCount = observations.length;
+
+    // Prior synthesis outputs inside the rejection lookback: rejected ones veto
+    // similar candidates; non-rejected ones make a similar candidate a duplicate.
+    const rejectionSince = new Date(until.getTime() - input.request.rejectionLookbackDays * 24 * 60 * 60 * 1000);
+    const priorSynthesisRows = input.request.rejectionLookbackDays === 0
+      ? []
+      : await db
+        .select()
+        .from(memoryLocalRecords)
+        .where(
+          and(
+            eq(memoryLocalRecords.companyId, input.companyId),
+            eq(memoryLocalRecords.bindingId, input.binding.id),
+            isNull(memoryLocalRecords.deletedAt),
+            gte(memoryLocalRecords.createdAt, rejectionSince),
+          ),
+        )
+        .orderBy(asc(memoryLocalRecords.createdAt))
+        .limit(input.request.sourceLimit);
+    const priorSynthesis = priorSynthesisRows
+      .filter((row) => row.metadata?.generated_by === "memory.synthesis" || (typeof row.metadata?.category === "string" && row.metadata.category === "synthesis"))
+      .map((row) => ({
+        rejected: row.reviewState === "rejected",
+        tokens: tokenizeForSynthesis(`${row.title ?? ""} ${row.content}`),
+      }));
+
+    const clusters = clusterSynthesisObservations(observations, input.request.similarityThreshold);
+    summary.clusterCount = clusters.length;
+
+    let processed = 0;
+    for (const cluster of clusters) {
+      processed += 1;
+      await backgroundJobsSvc.updateRunProgress(input.runId, {
+        totalItems: clusters.length,
+        processedItems: processed - 1,
+        succeededItems: candidateRecordIds.length,
+        failedItems: 0,
+        skippedItems: processed - 1 - candidateRecordIds.length,
+        currentItem: `cluster ${processed}/${clusters.length}`,
+      });
+
+      const verdict = evaluateSynthesisClusterGates(cluster, {
+        minSupport: input.request.minSupport,
+        minDistinctAgents: input.request.minDistinctAgents,
+        minObservationAgeDays: input.request.minObservationAgeDays,
+        now: until,
+      });
+      if (!verdict.pass) {
+        summary.skipped[verdict.reason] += 1;
+        continue;
+      }
+
+      const rendered = renderSynthesisCandidate(cluster, { since, until });
+      const candidateTokens = tokenizeForSynthesis(`${rendered.title} ${rendered.content}`);
+      const rejectedMatch = priorSynthesis.find(
+        (prior) => prior.rejected && synthesisSimilarity(candidateTokens, prior.tokens) >= input.request.similarityThreshold,
+      );
+      if (rejectedMatch) {
+        summary.skipped.recentlyRejected += 1;
+        continue;
+      }
+      const duplicateMatch = priorSynthesis.find(
+        (prior) => !prior.rejected && synthesisSimilarity(candidateTokens, prior.tokens) >= input.request.similarityThreshold,
+      );
+      if (duplicateMatch) {
+        await backgroundJobsSvc.appendEvent(input.runId, {
+          eventType: "checkpoint",
+          level: "info",
+          message: "Skipped synthesis candidate: near-duplicate of an existing synthesis record",
+          currentItem: `cluster ${processed}/${clusters.length}`,
+          details: { title: rendered.title, support: cluster.members.length },
+        });
+        continue;
+      }
+
+      summary.candidateCount += 1;
+      if (input.request.dryRun) continue;
+
+      const clusterSensitivity = cluster.members.reduce<MemorySensitivityLabel>(
+        (max, member) => (SENSITIVITY_RANK[member.sensitivityLabel] > SENSITIVITY_RANK[max] ? member.sensitivityLabel : max),
+        "public",
+      );
+      const captureResult = await service.capture(
+        input.companyId,
+        {
+          bindingKey: input.binding.key,
+          scope: {},
+          source: { kind: "manual_note" },
+          citation: {
+            label: "memory synthesis",
+            sourceTitle: rendered.title,
+          },
+          sensitivityLabel: clusterSensitivity,
+          title: rendered.title,
+          content: rendered.content,
+          summary: rendered.summary,
+          metadata: {
+            category: "synthesis",
+            generated_by: "memory.synthesis",
+            backgroundJobRunId: input.runId,
+            support: cluster.members.length,
+            distinct_agents: new Set(cluster.members.map((m) => m.agentKey).filter(Boolean)).size,
+            source_record_ids: cluster.members.map((member) => member.id),
+            window_since: since.toISOString(),
+            window_until: until.toISOString(),
+          },
+        },
+        input.actor,
+        "manual",
+        undefined,
+      );
+      candidateRecordIds.push(...captureResult.records.map((record) => record.id));
+      await backgroundJobsSvc.appendEvent(input.runId, {
+        eventType: "checkpoint",
+        level: "info",
+        message: `Synthesized memory record from ${cluster.members.length} observation(s)`,
+        currentItem: `cluster ${processed}/${clusters.length}`,
+        details: {
+          recordIds: captureResult.records.map((record) => record.id),
+          support: cluster.members.length,
+          title: rendered.title,
+        },
+      });
+    }
+
+    const run = await backgroundJobsSvc.completeRun(input.runId, {
+      status: "succeeded",
+      result: {
+        dryRun: input.request.dryRun,
+        summary,
+        candidateRecordIds,
+      },
+    });
+    return { run, summary, candidateRecordIds };
+  }
+
   const service = {
     providers: async () => {
       const pluginProviders = pluginMemoryProviders?.listProviders() ?? [];
@@ -3372,18 +3724,103 @@ export function memoryService(
     },
 
     startSynthesisJob: async (
-      _companyId: string,
+      companyId: string,
       data: MemorySynthesisJob,
-      _actor: ActorInfo,
-      _options?: { runInline?: boolean },
+      actor: ActorInfo,
+      options?: { runInline?: boolean },
     ): Promise<MemorySynthesisJobResult> => {
-      memorySynthesisJobSchema.parse(data);
-      // Synthesis job orchestration is owned by a sibling phase (AUR-948).
-      // The executor (resolveSynthesisBinding / executeSynthesisJob /
-      // emptySynthesisSummary) lands with that work. This stub keeps the
-      // method signature wired so callers can be typechecked, and fails
-      // fast at runtime until the synthesis pipeline ships.
-      throw new Error("memory.startSynthesisJob not implemented yet (owned by AUR-948)");
+      const parsed = memorySynthesisJobSchema.parse(data);
+      const resolvedBinding = parsed.bindingId
+        ? await getBindingOrThrow(parsed.bindingId)
+        : (await resolveBindingInternal(companyId, {}, parsed.bindingKey ?? null)).binding;
+      if (!resolvedBinding || resolvedBinding.companyId !== companyId) {
+        throw notFound("Memory binding not found");
+      }
+      const binding = resolvedBinding;
+
+      const actorFields = {
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        userId: actor.userId,
+      };
+      const job = await backgroundJobsSvc.createOrUpdateJob(
+        companyId,
+        {
+          key: "memory.synthesis",
+          jobType: "memory_synthesis",
+          displayName: "Memory synthesis",
+          description: "Consolidate recurring accepted observations into durable synthesized memory records.",
+          backendKind: "server_worker",
+          status: "active",
+          config: {
+            bindingId: binding.id,
+            lookbackDays: parsed.lookbackDays,
+            similarityThreshold: parsed.similarityThreshold,
+          },
+        },
+        actorFields,
+      );
+      const run = await backgroundJobsSvc.createRun(
+        companyId,
+        {
+          jobId: job.id,
+          trigger: parsed.trigger,
+          heartbeatRunId: actor.runId ?? null,
+          config: {
+            bindingKey: binding.key,
+            dryRun: parsed.dryRun,
+            lookbackDays: parsed.lookbackDays,
+            similarityThreshold: parsed.similarityThreshold,
+            minSupport: parsed.minSupport,
+            minDistinctAgents: parsed.minDistinctAgents,
+          },
+        },
+        actorFields,
+      );
+
+      if (options?.runInline || parsed.dryRun) {
+        const completed = await executeSynthesisJob({
+          companyId,
+          runId: run.id,
+          binding,
+          request: parsed,
+          actor,
+        });
+        return {
+          job,
+          run: completed.run,
+          dryRun: parsed.dryRun,
+          bindingId: binding.id,
+          summary: completed.summary,
+          candidateRecordIds: completed.candidateRecordIds,
+        };
+      }
+
+      const until = new Date();
+      const since = new Date(until.getTime() - parsed.lookbackDays * 24 * 60 * 60 * 1000);
+      void executeSynthesisJob({
+        companyId,
+        runId: run.id,
+        binding,
+        request: parsed,
+        actor,
+      }).catch(async (error) => {
+        await backgroundJobsSvc.completeRun(run.id, {
+          status: "failed",
+          error: error instanceof Error ? error.message : String(error),
+          result: { dryRun: parsed.dryRun },
+        }).catch(() => undefined);
+      });
+
+      return {
+        job,
+        run,
+        dryRun: parsed.dryRun,
+        bindingId: binding.id,
+        summary: emptySynthesisSummary({ since, until }),
+        candidateRecordIds: [],
+      };
     },
 
     preRunHydrate: async (input: {

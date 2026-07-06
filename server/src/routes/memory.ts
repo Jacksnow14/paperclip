@@ -31,6 +31,7 @@ import {
   memoryListRecordsQuerySchema,
   memoryQuerySchema,
   memoryRefreshJobSchema,
+  memorySynthesisJobSchema,
   memoryRetentionSweepSchema,
   memoryReviewSchema,
   memoryRevokeSchema,
@@ -639,6 +640,31 @@ export function memoryRoutes(
         jobId: result.job.id,
         dryRun: result.dryRun,
         sourceCounts: result.sourceCounts,
+      },
+    });
+    res.status(202).json(result);
+  });
+
+  // Agents may start synthesis: it only consolidates already-accepted records
+  // into the agent-mutable `synthesis` category (AUR-3072), which agents can
+  // already write directly — the job grants no new capability.
+  router.post("/companies/:companyId/memory/synthesis-jobs", validate(memorySynthesisJobSchema), async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const result = await memory.startSynthesisJob(companyId, req.body, actorInfoFromReq(req));
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      action: "memory.synthesis_job_started",
+      entityType: "background_job_run",
+      entityId: result.run.id,
+      details: {
+        jobId: result.job.id,
+        bindingId: result.bindingId,
+        dryRun: result.dryRun,
       },
     });
     res.status(202).json(result);

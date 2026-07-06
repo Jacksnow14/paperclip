@@ -1155,8 +1155,9 @@ describe("heartbeat comment wake batching", () => {
       expect(payloads).toHaveLength(2);
       expect(runs[1]?.contextSnapshot).toMatchObject({
         retryReason: "missing_issue_comment",
-        modelProfile: "cheap",
       });
+      // Recovery no longer force-pins a cheap model profile (AUR-2248).
+      expect((runs[1]?.contextSnapshot as Record<string, unknown>)?.modelProfile).toBeUndefined();
     } finally {
       gateway.releaseFirstWait();
       await gateway.close();
@@ -1357,7 +1358,8 @@ describe("heartbeat comment wake batching", () => {
           ),
       );
       expect(missingCommentRetries).toHaveLength(1);
-      expect(missingCommentRetries[0]?.payload).toMatchObject({ modelProfile: "cheap" });
+      // Recovery no longer force-pins a cheap model profile (AUR-2248).
+      expect((missingCommentRetries[0]?.payload as Record<string, unknown>)?.modelProfile).toBeUndefined();
     } finally {
       gateway.releaseFirstWait();
       await gateway.close();

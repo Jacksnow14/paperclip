@@ -208,7 +208,8 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(evaluations[0]).toMatchObject({
       priority: "medium",
       assigneeAgentId: managerId,
-      assigneeAdapterOverrides: { modelProfile: "cheap" },
+      // Recovery no longer force-pins a cheap model profile (AUR-2248).
+      assigneeAdapterOverrides: {},
       originId: runId,
       originFingerprint: `stale_active_run:${companyId}:${runId}`,
     });

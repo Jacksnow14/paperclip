@@ -2130,24 +2130,40 @@ export function resolveAdapterRunOutcome(input: {
 }): {
   outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
   reclaimedFromStaleFailure: boolean;
+  failedOnTransientLaunch: boolean;
 } {
   const adapterSucceeded =
     !input.adapterResult.timedOut &&
     (input.adapterResult.exitCode ?? 0) === 0 &&
     !input.adapterResult.errorMessage;
+  const resolve = (
+    outcome: "succeeded" | "failed" | "cancelled" | "timed_out",
+    reclaimedFromStaleFailure = false,
+  ) => ({
+    outcome,
+    reclaimedFromStaleFailure,
+    // A CLI-launch failure can surface as a returned adapter result, not only
+    // as a thrown error (which the executeRun catch blocks classify). Flag it
+    // here so the finalize path tags the run transient_upstream/
+    // adapter_cli_unresolvable and the recovery contract schedules a bounded
+    // retry instead of terminalizing real work.
+    failedOnTransientLaunch:
+      outcome === "failed" &&
+      isTransientAdapterLaunchFailureMessage(input.adapterResult.errorMessage),
+  });
   if (isHeartbeatRunTerminalStatus(input.latestRunStatus)) {
     if (input.latestRunStatus === "failed" && adapterSucceeded) {
-      return { outcome: "succeeded", reclaimedFromStaleFailure: true };
+      return resolve("succeeded", true);
     }
-    return { outcome: input.latestRunStatus, reclaimedFromStaleFailure: false };
+    return resolve(input.latestRunStatus);
   }
   if (input.adapterResult.timedOut) {
-    return { outcome: "timed_out", reclaimedFromStaleFailure: false };
+    return resolve("timed_out");
   }
   if (adapterSucceeded) {
-    return { outcome: "succeeded", reclaimedFromStaleFailure: false };
+    return resolve("succeeded");
   }
-  return { outcome: "failed", reclaimedFromStaleFailure: false };
+  return resolve("failed");
 }
 
 export function buildPaperclipTaskMarkdown(input: {
@@ -7969,6 +7985,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterResult,
       });
       const outcome = resolvedOutcome.outcome;
+      const failedOnTransientLaunch = resolvedOutcome.failedOnTransientLaunch;
       const runErrorMessage =
         outcome === "cancelled"
           ? (latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
@@ -7984,7 +8001,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           : outcome === "cancelled"
             ? (latestRun?.errorCode ?? "cancelled")
             : outcome === "failed"
-              ? (adapterResult.errorCode ?? "adapter_failed")
+              ? failedOnTransientLaunch
+                ? ADAPTER_CLI_UNRESOLVABLE_ERROR_CODE
+                : (adapterResult.errorCode ?? "adapter_failed")
               : null;
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
@@ -8037,7 +8056,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           resultJson: mergeModelProfileRunMetadata(
             mergeAdapterRecoveryMetadata({
               resultJson: adapterResult.resultJson ?? null,
-              errorFamily: adapterResult.errorFamily ?? null,
+              errorFamily:
+                adapterResult.errorFamily ?? (failedOnTransientLaunch ? "transient_upstream" : null),
               retryNotBefore: adapterResult.retryNotBefore ?? null,
             }),
             modelProfileApplication,

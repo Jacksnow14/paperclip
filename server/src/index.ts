@@ -703,6 +703,14 @@ export async function startServer(): Promise<StartedServer> {
       return rows[0]?.id;
     };
 
+    // AUR-3118: return every company so multi-tenant schedulers (e.g. Gmail
+    // intake) poll all of them. `getFirstCompanyId` (LIMIT 1, no ORDER BY)
+    // silently starved every company but one on a shared server.
+    const getAllCompanyIds = async (): Promise<string[]> => {
+      const rows = await (db as any).select({ id: companies.id }).from(companies);
+      return rows.map((r: { id: string }) => r.id);
+    };
+
     // AUR-1735: resolve artifact-retention from instance settings each tick so
     // operator changes take effect without a server restart. Falls back to the
     // dormant baseline (CI/dev) or the prod-default activation overlay (prod).
@@ -863,7 +871,7 @@ export async function startServer(): Promise<StartedServer> {
         const { createGmailIntakeScheduler } = await import("./services/gmail-intake-scheduler.js");
         const intakeSvc = createGmailIntakeService(db as any);
         createGmailIntakeScheduler({
-          getCompanyId: getFirstCompanyId,
+          getCompanyIds: getAllCompanyIds,
           intakeService: intakeSvc,
           startupDelayMs: 60_000,
           intervalMs: config.gmailIntakePollerIntervalMs,

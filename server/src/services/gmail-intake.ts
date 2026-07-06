@@ -1,7 +1,7 @@
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, gmailIntakeRecords, issues } from "@paperclipai/db";
-import type { IssueCommentMetadata } from "@paperclipai/shared";
+import type { IssueCommentMetadata, IssueCommentMetadataSection } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 import { createGmailService, GMAIL_SUPPORTED_ALIASES, type GmailAlias } from "./gmail.js";
 import { issueService } from "./issues.js";
@@ -424,7 +424,7 @@ function buildGmailReferenceMetadata(
   parsed: ParsedMessage,
   opts: { includeSubject?: boolean } = {},
 ): IssueCommentMetadata {
-  const rows: IssueCommentMetadata["sections"][number]["rows"] = [
+  const rows: IssueCommentMetadataSection["rows"] = [
     { type: "key_value", label: "Mailbox", value: `${mailbox}@tryauranode.com` },
     { type: "key_value", label: "From", value: sanitizeHeaderValue(parsed.from) || "(unknown)" },
   ];

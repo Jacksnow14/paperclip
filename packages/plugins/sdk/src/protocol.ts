@@ -473,6 +473,20 @@ export interface PluginRenderCloseEvent {
  * on a worker. Used by both the host dispatcher and the worker handler to
  * ensure type safety across the IPC boundary.
  */
+
+/**
+ * Host→worker invocation of a plugin-declared memory provider
+ * (`manifest.memoryProviders`). `input` and the result carry the
+ * MemoryProvider{Query,Capture,Forget}{Input,Output} contracts from
+ * `@paperclipai/shared` — typed as `unknown` here so the SDK stays
+ * dependency-free; the host validates both sides.
+ */
+export interface InvokeMemoryProviderParams {
+  providerKey: string;
+  action: "query" | "capture" | "forget";
+  input: unknown;
+}
+
 export interface HostToWorkerMethods {
   /** @see PLUGIN_SPEC.md §13.1 */
   initialize: [params: InitializeParams, result: InitializeResult];
@@ -530,6 +544,8 @@ export interface HostToWorkerMethods {
     params: PluginEnvironmentExecuteParams,
     result: PluginEnvironmentExecuteResult,
   ];
+  /** Invoke a manifest-declared memory provider (optional; only for plugins declaring `memoryProviders`). */
+  invokeMemoryProvider: [params: InvokeMemoryProviderParams, result: unknown];
 }
 
 /** Union of all host→worker method names. */

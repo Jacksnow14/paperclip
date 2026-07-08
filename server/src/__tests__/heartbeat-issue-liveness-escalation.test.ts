@@ -369,7 +369,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(escalations[0]).toMatchObject({
       parentId: blockerIssueId,
       assigneeAgentId: managerId,
-      assigneeAdapterOverrides: { modelProfile: "cheap" },
+      assigneeAdapterOverrides: {},
       status: expect.stringMatching(/^(todo|in_progress|done)$/),
       originFingerprint: [
         "harness_liveness_leaf",
@@ -618,7 +618,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       executionWorkspaceId: null,
       executionWorkspacePreference: null,
       assigneeAgentId: managerId,
-      assigneeAdapterOverrides: { modelProfile: "cheap" },
+      assigneeAdapterOverrides: {},
     });
   });
 

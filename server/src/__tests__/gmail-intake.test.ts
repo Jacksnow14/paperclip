@@ -532,7 +532,7 @@ describe("sender-based routing: Google Payments → CFO", () => {
     );
   });
 
-  it("forwards the email to adrian@ when sender matches a route with forwardTo", async () => {
+  it("does not forward google payments/workspace routes now that adrian@ is a board@ alias", async () => {
     const msg = makeGooglePaymentsMessage("msg-fwd1", "thread-fwd1");
     mockListMessages.mockResolvedValue({ messages: [{ id: "msg-fwd1" }] });
     mockGetMessage.mockResolvedValue(msg);
@@ -544,13 +544,7 @@ describe("sender-based routing: Google Payments → CFO", () => {
     const svc = createGmailIntakeService(db);
     await svc.processMailbox(COMPANY_ID, "board");
 
-    expect(mockSendMessage).toHaveBeenCalledWith(
-      "board",
-      expect.objectContaining({
-        to: "adrian@tryauranode.com",
-        subject: expect.stringContaining("Fwd:"),
-      }),
-    );
+    expect(mockSendMessage).not.toHaveBeenCalled();
   });
 
   it("does not forward when sender does not match any route", async () => {
@@ -567,22 +561,5 @@ describe("sender-based routing: Google Payments → CFO", () => {
     await svc.processMailbox(COMPANY_ID, "board");
 
     expect(mockSendMessage).not.toHaveBeenCalled();
-  });
-
-  it("does not crash when forwarding fails", async () => {
-    const msg = makeGooglePaymentsMessage("msg-fwdfail", "thread-fwdfail");
-    mockListMessages.mockResolvedValue({ messages: [{ id: "msg-fwdfail" }] });
-    mockGetMessage.mockResolvedValue(msg);
-    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
-    mockModifyMessageLabels.mockResolvedValue({});
-    mockIssueCreate.mockResolvedValue({ id: "issue-fwdfail" });
-    mockSendMessage.mockRejectedValueOnce(new Error("send failed"));
-
-    const db = makeAgentLookupDb();
-    const svc = createGmailIntakeService(db);
-    const result = await svc.processMailbox(COMPANY_ID, "board");
-
-    expect(result.created).toBe(1);
-    expect(result.errors).toBe(0);
   });
 });

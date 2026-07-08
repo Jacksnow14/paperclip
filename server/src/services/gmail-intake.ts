@@ -19,8 +19,8 @@ const SENDER_ROUTES: Array<{
   targetRole: string;
   forwardTo?: string;
 }> = [
-  { senderMatch: "payments-noreply@google.com", targetRole: "cfo", forwardTo: "adrian@tryauranode.com" },
-  { senderMatch: "workspace-noreply@google.com", targetRole: "cfo", forwardTo: "adrian@tryauranode.com" },
+  { senderMatch: "payments-noreply@google.com", targetRole: "cfo" },
+  { senderMatch: "workspace-noreply@google.com", targetRole: "cfo" },
 ];
 
 // Gmail label names applied by the intake pipeline.

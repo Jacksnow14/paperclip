@@ -37,6 +37,7 @@ const permissionLabels: Record<PermissionKey, string> = {
   "tasks:comment_cross_issue": "Comment on any issue",
   "joins:approve": "Approve join requests",
   "environments:manage": "Manage environments",
+  "routines:manage": "Manage routines",
 };
 
 function formatGrantSummary(member: CompanyMember) {

@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
   applyPaperclipWorkspaceEnv,
   appendWithByteCap,
+  augmentPathWithUserLocalDirs,
   buildInvocationEnvForLogs,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   ensureCommandResolvable,
@@ -1003,5 +1004,45 @@ describe("appendWithByteCap", () => {
     expect(output).not.toContain("\uFFFD");
     expect(Buffer.from(output, "utf8").toString("utf8")).toBe(output);
     expect(Buffer.byteLength(output, "utf8")).toBeLessThanOrEqual(7);
+  });
+});
+
+describe("augmentPathWithUserLocalDirs", () => {
+  const fakeHome = "/home/testuser";
+  const localBin = path.join(fakeHome, ".local", "bin");
+
+  it("prepends ~/.local/bin when it is absent from PATH", () => {
+    const result = augmentPathWithUserLocalDirs(
+      { PATH: "/usr/local/bin:/usr/bin:/bin" },
+      fakeHome,
+    );
+    const segments = (result.PATH ?? "").split(path.delimiter);
+    expect(segments[0]).toBe(localBin);
+    expect(segments).toContain("/usr/local/bin");
+  });
+
+  it("does not duplicate ~/.local/bin when already present", () => {
+    const original = `${localBin}:/usr/local/bin:/usr/bin:/bin`;
+    const result = augmentPathWithUserLocalDirs({ PATH: original }, fakeHome);
+    expect(result.PATH).toBe(original);
+  });
+
+  it("prepends ~/.local/bin when PATH is empty", () => {
+    const result = augmentPathWithUserLocalDirs({ PATH: "" }, fakeHome);
+    const segments = (result.PATH ?? "").split(path.delimiter).filter(Boolean);
+    expect(segments[0]).toBe(localBin);
+  });
+
+  it("prepends ~/.local/bin when PATH is absent", () => {
+    const result = augmentPathWithUserLocalDirs({}, fakeHome);
+    const segments = (result.PATH ?? "").split(path.delimiter).filter(Boolean);
+    expect(segments[0]).toBe(localBin);
+  });
+
+  it("uses os.homedir() when no homeDir override is provided", () => {
+    const result = augmentPathWithUserLocalDirs({ PATH: "/usr/bin" });
+    const expectedLocalBin = path.join(os.homedir(), ".local", "bin");
+    const segments = (result.PATH ?? "").split(path.delimiter);
+    expect(segments[0]).toBe(expectedLocalBin);
   });
 });

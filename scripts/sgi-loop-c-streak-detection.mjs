@@ -57,20 +57,35 @@ const asArray = (d, key) => (Array.isArray(d) ? d : (d && d[key]) || []);
 async function fetchAllRecords() {
   // Paginate via offset until a short page is returned, deduping by record id
   // (offset paging can repeat a row if records are inserted mid-scan).
+  // NOTE: this deployment's memory API caps `limit` at 1000, IGNORES `offset`,
+  // and returns records newest-first with no cursor. Offset paging therefore
+  // yields the SAME newest page every time — the old `page.length < SCAN_LIMIT`
+  // break condition never fires once the corpus exceeds 1000, causing an
+  // infinite loop. We instead stop as soon as a page adds ZERO new records
+  // (dedup by id). This is correct for Loop C: records are newest-first and we
+  // only ever need the 3 most-recent scorecards per bucket, all of which live
+  // in the newest page. It also still terminates correctly if a future API
+  // build starts honoring `offset`. Tracked as an infra gap (see retro/memory).
   const byId = new Map();
   let offset = 0;
+  let guard = 0;
   for (;;) {
     const data = await apiFetch(
       `/api/companies/${COMPANY_ID}/memory/records?limit=${SCAN_LIMIT}&offset=${offset}`,
     );
     if (data._notFound) break;
     const page = asArray(data, 'records');
+    let added = 0;
     for (const r of page) {
       const id = r.id ?? r._id ?? `${r.title}|${r.createdAt || r.created_at || ''}`;
-      if (!byId.has(id)) byId.set(id, r);
+      if (!byId.has(id)) { byId.set(id, r); added += 1; }
     }
+    // Stop on a short page (offset honored, corpus exhausted) OR when a full
+    // page contributed nothing new (offset ignored → same newest page again).
     if (page.length < SCAN_LIMIT) break;
+    if (added === 0) break;
     offset += SCAN_LIMIT;
+    if (++guard > 100) break; // hard backstop against any runaway
   }
   return [...byId.values()];
 }

@@ -4913,6 +4913,72 @@ export function issueService(db: Db) {
         };
       }),
 
+    // Agent-facing counterpart to adminForceRelease: any company agent may
+    // reconcile a checkout/execution lock, but only when the run(s) backing
+    // it are terminal or missing. A still-live run keeps this a board/
+    // override-only takeover (see hasActiveCheckoutManagementOverride).
+    staleLockReconcile: async (id: string, options: { clearAssignee?: boolean } = {}) =>
+      db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
+        );
+        const existing = await tx
+          .select({
+            id: issues.id,
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(eq(issues.id, id))
+          .then((rows) => rows[0] ?? null);
+        if (!existing) return { outcome: "not_found" as const };
+        if (!existing.checkoutRunId && !existing.executionRunId) {
+          return { outcome: "no_lock" as const };
+        }
+
+        const [checkoutStale, executionStale] = await Promise.all([
+          existing.checkoutRunId ? isTerminalOrMissingHeartbeatRun(existing.checkoutRunId) : true,
+          existing.executionRunId ? isTerminalOrMissingHeartbeatRun(existing.executionRunId) : true,
+        ]);
+        if (!checkoutStale || !executionStale) {
+          return {
+            outcome: "live" as const,
+            checkoutRunId: existing.checkoutRunId,
+            executionRunId: existing.executionRunId,
+          };
+        }
+
+        const patch: Partial<typeof issues.$inferInsert> = {
+          status: "todo",
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: new Date(),
+        };
+        if (options.clearAssignee) {
+          patch.assigneeAgentId = null;
+        }
+
+        const updated = await tx
+          .update(issues)
+          .set(patch)
+          .where(eq(issues.id, id))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!updated) return { outcome: "not_found" as const };
+
+        const [enriched] = await withIssueLabels(tx, [updated]);
+        return {
+          outcome: "reconciled" as const,
+          issue: enriched,
+          previous: {
+            checkoutRunId: existing.checkoutRunId,
+            executionRunId: existing.executionRunId,
+          },
+        };
+      }),
+
     listLabels: (companyId: string) =>
       db.select().from(labels).where(eq(labels.companyId, companyId)).orderBy(asc(labels.name), asc(labels.id)),
 

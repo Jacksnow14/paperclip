@@ -213,6 +213,245 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     });
   });
 
+  it("lets a non-assignee agent reconcile a lock whose checkout run is terminal", async () => {
+    const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId,
+      name: "OtherAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const otherRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: otherRunId,
+      companyId,
+      agentId: otherAgentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(),
+    });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Stale lock reconcile",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: failedRunId,
+      executionRunId: failedRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, otherAgentId, otherRunId)))
+      .post(`/api/issues/${issueId}/reconcile-lock`)
+      .send();
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toMatchObject({
+      id: issueId,
+      status: "todo",
+      checkoutRunId: null,
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+    });
+    expect(res.body.assigneeAgentId).toBe(agentId);
+
+    const audit = await db
+      .select({ action: activityLog.action, actorId: activityLog.actorId, details: activityLog.details })
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.stale_lock_reconciled"))
+      .then((rows) => rows[0]);
+    expect(audit).toMatchObject({
+      action: "issue.stale_lock_reconciled",
+      actorId: otherAgentId,
+      details: {
+        issueId,
+        actorAgentId: otherAgentId,
+        prevCheckoutRunId: failedRunId,
+        prevExecutionRunId: failedRunId,
+        clearAssignee: false,
+      },
+    });
+  });
+
+  it("rejects a non-assignee agent reconcile attempt when the checkout run is still live", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId,
+      name: "OtherAgent2",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const otherRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: otherRunId,
+      companyId,
+      agentId: otherAgentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(),
+    });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Live lock reconcile attempt",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, otherAgentId, otherRunId)))
+      .post(`/api/issues/${issueId}/reconcile-lock`)
+      .send();
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+
+    const row = await db
+      .select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+    });
+  });
+
+  it("no-ops without crashing when reconciling an issue that has no lock at all", async () => {
+    const { companyId, agentId } = await seedCompanyAgentAndRuns();
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId,
+      name: "OtherAgent3",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const otherRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: otherRunId,
+      companyId,
+      agentId: otherAgentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(),
+    });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "No lock to reconcile",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+
+    const res = await request(createApp(agentActor(companyId, otherAgentId, otherRunId)))
+      .post(`/api/issues/${issueId}/reconcile-lock`)
+      .send();
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toMatchObject({ id: issueId, status: "todo", assigneeAgentId: agentId });
+
+    const audit = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.stale_lock_reconciled"))
+      .then((rows) => rows[0]);
+    expect(audit).toBeUndefined();
+  });
+
+  it("still allows a mention-woken non-assignee to post a handoff comment", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const mentionedAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: mentionedAgentId,
+      companyId,
+      name: "MentionedAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Mention wake handoff",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    await db.insert(issueComments).values({
+      id: randomUUID(),
+      issueId,
+      companyId,
+      authorAgentId: agentId,
+      body: `Looping in [@MentionedAgent](agent://${mentionedAgentId}) for context`,
+      mentionedAgentIds: [mentionedAgentId],
+    });
+
+    const mentionedRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: mentionedRunId,
+      companyId,
+      agentId: mentionedAgentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, mentionedAgentId, mentionedRunId)))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "Handoff notes for you." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+  });
+
   it("restricts admin force-release to board users with company access and writes an audit event", async () => {
     const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
     const issueId = randomUUID();

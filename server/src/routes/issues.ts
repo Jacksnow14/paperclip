@@ -4019,6 +4019,70 @@ export function issueRoutes(
     res.json(released);
   });
 
+  // Agent-facing stale-lock reconcile (AUR-3534): unlike /release (owner-only)
+  // and /admin/force-release (board-only), this lets ANY company agent clear a
+  // checkout/execution lock left behind by a dead run without board
+  // involvement — but only when that run is actually terminal/missing. A
+  // still-live lock is a live takeover, which stays board/override-gated via
+  // /admin/force-release or hasActiveCheckoutManagementOverride.
+  router.post("/issues/:id/reconcile-lock", async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await svc.getById(id);
+    if (!existing) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, existing.companyId);
+    if (req.actor.type !== "agent" || !req.actor.agentId) {
+      res.status(403).json({ error: "Agent authentication required" });
+      return;
+    }
+    const actorAgentId = req.actor.agentId;
+
+    const clearAssignee = req.query.clearAssignee === "true";
+    const result = await svc.staleLockReconcile(id, { clearAssignee });
+    if (result.outcome === "not_found") {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    if (result.outcome === "live") {
+      res.status(409).json({
+        error: "Checkout lock run is still live",
+        details: {
+          issueId: id,
+          checkoutRunId: result.checkoutRunId,
+          executionRunId: result.executionRunId,
+        },
+      });
+      return;
+    }
+    if (result.outcome === "no_lock") {
+      res.json(existing);
+      return;
+    }
+
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: result.issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "issue.stale_lock_reconciled",
+      entityType: "issue",
+      entityId: result.issue.id,
+      details: {
+        issueId: result.issue.id,
+        actorAgentId,
+        prevCheckoutRunId: result.previous.checkoutRunId,
+        prevExecutionRunId: result.previous.executionRunId,
+        clearAssignee,
+      },
+    });
+
+    res.json(result.issue);
+  });
+
   router.post("/issues/:id/admin/force-release", async (req, res) => {
     if (req.actor.type !== "board") {
       res.status(403).json({ error: "Board access required" });

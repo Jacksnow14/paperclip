@@ -228,6 +228,7 @@ export interface IssueFilters {
   originKind?: string;
   originKindPrefix?: string;
   originId?: string;
+  identifiers?: string[];
   includeRoutineExecutions?: boolean;
   excludeRoutineExecutions?: boolean;
   includePluginOperations?: boolean;
@@ -3477,6 +3478,9 @@ export function issueService(db: Db) {
         conditions.push(eq(issues.executionWorkspaceId, filters.executionWorkspaceId));
       }
       if (filters?.parentId) conditions.push(eq(issues.parentId, filters.parentId));
+      if (filters?.identifiers && filters.identifiers.length > 0) {
+        conditions.push(inArray(issues.identifier, filters.identifiers));
+      }
       if (filters?.originKind) conditions.push(eq(issues.originKind, filters.originKind));
       if (filters?.originKindPrefix) conditions.push(like(issues.originKind, `${filters.originKindPrefix}%`));
       if (filters?.originId) conditions.push(eq(issues.originId, filters.originId));

@@ -5,6 +5,7 @@ const mockMessagesList = vi.fn();
 const mockMessagesGet = vi.fn();
 const mockMessagesSend = vi.fn();
 const mockMessagesModify = vi.fn();
+const mockAttachmentsGet = vi.fn();
 const mockThreadsList = vi.fn();
 const mockThreadsGet = vi.fn();
 const mockLabelsList = vi.fn();
@@ -18,6 +19,9 @@ const mockGmailFactory = vi.fn(() => ({
       get: mockMessagesGet,
       send: mockMessagesSend,
       modify: mockMessagesModify,
+      attachments: {
+        get: mockAttachmentsGet,
+      },
     },
     threads: {
       list: mockThreadsList,
@@ -197,6 +201,35 @@ describe("createGmailService", () => {
     });
   });
 
+  describe("getAttachment", () => {
+    it("calls gmail.users.messages.attachments.get and returns data + dataBase64", async () => {
+      const base64url = Buffer.from("hello attachment").toString("base64url");
+      mockAttachmentsGet.mockResolvedValue({ data: { size: 17, data: base64url } });
+      const service = createGmailService();
+      const result = await service.getAttachment("board", "msg1", "att1");
+
+      expect(mockAttachmentsGet).toHaveBeenCalledWith({
+        userId: "me",
+        messageId: "msg1",
+        id: "att1",
+      });
+      expect(result.attachmentId).toBe("att1");
+      expect(result.size).toBe(17);
+      expect(result.data).toBe(base64url);
+      expect(Buffer.from(result.dataBase64, "base64").toString("utf-8")).toBe("hello attachment");
+    });
+
+    it("returns empty strings when the response has no data", async () => {
+      mockAttachmentsGet.mockResolvedValue({ data: {} });
+      const service = createGmailService();
+      const result = await service.getAttachment("board", "msg1", "att1");
+
+      expect(result.data).toBe("");
+      expect(result.dataBase64).toBe("");
+      expect(result.size).toBe(0);
+    });
+  });
+
   describe("sendMessage", () => {
     it("sends with base64url-encoded raw message", async () => {
       mockMessagesSend.mockResolvedValue({ data: { id: "sent1" } });
@@ -310,6 +343,107 @@ describe("createGmailService", () => {
       const decoded = Buffer.from(callArgs.requestBody.raw, "base64url").toString("utf-8");
       expect(decoded).toContain("References: <orig-msg-id@mail.gmail.com>");
     });
+
+    it("includes Cc and Reply-To headers when provided", async () => {
+      mockMessagesSend.mockResolvedValue({ data: { id: "sent1" } });
+      const service = createGmailService();
+      await service.sendMessage("board", {
+        to: "user@example.com",
+        subject: "Hello",
+        body: "World",
+        cc: ["cc1@example.com", "cc2@example.com"],
+        replyTo: "replies@example.com",
+      });
+
+      const callArgs = mockMessagesSend.mock.calls[0][0];
+      const decoded = Buffer.from(callArgs.requestBody.raw, "base64url").toString("utf-8");
+      expect(decoded).toContain("Cc: cc1@example.com, cc2@example.com");
+      expect(decoded).toContain("Reply-To: replies@example.com");
+    });
+
+    it("builds a multipart/mixed message with an attachment part", async () => {
+      mockMessagesSend.mockResolvedValue({ data: { id: "sent1" } });
+      const service = createGmailService();
+      const contentBase64 = Buffer.from("file contents").toString("base64");
+      await service.sendMessage("board", {
+        to: "user@example.com",
+        subject: "Hello",
+        body: "See attached",
+        attachments: [{ filename: "note.txt", mimeType: "text/plain", contentBase64 }],
+      });
+
+      const callArgs = mockMessagesSend.mock.calls[0][0];
+      const decoded = Buffer.from(callArgs.requestBody.raw, "base64url").toString("utf-8");
+      expect(decoded).toContain("Content-Type: multipart/mixed; boundary=");
+      expect(decoded).toContain("Content-Disposition: attachment; filename=\"note.txt\"");
+      expect(decoded).toContain("Content-Transfer-Encoding: base64");
+      expect(decoded).toContain(contentBase64);
+      expect(decoded).toContain("See attached");
+    });
+
+    it("rejects an attachment over the size cap with a 400", async () => {
+      const service = createGmailService();
+      const oversized = "a".repeat(34_000_001);
+      await expect(
+        service.sendMessage("board", {
+          to: "user@example.com",
+          subject: "Hello",
+          body: "World",
+          attachments: [{ filename: "big.bin", mimeType: "application/octet-stream", contentBase64: oversized }],
+        }),
+      ).rejects.toMatchObject({ status: 400 });
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+    });
+
+    it("allows an ordinary send with no gated signals", async () => {
+      mockMessagesSend.mockResolvedValue({ data: { id: "sent1" } });
+      const service = createGmailService();
+      await expect(
+        service.sendMessage("board", { to: "customer@example.com", subject: "Hi", body: "Hi" }),
+      ).resolves.toEqual({ id: "sent1" });
+    });
+
+    it("blocks a gated outbound (fraud report) at the service chokepoint without an approval", async () => {
+      const service = createGmailService();
+      await expect(
+        service.sendMessage("board", {
+          to: "report@bunq.com",
+          subject: "Fraud report",
+          body: "We are reporting an account takeover.",
+        }),
+      ).rejects.toMatchObject({ name: "GmailOutboundBlockedError" });
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+    });
+
+    it("allows a gated outbound when the caller has verified approval", async () => {
+      mockMessagesSend.mockResolvedValue({ data: { id: "sent1" } });
+      const service = createGmailService();
+      await expect(
+        service.sendMessage(
+          "board",
+          {
+            to: "report@bunq.com",
+            subject: "Fraud report",
+            body: "We are reporting an account takeover.",
+          },
+          { approvalVerified: true },
+        ),
+      ).resolves.toEqual({ id: "sent1" });
+      expect(mockMessagesSend).toHaveBeenCalledOnce();
+    });
+
+    it("blocks a gated cc recipient even when the primary `to` is benign", async () => {
+      const service = createGmailService();
+      await expect(
+        service.sendMessage("board", {
+          to: "customer@example.com",
+          cc: "legal@shopify.com",
+          subject: "FYI",
+          body: "See attached.",
+        }),
+      ).rejects.toMatchObject({ name: "GmailOutboundBlockedError" });
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+    });
   });
 
   describe("replyInThread", () => {
@@ -404,6 +538,83 @@ describe("createGmailService", () => {
       await expect(
         service.replyInThread("board", { body: "Reply" } as never),
       ).rejects.toThrow("replyInThread requires replyToMessageId or threadId");
+    });
+
+    it("threads cc, replyTo, and attachments through to sendMessage", async () => {
+      mockMessagesGet.mockResolvedValue({
+        data: {
+          id: "msg1",
+          threadId: "thread42",
+          payload: {
+            headers: [
+              { name: "Message-ID", value: "<orig@mail.gmail.com>" },
+              { name: "Subject", value: "Hi" },
+              { name: "From", value: "jane@example.com" },
+            ],
+          },
+        },
+      });
+      mockMessagesSend.mockResolvedValue({ data: { id: "reply1" } });
+      const service = createGmailService();
+      const contentBase64 = Buffer.from("attachment").toString("base64");
+      await service.replyInThread("board", {
+        replyToMessageId: "msg1",
+        body: "Reply body",
+        cc: "cc@example.com",
+        replyTo: "replies@example.com",
+        attachments: [{ filename: "a.txt", mimeType: "text/plain", contentBase64 }],
+      });
+
+      const callArgs = mockMessagesSend.mock.calls[0][0];
+      const decoded = Buffer.from(callArgs.requestBody.raw, "base64url").toString("utf-8");
+      expect(decoded).toContain("Cc: cc@example.com");
+      expect(decoded).toContain("Reply-To: replies@example.com");
+      expect(decoded).toContain("Content-Disposition: attachment; filename=\"a.txt\"");
+    });
+
+    it("threads the outbound guard context through to sendMessage — blocks a gated reply without approval", async () => {
+      mockMessagesGet.mockResolvedValue({
+        data: {
+          id: "msg1",
+          threadId: "thread42",
+          payload: {
+            headers: [{ name: "Subject", value: "Hi" }, { name: "From", value: "report@bunq.com" }],
+          },
+        },
+      });
+      const service = createGmailService();
+      await expect(
+        service.replyInThread("board", {
+          replyToMessageId: "msg1",
+          body: "We are reporting an account takeover.",
+        }),
+      ).rejects.toMatchObject({ name: "GmailOutboundBlockedError" });
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+    });
+
+    it("allows a gated reply when approvalVerified is passed through", async () => {
+      mockMessagesGet.mockResolvedValue({
+        data: {
+          id: "msg1",
+          threadId: "thread42",
+          payload: {
+            headers: [{ name: "Subject", value: "Hi" }, { name: "From", value: "report@bunq.com" }],
+          },
+        },
+      });
+      mockMessagesSend.mockResolvedValue({ data: { id: "reply1" } });
+      const service = createGmailService();
+      await expect(
+        service.replyInThread(
+          "board",
+          {
+            replyToMessageId: "msg1",
+            body: "We are reporting an account takeover.",
+          },
+          { approvalVerified: true },
+        ),
+      ).resolves.toEqual({ id: "reply1" });
+      expect(mockMessagesSend).toHaveBeenCalledOnce();
     });
   });
 

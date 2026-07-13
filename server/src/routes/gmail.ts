@@ -1,23 +1,39 @@
-import { Router } from "express";
+import { Router, type Request } from "express";
 import { z } from "zod";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { gmailIntakeRecords } from "@paperclipai/db";
+import { approvals, gmailIntakeRecords } from "@paperclipai/db";
 import { validate } from "../middleware/validate.js";
 import { assertCompanyAccess } from "./authz.js";
-import { badRequest, unprocessable } from "../errors.js";
+import { badRequest, forbidden, unprocessable } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 import {
   createGmailService,
   isSupportedGmailAlias,
   GMAIL_SUPPORTED_ALIASES,
+  type GmailSendGuardContext,
 } from "../services/gmail.js";
+import { GmailOutboundBlockedError, type GmailOutboundDecision } from "../services/gmail-outbound-guard.js";
 import { createGmailIntakeService } from "../services/gmail-intake.js";
+import { issueService } from "../services/index.js";
+
+const attachmentInputSchema = z.object({
+  filename: z.string().min(1),
+  mimeType: z.string().min(1),
+  contentBase64: z.string().min(1),
+});
+
+const ccSchema = z.union([z.string(), z.array(z.string())]).optional();
 
 const sendMessageBodySchema = z.object({
   to: z.string().email(),
   subject: z.string().min(1),
   body: z.string().min(1),
   replyToMessageId: z.string().optional(),
+  cc: ccSchema,
+  replyTo: z.string().email().optional(),
+  attachments: z.array(attachmentInputSchema).optional(),
+  ceoApprovalId: z.string().optional(),
 });
 
 const replyBodySchema = z
@@ -25,6 +41,10 @@ const replyBodySchema = z
     replyToMessageId: z.string().optional(),
     threadId: z.string().optional(),
     body: z.string().min(1),
+    cc: ccSchema,
+    replyTo: z.string().email().optional(),
+    attachments: z.array(attachmentInputSchema).optional(),
+    ceoApprovalId: z.string().optional(),
   })
   .refine((v) => Boolean(v.replyToMessageId || v.threadId), {
     message: "replyToMessageId or threadId is required",
@@ -57,6 +77,66 @@ function parseListQuery(raw: Record<string, unknown>) {
     throw badRequest("maxResults must be an integer between 1 and 500");
   }
   return { query: q, maxResults, pageToken };
+}
+
+// AUR-2525/AUR-3523: an attached ceoApprovalId only counts as verification for
+// the outbound guard if it resolves to an `approved` approvals row scoped to
+// this company. Anything else (missing, pending, wrong company) is treated as
+// unverified and the service-layer chokepoint in sendMessage() decides
+// whether that matters (i.e. whether this particular send is actually gated).
+async function verifyCeoApproval(
+  db: Db,
+  companyId: string,
+  ceoApprovalId: string | undefined,
+): Promise<GmailSendGuardContext> {
+  const approvalId = ceoApprovalId?.trim();
+  if (!approvalId) return {};
+  const approval = await db
+    .select()
+    .from(approvals)
+    .where(and(eq(approvals.id, approvalId), eq(approvals.companyId, companyId)))
+    .then((rows) => rows[0] ?? null);
+  return { approvalVerified: approval?.status === "approved" };
+}
+
+// Fire-and-forget: file a high-priority incident issue assigned to the
+// calling agent so a blocked gated send doesn't just silently vanish.
+function fileBlockedSendIncident(
+  db: Db,
+  companyId: string,
+  req: Request,
+  mailbox: string,
+  context: { to?: string; replyToMessageId?: string; threadId?: string },
+  decision: GmailOutboundDecision,
+) {
+  const callerAgentId = req.actor.type === "agent" ? (req.actor.agentId ?? null) : null;
+  if (!callerAgentId) return;
+  const target = context.to
+    ? `to ${context.to}`
+    : `replying in ${context.replyToMessageId ? `message ${context.replyToMessageId}` : `thread ${context.threadId}`}`;
+  issueService(db)
+    .create(companyId, {
+      title: `BLOCKED: outbound ${decision.category ?? "report"} from ${mailbox}@ ${target}`,
+      description:
+        `## Gmail outbound guardrail triggered (AUR-2525)\n\n` +
+        `**Mailbox:** ${mailbox}@tryauranode.com\n` +
+        `**Target:** ${target}\n` +
+        `**Classification:** ${decision.category}\n` +
+        `**Signals:** ${decision.reasons.join(", ")}\n\n` +
+        `The send was hard-blocked. To proceed:\n` +
+        `1. Verify this is a legitimate report (check memory / prior board decisions).\n` +
+        `2. Create a board approval via \`POST /api/companies/{co}/approvals\` with type \`request_board_approval\`.\n` +
+        `3. After CEO approves, re-send with \`ceoApprovalId\` in the request body.`,
+      priority: "high",
+      status: "todo",
+      assigneeAgentId: callerAgentId,
+    })
+    .catch((err: unknown) => {
+      logger.error(
+        { err, mailbox, target },
+        "gmail-guard: failed to create blocked-send incident issue",
+      );
+    });
 }
 
 export function gmailRoutes(db: Db) {
@@ -98,6 +178,21 @@ export function gmailRoutes(db: Db) {
     },
   );
 
+  router.get(
+    "/companies/:companyId/gmail/mailboxes/:mailbox/messages/:messageId/attachments/:attachmentId",
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      const mailbox = req.params.mailbox as string;
+      const messageId = req.params.messageId as string;
+      const attachmentId = req.params.attachmentId as string;
+      assertCompanyAccess(req, companyId);
+      assertGmailAvailable();
+      if (!isSupportedGmailAlias(mailbox)) throw badRequest(`Unsupported mailbox: ${mailbox}`);
+      const data = await gmail.getAttachment(mailbox, messageId, attachmentId);
+      res.json(data);
+    },
+  );
+
   router.post(
     "/companies/:companyId/gmail/mailboxes/:mailbox/messages",
     validate(sendMessageBodySchema),
@@ -108,8 +203,17 @@ export function gmailRoutes(db: Db) {
       assertGmailAvailable();
       if (!isSupportedGmailAlias(mailbox)) throw badRequest(`Unsupported mailbox: ${mailbox}`);
       const body = req.body as z.infer<typeof sendMessageBodySchema>;
-      const data = await gmail.sendMessage(mailbox, body);
-      res.status(201).json(data);
+      const guard = await verifyCeoApproval(db, companyId, body.ceoApprovalId);
+      try {
+        const data = await gmail.sendMessage(mailbox, body, guard);
+        res.status(201).json(data);
+      } catch (err) {
+        if (err instanceof GmailOutboundBlockedError) {
+          fileBlockedSendIncident(db, companyId, req, mailbox, { to: body.to }, err.decision);
+          throw forbidden(err.message);
+        }
+        throw err;
+      }
     },
   );
 
@@ -123,8 +227,24 @@ export function gmailRoutes(db: Db) {
       assertGmailAvailable();
       if (!isSupportedGmailAlias(mailbox)) throw badRequest(`Unsupported mailbox: ${mailbox}`);
       const body = req.body as z.infer<typeof replyBodySchema>;
-      const data = await gmail.replyInThread(mailbox, body);
-      res.status(201).json(data);
+      const guard = await verifyCeoApproval(db, companyId, body.ceoApprovalId);
+      try {
+        const data = await gmail.replyInThread(mailbox, body, guard);
+        res.status(201).json(data);
+      } catch (err) {
+        if (err instanceof GmailOutboundBlockedError) {
+          fileBlockedSendIncident(
+            db,
+            companyId,
+            req,
+            mailbox,
+            { replyToMessageId: body.replyToMessageId, threadId: body.threadId },
+            err.decision,
+          );
+          throw forbidden(err.message);
+        }
+        throw err;
+      }
     },
   );
 

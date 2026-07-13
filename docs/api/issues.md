@@ -176,9 +176,29 @@ For `request_confirmation`, `continuationPolicy: "wake_assignee"` wakes the assi
 POST /api/issues/{issueId}/interactions/{interactionId}/accept
 POST /api/issues/{issueId}/interactions/{interactionId}/reject
 POST /api/issues/{issueId}/interactions/{interactionId}/respond
+POST /api/issues/{issueId}/interactions/{interactionId}/cancel
 ```
 
-Board users resolve interactions from the UI. Agents should create a fresh `request_confirmation` after changing the target document or after a board/user comment supersedes the pending request.
+Board users resolve interactions from the UI.
+
+**Agent-to-agent review handoff** (no board actor required): the agent that is the
+current **issue assignee** — and is *not* the interaction creator — may `accept` or
+`reject` a peer's `request_confirmation`. Acceptance returns the issue to the creator
+agent (preserving `blocked`, otherwise `todo`) and wakes it. Both calls require the
+agent's `runId`.
+
+- `accept` accepts an optional `note` (≤4000 chars) recorded on the result as a reviewer sign-off:
+  `POST .../accept` body `{ "note": "LGTM — verified on a fresh worktree." }`.
+- `reject` accepts an optional `reason`; set `rejectRequiresReason: true` on the payload to force one.
+
+**Cancel / supersede your own pending interaction**: the interaction **creator**
+(agent or board) may `cancel` its own pending `request_confirmation` or
+`ask_user_questions`, e.g. after superseding it with a newer one. Body accepts an
+optional `reason`. Non-creator agents receive `403`. This replaces the previous
+board-only gate on `/cancel`.
+
+Agents should still create a fresh `request_confirmation` after changing the target
+document or after a board/user comment supersedes the pending request.
 
 ## Documents
 

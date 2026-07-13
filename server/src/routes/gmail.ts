@@ -15,7 +15,6 @@ import {
 } from "../services/gmail.js";
 import { GmailOutboundBlockedError, type GmailOutboundDecision } from "../services/gmail-outbound-guard.js";
 import { createGmailIntakeService } from "../services/gmail-intake.js";
-import { issueService } from "../services/index.js";
 
 const attachmentInputSchema = z.object({
   filename: z.string().min(1),
@@ -114,8 +113,12 @@ function fileBlockedSendIncident(
   const target = context.to
     ? `to ${context.to}`
     : `replying in ${context.replyToMessageId ? `message ${context.replyToMessageId}` : `thread ${context.threadId}`}`;
-  issueService(db)
-    .create(companyId, {
+  // Lazy import so the route module graph doesn't statically pull in the full
+  // issues service (and its module-load-time db/drizzle usage). This path only
+  // runs on the rare blocked-outbound case.
+  void import("../services/index.js")
+    .then(({ issueService }) =>
+      issueService(db).create(companyId, {
       title: `BLOCKED: outbound ${decision.category ?? "report"} from ${mailbox}@ ${target}`,
       description:
         `## Gmail outbound guardrail triggered (AUR-2525)\n\n` +
@@ -130,7 +133,8 @@ function fileBlockedSendIncident(
       priority: "high",
       status: "todo",
       assigneeAgentId: callerAgentId,
-    })
+      }),
+    )
     .catch((err: unknown) => {
       logger.error(
         { err, mailbox, target },

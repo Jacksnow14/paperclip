@@ -9,6 +9,8 @@ import {
   buildInvocationEnvForLogs,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   ensureCommandResolvable,
+  ensurePathInEnv,
+  ensureUserLocalBinInPath,
   materializePaperclipSkillCopy,
   refreshPaperclipWorkspaceEnvForExecution,
   renderPaperclipWakePrompt,
@@ -1003,5 +1005,99 @@ describe("appendWithByteCap", () => {
     expect(output).not.toContain("\uFFFD");
     expect(Buffer.from(output, "utf8").toString("utf8")).toBe(output);
     expect(Buffer.byteLength(output, "utf8")).toBeLessThanOrEqual(7);
+  });
+});
+
+describe("ensurePathInEnv", () => {
+  it("leaves an already-populated PATH untouched (empty-fill semantics only)", () => {
+    const env = { HOME: "/nonexistent-aur3529", PATH: "/usr/bin:/bin" };
+    const result = ensurePathInEnv(env);
+
+    expect(result).toBe(env);
+    expect(result.PATH).toBe("/usr/bin:/bin");
+  });
+
+  it("substitutes a platform default when PATH is absent", () => {
+    const result = ensurePathInEnv({ HOME: "/nonexistent-aur3529" });
+    expect(typeof result.PATH).toBe("string");
+    expect((result.PATH as string).length).toBeGreaterThan(0);
+  });
+});
+
+describe.skipIf(process.platform === "win32")("ensureUserLocalBinInPath", () => {
+  async function withTempHome(run: (home: string) => Promise<void>) {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "aur3529-home-"));
+    const originalHome = process.env.HOME;
+    // Pin process.env.HOME (which os.homedir() reads on POSIX) to the temp
+    // dir so real-host dirs (e.g. this sandbox's own ~/.local/bin) can't leak
+    // into candidateUserLocalBinDirs and make these assertions flaky.
+    process.env.HOME = home;
+    try {
+      await run(home);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      await fs.rm(home, { recursive: true, force: true });
+    }
+  }
+
+  const minimalPath = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"].join(
+    path.delimiter,
+  );
+
+  it("prepends an existing user-local bin dir (~/.local/bin) that PATH omits (AUR-3529)", async () => {
+    await withTempHome(async (home) => {
+      const localBin = path.join(home, ".local/bin");
+      await fs.mkdir(localBin, { recursive: true });
+
+      const result = ensureUserLocalBinInPath({ HOME: home, PATH: minimalPath });
+      const segments = (result.PATH as string).split(path.delimiter);
+
+      // The run-scoped HOME comes first in resolution order, so its existing
+      // .local/bin is the first dir prepended.
+      expect(segments[0]).toBe(localBin);
+      // The original PATH is preserved in full after the prepended dirs.
+      expect((result.PATH as string).endsWith(minimalPath)).toBe(true);
+    });
+  });
+
+  it("does not duplicate a user-local bin dir already on PATH", async () => {
+    await withTempHome(async (home) => {
+      const localBin = path.join(home, ".local/bin");
+      await fs.mkdir(localBin, { recursive: true });
+
+      const withDir = [localBin, minimalPath].join(path.delimiter);
+      const env = { HOME: home, PATH: withDir };
+      const result = ensureUserLocalBinInPath(env);
+
+      const occurrences = (result.PATH as string)
+        .split(path.delimiter)
+        .filter((segment) => segment === localBin).length;
+      expect(occurrences).toBe(1);
+    });
+  });
+
+  it("never adds a candidate bin dir that does not exist", async () => {
+    await withTempHome(async (home) => {
+      // Temp HOME has none of the well-known bin subdirs, so none of ITS dirs
+      // should ever be injected (unrelated dirs from the real process HOME may
+      // still be prepended — that is intended).
+      const result = ensureUserLocalBinInPath({ HOME: home, PATH: minimalPath });
+      const segments = (result.PATH as string).split(path.delimiter);
+
+      expect(segments).not.toContain(path.join(home, ".local/bin"));
+      expect(segments).not.toContain(path.join(home, ".npm-global/bin"));
+      expect(segments).not.toContain(path.join(home, ".local/share/pnpm"));
+      // The original PATH is always still present in full.
+      expect((result.PATH as string).endsWith(minimalPath)).toBe(true);
+    });
+  });
+
+  it("is a byte-for-byte no-op (same object) when nothing needs adding", async () => {
+    await withTempHome(async (home) => {
+      const env = { HOME: home, PATH: minimalPath };
+      const result = ensureUserLocalBinInPath(env);
+      expect(result).toBe(env);
+    });
   });
 });

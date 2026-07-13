@@ -200,4 +200,103 @@ describeEmbeddedPostgres("issue identifier routes", () => {
     expect(withInclude.body.comments).toHaveLength(1);
     expect(withInclude.body.comments[0]).toMatchObject({ body: "First comment" });
   });
+
+  it("?search= is an alias for ?q= keyword search (AUR-3526)", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Search alias tenant",
+      issuePrefix: "SRCH",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values([
+      {
+        id: randomUUID(),
+        companyId,
+        issueNumber: 1,
+        identifier: "SRCH-1",
+        title: "Deploy the widget pipeline",
+        status: "todo",
+        priority: "medium",
+        createdByUserId: "cloud-user-1",
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        issueNumber: 2,
+        identifier: "SRCH-2",
+        title: "Unrelated gardening task",
+        status: "todo",
+        priority: "medium",
+        createdByUserId: "cloud-user-1",
+      },
+    ]);
+
+    const app = createApp(companyId);
+    const res = await request(app).get(
+      `/api/companies/${companyId}/issues?search=widget`,
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.map((issue: { identifier: string }) => issue.identifier)).toEqual(["SRCH-1"]);
+  });
+
+  it("?completedAt/cancelledAt range filters narrow the list to the window (AUR-3526)", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Date range tenant",
+      issuePrefix: "DR",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values([
+      {
+        id: randomUUID(),
+        companyId,
+        issueNumber: 1,
+        identifier: "DR-1",
+        title: "Completed in window",
+        status: "done",
+        priority: "medium",
+        createdByUserId: "cloud-user-1",
+        completedAt: new Date("2026-07-05T12:00:00Z"),
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        issueNumber: 2,
+        identifier: "DR-2",
+        title: "Completed outside window",
+        status: "done",
+        priority: "medium",
+        createdByUserId: "cloud-user-1",
+        completedAt: new Date("2026-06-01T12:00:00Z"),
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        issueNumber: 3,
+        identifier: "DR-3",
+        title: "Cancelled in window",
+        status: "cancelled",
+        priority: "medium",
+        createdByUserId: "cloud-user-1",
+        cancelledAt: new Date("2026-07-06T12:00:00Z"),
+      },
+    ]);
+
+    const app = createApp(companyId);
+
+    const completed = await request(app).get(
+      `/api/companies/${companyId}/issues?completedAtFrom=2026-07-01T00:00:00Z&completedAtTo=2026-07-31T23:59:59Z`,
+    );
+    expect(completed.status, JSON.stringify(completed.body)).toBe(200);
+    expect(completed.body.map((issue: { identifier: string }) => issue.identifier)).toEqual(["DR-1"]);
+
+    const cancelled = await request(app).get(
+      `/api/companies/${companyId}/issues?cancelledAtFrom=2026-07-01T00:00:00Z`,
+    );
+    expect(cancelled.status, JSON.stringify(cancelled.body)).toBe(200);
+    expect(cancelled.body.map((issue: { identifier: string }) => issue.identifier)).toEqual(["DR-3"]);
+  });
 });

@@ -1572,6 +1572,10 @@ export function issueRoutes(
       originKindPrefix: req.query.originKindPrefix as string | undefined,
       originId: req.query.originId as string | undefined,
       identifiers,
+      completedAtFrom: req.query.completedAtFrom as string | undefined,
+      completedAtTo: req.query.completedAtTo as string | undefined,
+      cancelledAtFrom: req.query.cancelledAtFrom as string | undefined,
+      cancelledAtTo: req.query.cancelledAtTo as string | undefined,
       includeRoutineExecutions:
         req.query.includeRoutineExecutions === "true" || req.query.includeRoutineExecutions === "1",
       excludeRoutineExecutions:
@@ -1581,7 +1585,7 @@ export function issueRoutes(
       includeBlockedBy: req.query.includeBlockedBy === "true" || req.query.includeBlockedBy === "1",
       includeBlockedInboxAttention:
         req.query.includeBlockedInboxAttention === "true" || req.query.includeBlockedInboxAttention === "1",
-      q: req.query.q as string | undefined,
+      q: (req.query.q ?? req.query.search) as string | undefined,
       limit,
       offset,
     });

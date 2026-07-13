@@ -1499,11 +1499,24 @@ export function issueRoutes(
       unreadForUserFilterRaw === "me" && req.actor.type === "board"
         ? req.actor.userId
         : unreadForUserFilterRaw;
+    const rawIdentifier = req.query.identifier as string | undefined;
+    const identifiers = rawIdentifier
+      ? Array.from(new Set(
+          rawIdentifier
+            .split(",")
+            .map((token) => normalizeIssueReferenceIdentifier(token))
+            .filter((value): value is string => value !== null),
+        ))
+      : undefined;
     const rawLimit = req.query.limit as string | undefined;
     const parsedLimit = rawLimit !== undefined && /^\d+$/.test(rawLimit)
       ? Number.parseInt(rawLimit, 10)
       : null;
-    const limit = parsedLimit === null ? ISSUE_LIST_DEFAULT_LIMIT : clampIssueListLimit(parsedLimit);
+    const limit = parsedLimit !== null
+      ? clampIssueListLimit(parsedLimit)
+      : identifiers && identifiers.length > 0
+        ? undefined
+        : ISSUE_LIST_DEFAULT_LIMIT;
     const rawOffset = req.query.offset as string | undefined;
     const parsedOffset = rawOffset !== undefined && /^\d+$/.test(rawOffset)
       ? Number.parseInt(rawOffset, 10)
@@ -1558,6 +1571,7 @@ export function issueRoutes(
       originKind: req.query.originKind as string | undefined,
       originKindPrefix: req.query.originKindPrefix as string | undefined,
       originId: req.query.originId as string | undefined,
+      identifiers,
       includeRoutineExecutions:
         req.query.includeRoutineExecutions === "true" || req.query.includeRoutineExecutions === "1",
       excludeRoutineExecutions:
@@ -1816,6 +1830,8 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
+    const rawInclude = req.query.include as string | undefined;
+    const includeComments = (rawInclude?.split(",").map((token) => token.trim()) ?? []).includes("comments");
     const [
       { project, goal },
       ancestors,
@@ -1828,6 +1844,7 @@ export function issueRoutes(
       successfulRunHandoffStates,
       scheduledRetry,
       activeRecoveryAction,
+      comments,
     ] = await Promise.all([
       resolveIssueProjectAndGoal(issue),
       svc.getAncestors(issue.id),
@@ -1840,6 +1857,7 @@ export function issueRoutes(
       listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id]),
       svc.getCurrentScheduledRetry(issue.id),
       recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
+      includeComments ? svc.listComments(issue.id) : Promise.resolve(null),
     ]);
     const recoveryActionsByRelationIssue = await relationRecoveryActionMap(
       recoveryActionsSvc,
@@ -1876,6 +1894,7 @@ export function issueRoutes(
       mentionedProjects,
       currentExecutionWorkspace,
       workProducts,
+      ...(includeComments ? { comments } : {}),
     });
   });
 

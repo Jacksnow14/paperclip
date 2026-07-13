@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { and, asc, desc, eq, gt, inArray, isNull, like, lt, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, like, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -229,6 +229,10 @@ export interface IssueFilters {
   originKindPrefix?: string;
   originId?: string;
   identifiers?: string[];
+  completedAtFrom?: string;
+  completedAtTo?: string;
+  cancelledAtFrom?: string;
+  cancelledAtTo?: string;
   includeRoutineExecutions?: boolean;
   excludeRoutineExecutions?: boolean;
   includePluginOperations?: boolean;
@@ -3481,6 +3485,19 @@ export function issueService(db: Db) {
       if (filters?.identifiers && filters.identifiers.length > 0) {
         conditions.push(inArray(issues.identifier, filters.identifiers));
       }
+      const parseFilterDate = (value: string | undefined): Date | undefined => {
+        if (!value) return undefined;
+        const parsed = new Date(value);
+        return Number.isNaN(parsed.getTime()) ? undefined : parsed;
+      };
+      const completedAtFrom = parseFilterDate(filters?.completedAtFrom);
+      const completedAtTo = parseFilterDate(filters?.completedAtTo);
+      const cancelledAtFrom = parseFilterDate(filters?.cancelledAtFrom);
+      const cancelledAtTo = parseFilterDate(filters?.cancelledAtTo);
+      if (completedAtFrom) conditions.push(gte(issues.completedAt, completedAtFrom));
+      if (completedAtTo) conditions.push(lte(issues.completedAt, completedAtTo));
+      if (cancelledAtFrom) conditions.push(gte(issues.cancelledAt, cancelledAtFrom));
+      if (cancelledAtTo) conditions.push(lte(issues.cancelledAt, cancelledAtTo));
       if (filters?.originKind) conditions.push(eq(issues.originKind, filters.originKind));
       if (filters?.originKindPrefix) conditions.push(like(issues.originKind, `${filters.originKindPrefix}%`));
       if (filters?.originId) conditions.push(eq(issues.originId, filters.originId));

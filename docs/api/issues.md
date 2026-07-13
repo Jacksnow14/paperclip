@@ -18,6 +18,8 @@ Query parameters:
 | `status` | Filter by status (comma-separated: `todo,in_progress`) |
 | `assigneeAgentId` | Filter by assigned agent |
 | `projectId` | Filter by project |
+| `q` | Server-side keyword search. Matches (case-insensitive) against the issue `identifier`, `title`, `description`, and any comment body on the issue. A query like `q=AUR-3520` returns just the matching issue(s) — no client-side filtering needed. |
+| `identifier` | Batch identifier lookup: a comma-separated list, e.g. `identifier=AUR-1,AUR-2,AUR-3`. Each token is normalized case-insensitively (see `normalizeIssueReferenceIdentifier`); unrecognized tokens are dropped silently. Returns exactly the matching issues — unknown identifiers are simply absent from the result (never a 500). Combinable with the other filters above. When `identifier` is present and `limit` is not explicitly set, the default 1000-row cap is not applied (all matches are returned). |
 
 Results sorted by priority.
 
@@ -29,11 +31,18 @@ GET /api/issues/{issueId}
 
 Returns the issue with `project`, `goal`, and `ancestors` (parent chain with their projects and goals).
 
+Query parameters:
+
+| Param | Description |
+|-------|-------------|
+| `include` | Comma-separated list of extra projections to embed. Currently supports `comments`: when present, the response includes a `comments` array (same data as `GET /issues/{issueId}/comments`) fetched alongside the issue in one round trip. Omitting `include` leaves the response unchanged — no extra query is run. |
+
 The response also includes:
 
 - `planDocument`: the full text of the issue document with key `plan`, when present
 - `documentSummaries`: metadata for all linked issue documents
 - `legacyPlanDocument`: a read-only fallback when the description still contains an old `<plan>` block
+- `comments`: only present when `?include=comments` was passed
 
 ## Create Issue
 
@@ -120,6 +129,15 @@ POST /api/issues/{issueId}/comments
 ```
 
 @-mentions (`@AgentName`) in comments trigger heartbeats for the mentioned agent.
+
+### Linking Memory Captures to an Issue
+
+```
+POST /api/companies/{companyId}/memory/capture
+{ "source": { "kind": "issue", "issueId": "AUR-1234" }, ... }
+```
+
+`source.issueId` is a loose string, not required to be a UUID: it accepts either the issue's internal id or its human `AUR-NNNN` identifier, resolved server-side (`resolveSourceIssueId`) the same way `?identifier=` above normalizes tokens. If the identifier can't be resolved to an issue in the company, the request fails with `400` and a message containing `could not be resolved`.
 
 ## Issue-Thread Interactions
 

@@ -3,7 +3,7 @@ import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { companies, createDb, issues } from "@paperclipai/db";
+import { companies, createDb, issueComments, issues } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -101,5 +101,103 @@ describeEmbeddedPostgres("issue identifier routes", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
     expect(stored?.priority).toBe("high");
+  });
+
+  it("?identifier= batch filter returns exactly the matching issues and omits unknown ones (AUR-3530)", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Batch identifier tenant",
+      issuePrefix: "BID",
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const issueIdA = randomUUID();
+    const issueIdB = randomUUID();
+    const issueIdC = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: issueIdA,
+        companyId,
+        issueNumber: 1,
+        identifier: "BID-1",
+        title: "First",
+        status: "todo",
+        priority: "medium",
+        createdByUserId: "cloud-user-1",
+      },
+      {
+        id: issueIdB,
+        companyId,
+        issueNumber: 2,
+        identifier: "BID-2",
+        title: "Second",
+        status: "todo",
+        priority: "medium",
+        createdByUserId: "cloud-user-1",
+      },
+      {
+        id: issueIdC,
+        companyId,
+        issueNumber: 3,
+        identifier: "BID-3",
+        title: "Third (not requested)",
+        status: "todo",
+        priority: "medium",
+        createdByUserId: "cloud-user-1",
+      },
+    ]);
+
+    const app = createApp(companyId);
+    const res = await request(app).get(
+      `/api/companies/${companyId}/issues?identifier=bid-1,BID-2,BID-999`,
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toHaveLength(2);
+    expect(res.body.map((issue: { identifier: string }) => issue.identifier).sort()).toEqual([
+      "BID-1",
+      "BID-2",
+    ]);
+  });
+
+  it("?include=comments embeds the issue's comments in GET /issues/:id (AUR-3530)", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Include comments tenant",
+      issuePrefix: "INC",
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      issueNumber: 1,
+      identifier: "INC-1",
+      title: "Has comments",
+      status: "todo",
+      priority: "medium",
+      createdByUserId: "cloud-user-1",
+    });
+    await db.insert(issueComments).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      authorUserId: "cloud-user-1",
+      body: "First comment",
+    });
+
+    const app = createApp(companyId);
+
+    const withoutInclude = await request(app).get(`/api/issues/${issueId}`);
+    expect(withoutInclude.status, JSON.stringify(withoutInclude.body)).toBe(200);
+    expect(withoutInclude.body.comments).toBeUndefined();
+
+    const withInclude = await request(app).get(`/api/issues/${issueId}?include=comments`);
+    expect(withInclude.status, JSON.stringify(withInclude.body)).toBe(200);
+    expect(withInclude.body.comments).toHaveLength(1);
+    expect(withInclude.body.comments[0]).toMatchObject({ body: "First comment" });
   });
 });

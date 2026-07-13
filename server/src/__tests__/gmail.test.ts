@@ -475,6 +475,83 @@ describe("createGmailService", () => {
     });
   });
 
+  describe("retry/backoff on transient failures", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("retries a transient network error and succeeds once the call recovers", async () => {
+      vi.useFakeTimers();
+      const transientErr = Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+      mockMessagesList
+        .mockRejectedValueOnce(transientErr)
+        .mockRejectedValueOnce(transientErr)
+        .mockResolvedValueOnce({ data: { messages: [{ id: "abc" }] } });
+      const service = createGmailService();
+
+      const resultPromise = service.listMessages("board");
+      await vi.runAllTimersAsync();
+      const result = await resultPromise;
+
+      expect(mockMessagesList).toHaveBeenCalledTimes(3);
+      expect(result).toEqual({ messages: [{ id: "abc" }] });
+    });
+
+    it("retries on a 429 and on a 5xx response", async () => {
+      vi.useFakeTimers();
+      const rateLimitErr = Object.assign(new Error("rate limited"), { code: 429 });
+      const serverErr = Object.assign(new Error("backend error"), {
+        response: { status: 503 },
+      });
+      mockMessagesList
+        .mockRejectedValueOnce(rateLimitErr)
+        .mockRejectedValueOnce(serverErr)
+        .mockResolvedValueOnce({ data: { messages: [] } });
+      const service = createGmailService();
+
+      const resultPromise = service.listMessages("board");
+      await vi.runAllTimersAsync();
+      const result = await resultPromise;
+
+      expect(mockMessagesList).toHaveBeenCalledTimes(3);
+      expect(result).toEqual({ messages: [] });
+    });
+
+    it("gives up after the max attempts on a persistent transient error", async () => {
+      vi.useFakeTimers();
+      const transientErr = Object.assign(new Error("timed out"), { code: "ETIMEDOUT" });
+      mockMessagesList.mockRejectedValue(transientErr);
+      const service = createGmailService();
+
+      const resultPromise = service.listMessages("board");
+      resultPromise.catch(() => {});
+      await vi.runAllTimersAsync();
+
+      await expect(resultPromise).rejects.toThrow("timed out");
+      expect(mockMessagesList).toHaveBeenCalledTimes(3);
+    });
+
+    it("does not retry a 4xx auth/config error", async () => {
+      const authErr = Object.assign(new Error("invalid_grant"), { code: 400 });
+      mockMessagesList.mockRejectedValue(authErr);
+      const service = createGmailService();
+
+      await expect(service.listMessages("board")).rejects.toThrow("invalid_grant");
+      expect(mockMessagesList).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not retry a 403 permission error", async () => {
+      const forbiddenErr = Object.assign(new Error("insufficient permission"), {
+        response: { status: 403 },
+      });
+      mockMessagesList.mockRejectedValue(forbiddenErr);
+      const service = createGmailService();
+
+      await expect(service.listMessages("board")).rejects.toThrow("insufficient permission");
+      expect(mockMessagesList).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe("updateVacationSettings", () => {
     it("calls gmail.users.settings.updateVacation with correct payload", async () => {
       mockSettingsUpdateVacation.mockResolvedValue({ data: { enableAutoReply: true } });

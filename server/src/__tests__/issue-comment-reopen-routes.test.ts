@@ -8,6 +8,11 @@ const mockIssueService = vi.hoisted(() => ({
   update: vi.fn(),
   addComment: vi.fn(),
   getDependencyReadiness: vi.fn(),
+  // Consulted by assertAgentCommentAllowed for non-assignee agents (AUR-2825
+  // mention-scoped replies). Default to "not mentioned" so these tests exercise
+  // the ownership-gate path; without it the bare mock is undefined and the
+  // route throws → 500 instead of the expected 403/409.
+  wasAgentMentionedInThread: vi.fn(async () => false),
   findMentionedAgents: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
@@ -235,6 +240,12 @@ describe.sequential("issue comment reopen routes", () => {
     mockHeartbeatService.cancelRun.mockReset();
     mockAgentService.getById.mockReset();
     mockAgentService.list.mockReset();
+    // Safe default: the agent issue-mutation gate consults agentService.list()
+    // via the reporting-chain checkout-override check. Without a default the
+    // bare mock returns undefined and `.map` throws → 500 instead of the
+    // expected 403/409 authz responses. Tests needing specific agents override
+    // this below.
+    mockAgentService.list.mockResolvedValue([]);
     mockAgentService.resolveByReference.mockReset();
     mockLogActivity.mockReset();
     mockFeedbackService.listIssueVotesForUser.mockReset();

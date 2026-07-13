@@ -11,6 +11,68 @@ const GMAIL_SCOPES = [
   "https://www.googleapis.com/auth/gmail.settings.basic",
 ];
 
+const RETRY_MAX_ATTEMPTS = 3;
+const RETRY_BASE_DELAY_MS = 250;
+const RETRY_MAX_DELAY_MS = 4_000;
+
+const TRANSIENT_NETWORK_ERROR_CODES = new Set([
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EPIPE",
+]);
+
+function getHttpStatus(err: unknown): number | undefined {
+  if (!err || typeof err !== "object") return undefined;
+  const candidate = err as { status?: unknown; code?: unknown; response?: { status?: unknown } };
+  for (const value of [candidate.status, candidate.response?.status, candidate.code]) {
+    if (typeof value === "number") return value;
+    if (typeof value === "string" && /^\d+$/.test(value)) return Number(value);
+  }
+  return undefined;
+}
+
+// Retries transient network/5xx/429 failures on outbound Google API calls
+// (DNS hiccups, resets, rate limiting). Never retries 4xx auth/config errors
+// (bad key, missing scope, invalid request) since retrying those just wastes
+// attempts on a failure that will not change.
+function isTransientGoogleApiError(err: unknown): boolean {
+  if (err && typeof err === "object") {
+    const code = (err as { code?: unknown }).code;
+    if (typeof code === "string" && TRANSIENT_NETWORK_ERROR_CODES.has(code)) return true;
+  }
+  const status = getHttpStatus(err);
+  return status === 429 || (status !== undefined && status >= 500 && status < 600);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withRetry<T>(operation: string, fn: () => Promise<T>): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      if (attempt >= RETRY_MAX_ATTEMPTS || !isTransientGoogleApiError(err)) {
+        throw err;
+      }
+      const backoffMs = Math.min(RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), RETRY_MAX_DELAY_MS);
+      const jitteredMs = backoffMs + Math.random() * backoffMs * 0.5;
+      logger.warn(
+        { operation, attempt, maxAttempts: RETRY_MAX_ATTEMPTS, err },
+        "gmail: retrying transient failure",
+      );
+      await sleep(jitteredMs);
+    }
+  }
+  throw lastError;
+}
+
 export interface GmailSendOptions {
   to: string;
   subject: string;
@@ -119,18 +181,22 @@ export function isSupportedGmailAlias(alias: string): alias is GmailAlias {
 export function createGmailService() {
   async function listMessages(alias: GmailAlias, opts?: GmailListOptions) {
     const gmail = buildGmailClient(alias);
-    const res = await gmail.users.messages.list({
-      userId: "me",
-      q: opts?.query,
-      maxResults: opts?.maxResults ?? 20,
-      pageToken: opts?.pageToken,
-    });
+    const res = await withRetry("messages.list", () =>
+      gmail.users.messages.list({
+        userId: "me",
+        q: opts?.query,
+        maxResults: opts?.maxResults ?? 20,
+        pageToken: opts?.pageToken,
+      }),
+    );
     return res.data;
   }
 
   async function getMessage(alias: GmailAlias, messageId: string) {
     const gmail = buildGmailClient(alias);
-    const res = await gmail.users.messages.get({ userId: "me", id: messageId, format: "full" });
+    const res = await withRetry("messages.get", () =>
+      gmail.users.messages.get({ userId: "me", id: messageId, format: "full" }),
+    );
     return res.data;
   }
 
@@ -160,7 +226,9 @@ export function createGmailService() {
       inReplyTo,
       references,
     });
-    const res = await gmail.users.messages.send({ userId: "me", requestBody });
+    const res = await withRetry("messages.send", () =>
+      gmail.users.messages.send({ userId: "me", requestBody }),
+    );
     logger.info({ alias, to: opts.to, messageId: res.data.id }, "gmail: message sent");
     return res.data;
   }
@@ -194,71 +262,83 @@ export function createGmailService() {
 
   async function listThreads(alias: GmailAlias, opts?: GmailListOptions) {
     const gmail = buildGmailClient(alias);
-    const res = await gmail.users.threads.list({
-      userId: "me",
-      q: opts?.query,
-      maxResults: opts?.maxResults ?? 20,
-      pageToken: opts?.pageToken,
-    });
+    const res = await withRetry("threads.list", () =>
+      gmail.users.threads.list({
+        userId: "me",
+        q: opts?.query,
+        maxResults: opts?.maxResults ?? 20,
+        pageToken: opts?.pageToken,
+      }),
+    );
     return res.data;
   }
 
   async function getThread(alias: GmailAlias, threadId: string) {
     const gmail = buildGmailClient(alias);
-    const res = await gmail.users.threads.get({ userId: "me", id: threadId, format: "full" });
+    const res = await withRetry("threads.get", () =>
+      gmail.users.threads.get({ userId: "me", id: threadId, format: "full" }),
+    );
     return res.data;
   }
 
   async function listLabels(alias: GmailAlias) {
     const gmail = buildGmailClient(alias);
-    const res = await gmail.users.labels.list({ userId: "me" });
+    const res = await withRetry("labels.list", () => gmail.users.labels.list({ userId: "me" }));
     return res.data.labels ?? [];
   }
 
   async function createLabel(alias: GmailAlias, name: string) {
     const gmail = buildGmailClient(alias);
-    const res = await gmail.users.labels.create({
-      userId: "me",
-      requestBody: { name, labelListVisibility: "labelShow", messageListVisibility: "show" },
-    });
+    const res = await withRetry("labels.create", () =>
+      gmail.users.labels.create({
+        userId: "me",
+        requestBody: { name, labelListVisibility: "labelShow", messageListVisibility: "show" },
+      }),
+    );
     return res.data;
   }
 
   async function modifyMessageLabels(alias: GmailAlias, messageId: string, opts: GmailModifyLabelsOptions) {
     const gmail = buildGmailClient(alias);
-    const res = await gmail.users.messages.modify({
-      userId: "me",
-      id: messageId,
-      requestBody: {
-        addLabelIds: opts.addLabelIds,
-        removeLabelIds: opts.removeLabelIds,
-      },
-    });
+    const res = await withRetry("messages.modify", () =>
+      gmail.users.messages.modify({
+        userId: "me",
+        id: messageId,
+        requestBody: {
+          addLabelIds: opts.addLabelIds,
+          removeLabelIds: opts.removeLabelIds,
+        },
+      }),
+    );
     return res.data;
   }
 
   async function getVacationSettings(alias: GmailAlias) {
     const gmail = buildGmailClient(alias);
-    const res = await gmail.users.settings.getVacation({ userId: "me" });
+    const res = await withRetry("settings.getVacation", () =>
+      gmail.users.settings.getVacation({ userId: "me" }),
+    );
     return res.data;
   }
 
   async function updateVacationSettings(alias: GmailAlias, settings: GmailVacationSettings) {
     const gmail = buildGmailClient(alias);
-    const res = await gmail.users.settings.updateVacation({
-      userId: "me",
-      requestBody: {
-        enableAutoReply: settings.enableAutoReply,
-        responseSubject: settings.responseSubject,
-        responseBodyHtml: settings.responseBodyHtml,
-        startTime: settings.startTimeIso
-          ? String(new Date(settings.startTimeIso).getTime())
-          : undefined,
-        endTime: settings.endTimeIso
-          ? String(new Date(settings.endTimeIso).getTime())
-          : undefined,
-      },
-    });
+    const res = await withRetry("settings.updateVacation", () =>
+      gmail.users.settings.updateVacation({
+        userId: "me",
+        requestBody: {
+          enableAutoReply: settings.enableAutoReply,
+          responseSubject: settings.responseSubject,
+          responseBodyHtml: settings.responseBodyHtml,
+          startTime: settings.startTimeIso
+            ? String(new Date(settings.startTimeIso).getTime())
+            : undefined,
+          endTime: settings.endTimeIso
+            ? String(new Date(settings.endTimeIso).getTime())
+            : undefined,
+        },
+      }),
+    );
     return res.data;
   }
 

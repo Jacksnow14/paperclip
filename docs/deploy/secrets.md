@@ -399,3 +399,31 @@ Agent environment variables use secret references:
 ```
 
 The server resolves and decrypts these at runtime, injecting the real value into the agent process environment.
+
+## Injecting Secrets Into Routine & Worker Runs
+
+Routines, scheduled workers, and other unattended runs need secrets in their
+process env the same way an interactive agent run does. The **supported**
+pattern is the same `secret_ref` binding described above — there is no
+separate mechanism for routine/worker runs:
+
+1. Create (or reuse) the company secret in `Company Settings > Secrets`.
+2. Bind it as a `secret_ref` row into the **executing agent's** `env`, or into
+   the **project's** `env` if every agent/routine in that project needs it.
+3. `resolveExecutionRunAdapterConfig` (`server/src/services/heartbeat.ts`)
+   resolves the binding server-side and injects the decrypted value into the
+   run's process env before the agent process starts, for both interactive
+   heartbeats and routine-triggered runs — the run type does not change how
+   the value gets there.
+
+The org-scoped `GOOGLE_WORKSPACE_SA_KEY` binding used by the CTO agent's
+gmail-intake routine (AUR-3531) is the worked example: the secret is bound
+once on the CTO agent's `env`, and every routine execution that runs as that
+agent inherits the resolved value automatically.
+
+**Do not hand-roll a per-worker dotenv loader, a custom secret-fetch script,
+or a bespoke env file for a routine.** That bypasses the audit trail, the
+custody boundary above, and rotation — and it silently drifts from the bound
+secret the next time the value is rotated. If a routine or worker is missing
+an env var, fix it by adding or updating the `secret_ref` binding on the
+agent/project, not by loading it another way in code.

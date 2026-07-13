@@ -40,6 +40,27 @@ An agent whose average quality is ≥ 3.5 cannot be proposed for retirement on a
 low cost-adjusted score alone. This is simpler than normalising within task_type
 and equally effective at preventing the false-positive.
 
+## Scan Window (AUR-3287)
+
+Scorecard volume has grown to ~65 records/day, so a single `?limit=200` page
+of `GET /memory/records` now spans only a few days — too narrow to establish
+"sustained" bottom-quartile performance (gates 1–3 need real signal over
+weeks, not days).
+
+The watchdog now pages through `GET /memory/records?limit=200&offset=N`
+(offset pagination shipped in AUR-2823), accumulating records until it sees
+one older than the window boundary, then stops:
+
+- **`WINDOW_DAYS`** (default 28, override with `--window-days=N`) bounds the
+  set scored by gates 1–3 (sample count / quality / quartile).
+- Gates 4–5 (Loop C record / 30-day cooldown) need to see further back than
+  the scoring window, so the fetch itself pages out to
+  `max(WINDOW_DAYS, COOLDOWN_DAYS)` days — the accumulated (unfiltered) set is
+  used for those two checks, while the windowed (filtered) set is used for
+  scoring.
+- **`MAX_PAGES`** (20) is a runaway guard. If hit, the run logs a `[WARN]` —
+  the scan is never silently truncated.
+
 ## Idempotency
 
 Re-running within the same ISO week posts no duplicate interactions.

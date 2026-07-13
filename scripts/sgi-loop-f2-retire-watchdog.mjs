@@ -35,14 +35,27 @@
  *    within the last 30 days; skip if present. After firing a proposal, write
  *    a capacity-decisions/{agentId}/{date} cooldown record.
  *
+ * ### Scan window (AUR-3287)
+ * Scorecard volume (~65 records/day) means a single 200-record page only spans
+ * a few days — too narrow to establish "sustained" bottom-quartile performance.
+ * The watchdog now pages through `GET /memory/records?limit=200&offset=N`
+ * (AUR-2823) accumulating records until one older than the window boundary is
+ * seen, then stops (bounded by MAX_PAGES as a runaway guard). Gates 1–3 (sample
+ * count / quality / quartile) score only records inside WINDOW_DAYS (default
+ * 28, override with `--window-days=N`). Gates 4–5 (Loop C / cooldown) look at
+ * the full accumulated set, which is fetched out to
+ * `max(WINDOW_DAYS, COOLDOWN_DAYS)` days so the 30-day cooldown check is never
+ * starved by a shorter scoring window.
+ *
  * ### Idempotency
  * Re-running in the same ISO week produces no duplicate board interactions.
  * idempotencyKey = `f2-retire-{agentId}-{isoYear}-W{isoWeek}`.
  *
  * Usage:
- *   node scripts/sgi-loop-f2-retire-watchdog.mjs            # live run
- *   node scripts/sgi-loop-f2-retire-watchdog.mjs --dry-run  # print, do not post
+ *   node scripts/sgi-loop-f2-retire-watchdog.mjs                 # live run
+ *   node scripts/sgi-loop-f2-retire-watchdog.mjs --dry-run       # print, do not post
  *   node scripts/sgi-loop-f2-retire-watchdog.mjs --date=2026-06-09
+ *   node scripts/sgi-loop-f2-retire-watchdog.mjs --window-days=14 # override scoring window
  */
 
 const API_URL = process.env.PAPERCLIP_API_URL;
@@ -56,9 +69,15 @@ const argv = process.argv.slice(2);
 const DRY_RUN = argv.includes('--dry-run');
 const dateArg = (argv.find(a => a.startsWith('--date=')) || '').split('=')[1];
 const REF_DATE = dateArg ? new Date(dateArg + 'T00:00:00Z') : new Date();
+const windowDaysArg = (argv.find(a => a.startsWith('--window-days=')) || '').split('=')[1];
 
-// Scan window: most-recent 200 memory records (API cap, no pagination/offset).
-const SCAN_LIMIT = 200;
+// Scoring window in days — how far back records must fall to count toward the
+// sample-count / quality / quartile gates. Default 28 (see AUR-3287).
+const WINDOW_DAYS = windowDaysArg ? Number(windowDaysArg) : 28;
+
+// Records per page and runaway guard for the offset-pagination loop.
+const SCAN_PAGE_LIMIT = 200;
+const MAX_PAGES = 20;
 
 // Min scorecards per agent to qualify for quartile ranking.
 const MIN_SAMPLE_COUNT = 8;
@@ -88,14 +107,6 @@ async function apiFetch(path, opts = {}) {
     throw new Error(`API ${opts.method || 'GET'} ${path} → ${res.status}: ${body}`);
   }
   return res.json();
-}
-
-async function fetchAllRecords() {
-  const data = await apiFetch(
-    `/api/companies/${COMPANY_ID}/memory/records?limit=${SCAN_LIMIT}`
-  );
-  if (data._notFound) return [];
-  return Array.isArray(data) ? data : (data.records || []);
 }
 
 async function postComment(issueId, body) {
@@ -130,6 +141,56 @@ async function captureRecord(title, content, metadata) {
     method: 'POST',
     body: JSON.stringify({ title, content, metadata, source }),
   });
+}
+
+// ---- Windowed pagination -----------------------------------------------
+
+function cutoffIso(refDate, days) {
+  const d = new Date(refDate);
+  d.setUTCDate(d.getUTCDate() - days);
+  return d.toISOString();
+}
+
+/**
+ * Pages through GET /memory/records (offset pagination, AUR-2823) accumulating
+ * records until one older than the fetch-window boundary is seen (or the API
+ * runs out of records, or MAX_PAGES is hit). `get(path)` is injected so this
+ * is testable without a live API.
+ *
+ * Returns:
+ *   - accumulated: every record fetched, bounded by max(windowDays, cooldownDays)
+ *   - windowed: the subset of `accumulated` within windowDays — used for scoring
+ *   - pages / hitPageCap: pagination diagnostics
+ */
+async function fetchWindowedRecords(get, companyId, { refDate, windowDays, cooldownDays = COOLDOWN_DAYS, pageLimit = SCAN_PAGE_LIMIT, maxPages = MAX_PAGES } = {}) {
+  const fetchWindowDays = Math.max(windowDays, cooldownDays);
+  const scoreCutoffIso = cutoffIso(refDate, windowDays);
+  const fetchCutoffIso = cutoffIso(refDate, fetchWindowDays);
+
+  const accumulated = [];
+  let offset = 0;
+  let pages = 0;
+
+  while (pages < maxPages) {
+    const data = await get(`/api/companies/${companyId}/memory/records?limit=${pageLimit}&offset=${offset}`);
+    const batch = (data && data._notFound) ? [] : (Array.isArray(data) ? data : (data.records || []));
+    if (batch.length === 0) break;
+
+    accumulated.push(...batch);
+    pages++;
+
+    const oldestInBatch = batch[batch.length - 1]?.createdAt || '';
+    const reachedBoundary = oldestInBatch && oldestInBatch < fetchCutoffIso;
+    const shortBatch = batch.length < pageLimit;
+    if (reachedBoundary || shortBatch) break;
+
+    offset += pageLimit;
+  }
+
+  const hitPageCap = pages >= maxPages;
+  const windowed = accumulated.filter(r => (r.createdAt || '') >= scoreCutoffIso);
+
+  return { accumulated, windowed, pages, hitPageCap, scoreCutoffIso, fetchCutoffIso };
 }
 
 // ---- ISO week helpers ------------------------------------------------------
@@ -205,118 +266,110 @@ function hasLoopCRecord(records, agentId) {
 // ---- Cooldown gate ---------------------------------------------------------
 
 function withinCooldown(records, agentId, refDate) {
-  const cutoff = new Date(refDate);
-  cutoff.setUTCDate(cutoff.getUTCDate() - COOLDOWN_DAYS);
+  const cutoff = cutoffIso(refDate, COOLDOWN_DAYS);
   return records.some(r => {
     const t = r.title || '';
     if (!t.startsWith(`capacity-decisions/${agentId}/`)) return false;
     const ts = r.createdAt || '';
-    return ts >= cutoff.toISOString();
+    return ts >= cutoff;
   });
 }
 
-// ---- Main ------------------------------------------------------------------
+// ---- Gate evaluation (pure — testable without the API) --------------------
 
-async function main() {
-  const { year: isoYear, week: isoWeek } = isoWeekYear(REF_DATE);
-  const refDateStr = REF_DATE.toISOString().slice(0, 10);
-  console.log(`SGI Loop F-2 Retire Watchdog — ref date ${refDateStr} (ISO ${isoYear}-W${String(isoWeek).padStart(2, '0')})`);
-  console.log(`Mode: ${DRY_RUN ? 'DRY-RUN (no writes)' : 'LIVE'}\n`);
+/**
+ * Runs gates 1–5 and builds the proposal/skip lists. `windowed` scores gates
+ * 1–3; `accumulated` (which reaches back to at least COOLDOWN_DAYS) is used
+ * for the Loop C / cooldown checks in gates 4–5.
+ */
+function evaluateGates(windowed, accumulated, refDate) {
+  const { year: isoYear, week: isoWeek } = isoWeekYear(refDate);
 
-  const allRecords = await fetchAllRecords();
-  const windowOldest = allRecords.reduce((min, r) => {
-    const ts = r.createdAt || '';
-    return (!min || ts < min) ? ts : min;
-  }, '');
-  const windowNewest = allRecords.reduce((max, r) => {
-    const ts = r.createdAt || '';
-    return (!max || ts > max) ? ts : max;
-  }, '');
-  console.log(`Memory window: ${allRecords.length} records  oldest=${windowOldest.slice(0,10)}  newest=${windowNewest.slice(0,10)}`);
-
-  // Step 1 — Aggregate per-agent scores.
-  const agents = aggregateScores(allRecords);
-  console.log(`\nAll agents with scorecard-adjusted records (${agents.length}):`);
-  for (const a of agents.sort((x, y) => y.n - x.n)) {
-    console.log(`  ${a.agentId}  n=${a.n}  meanScore=${a.meanScore.toExponential(3)}  meanQuality=${a.meanQuality.toFixed(2)}`);
-  }
-
-  // Step 2 — Apply min sample gate.
+  const agents = aggregateScores(windowed);
   const qualifying = agents.filter(a => a.n >= MIN_SAMPLE_COUNT);
-  console.log(`\nAfter gate 1 (n ≥ ${MIN_SAMPLE_COUNT}): ${qualifying.length} agent(s) qualify`);
-  for (const a of qualifying) {
-    console.log(`  ${a.agentId}  n=${a.n}`);
-  }
-
-  // Step 3 — Value-signal bias guard: exclude high-quality agents.
   const lowQuality = qualifying.filter(a => a.meanQuality < QUALITY_EXEMPTION_THRESHOLD);
   const exemptedByQuality = qualifying.filter(a => a.meanQuality >= QUALITY_EXEMPTION_THRESHOLD);
-  console.log(`\nAfter gate 2 (mean quality < ${QUALITY_EXEMPTION_THRESHOLD}): ${lowQuality.length} remain, ${exemptedByQuality.length} exempted`);
-  for (const a of exemptedByQuality) {
-    console.log(`  EXEMPT: ${a.agentId}  meanQuality=${a.meanQuality.toFixed(2)} ≥ ${QUALITY_EXEMPTION_THRESHOLD} — high-quality infra/ops agent, skip`);
-  }
-
-  // Step 4 — Compute bottom-quartile threshold.
   const q1 = quartileThreshold(lowQuality.map(a => a.meanScore));
   const bottomQ = lowQuality.filter(a => a.meanScore <= q1);
-  console.log(`\nQ1 threshold (among quality-gated agents): ${q1.toExponential(4)}`);
-  console.log(`After gate 3 (bottom quartile): ${bottomQ.length} agent(s)`);
-  for (const a of bottomQ) {
-    console.log(`  ${a.agentId}  meanScore=${a.meanScore.toExponential(3)}`);
-  }
 
-  // Step 5–9 — Per-agent Loop C + cooldown gates and proposal posting.
   const proposals = [];
   const skipped = [];
 
   for (const agent of bottomQ) {
     const { agentId, n, meanScore, meanQuality, taskTypeDist, oldest, newest } = agent;
 
-    // Gate 4: Loop C.
-    if (!hasLoopCRecord(allRecords, agentId)) {
+    if (!hasLoopCRecord(accumulated, agentId)) {
       skipped.push({ agentId, reason: 'no Loop C self-edit on record (prompt-improvement-proposal not found)' });
       continue;
     }
 
-    // Gate 5: cooldown.
-    if (withinCooldown(allRecords, agentId, REF_DATE)) {
+    if (withinCooldown(accumulated, agentId, refDate)) {
       skipped.push({ agentId, reason: `capacity-decisions record exists within last ${COOLDOWN_DAYS} days` });
       continue;
     }
 
-    // All gates passed — propose.
-    const taskDist = Object.entries(taskTypeDist).sort((a, b) => b[1] - a[1]).map(([t, c]) => `${t}×${c}`).join(', ');
     const idempotencyKey = `f2-retire-${agentId}-${isoYear}-W${String(isoWeek).padStart(2, '0')}`;
-    const interactionTitle = `Loop F-2 proposal: retire or repurpose agent ${agentId.slice(0, 8)}`;
-    const body = [
-      `## Loop F-2 Retire/Repurpose Proposal`,
-      ``,
-      `**Agent:** \`${agentId}\``,
-      `**Scorecard window:** ${oldest.slice(0, 10)} → ${newest.slice(0, 10)} (n=${n})`,
-      `**Mean cost-adjusted score:** ${meanScore.toExponential(4)} (Q1 threshold: ${q1.toExponential(4)})`,
-      `**Mean quality_signal:** ${meanQuality.toFixed(2)} (below exemption threshold ${QUALITY_EXEMPTION_THRESHOLD})`,
-      `**Task-type distribution:** ${taskDist}`,
-      `**Loop C self-edit:** record confirmed (prompt-improvement-proposal/${agentId}/*)`,
-      `**Cooldown:** no capacity-decisions record within last ${COOLDOWN_DAYS} days`,
-      ``,
-      `### What happened`,
-      `This agent ranks in the cost-adjusted bottom quartile (score ≤ Q1) among agents`,
-      `with sufficient sample size (n ≥ ${MIN_SAMPLE_COUNT}) and low mean quality (< ${QUALITY_EXEMPTION_THRESHOLD}).`,
-      `A Loop C self-edit was already attempted and approved. The 30-day cooldown has cleared.`,
-      ``,
-      `### Board action required`,
-      `Please decide: **retire** this agent (cancel routine/issues, revoke access) or **repurpose**`,
-      `(reassign to different task types where their skill set is better matched).`,
-      ``,
-      `Accepting this interaction will log the decision and set a 30-day cooldown.`,
-      `Rejecting will skip this cycle; the agent will be re-evaluated next week.`,
-    ].join('\n');
+    proposals.push({ agentId, idempotencyKey, n, meanScore, meanQuality, taskTypeDist, oldest, newest, q1 });
+  }
 
-    proposals.push({ agentId, idempotencyKey, interactionTitle, body, n, meanScore, q1 });
+  return { isoYear, isoWeek, agents, qualifying, lowQuality, exemptedByQuality, q1, bottomQ, proposals, skipped };
+}
+
+// ---- Main ------------------------------------------------------------------
+
+async function main() {
+  const refDateStr = REF_DATE.toISOString().slice(0, 10);
+  console.log(`SGI Loop F-2 Retire Watchdog — ref date ${refDateStr}`);
+  console.log(`Mode: ${DRY_RUN ? 'DRY-RUN (no writes)' : 'LIVE'}`);
+  console.log(`Scoring window: ${WINDOW_DAYS} days\n`);
+
+  const { accumulated, windowed, pages, hitPageCap } = await fetchWindowedRecords(
+    (path) => apiFetch(path),
+    COMPANY_ID,
+    { refDate: REF_DATE, windowDays: WINDOW_DAYS }
+  );
+
+  if (hitPageCap) {
+    console.log(`[WARN] Hit MAX_PAGES cap (${MAX_PAGES}) after ${pages} page(s) while paging memory records — scan may be truncated before the full window was reached.`);
+  }
+  console.log(`Pagination: ${pages} page(s) fetched, ${accumulated.length} record(s) accumulated, ${windowed.length} within the ${WINDOW_DAYS}-day scoring window.`);
+
+  const windowOldest = windowed.reduce((min, r) => {
+    const ts = r.createdAt || '';
+    return (!min || ts < min) ? ts : min;
+  }, '');
+  const windowNewest = windowed.reduce((max, r) => {
+    const ts = r.createdAt || '';
+    return (!max || ts > max) ? ts : max;
+  }, '');
+  console.log(`Scoring window: ${windowed.length} records  oldest=${windowOldest.slice(0,10)}  newest=${windowNewest.slice(0,10)}`);
+
+  const { isoYear, isoWeek, agents, qualifying, lowQuality, exemptedByQuality, q1, bottomQ, proposals, skipped } =
+    evaluateGates(windowed, accumulated, REF_DATE);
+
+  console.log(`\nAll agents with scorecard-adjusted records (${agents.length}):`);
+  for (const a of agents.sort((x, y) => y.n - x.n)) {
+    console.log(`  ${a.agentId}  n=${a.n}  meanScore=${a.meanScore.toExponential(3)}  meanQuality=${a.meanQuality.toFixed(2)}`);
+  }
+
+  console.log(`\nAfter gate 1 (n ≥ ${MIN_SAMPLE_COUNT}): ${qualifying.length} agent(s) qualify`);
+  for (const a of qualifying) {
+    console.log(`  ${a.agentId}  n=${a.n}`);
+  }
+
+  console.log(`\nAfter gate 2 (mean quality < ${QUALITY_EXEMPTION_THRESHOLD}): ${lowQuality.length} remain, ${exemptedByQuality.length} exempted`);
+  for (const a of exemptedByQuality) {
+    console.log(`  EXEMPT: ${a.agentId}  meanQuality=${a.meanQuality.toFixed(2)} ≥ ${QUALITY_EXEMPTION_THRESHOLD} — high-quality infra/ops agent, skip`);
+  }
+
+  console.log(`\nQ1 threshold (among quality-gated agents): ${q1.toExponential(4)}`);
+  console.log(`After gate 3 (bottom quartile): ${bottomQ.length} agent(s)`);
+  for (const a of bottomQ) {
+    console.log(`  ${a.agentId}  meanScore=${a.meanScore.toExponential(3)}`);
   }
 
   console.log(`\n--- Summary ---`);
-  console.log(`Window: ${windowOldest.slice(0, 10)} → ${windowNewest.slice(0, 10)} (${allRecords.length} records scanned)`);
+  console.log(`Window: ${windowOldest.slice(0, 10)} → ${windowNewest.slice(0, 10)} (${windowed.length} records scanned, ${WINDOW_DAYS}-day window)`);
   console.log(`Agents scored: ${agents.length}  Qualifying (n≥${MIN_SAMPLE_COUNT}): ${qualifying.length}  Low-quality: ${lowQuality.length}  Bottom-Q: ${bottomQ.length}`);
   console.log(`Q1 threshold: ${q1.toExponential(4)}`);
   console.log(`\nExempted by quality guard (${exemptedByQuality.length}):`);
@@ -332,19 +385,47 @@ async function main() {
     console.log(`  ${p.agentId}  key=${p.idempotencyKey}`);
   }
 
+  const proposalBodies = proposals.map(p => {
+    const taskDist = Object.entries(p.taskTypeDist).sort((a, b) => b[1] - a[1]).map(([t, c]) => `${t}×${c}`).join(', ');
+    const interactionTitle = `Loop F-2 proposal: retire or repurpose agent ${p.agentId.slice(0, 8)}`;
+    const body = [
+      `## Loop F-2 Retire/Repurpose Proposal`,
+      ``,
+      `**Agent:** \`${p.agentId}\``,
+      `**Scorecard window:** ${p.oldest.slice(0, 10)} → ${p.newest.slice(0, 10)} (n=${p.n}, ${WINDOW_DAYS}-day scan)`,
+      `**Mean cost-adjusted score:** ${p.meanScore.toExponential(4)} (Q1 threshold: ${p.q1.toExponential(4)})`,
+      `**Mean quality_signal:** ${p.meanQuality.toFixed(2)} (below exemption threshold ${QUALITY_EXEMPTION_THRESHOLD})`,
+      `**Task-type distribution:** ${taskDist}`,
+      `**Loop C self-edit:** record confirmed (prompt-improvement-proposal/${p.agentId}/*)`,
+      `**Cooldown:** no capacity-decisions record within last ${COOLDOWN_DAYS} days`,
+      ``,
+      `### What happened`,
+      `This agent ranks in the cost-adjusted bottom quartile (score ≤ Q1) among agents`,
+      `with sufficient sample size (n ≥ ${MIN_SAMPLE_COUNT}) and low mean quality (< ${QUALITY_EXEMPTION_THRESHOLD})`,
+      `sustained over a ${WINDOW_DAYS}-day window.`,
+      `A Loop C self-edit was already attempted and approved. The 30-day cooldown has cleared.`,
+      ``,
+      `### Board action required`,
+      `Please decide: **retire** this agent (cancel routine/issues, revoke access) or **repurpose**`,
+      `(reassign to different task types where their skill set is better matched).`,
+      ``,
+      `Accepting this interaction will log the decision and set a 30-day cooldown.`,
+      `Rejecting will skip this cycle; the agent will be re-evaluated next week.`,
+    ].join('\n');
+    return { ...p, interactionTitle, body };
+  });
+
   if (DRY_RUN) {
     console.log('\n[DRY-RUN] No interactions or memory records written.');
-    if (proposals.length > 0) {
-      for (const p of proposals) {
-        console.log(`\n--- Proposal for ${p.agentId} ---\n${p.body}`);
-      }
+    for (const p of proposalBodies) {
+      console.log(`\n--- Proposal for ${p.agentId} ---\n${p.body}`);
     }
-    return { dryRun: true, proposals: proposals.length, skipped: skipped.length, q1, exemptedByQuality: exemptedByQuality.length };
+    return { dryRun: true, proposals: proposals.length, skipped: skipped.length, q1, exemptedByQuality: exemptedByQuality.length, windowDays: WINDOW_DAYS, recordsScanned: windowed.length, pagesFetched: pages, hitPageCap };
   }
 
   // Live mode: post interactions and write cooldown records.
   const posted = [];
-  for (const p of proposals) {
+  for (const p of proposalBodies) {
     if (!TASK_ID) {
       console.warn(`[WARN] PAPERCLIP_TASK_ID not set — skipping interaction for ${p.agentId}`);
       continue;
@@ -389,7 +470,7 @@ async function main() {
       `## SGI Loop F-2 — Retire/Repurpose Watchdog Run`,
       ``,
       `**Date:** ${refDateStr} · **ISO week:** ${isoYear}-W${String(isoWeek).padStart(2, '0')}`,
-      `**Records scanned:** ${allRecords.length} (window ${windowOldest.slice(0,10)} → ${windowNewest.slice(0,10)})`,
+      `**Scoring window:** ${WINDOW_DAYS} days (${windowOldest.slice(0,10)} → ${windowNewest.slice(0,10)}) · **Records scanned:** ${windowed.length} (${pages} page(s), ${accumulated.length} accumulated)`,
       `**Agents scored:** ${agents.length} total · ${qualifying.length} with n≥${MIN_SAMPLE_COUNT} · Q1 threshold: \`${q1.toExponential(4)}\``,
       ``,
       `### Exempted by value-signal bias guard (quality ≥ ${QUALITY_EXEMPTION_THRESHOLD})`,
@@ -407,7 +488,11 @@ async function main() {
   return {
     date: refDateStr,
     isoWeek: `${isoYear}-W${String(isoWeek).padStart(2, '0')}`,
-    recordsScanned: allRecords.length,
+    windowDays: WINDOW_DAYS,
+    recordsScanned: windowed.length,
+    recordsAccumulated: accumulated.length,
+    pagesFetched: pages,
+    hitPageCap,
     agentsScored: agents.length,
     qualifying: qualifying.length,
     lowQuality: lowQuality.length,
@@ -419,9 +504,22 @@ async function main() {
   };
 }
 
-main().then(result => {
-  console.log('\nResult:', JSON.stringify(result, null, 2));
-}).catch(err => {
-  console.error('SGI Loop F-2 error:', err.message);
-  process.exit(1);
-});
+export {
+  fetchWindowedRecords,
+  aggregateScores,
+  quartileThreshold,
+  hasLoopCRecord,
+  withinCooldown,
+  isoWeekYear,
+  evaluateGates,
+};
+
+const isMain = process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/\\/g, '/').split('/').pop());
+if (isMain) {
+  main().then(result => {
+    console.log('\nResult:', JSON.stringify(result, null, 2));
+  }).catch(err => {
+    console.error('SGI Loop F-2 error:', err.message);
+    process.exit(1);
+  });
+}

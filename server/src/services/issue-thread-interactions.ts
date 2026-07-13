@@ -479,6 +479,7 @@ export function issueThreadInteractionService(db: Db) {
     issue: { id: string; companyId: string };
     current: IssueThreadInteractionRow;
     actor: InteractionActor;
+    note?: string | null;
   }): Promise<{
     interaction: IssueThreadInteraction;
     continuationIssue: IssueWakeTarget | null;
@@ -491,6 +492,7 @@ export function issueThreadInteractionService(db: Db) {
       return { interaction: expired, continuationIssue: null };
     }
 
+    const reviewerNote = args.note?.trim() || null;
     const now = new Date();
     return db.transaction(async (tx) => {
       const [updated] = await tx
@@ -500,6 +502,7 @@ export function issueThreadInteractionService(db: Db) {
           result: {
             version: 1,
             outcome: "accepted",
+            ...(reviewerNote ? { note: reviewerNote } : {}),
           },
           resolvedByAgentId: args.actor.agentId ?? null,
           resolvedByUserId: args.actor.userId ?? null,
@@ -663,6 +666,42 @@ export function issueThreadInteractionService(db: Db) {
     });
   }
 
+  async function cancelRequestConfirmation(args: {
+    issue: { id: string; companyId: string };
+    current: IssueThreadInteractionRow;
+    input: CancelIssueThreadInteraction;
+    actor: InteractionActor;
+  }): Promise<IssueThreadInteraction> {
+    const reason = args.input.reason?.trim() || null;
+    const now = new Date();
+    const [updated] = await db
+      .update(issueThreadInteractions)
+      .set({
+        status: "cancelled",
+        result: {
+          version: 1,
+          outcome: "cancelled",
+          reason,
+        },
+        resolvedByAgentId: args.actor.agentId ?? null,
+        resolvedByUserId: args.actor.userId ?? null,
+        resolvedAt: now,
+        updatedAt: now,
+      })
+      .where(and(
+        eq(issueThreadInteractions.id, args.current.id),
+        eq(issueThreadInteractions.status, "pending"),
+      ))
+      .returning();
+
+    if (!updated) {
+      throw conflict("Interaction has already been resolved");
+    }
+
+    await touchIssue(db, args.issue.id);
+    return hydrateInteraction(updated);
+  }
+
   return {
     listForIssue: async (issueId: string) => {
       const rows = await db
@@ -814,6 +853,7 @@ export function issueThreadInteractionService(db: Db) {
             issue,
             current,
             actor,
+            note: data.note ?? null,
           });
           return {
             interaction: accepted.interaction,
@@ -1227,6 +1267,24 @@ export function issueThreadInteractionService(db: Db) {
 
       await touchIssue(db, issue.id);
       return hydrateInteraction(updated);
+    },
+
+    cancelInteraction: async (
+      issue: { id: string; companyId: string },
+      interactionId: string,
+      input: CancelIssueThreadInteraction,
+      actor: InteractionActor,
+    ) => {
+      const data = cancelIssueThreadInteractionSchema.parse(input);
+      const current = await getPendingInteractionForResolution({ issue, interactionId });
+      switch (current.kind) {
+        case "ask_user_questions":
+          return issueThreadInteractionService(db).cancelQuestions(issue, interactionId, data, actor);
+        case "request_confirmation":
+          return cancelRequestConfirmation({ issue, current, input: data, actor });
+        default:
+          throw unprocessable(`Interactions of kind ${current.kind} cannot be cancelled`);
+      }
     },
 
     cancelQuestions: async (

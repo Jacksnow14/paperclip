@@ -716,8 +716,10 @@ export const requestConfirmationPayloadSchema = z.object({
 
 export const requestConfirmationResultSchema = z.object({
   version: z.literal(1),
-  outcome: z.enum(["accepted", "rejected", "superseded_by_comment", "stale_target"]),
+  outcome: z.enum(["accepted", "rejected", "superseded_by_comment", "stale_target", "cancelled"]),
   reason: z.string().trim().max(4000).nullable().optional(),
+  /** Optional reviewer note captured on acceptance (agent-to-agent review sign-off). */
+  note: z.string().trim().max(4000).nullable().optional(),
   commentId: z.string().uuid().nullable().optional(),
   staleTarget: requestConfirmationTargetSchema.nullable().optional(),
 });
@@ -759,6 +761,8 @@ export type CreateIssueThreadInteraction = z.infer<typeof createIssueThreadInter
 
 export const acceptIssueThreadInteractionSchema = z.object({
   selectedClientKeys: z.array(z.string().trim().min(1).max(120)).min(1).max(50).optional(),
+  /** Optional reviewer note recorded on the accepted request_confirmation. */
+  note: z.string().trim().max(4000).optional(),
 }).superRefine((value, ctx) => {
   const seenClientKeys = new Set<string>();
   for (const [index, clientKey] of (value.selectedClientKeys ?? []).entries()) {

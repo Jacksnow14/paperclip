@@ -24,6 +24,7 @@ const mockIssueService = vi.hoisted(() => ({
   update: vi.fn(),
   findMentionedAgents: vi.fn(),
   wasAgentMentionedInThread: vi.fn(),
+  wasAgentPriorParticipantInThread: vi.fn(),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -299,6 +300,8 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
     mockIssueService.wasAgentMentionedInThread.mockResolvedValue(false);
+    mockIssueService.wasAgentPriorParticipantInThread.mockReset();
+    mockIssueService.wasAgentPriorParticipantInThread.mockResolvedValue(false);
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...makeIssue(),
       ...patch,
@@ -640,5 +643,125 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).not.toHaveBeenCalledWith(issueId, expect.objectContaining({ status: "todo" }));
     });
 
+  });
+
+  describe("participant-scoped reply comments", () => {
+    it("allows a non-assignee prior participant to post an inert comment on an in_review issue; status unchanged", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_review", assigneeAgentId: ownerAgentId }));
+      mockIssueService.wasAgentMentionedInThread.mockResolvedValue(false);
+      mockIssueService.wasAgentPriorParticipantInThread.mockResolvedValue(true);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "77777777-7777-4777-8777-777777777777",
+        issueId,
+        companyId,
+        body: "evidence ack",
+        metadata: { version: 1, mentionReply: true, mentionRepliedByAgentId: peerAgentId },
+      });
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "evidence ack" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.wasAgentPriorParticipantInThread).toHaveBeenCalledWith(companyId, issueId, peerAgentId);
+      expect(mockIssueService.addComment).toHaveBeenCalledWith(
+        issueId,
+        "evidence ack",
+        expect.objectContaining({ agentId: peerAgentId }),
+        expect.objectContaining({ authorType: "agent" }),
+      );
+      // Inert: no status mutation / no reopen. Wake of the current assignee is handled by the
+      // shared mentionReply path (see mention-scoped tests) since the same flag is reused.
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("allows a non-assignee prior participant to post an inert comment on a closed (done) issue without reopening it", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "done", assigneeAgentId: ownerAgentId }));
+      mockIssueService.wasAgentMentionedInThread.mockResolvedValue(false);
+      mockIssueService.wasAgentPriorParticipantInThread.mockResolvedValue(true);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "77777777-7777-4777-8777-777777777777",
+        issueId,
+        companyId,
+        body: "closing ack",
+        metadata: { version: 1, mentionReply: true, mentionRepliedByAgentId: peerAgentId },
+      });
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "closing ack" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.update).not.toHaveBeenCalledWith(issueId, expect.objectContaining({ status: "todo" }));
+    });
+
+    it("ignores reopen:true from a participant-reply actor — issue stays closed", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "done", assigneeAgentId: ownerAgentId }));
+      mockIssueService.wasAgentMentionedInThread.mockResolvedValue(false);
+      mockIssueService.wasAgentPriorParticipantInThread.mockResolvedValue(true);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "77777777-7777-4777-8777-777777777777",
+        issueId,
+        companyId,
+        body: "trying to reopen",
+        metadata: { version: 1, mentionReply: true, mentionRepliedByAgentId: peerAgentId },
+      });
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "trying to reopen", reopen: true });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.update).not.toHaveBeenCalledWith(issueId, expect.objectContaining({ status: "todo" }));
+    });
+
+    it("still rejects a non-assignee stranger with no prior participation (fail-secure) with 403 on a closed issue", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "done", assigneeAgentId: ownerAgentId }));
+      mockIssueService.wasAgentMentionedInThread.mockResolvedValue(false);
+      mockIssueService.wasAgentPriorParticipantInThread.mockResolvedValue(false);
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "stranger note" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("still rejects a non-assignee stranger with no prior participation with 409 on an in_progress issue", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId }));
+      mockIssueService.wasAgentMentionedInThread.mockResolvedValue(false);
+      mockIssueService.wasAgentPriorParticipantInThread.mockResolvedValue(false);
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "stranger note" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.error).toBe("Issue is checked out by another agent");
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    it("does not consult participant lookup when the mention check already passed (mention takes precedence)", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_review", assigneeAgentId: ownerAgentId }));
+      mockIssueService.wasAgentMentionedInThread.mockResolvedValue(true);
+      mockIssueService.wasAgentPriorParticipantInThread.mockResolvedValue(true);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "77777777-7777-4777-8777-777777777777",
+        issueId,
+        companyId,
+        body: "mentioned reply",
+        metadata: { version: 1, mentionReply: true, mentionRepliedByAgentId: peerAgentId },
+      });
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "mentioned reply" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.wasAgentPriorParticipantInThread).not.toHaveBeenCalled();
+    });
   });
 });

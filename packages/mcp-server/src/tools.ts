@@ -161,6 +161,30 @@ const apiRequestSchema = z.object({
   jsonBody: z.string().optional(),
 });
 
+const gmailMailboxSchema = z.string().min(1).describe("Mailbox alias, e.g. \"board\" or \"alex\" (mailbox@tryauranode.com)");
+
+const gmailListMessagesToolSchema = z.object({
+  companyId: companyIdOptional,
+  mailbox: gmailMailboxSchema,
+  query: z.string().optional().describe("Gmail search query syntax, e.g. \"is:unread\""),
+  maxResults: z.number().int().positive().max(500).optional(),
+  pageToken: z.string().optional(),
+});
+
+const gmailReadMessageToolSchema = z.object({
+  companyId: companyIdOptional,
+  mailbox: gmailMailboxSchema,
+  messageId: z.string().min(1),
+});
+
+const gmailSendReplyToolSchema = z.object({
+  companyId: companyIdOptional,
+  mailbox: gmailMailboxSchema,
+  body: z.string().min(1),
+  replyToMessageId: z.string().min(1).optional(),
+  threadId: z.string().min(1).optional(),
+});
+
 const workspaceRuntimeControlTargetSchema = z.object({
   workspaceCommandId: z.string().min(1).optional().nullable(),
   runtimeServiceId: z.string().uuid().optional().nullable(),
@@ -591,6 +615,43 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
         client.requestJson("POST", `/approvals/${encodeURIComponent(approvalId)}/comments`, {
           body: { body },
         }),
+    ),
+    makeTool(
+      "gmail_list_messages",
+      "List Gmail messages in a mailbox (e.g. board or alex @tryauranode.com), optionally filtered by a Gmail search query",
+      gmailListMessagesToolSchema,
+      async ({ companyId, mailbox, query, maxResults, pageToken }) => {
+        const params = new URLSearchParams();
+        if (query) params.set("q", query);
+        if (maxResults) params.set("maxResults", String(maxResults));
+        if (pageToken) params.set("pageToken", pageToken);
+        const qs = params.toString();
+        return client.requestJson(
+          "GET",
+          `/companies/${client.resolveCompanyId(companyId)}/gmail/mailboxes/${encodeURIComponent(mailbox)}/messages${qs ? `?${qs}` : ""}`,
+        );
+      },
+    ),
+    makeTool(
+      "gmail_read_message",
+      "Read a single Gmail message by id, including the full decoded bodyText/bodyHtml (not a truncated snippet)",
+      gmailReadMessageToolSchema,
+      async ({ companyId, mailbox, messageId }) =>
+        client.requestJson(
+          "GET",
+          `/companies/${client.resolveCompanyId(companyId)}/gmail/mailboxes/${encodeURIComponent(mailbox)}/messages/${encodeURIComponent(messageId)}`,
+        ),
+    ),
+    makeTool(
+      "gmail_send_reply",
+      "Reply in an existing Gmail thread (by replyToMessageId or threadId) with correct RFC in-reply-to/references threading headers",
+      gmailSendReplyToolSchema,
+      async ({ companyId, mailbox, ...body }) =>
+        client.requestJson(
+          "POST",
+          `/companies/${client.resolveCompanyId(companyId)}/gmail/mailboxes/${encodeURIComponent(mailbox)}/reply`,
+          { body },
+        ),
     ),
     makeTool(
       "paperclipApiRequest",

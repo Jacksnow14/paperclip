@@ -28,5 +28,13 @@ export const gmailIntakeRecords = pgTable(
       table.mailbox,
       table.gmailThreadId,
     ),
+    // Supports cross-thread sender+subject dedupe (AUR-2674): folds auto-reply
+    // floods from the same sender with the same normalized subject into one issue.
+    senderSubjectIdx: index("gmail_intake_sender_subject_idx").on(
+      table.companyId,
+      table.mailbox,
+      table.sender,
+      table.subject,
+    ),
   }),
 );

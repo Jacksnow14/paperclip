@@ -13,6 +13,11 @@ const mockIssueService = vi.hoisted(() => ({
   // the ownership-gate path; without it the bare mock is undefined and the
   // route throws → 500 instead of the expected 403/409.
   wasAgentMentionedInThread: vi.fn(async () => false),
+  // Consulted by assertAgentCommentAllowed for non-assignee agents (AUR-3297
+  // participant-scoped append-only bypass). Default to "not a prior participant"
+  // so these tests exercise the ownership-gate path; without it the bare mock is
+  // undefined and the route throws → 500 instead of the expected 403/409.
+  wasAgentPriorParticipantInThread: vi.fn(async () => false),
   findMentionedAgents: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),

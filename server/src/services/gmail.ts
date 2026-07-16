@@ -1,6 +1,7 @@
 import { google } from "googleapis";
 import { logger } from "../middleware/logger.js";
-import { HttpError, notFound, tooManyRequests, badGateway, gatewayTimeout } from "../errors.js";
+import { HttpError, badRequest, notFound, tooManyRequests, badGateway, gatewayTimeout } from "../errors.js";
+import { classifyGmailOutbound, GmailOutboundBlockedError } from "./gmail-outbound-guard.js";
 
 const DOMAIN = "tryauranode.com";
 export const GMAIL_SUPPORTED_ALIASES = ["board", "alex"] as const;
@@ -115,17 +116,62 @@ async function withRetry<T>(operation: string, fn: () => Promise<T>): Promise<T>
   throw mapGoogleApiError(operation, lastError);
 }
 
+// Base64 inflates payload size ~4/3; 25MB decoded ~= 33.4MB encoded.
+const MAX_ATTACHMENT_BASE64_BYTES = 34_000_000;
+
+function normalizeRecipients(...groups: Array<string | string[] | undefined>): string[] {
+  const out: string[] = [];
+  for (const group of groups) {
+    if (!group) continue;
+    const arr = Array.isArray(group) ? group : [group];
+    for (const entry of arr) {
+      for (const addr of entry.split(",")) {
+        const trimmed = addr.trim();
+        if (trimmed) out.push(trimmed);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Guard context threaded through the service-layer chokepoint. The ONLY way a
+ * gated outbound (fraud/abuse/legal/chargeback/law-enforcement/blocklisted-
+ * domain — see gmail-outbound-guard.ts) is allowed through `sendMessage` is
+ * when a caller that has already verified an explicit CEO board approval
+ * passes `approvalVerified: true` (see routes/gmail.ts).
+ *
+ * AUR-2525/AUR-2682/AUR-3523: classification lives in sendMessage() itself —
+ * not just the HTTP route — so any in-repo caller (intake auto-replies,
+ * replyInThread, future scripts) is gated regardless of code path.
+ */
+export interface GmailSendGuardContext {
+  approvalVerified?: boolean;
+}
+
+export interface GmailAttachmentInput {
+  filename: string;
+  mimeType: string;
+  contentBase64: string;
+}
+
 export interface GmailSendOptions {
   to: string;
   subject: string;
   body: string;
   replyToMessageId?: string;
+  cc?: string | string[];
+  replyTo?: string;
+  attachments?: GmailAttachmentInput[];
 }
 
 export interface GmailReplyOptions {
   replyToMessageId?: string;
   threadId?: string;
   body: string;
+  cc?: string | string[];
+  replyTo?: string;
+  attachments?: GmailAttachmentInput[];
 }
 
 export interface GmailListOptions {
@@ -196,6 +242,41 @@ function extractHeader(
   return (headers ?? []).find((h) => h.name?.toLowerCase() === name.toLowerCase())?.value ?? "";
 }
 
+export interface GmailMessagePart {
+  mimeType?: string | null;
+  body?: { data?: string | null; size?: number | null } | null;
+  parts?: GmailMessagePart[] | null;
+}
+
+export interface GmailDecodedBody {
+  bodyText: string | null;
+  bodyHtml: string | null;
+}
+
+// Gmail's "full" format nests the body in a MIME part tree, base64url-encoded.
+// Walk it breadth-first and take the first text/plain and text/html leaf found,
+// mirroring how mail clients pick a representative part out of multipart/alternative.
+export function decodeGmailMessageBody(
+  payload: GmailMessagePart | null | undefined,
+): GmailDecodedBody {
+  let bodyText: string | null = null;
+  let bodyHtml: string | null = null;
+  const queue: Array<GmailMessagePart | null | undefined> = [payload];
+  while (queue.length > 0) {
+    const part = queue.shift();
+    if (!part) continue;
+    const mimeType = part.mimeType ?? "";
+    const data = part.body?.data;
+    if (data && mimeType === "text/plain" && bodyText === null) {
+      bodyText = Buffer.from(data, "base64url").toString("utf-8");
+    } else if (data && mimeType === "text/html" && bodyHtml === null) {
+      bodyHtml = Buffer.from(data, "base64url").toString("utf-8");
+    }
+    if (part.parts) queue.push(...part.parts);
+  }
+  return { bodyText, bodyHtml };
+}
+
 interface BuildRawMessageOptions {
   from: string;
   to: string;
@@ -203,17 +284,63 @@ interface BuildRawMessageOptions {
   body: string;
   inReplyTo?: string;
   references?: string;
+  cc?: string | string[];
+  replyTo?: string;
+  attachments?: GmailAttachmentInput[];
+}
+
+function wrapBase64(data: string): string {
+  return data.replace(/.{1,76}/g, "$&\r\n").trimEnd();
+}
+
+function buildMimeBoundary(): string {
+  return `paperclip-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
 function buildRawMessage(opts: BuildRawMessageOptions): string {
   const isReply = Boolean(opts.inReplyTo);
   const subject =
     isReply && !/^re:/i.test(opts.subject.trim()) ? `Re: ${opts.subject}` : opts.subject;
-  const lines = [`From: ${opts.from}`, `To: ${opts.to}`, `Subject: ${subject}`];
-  if (opts.inReplyTo) lines.push(`In-Reply-To: ${opts.inReplyTo}`);
-  if (opts.references) lines.push(`References: ${opts.references}`);
-  lines.push("MIME-Version: 1.0", "Content-Type: text/plain; charset=utf-8", "", opts.body);
-  return Buffer.from(lines.join("\r\n")).toString("base64url");
+  const cc = normalizeRecipients(opts.cc).join(", ");
+
+  const headers = [`From: ${opts.from}`, `To: ${opts.to}`];
+  if (cc) headers.push(`Cc: ${cc}`);
+  if (opts.replyTo) headers.push(`Reply-To: ${opts.replyTo}`);
+  headers.push(`Subject: ${subject}`);
+  if (opts.inReplyTo) headers.push(`In-Reply-To: ${opts.inReplyTo}`);
+  if (opts.references) headers.push(`References: ${opts.references}`);
+  headers.push("MIME-Version: 1.0");
+
+  const attachments = opts.attachments ?? [];
+  if (attachments.length === 0) {
+    headers.push("Content-Type: text/plain; charset=utf-8", "", opts.body);
+    return Buffer.from(headers.join("\r\n")).toString("base64url");
+  }
+
+  const boundary = buildMimeBoundary();
+  headers.push(`Content-Type: multipart/mixed; boundary="${boundary}"`, "");
+
+  const parts: string[] = [
+    `--${boundary}`,
+    "Content-Type: text/plain; charset=utf-8",
+    "",
+    opts.body,
+    "",
+  ];
+  for (const attachment of attachments) {
+    parts.push(
+      `--${boundary}`,
+      `Content-Type: ${attachment.mimeType}; name="${attachment.filename}"`,
+      `Content-Disposition: attachment; filename="${attachment.filename}"`,
+      "Content-Transfer-Encoding: base64",
+      "",
+      wrapBase64(attachment.contentBase64),
+      "",
+    );
+  }
+  parts.push(`--${boundary}--`);
+
+  return Buffer.from([...headers, ...parts].join("\r\n")).toString("base64url");
 }
 
 export function isSupportedGmailAlias(alias: string): alias is GmailAlias {
@@ -242,7 +369,55 @@ export function createGmailService() {
     return res.data;
   }
 
-  async function sendMessage(alias: GmailAlias, opts: GmailSendOptions) {
+  async function getAttachment(alias: GmailAlias, messageId: string, attachmentId: string) {
+    const gmail = buildGmailClient(alias);
+    const res = await withRetry("messages.attachments.get", () =>
+      gmail.users.messages.attachments.get({
+        userId: "me",
+        messageId,
+        id: attachmentId,
+      }),
+    );
+    const data = res.data.data ?? "";
+    return {
+      attachmentId,
+      size: res.data.size ?? 0,
+      data,
+      dataBase64: data ? Buffer.from(data, "base64url").toString("base64") : "",
+    };
+  }
+
+  async function sendMessage(
+    alias: GmailAlias,
+    opts: GmailSendOptions,
+    guard?: GmailSendGuardContext,
+  ) {
+    for (const attachment of opts.attachments ?? []) {
+      if (attachment.contentBase64.length > MAX_ATTACHMENT_BASE64_BYTES) {
+        throw badRequest(
+          `Attachment ${attachment.filename} exceeds the 25MB size limit`,
+        );
+      }
+    }
+
+    // AUR-2682 service-layer chokepoint: classify EVERY outbound, regardless
+    // of which code path called us (direct send, replyInThread, future
+    // callers). Gated categories are hard-blocked unless the caller has
+    // already verified an explicit CEO board approval.
+    const decision = classifyGmailOutbound({
+      to: opts.to,
+      subject: opts.subject,
+      text: opts.body,
+      cc: opts.cc,
+    });
+    if (decision.gated && !guard?.approvalVerified) {
+      logger.error(
+        { alias, to: opts.to, category: decision.category, reasons: decision.reasons },
+        "gmail-guard: BLOCKED gated outbound at service chokepoint (AUR-2525/AUR-2682)",
+      );
+      throw new GmailOutboundBlockedError(decision);
+    }
+
     const gmail = buildGmailClient(alias);
     const from = resolveMailboxEmail(alias);
     const requestBody: { raw: string; threadId?: string } = { raw: "" };
@@ -267,15 +442,25 @@ export function createGmailService() {
       body: opts.body,
       inReplyTo,
       references,
+      cc: opts.cc,
+      replyTo: opts.replyTo,
+      attachments: opts.attachments,
     });
     const res = await withRetry("messages.send", () =>
       gmail.users.messages.send({ userId: "me", requestBody }),
     );
-    logger.info({ alias, to: opts.to, messageId: res.data.id }, "gmail: message sent");
+    logger.info(
+      { alias, to: opts.to, cc: opts.cc, subject: opts.subject, messageId: res.data.id },
+      "gmail: message sent",
+    );
     return res.data;
   }
 
-  async function replyInThread(alias: GmailAlias, opts: GmailReplyOptions) {
+  async function replyInThread(
+    alias: GmailAlias,
+    opts: GmailReplyOptions,
+    guard?: GmailSendGuardContext,
+  ) {
     if (!opts.replyToMessageId && !opts.threadId) {
       throw new Error("replyInThread requires replyToMessageId or threadId");
     }
@@ -294,12 +479,19 @@ export function createGmailService() {
     if (!replyTo) {
       throw new Error(`Could not determine reply-to address for message ${targetMessageId}`);
     }
-    return sendMessage(alias, {
-      to: replyTo,
-      subject,
-      body: opts.body,
-      replyToMessageId: targetMessageId,
-    });
+    return sendMessage(
+      alias,
+      {
+        to: replyTo,
+        subject,
+        body: opts.body,
+        replyToMessageId: targetMessageId,
+        cc: opts.cc,
+        replyTo: opts.replyTo,
+        attachments: opts.attachments,
+      },
+      guard,
+    );
   }
 
   async function listThreads(alias: GmailAlias, opts?: GmailListOptions) {
@@ -387,6 +579,7 @@ export function createGmailService() {
   return {
     listMessages,
     getMessage,
+    getAttachment,
     sendMessage,
     replyInThread,
     listThreads,

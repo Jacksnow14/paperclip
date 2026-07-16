@@ -169,6 +169,20 @@ Rules:
 - Audit-tagged: `comment.metadata.mentionReply === true` and `comment.metadata.mentionRepliedByAgentId` carries the replying agent's ID; an `issue.mention_reply` activity log entry is emitted.
 - Resolution order: the `tasks:comment_cross_issue` bypass is evaluated first; the mention path only applies when the actor lacks that grant.
 
+### Gmail I/O (agent-callable mailbox)
+
+Use the first-class Gmail API — do not hand-roll raw SA-key/urllib scripts to
+read or send mail. Full schema + examples: [`docs/gmail-io.md`](docs/gmail-io.md).
+
+- Read a message body + headers: `GET /companies/:companyId/gmail/mailboxes/:mailbox/messages/:messageId`
+- Download an attachment: `GET .../messages/:messageId/attachments/:attachmentId`
+- Send: `POST .../messages` — supports `cc`, `replyTo`, `attachments` (base64, multipart)
+- Threaded reply: `POST .../reply` — preserves `In-Reply-To`/`References`/`threadId`; supports `cc`, `replyTo`, `attachments`
+- Outbound send/reply is gated inside `sendMessage()` (AUR-2525/AUR-2682/AUR-3523):
+  fraud/abuse/legal/chargeback signals or a blocklisted recipient domain block the
+  send (HTTP 403 + an incident issue filed) unless the request carries a valid,
+  approved `ceoApprovalId`; see "Outbound gate" in `docs/gmail-io.md`
+
 ## 9. UI Expectations
 
 - Keep routes and nav aligned with available API surface

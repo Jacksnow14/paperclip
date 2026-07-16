@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
   agents,
+  agentWakeupRequests,
   companies,
   createDb,
   heartbeatRuns,
@@ -46,6 +47,12 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     await db.delete(activityLog);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
+    // The stale-lock recovery route fires an agent wakeup insert; clear the
+    // child rows before agents so teardown can't hit the
+    // agent_wakeup_requests_agent_id_agents_id_fk FK when the wakeup write
+    // lands around afterEach under CI shard load (mirrors the sibling
+    // issue-scheduled-retry-routes teardown ordering).
+    await db.delete(agentWakeupRequests);
     await db.delete(agents);
     await db.delete(companies);
   });

@@ -624,6 +624,20 @@
       "when": 1748873600002,
       "tag": "0088_memory_tables",
       "breakpoints": true
+    },
+    {
+      "idx": 89,
+      "version": "7",
+      "when": 1750165200000,
+      "tag": "0089_gmail_intake_records_table",
+      "breakpoints": true
+    },
+    {
+      "idx": 90,
+      "version": "7",
+      "when": 1750165200001,
+      "tag": "0090_gmail_intake_sender_subject_idx",
+      "breakpoints": true
     }
   ]
 }

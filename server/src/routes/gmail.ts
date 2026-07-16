@@ -79,11 +79,20 @@ function parseListQuery(raw: Record<string, unknown>) {
   return { query: q, maxResults, pageToken };
 }
 
-// AUR-2525/AUR-3523: an attached ceoApprovalId only counts as verification for
-// the outbound guard if it resolves to an `approved` approvals row scoped to
-// this company. Anything else (missing, pending, wrong company) is treated as
-// unverified and the service-layer chokepoint in sendMessage() decides
-// whether that matters (i.e. whether this particular send is actually gated).
+// AUR-2525/AUR-3523/AUR-3628: an attached ceoApprovalId only counts as
+// verification for the outbound guard if it resolves to an `approved`
+// approvals row scoped to this company AND that row is a board approval
+// (type "request_board_approval") whose payload carries a `gmailOutbound`
+// scope block (mailbox + to [+ optional subject]). Anything else (missing,
+// pending, wrong company, wrong type, unscoped/missing gmailOutbound block)
+// is treated as unverified.
+//
+// The `approvalScope` this returns is NOT itself proof the approval covers
+// THIS send — it only proves the approval is a validly-shaped, approved
+// gmail-outbound approval. Whether the scope actually matches the mailbox/
+// recipient/subject of the current send is decided by the service-layer
+// chokepoint in sendMessage() (isApprovalScopedToSend), so an approval
+// legitimately granted for a different recipient can't be reused here.
 async function verifyCeoApproval(
   db: Db,
   companyId: string,
@@ -96,7 +105,23 @@ async function verifyCeoApproval(
     .from(approvals)
     .where(and(eq(approvals.id, approvalId), eq(approvals.companyId, companyId)))
     .then((rows) => rows[0] ?? null);
-  return { approvalVerified: approval?.status === "approved" };
+  if (!approval || approval.status !== "approved" || approval.type !== "request_board_approval") {
+    return { approvalVerified: false };
+  }
+  const payload = approval.payload as Record<string, unknown> | null;
+  const scope = payload?.gmailOutbound;
+  if (!scope || typeof scope !== "object") {
+    return { approvalVerified: false };
+  }
+  const { mailbox, to, subject } = scope as Record<string, unknown>;
+  return {
+    approvalVerified: true,
+    approvalScope: {
+      mailbox: typeof mailbox === "string" ? mailbox : undefined,
+      to: typeof to === "string" ? to : undefined,
+      subject: typeof subject === "string" ? subject : undefined,
+    },
+  };
 }
 
 // Fire-and-forget: file a high-priority incident issue assigned to the
@@ -129,7 +154,9 @@ function fileBlockedSendIncident(
         `**Signals:** ${decision.reasons.join(", ")}\n\n` +
         `The send was hard-blocked. To proceed:\n` +
         `1. Verify this is a legitimate report (check memory / prior board decisions).\n` +
-        `2. Create a board approval via \`POST /api/companies/{co}/approvals\` with type \`request_board_approval\`.\n` +
+        `2. Create a board approval via \`POST /api/companies/{co}/approvals\` with type \`request_board_approval\` and a payload ` +
+        `containing \`gmailOutbound: { mailbox: "${mailbox}", to: "${context.to ?? "<target recipient>"}" }\` ` +
+        `(the approval must be scoped to this exact mailbox + recipient — AUR-3628).\n` +
         `3. After CEO approves, re-send with \`ceoApprovalId\` in the request body.`,
       priority: "high",
       status: "todo",

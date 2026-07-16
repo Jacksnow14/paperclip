@@ -113,8 +113,14 @@ describe("Gmail outbound guard — route enforcement", () => {
       );
     });
 
-    it("allows the gated send when a valid, approved ceoApprovalId is attached", async () => {
-      approvalRow = { id: "appr-ok", companyId: "company-1", status: "approved" };
+    it("allows the gated send when a valid, approved, correctly-scoped ceoApprovalId is attached", async () => {
+      approvalRow = {
+        id: "appr-ok",
+        companyId: "company-1",
+        status: "approved",
+        type: "request_board_approval",
+        payload: { gmailOutbound: { mailbox: "board", to: "report@bunq.com" } },
+      };
       const app = await createApp();
       const res = await request(app)
         .post("/api/companies/company-1/gmail/mailboxes/board/messages")
@@ -129,7 +135,13 @@ describe("Gmail outbound guard — route enforcement", () => {
     });
 
     it("still blocks when the approval exists but is only pending", async () => {
-      approvalRow = { id: "appr-pending", companyId: "company-1", status: "pending" };
+      approvalRow = {
+        id: "appr-pending",
+        companyId: "company-1",
+        status: "pending",
+        type: "request_board_approval",
+        payload: { gmailOutbound: { mailbox: "board", to: "report@bunq.com" } },
+      };
       const app = await createApp();
       const res = await request(app)
         .post("/api/companies/company-1/gmail/mailboxes/board/messages")
@@ -138,6 +150,56 @@ describe("Gmail outbound guard — route enforcement", () => {
           subject: "URGENT fraud report",
           body: "We are reporting an account takeover.",
           ceoApprovalId: "appr-pending",
+        });
+      expect(res.status).toBe(403);
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+    });
+
+    // AUR-3628: an approval that IS approved, but was granted for a different
+    // recipient/mailbox (or isn't a gmail-outbound-scoped board approval at
+    // all), must not satisfy the gate for THIS send.
+    it("rejects an approved approval that is not scoped to this Gmail send (wrong recipient) and files an incident", async () => {
+      approvalRow = {
+        id: "appr-other",
+        companyId: "company-1",
+        status: "approved",
+        type: "request_board_approval",
+        payload: { gmailOutbound: { mailbox: "board", to: "someone-else@example.com" } },
+      };
+      const app = await createApp();
+      const res = await request(app)
+        .post("/api/companies/company-1/gmail/mailboxes/board/messages")
+        .send({
+          to: "report@bunq.com",
+          subject: "URGENT fraud report",
+          body: "We are reporting an account takeover.",
+          ceoApprovalId: "appr-other",
+        });
+      expect(res.status).toBe(403);
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(mockIssueCreate).toHaveBeenCalledWith(
+        "company-1",
+        expect.objectContaining({ priority: "high", assigneeAgentId: "agent-1" }),
+      );
+    });
+
+    it("rejects an approved approval that isn't scoped to Gmail outbound at all (unrelated approval type reused)", async () => {
+      approvalRow = {
+        id: "appr-unrelated",
+        companyId: "company-1",
+        status: "approved",
+        type: "hire_agent",
+        payload: { agentName: "some other approval entirely" },
+      };
+      const app = await createApp();
+      const res = await request(app)
+        .post("/api/companies/company-1/gmail/mailboxes/board/messages")
+        .send({
+          to: "report@bunq.com",
+          subject: "URGENT fraud report",
+          body: "We are reporting an account takeover.",
+          ceoApprovalId: "appr-unrelated",
         });
       expect(res.status).toBe(403);
       expect(mockMessagesSend).not.toHaveBeenCalled();
@@ -183,8 +245,14 @@ describe("Gmail outbound guard — route enforcement", () => {
       );
     });
 
-    it("allows a gated reply when a valid, approved ceoApprovalId is attached", async () => {
-      approvalRow = { id: "appr-ok", companyId: "company-1", status: "approved" };
+    it("allows a gated reply when a valid, approved, correctly-scoped ceoApprovalId is attached", async () => {
+      approvalRow = {
+        id: "appr-ok",
+        companyId: "company-1",
+        status: "approved",
+        type: "request_board_approval",
+        payload: { gmailOutbound: { mailbox: "board", to: "report@bunq.com" } },
+      };
       mockMessagesSend.mockResolvedValue({ data: { id: "reply-1" } });
       const app = await createApp();
       const res = await request(app)

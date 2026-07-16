@@ -414,8 +414,27 @@ describe("createGmailService", () => {
       expect(mockMessagesSend).not.toHaveBeenCalled();
     });
 
-    it("allows a gated outbound when the caller has verified approval", async () => {
+    it("allows a gated outbound when the caller has a verified approval scoped to this send", async () => {
       mockMessagesSend.mockResolvedValue({ data: { id: "sent1" } });
+      const service = createGmailService();
+      await expect(
+        service.sendMessage(
+          "board",
+          {
+            to: "report@bunq.com",
+            subject: "Fraud report",
+            body: "We are reporting an account takeover.",
+          },
+          { approvalVerified: true, approvalScope: { mailbox: "board", to: "report@bunq.com" } },
+        ),
+      ).resolves.toEqual({ id: "sent1" });
+      expect(mockMessagesSend).toHaveBeenCalledOnce();
+    });
+
+    // AUR-3628: approvalVerified alone (no matching scope, or a scope for a
+    // different mailbox/recipient) must NOT satisfy the gate — otherwise any
+    // approved approval in the company could be replayed against any send.
+    it("blocks a gated outbound when approvalVerified is true but the approval has no scope", async () => {
       const service = createGmailService();
       await expect(
         service.sendMessage(
@@ -427,8 +446,102 @@ describe("createGmailService", () => {
           },
           { approvalVerified: true },
         ),
-      ).resolves.toEqual({ id: "sent1" });
-      expect(mockMessagesSend).toHaveBeenCalledOnce();
+      ).rejects.toMatchObject({ name: "GmailOutboundBlockedError" });
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+    });
+
+    it("blocks a gated outbound when the approval's scope targets a different recipient", async () => {
+      const service = createGmailService();
+      await expect(
+        service.sendMessage(
+          "board",
+          {
+            to: "report@bunq.com",
+            subject: "Fraud report",
+            body: "We are reporting an account takeover.",
+          },
+          { approvalVerified: true, approvalScope: { mailbox: "board", to: "someone-else@example.com" } },
+        ),
+      ).rejects.toMatchObject({ name: "GmailOutboundBlockedError" });
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+    });
+
+    it("blocks a gated outbound when the approval's scope targets a different mailbox", async () => {
+      const service = createGmailService();
+      await expect(
+        service.sendMessage(
+          "board",
+          {
+            to: "report@bunq.com",
+            subject: "Fraud report",
+            body: "We are reporting an account takeover.",
+          },
+          { approvalVerified: true, approvalScope: { mailbox: "alex", to: "report@bunq.com" } },
+        ),
+      ).rejects.toMatchObject({ name: "GmailOutboundBlockedError" });
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+    });
+
+    it("rejects a `to` address containing CR/LF with a 400 (header injection defense-in-depth)", async () => {
+      const service = createGmailService();
+      await expect(
+        service.sendMessage("board", { to: "user@example.com\r\nBcc: evil@example.com", subject: "Hi", body: "Hi" }),
+      ).rejects.toMatchObject({ status: 400 });
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+    });
+
+    it("rejects a subject containing CR/LF with a 400", async () => {
+      const service = createGmailService();
+      await expect(
+        service.sendMessage("board", {
+          to: "user@example.com",
+          subject: "Hi\r\nBcc: evil@example.com",
+          body: "Hi",
+        }),
+      ).rejects.toMatchObject({ status: 400 });
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+    });
+
+    it("rejects a replyTo address containing CR/LF with a 400", async () => {
+      const service = createGmailService();
+      await expect(
+        service.sendMessage("board", {
+          to: "user@example.com",
+          subject: "Hi",
+          body: "Hi",
+          replyTo: "user@example.com\r\nBcc: evil@example.com",
+        }),
+      ).rejects.toMatchObject({ status: 400 });
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+    });
+
+    it("rejects a cc address containing CR/LF with a 400", async () => {
+      const service = createGmailService();
+      await expect(
+        service.sendMessage("board", {
+          to: "user@example.com",
+          subject: "Hi",
+          body: "Hi",
+          cc: "cc@example.com\r\nBcc: evil@example.com",
+        }),
+      ).rejects.toMatchObject({ status: 400 });
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+    });
+
+    it("rejects an attachment filename containing CR/LF with a 400", async () => {
+      const service = createGmailService();
+      const contentBase64 = Buffer.from("data").toString("base64");
+      await expect(
+        service.sendMessage("board", {
+          to: "user@example.com",
+          subject: "Hi",
+          body: "Hi",
+          attachments: [
+            { filename: "a.txt\r\nContent-Type: text/html", mimeType: "text/plain", contentBase64 },
+          ],
+        }),
+      ).rejects.toMatchObject({ status: 400 });
+      expect(mockMessagesSend).not.toHaveBeenCalled();
     });
 
     it("blocks a gated cc recipient even when the primary `to` is benign", async () => {
@@ -591,7 +704,7 @@ describe("createGmailService", () => {
       expect(mockMessagesSend).not.toHaveBeenCalled();
     });
 
-    it("allows a gated reply when approvalVerified is passed through", async () => {
+    it("allows a gated reply when the approval's scope matches the resolved mailbox/recipient", async () => {
       mockMessagesGet.mockResolvedValue({
         data: {
           id: "msg1",
@@ -610,10 +723,34 @@ describe("createGmailService", () => {
             replyToMessageId: "msg1",
             body: "We are reporting an account takeover.",
           },
-          { approvalVerified: true },
+          { approvalVerified: true, approvalScope: { mailbox: "board", to: "report@bunq.com" } },
         ),
       ).resolves.toEqual({ id: "reply1" });
       expect(mockMessagesSend).toHaveBeenCalledOnce();
+    });
+
+    it("blocks a gated reply when approvalVerified is true but the scope targets a different recipient", async () => {
+      mockMessagesGet.mockResolvedValue({
+        data: {
+          id: "msg1",
+          threadId: "thread42",
+          payload: {
+            headers: [{ name: "Subject", value: "Hi" }, { name: "From", value: "report@bunq.com" }],
+          },
+        },
+      });
+      const service = createGmailService();
+      await expect(
+        service.replyInThread(
+          "board",
+          {
+            replyToMessageId: "msg1",
+            body: "We are reporting an account takeover.",
+          },
+          { approvalVerified: true, approvalScope: { mailbox: "board", to: "other@example.com" } },
+        ),
+      ).rejects.toMatchObject({ name: "GmailOutboundBlockedError" });
+      expect(mockMessagesSend).not.toHaveBeenCalled();
     });
   });
 

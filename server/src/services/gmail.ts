@@ -1,6 +1,6 @@
 import { google } from "googleapis";
 import { logger } from "../middleware/logger.js";
-import { badRequest } from "../errors.js";
+import { HttpError, badRequest, notFound, tooManyRequests, badGateway, gatewayTimeout } from "../errors.js";
 import { classifyGmailOutbound, GmailOutboundBlockedError } from "./gmail-outbound-guard.js";
 
 const DOMAIN = "tryauranode.com";
@@ -53,6 +53,47 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function getErrorCode(err: unknown): string | undefined {
+  if (!err || typeof err !== "object") return undefined;
+  const code = (err as { code?: unknown }).code;
+  return typeof code === "string" ? code : undefined;
+}
+
+function getErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
+// Maps a thrown googleapis/Gaxios error (after retries are exhausted, or for
+// non-transient failures) to a structured HttpError so routes never leak an
+// opaque 500 for upstream Google failures. Errors that aren't recognized
+// upstream failures (e.g. 4xx auth/validation) pass through unchanged so
+// existing 400/422 paths are unaffected.
+function mapGoogleApiError(operation: string, err: unknown): unknown {
+  if (err instanceof HttpError) return err;
+  const status = getHttpStatus(err);
+  const errorCode = getErrorCode(err);
+  const upstreamMessage = getErrorMessage(err);
+  const details = { operation, upstreamMessage };
+
+  if (status === 404) {
+    return notFound(`Gmail API upstream error (${operation}): ${upstreamMessage}`);
+  }
+  if (status === 429) {
+    return tooManyRequests(`Gmail API rate limited (${operation}): ${upstreamMessage}`, details);
+  }
+  if (errorCode === "ETIMEDOUT") {
+    return gatewayTimeout(`Gmail API upstream timeout (${operation}): ${upstreamMessage}`, details);
+  }
+  if (
+    (errorCode && TRANSIENT_NETWORK_ERROR_CODES.has(errorCode)) ||
+    (status !== undefined && status >= 500 && status < 600)
+  ) {
+    return badGateway(`Gmail API upstream error (${operation}): ${upstreamMessage}`, details);
+  }
+  return err;
+}
+
 async function withRetry<T>(operation: string, fn: () => Promise<T>): Promise<T> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt++) {
@@ -61,7 +102,7 @@ async function withRetry<T>(operation: string, fn: () => Promise<T>): Promise<T>
     } catch (err) {
       lastError = err;
       if (attempt >= RETRY_MAX_ATTEMPTS || !isTransientGoogleApiError(err)) {
-        throw err;
+        throw mapGoogleApiError(operation, err);
       }
       const backoffMs = Math.min(RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), RETRY_MAX_DELAY_MS);
       const jitteredMs = backoffMs + Math.random() * backoffMs * 0.5;
@@ -72,7 +113,7 @@ async function withRetry<T>(operation: string, fn: () => Promise<T>): Promise<T>
       await sleep(jitteredMs);
     }
   }
-  throw lastError;
+  throw mapGoogleApiError(operation, lastError);
 }
 
 // Base64 inflates payload size ~4/3; 25MB decoded ~= 33.4MB encoded.

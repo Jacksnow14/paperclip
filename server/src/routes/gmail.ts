@@ -9,6 +9,7 @@ import { badRequest, forbidden, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import {
   createGmailService,
+  decodeGmailMessageBody,
   isSupportedGmailAlias,
   GMAIL_SUPPORTED_ALIASES,
   type GmailSendGuardContext,
@@ -178,7 +179,8 @@ export function gmailRoutes(db: Db) {
       assertGmailAvailable();
       if (!isSupportedGmailAlias(mailbox)) throw badRequest(`Unsupported mailbox: ${mailbox}`);
       const data = await gmail.getMessage(mailbox, messageId);
-      res.json(data);
+      const { bodyText, bodyHtml } = decodeGmailMessageBody(data.payload);
+      res.json({ ...data, bodyText, bodyHtml });
     },
   );
 

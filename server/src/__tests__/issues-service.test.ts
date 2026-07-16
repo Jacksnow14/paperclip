@@ -3113,3 +3113,114 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     expect(row).toEqual({ executionRunId: null, executionLockedAt: null });
   });
 });
+
+describeEmbeddedPostgres("issueService.wasAgentPriorParticipantInThread", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-service-participant-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+    await ensureIssueRelationsTable(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issues);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seed() {
+    const companyId = randomUUID();
+    const authorAgentId = randomUUID();
+    const strangerAgentId = randomUUID();
+    const issueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values([
+      {
+        id: authorAgentId,
+        companyId,
+        name: "PriorParticipant",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: strangerAgentId,
+        companyId,
+        name: "Stranger",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Participant helper issue",
+      status: "in_review",
+      priority: "medium",
+      createdByAgentId: strangerAgentId,
+    });
+
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId,
+      body: "Earlier evidence note from a prior participant.",
+    });
+
+    return { companyId, authorAgentId, strangerAgentId, issueId };
+  }
+
+  it("returns true for an agent who previously authored a comment on the issue", async () => {
+    const { companyId, authorAgentId, issueId } = await seed();
+    await expect(
+      svc.wasAgentPriorParticipantInThread(companyId, issueId, authorAgentId),
+    ).resolves.toBe(true);
+  });
+
+  it("returns false for an agent with no prior comment on the issue", async () => {
+    const { companyId, strangerAgentId, issueId } = await seed();
+    await expect(
+      svc.wasAgentPriorParticipantInThread(companyId, issueId, strangerAgentId),
+    ).resolves.toBe(false);
+  });
+
+  it("scopes participation to the specific issue (no cross-issue leakage)", async () => {
+    const { companyId, authorAgentId } = await seed();
+    const otherIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: otherIssueId,
+      companyId,
+      title: "Different issue with no comments from author",
+      status: "todo",
+      priority: "medium",
+      createdByAgentId: authorAgentId,
+    });
+    await expect(
+      svc.wasAgentPriorParticipantInThread(companyId, otherIssueId, authorAgentId),
+    ).resolves.toBe(false);
+  });
+});

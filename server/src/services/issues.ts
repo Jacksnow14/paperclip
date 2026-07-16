@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { and, asc, desc, eq, gt, inArray, isNull, like, lt, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, like, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -228,6 +228,11 @@ export interface IssueFilters {
   originKind?: string;
   originKindPrefix?: string;
   originId?: string;
+  identifiers?: string[];
+  completedAtFrom?: string;
+  completedAtTo?: string;
+  cancelledAtFrom?: string;
+  cancelledAtTo?: string;
   includeRoutineExecutions?: boolean;
   excludeRoutineExecutions?: boolean;
   includePluginOperations?: boolean;
@@ -3477,6 +3482,22 @@ export function issueService(db: Db) {
         conditions.push(eq(issues.executionWorkspaceId, filters.executionWorkspaceId));
       }
       if (filters?.parentId) conditions.push(eq(issues.parentId, filters.parentId));
+      if (filters?.identifiers && filters.identifiers.length > 0) {
+        conditions.push(inArray(issues.identifier, filters.identifiers));
+      }
+      const parseFilterDate = (value: string | undefined): Date | undefined => {
+        if (!value) return undefined;
+        const parsed = new Date(value);
+        return Number.isNaN(parsed.getTime()) ? undefined : parsed;
+      };
+      const completedAtFrom = parseFilterDate(filters?.completedAtFrom);
+      const completedAtTo = parseFilterDate(filters?.completedAtTo);
+      const cancelledAtFrom = parseFilterDate(filters?.cancelledAtFrom);
+      const cancelledAtTo = parseFilterDate(filters?.cancelledAtTo);
+      if (completedAtFrom) conditions.push(gte(issues.completedAt, completedAtFrom));
+      if (completedAtTo) conditions.push(lte(issues.completedAt, completedAtTo));
+      if (cancelledAtFrom) conditions.push(gte(issues.cancelledAt, cancelledAtFrom));
+      if (cancelledAtTo) conditions.push(lte(issues.cancelledAt, cancelledAtTo));
       if (filters?.originKind) conditions.push(eq(issues.originKind, filters.originKind));
       if (filters?.originKindPrefix) conditions.push(like(issues.originKind, `${filters.originKindPrefix}%`));
       if (filters?.originId) conditions.push(eq(issues.originId, filters.originId));
@@ -4901,6 +4922,72 @@ export function issueService(db: Db) {
 
         const [enriched] = await withIssueLabels(tx, [updated]);
         return {
+          issue: enriched,
+          previous: {
+            checkoutRunId: existing.checkoutRunId,
+            executionRunId: existing.executionRunId,
+          },
+        };
+      }),
+
+    // Agent-facing counterpart to adminForceRelease: any company agent may
+    // reconcile a checkout/execution lock, but only when the run(s) backing
+    // it are terminal or missing. A still-live run keeps this a board/
+    // override-only takeover (see hasActiveCheckoutManagementOverride).
+    staleLockReconcile: async (id: string, options: { clearAssignee?: boolean } = {}) =>
+      db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
+        );
+        const existing = await tx
+          .select({
+            id: issues.id,
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(eq(issues.id, id))
+          .then((rows) => rows[0] ?? null);
+        if (!existing) return { outcome: "not_found" as const };
+        if (!existing.checkoutRunId && !existing.executionRunId) {
+          return { outcome: "no_lock" as const };
+        }
+
+        const [checkoutStale, executionStale] = await Promise.all([
+          existing.checkoutRunId ? isTerminalOrMissingHeartbeatRun(existing.checkoutRunId) : true,
+          existing.executionRunId ? isTerminalOrMissingHeartbeatRun(existing.executionRunId) : true,
+        ]);
+        if (!checkoutStale || !executionStale) {
+          return {
+            outcome: "live" as const,
+            checkoutRunId: existing.checkoutRunId,
+            executionRunId: existing.executionRunId,
+          };
+        }
+
+        const patch: Partial<typeof issues.$inferInsert> = {
+          status: "todo",
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: new Date(),
+        };
+        if (options.clearAssignee) {
+          patch.assigneeAgentId = null;
+        }
+
+        const updated = await tx
+          .update(issues)
+          .set(patch)
+          .where(eq(issues.id, id))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!updated) return { outcome: "not_found" as const };
+
+        const [enriched] = await withIssueLabels(tx, [updated]);
+        return {
+          outcome: "reconciled" as const,
           issue: enriched,
           previous: {
             checkoutRunId: existing.checkoutRunId,

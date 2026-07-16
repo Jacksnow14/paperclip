@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
+import { constants as fsConstants, promises as fs, statSync, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
@@ -1271,6 +1271,75 @@ export function ensurePathInEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return { ...env, PATH: defaultPathForPlatform() };
 }
 
+// Well-known directories, relative to a user's home, where user-scoped CLI
+// installs place their launcher/symlink: the Claude Code native installer
+// (`~/.local/bin`), the npm `--global` prefix bin, and the pnpm global bin.
+// See candidateUserLocalBinDirs / ensureUserLocalBinInPath below (AUR-3529).
+const USER_LOCAL_BIN_SUBDIRS = [".local/bin", ".npm-global/bin", ".local/share/pnpm"] as const;
+
+/**
+ * Absolute user-local bin dirs to consider prepending to PATH, derived from
+ * every home directory we can see (the run-scoped HOME, the server process's
+ * own HOME, and os.homedir()). Returns [] on Windows, where these conventions
+ * don't apply.
+ */
+function candidateUserLocalBinDirs(env: NodeJS.ProcessEnv): string[] {
+  if (process.platform === "win32") return [];
+  const homes: string[] = [];
+  for (const home of [env.HOME, process.env.HOME, os.homedir()]) {
+    if (typeof home === "string" && home.length > 0 && !homes.includes(home)) {
+      homes.push(home);
+    }
+  }
+  const dirs: string[] = [];
+  for (const home of homes) {
+    for (const sub of USER_LOCAL_BIN_SUBDIRS) {
+      const dir = path.join(home, sub);
+      if (!dirs.includes(dir)) dirs.push(dir);
+    }
+  }
+  return dirs;
+}
+
+/**
+ * Additively prepend well-known user-local install dirs (`~/.local/bin`,
+ * npm/pnpm global bins) to PATH when they actually exist on disk and aren't
+ * already present. Does NOT touch `ensurePathInEnv`'s empty-fill semantics —
+ * call that first, then this, so existing callers of `ensurePathInEnv` that
+ * rely on its narrow fill-only behavior (e.g. adapters that build their own
+ * PATH ordering on top of it) are unaffected.
+ *
+ * Fixes AUR-3529: the paperclip server frequently runs under systemd/cron
+ * with a minimal PATH (e.g. `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:...`)
+ * that omits `~/.local/bin`, where the Claude Code native installer puts the
+ * `claude` launcher. Bare adapter commands (`claude`/`codex`/`gemini`) then
+ * fail to resolve for scheduled runs even though they work from an interactive
+ * login shell — burning a heartbeat per fire. The existence check keeps
+ * CI/test envs (which lack these dirs) byte-for-byte unchanged.
+ */
+export function ensureUserLocalBinInPath(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const key = typeof env.Path === "string" && env.Path.length > 0 ? "Path" : "PATH";
+  const current = typeof env[key] === "string" ? (env[key] as string) : "";
+
+  const present = new Set(current.split(path.delimiter).filter((segment) => segment.length > 0));
+  const prepend: string[] = [];
+  for (const dir of candidateUserLocalBinDirs(env)) {
+    if (present.has(dir) || prepend.includes(dir)) continue;
+    let isDir = false;
+    try {
+      isDir = statSync(dir).isDirectory();
+    } catch {
+      isDir = false;
+    }
+    if (isDir) prepend.push(dir);
+  }
+
+  if (prepend.length === 0) return env;
+
+  const nextPath = [...prepend, current].join(path.delimiter);
+  return { ...env, [key]: nextPath };
+}
+
 export async function ensureAbsoluteDirectory(
   cwd: string,
   opts: { createIfMissing?: boolean } = {},
@@ -1943,7 +2012,7 @@ export async function runChildProcess(
       delete rawMerged[key];
     }
 
-    const mergedEnv = ensurePathInEnv(rawMerged);
+    const mergedEnv = ensureUserLocalBinInPath(ensurePathInEnv(rawMerged));
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
       remoteEnv: opts.remoteExecution ? opts.env : null,

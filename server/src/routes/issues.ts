@@ -1499,11 +1499,24 @@ export function issueRoutes(
       unreadForUserFilterRaw === "me" && req.actor.type === "board"
         ? req.actor.userId
         : unreadForUserFilterRaw;
+    const rawIdentifier = req.query.identifier as string | undefined;
+    const identifiers = rawIdentifier
+      ? Array.from(new Set(
+          rawIdentifier
+            .split(",")
+            .map((token) => normalizeIssueReferenceIdentifier(token))
+            .filter((value): value is string => value !== null),
+        ))
+      : undefined;
     const rawLimit = req.query.limit as string | undefined;
     const parsedLimit = rawLimit !== undefined && /^\d+$/.test(rawLimit)
       ? Number.parseInt(rawLimit, 10)
       : null;
-    const limit = parsedLimit === null ? ISSUE_LIST_DEFAULT_LIMIT : clampIssueListLimit(parsedLimit);
+    const limit = parsedLimit !== null
+      ? clampIssueListLimit(parsedLimit)
+      : identifiers && identifiers.length > 0
+        ? undefined
+        : ISSUE_LIST_DEFAULT_LIMIT;
     const rawOffset = req.query.offset as string | undefined;
     const parsedOffset = rawOffset !== undefined && /^\d+$/.test(rawOffset)
       ? Number.parseInt(rawOffset, 10)
@@ -1558,6 +1571,11 @@ export function issueRoutes(
       originKind: req.query.originKind as string | undefined,
       originKindPrefix: req.query.originKindPrefix as string | undefined,
       originId: req.query.originId as string | undefined,
+      identifiers,
+      completedAtFrom: req.query.completedAtFrom as string | undefined,
+      completedAtTo: req.query.completedAtTo as string | undefined,
+      cancelledAtFrom: req.query.cancelledAtFrom as string | undefined,
+      cancelledAtTo: req.query.cancelledAtTo as string | undefined,
       includeRoutineExecutions:
         req.query.includeRoutineExecutions === "true" || req.query.includeRoutineExecutions === "1",
       excludeRoutineExecutions:
@@ -1567,7 +1585,7 @@ export function issueRoutes(
       includeBlockedBy: req.query.includeBlockedBy === "true" || req.query.includeBlockedBy === "1",
       includeBlockedInboxAttention:
         req.query.includeBlockedInboxAttention === "true" || req.query.includeBlockedInboxAttention === "1",
-      q: req.query.q as string | undefined,
+      q: (req.query.q ?? req.query.search) as string | undefined,
       limit,
       offset,
     });
@@ -1816,6 +1834,8 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
+    const rawInclude = req.query.include as string | undefined;
+    const includeComments = (rawInclude?.split(",").map((token) => token.trim()) ?? []).includes("comments");
     const [
       { project, goal },
       ancestors,
@@ -1828,6 +1848,7 @@ export function issueRoutes(
       successfulRunHandoffStates,
       scheduledRetry,
       activeRecoveryAction,
+      comments,
     ] = await Promise.all([
       resolveIssueProjectAndGoal(issue),
       svc.getAncestors(issue.id),
@@ -1840,6 +1861,7 @@ export function issueRoutes(
       listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id]),
       svc.getCurrentScheduledRetry(issue.id),
       recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
+      includeComments ? svc.listComments(issue.id) : Promise.resolve(null),
     ]);
     const recoveryActionsByRelationIssue = await relationRecoveryActionMap(
       recoveryActionsSvc,
@@ -1876,6 +1898,7 @@ export function issueRoutes(
       mentionedProjects,
       currentExecutionWorkspace,
       workProducts,
+      ...(includeComments ? { comments } : {}),
     });
   });
 
@@ -3998,6 +4021,70 @@ export function issueRoutes(
     });
 
     res.json(released);
+  });
+
+  // Agent-facing stale-lock reconcile (AUR-3534): unlike /release (owner-only)
+  // and /admin/force-release (board-only), this lets ANY company agent clear a
+  // checkout/execution lock left behind by a dead run without board
+  // involvement — but only when that run is actually terminal/missing. A
+  // still-live lock is a live takeover, which stays board/override-gated via
+  // /admin/force-release or hasActiveCheckoutManagementOverride.
+  router.post("/issues/:id/reconcile-lock", async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await svc.getById(id);
+    if (!existing) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, existing.companyId);
+    if (req.actor.type !== "agent" || !req.actor.agentId) {
+      res.status(403).json({ error: "Agent authentication required" });
+      return;
+    }
+    const actorAgentId = req.actor.agentId;
+
+    const clearAssignee = req.query.clearAssignee === "true";
+    const result = await svc.staleLockReconcile(id, { clearAssignee });
+    if (result.outcome === "not_found") {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    if (result.outcome === "live") {
+      res.status(409).json({
+        error: "Checkout lock run is still live",
+        details: {
+          issueId: id,
+          checkoutRunId: result.checkoutRunId,
+          executionRunId: result.executionRunId,
+        },
+      });
+      return;
+    }
+    if (result.outcome === "no_lock") {
+      res.json(existing);
+      return;
+    }
+
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: result.issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "issue.stale_lock_reconciled",
+      entityType: "issue",
+      entityId: result.issue.id,
+      details: {
+        issueId: result.issue.id,
+        actorAgentId,
+        prevCheckoutRunId: result.previous.checkoutRunId,
+        prevExecutionRunId: result.previous.executionRunId,
+        clearAssignee,
+      },
+    });
+
+    res.json(result.issue);
   });
 
   router.post("/issues/:id/admin/force-release", async (req, res) => {

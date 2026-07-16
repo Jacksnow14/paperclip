@@ -14,11 +14,17 @@
  *           (parent, grandparent, ...). Keeps a subtask with the agent already
  *           running the tree. This is the strongest signal and is tried first.
  *        b. Content routing — keyword match on title/description/labels:
- *             engineering -> Claude Code Fast (fallback CTO)
+ *             engineering -> Claude Code Fast vs Max, performance-aware tiebreak
+ *                            (recent scorecard-adjusted quality_signal); fallback CTO
  *             research    -> Predictor
  *             design      -> UX Designer
  *             marketing   -> CMO
  *        c. Creator fallback — the creatorAgentId, if the content is unclear.
+ *
+ * Consolidates the duplicate "Daily Orphaned-Issue Sweeper" (AUR-1969,
+ * scripts/orphan-issue-sweeper.mjs) per AUR-2935: this is the single surviving
+ * sweeper — it keeps ancestor ownership-continuity (highest-signal route) AND
+ * folds in AUR-1969's performance-aware Fast-vs-Max engineer tiebreaking.
  *   4. PATCHes the assignee, comments that the sweeper auto-routed it, and for
  *      high/critical orphans captures a routing/{id} rationale record.
  *   5. Prints a summary. Zero orphans => one-line all-clear.
@@ -85,6 +91,7 @@ async function buildRoster() {
   return {
     byId,
     engineer: pickName('Claude Code Fast') || (byRole.get('engineer') || [])[0] || pickName('CTO'),
+    engineerMax: pickName('Claude Code Max') || null,
     cto: pickName('CTO') || (byRole.get('cto') || [])[0],
     researcher: pickName('Predictor') || (byRole.get('researcher') || [])[0],
     designer: pickName('UX Designer') || (byRole.get('designer') || [])[0],
@@ -111,14 +118,52 @@ function classify(issue) {
   return null;
 }
 
-function ownerForBucket(bucket, roster) {
+// Performance-aware tiebreak between Claude Code Fast and Max for engineering
+// work, using recent scorecard-adjusted quality_signal (folded in from AUR-1969).
+// Higher recent quality wins; ties and missing data favour Fast. Falls back to
+// Fast (or CTO) when Max is unavailable.
+function chooseEngineer(roster, perfMap) {
+  const fast = roster.engineer;     // Claude Code Fast (or engineer/CTO fallback)
+  const max = roster.engineerMax;   // Claude Code Max, if present in roster
+  if (!fast && !max) return roster.cto && { agent: roster.cto, reason: 'engineering content — no engineer in roster, CTO fallback' };
+  if (!max) return fast && { agent: fast, reason: 'engineering content' };
+  if (!fast) return { agent: max, reason: 'engineering content' };
+  const fastQ = perfMap.get(fast.id) ?? 3;
+  const maxQ = perfMap.get(max.id) ?? 3;
+  const chosen = fastQ >= maxQ ? fast : max;
+  return {
+    agent: chosen,
+    reason: `engineering content — perf-aware pick (recent quality: fast=${fastQ.toFixed(2)}, max=${maxQ.toFixed(2)})`,
+  };
+}
+
+function ownerForBucket(bucket, roster, perfMap) {
   switch (bucket) {
     case 'research':    return roster.researcher && { agent: roster.researcher, reason: 'research content' };
     case 'design':      return roster.designer && { agent: roster.designer, reason: 'design content' };
     case 'marketing':   return roster.cmo && { agent: roster.cmo, reason: 'marketing content' };
-    case 'engineering': return (roster.engineer || roster.cto) && { agent: roster.engineer || roster.cto, reason: 'engineering content' };
+    case 'engineering': return chooseEngineer(roster, perfMap);
     default: return null;
   }
+}
+
+// Recent quality (avg scorecard-adjusted quality_signal, last 10) per engineer,
+// used by chooseEngineer. Non-fatal on any error — the tiebreak just defaults to Fast.
+async function loadEngineerQuality(roster) {
+  const map = new Map();
+  for (const a of [roster.engineer, roster.engineerMax]) {
+    if (!a) continue;
+    try {
+      const prefix = `scorecard-adjusted/${a.id}/`;
+      const data = await api(`/api/companies/${COMPANY_ID}/memory/records?titlePrefix=${encodeURIComponent(prefix)}&limit=10`);
+      const items = (Array.isArray(data) ? data : (data.records || []))
+        .filter(r => typeof r.title === 'string' && r.title.startsWith(prefix));
+      if (!items.length) continue;
+      const avg = items.reduce((s, r) => s + (r.metadata?.quality_signal ?? 3), 0) / items.length;
+      map.set(a.id, avg);
+    } catch { /* non-fatal */ }
+  }
+  return map;
 }
 
 // Walk up the parent chain to the nearest ancestor that has an agent assignee.
@@ -138,7 +183,7 @@ async function nearestAssignedAncestor(issue, cache) {
   return null;
 }
 
-async function resolveOwner(issue, roster, ancestorCache) {
+async function resolveOwner(issue, roster, ancestorCache, perfMap) {
   // a. Ownership continuity
   const anc = await nearestAssignedAncestor(issue, ancestorCache);
   if (anc && anc.assigneeAgentId && roster.byId.has(anc.assigneeAgentId)) {
@@ -148,9 +193,9 @@ async function resolveOwner(issue, roster, ancestorCache) {
       basis: 'ancestor',
     };
   }
-  // b. Content routing
+  // b. Content routing (engineering bucket uses perf-aware Fast-vs-Max tiebreak)
   const bucket = classify(issue);
-  const byContent = ownerForBucket(bucket, roster);
+  const byContent = ownerForBucket(bucket, roster, perfMap);
   if (byContent) return { agent: byContent.agent, reason: byContent.reason, basis: 'content', bucket };
   // c. Creator fallback
   if (issue.creatorAgentId && roster.byId.has(issue.creatorAgentId)) {
@@ -212,11 +257,12 @@ async function main() {
   }
 
   const roster = await buildRoster();
+  const perfMap = await loadEngineerQuality(roster);
   const ancestorCache = new Map();
   const routed = [];
 
   for (const o of orphans) {
-    const owner = await resolveOwner(o, roster, ancestorCache);
+    const owner = await resolveOwner(o, roster, ancestorCache, perfMap);
     if (!owner) {
       routed.push({ issue: o.identifier, status: 'UNROUTABLE', priority: o.priority });
       continue;

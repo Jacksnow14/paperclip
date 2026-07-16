@@ -43,9 +43,8 @@ vi.mock("googleapis", () => ({
 }));
 
 // Import after mock setup
-const { createGmailService, isSupportedGmailAlias, GMAIL_SUPPORTED_ALIASES } = await import(
-  "../services/gmail.js"
-);
+const { createGmailService, decodeGmailMessageBody, isSupportedGmailAlias, GMAIL_SUPPORTED_ALIASES } =
+  await import("../services/gmail.js");
 
 const FAKE_SA_KEY = JSON.stringify({
   type: "service_account",
@@ -585,5 +584,57 @@ describe("createGmailService", () => {
         String(new Date("2026-06-07T00:00:00.000Z").getTime()),
       );
     });
+  });
+});
+
+describe("decodeGmailMessageBody", () => {
+  function toBase64Url(text: string): string {
+    return Buffer.from(text, "utf-8").toString("base64url");
+  }
+
+  it("decodes a flat text/plain body", () => {
+    const result = decodeGmailMessageBody({
+      mimeType: "text/plain",
+      body: { data: toBase64Url("Hello, full body.") },
+    });
+
+    expect(result.bodyText).toBe("Hello, full body.");
+    expect(result.bodyHtml).toBeNull();
+  });
+
+  it("finds text/plain and text/html leaves inside a nested multipart/alternative tree", () => {
+    const result = decodeGmailMessageBody({
+      mimeType: "multipart/mixed",
+      body: {},
+      parts: [
+        {
+          mimeType: "multipart/alternative",
+          body: {},
+          parts: [
+            { mimeType: "text/plain", body: { data: toBase64Url("Plain version") } },
+            { mimeType: "text/html", body: { data: toBase64Url("<p>HTML version</p>") } },
+          ],
+        },
+      ],
+    });
+
+    expect(result.bodyText).toBe("Plain version");
+    expect(result.bodyHtml).toBe("<p>HTML version</p>");
+  });
+
+  it("returns nulls when no text/plain or text/html part is present", () => {
+    const result = decodeGmailMessageBody({
+      mimeType: "multipart/mixed",
+      body: {},
+      parts: [{ mimeType: "image/png", body: { data: toBase64Url("binary") } }],
+    });
+
+    expect(result.bodyText).toBeNull();
+    expect(result.bodyHtml).toBeNull();
+  });
+
+  it("handles a missing payload without throwing", () => {
+    expect(decodeGmailMessageBody(undefined)).toEqual({ bodyText: null, bodyHtml: null });
+    expect(decodeGmailMessageBody(null)).toEqual({ bodyText: null, bodyHtml: null });
   });
 });

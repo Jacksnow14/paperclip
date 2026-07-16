@@ -8,6 +8,7 @@ import { assertCompanyAccess } from "./authz.js";
 import { badRequest, unprocessable } from "../errors.js";
 import {
   createGmailService,
+  decodeGmailMessageBody,
   isSupportedGmailAlias,
   GMAIL_SUPPORTED_ALIASES,
 } from "../services/gmail.js";
@@ -94,7 +95,8 @@ export function gmailRoutes(db: Db) {
       assertGmailAvailable();
       if (!isSupportedGmailAlias(mailbox)) throw badRequest(`Unsupported mailbox: ${mailbox}`);
       const data = await gmail.getMessage(mailbox, messageId);
-      res.json(data);
+      const { bodyText, bodyHtml } = decodeGmailMessageBody(data.payload);
+      res.json({ ...data, bodyText, bodyHtml });
     },
   );
 

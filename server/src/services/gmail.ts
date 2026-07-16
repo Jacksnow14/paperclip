@@ -154,6 +154,41 @@ function extractHeader(
   return (headers ?? []).find((h) => h.name?.toLowerCase() === name.toLowerCase())?.value ?? "";
 }
 
+export interface GmailMessagePart {
+  mimeType?: string | null;
+  body?: { data?: string | null; size?: number | null } | null;
+  parts?: GmailMessagePart[] | null;
+}
+
+export interface GmailDecodedBody {
+  bodyText: string | null;
+  bodyHtml: string | null;
+}
+
+// Gmail's "full" format nests the body in a MIME part tree, base64url-encoded.
+// Walk it breadth-first and take the first text/plain and text/html leaf found,
+// mirroring how mail clients pick a representative part out of multipart/alternative.
+export function decodeGmailMessageBody(
+  payload: GmailMessagePart | null | undefined,
+): GmailDecodedBody {
+  let bodyText: string | null = null;
+  let bodyHtml: string | null = null;
+  const queue: Array<GmailMessagePart | null | undefined> = [payload];
+  while (queue.length > 0) {
+    const part = queue.shift();
+    if (!part) continue;
+    const mimeType = part.mimeType ?? "";
+    const data = part.body?.data;
+    if (data && mimeType === "text/plain" && bodyText === null) {
+      bodyText = Buffer.from(data, "base64url").toString("utf-8");
+    } else if (data && mimeType === "text/html" && bodyHtml === null) {
+      bodyHtml = Buffer.from(data, "base64url").toString("utf-8");
+    }
+    if (part.parts) queue.push(...part.parts);
+  }
+  return { bodyText, bodyHtml };
+}
+
 interface BuildRawMessageOptions {
   from: string;
   to: string;

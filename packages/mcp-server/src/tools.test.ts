@@ -341,4 +341,65 @@ describe("paperclip MCP tools", () => {
 
     expect(response.content[0]?.text).toContain("must not contain '..'");
   });
+
+  it("lists gmail messages with query and pagination params", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ messages: [{ id: "msg-1" }] }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("gmail_list_messages");
+    await tool.execute({
+      mailbox: "board",
+      query: "is:unread",
+      maxResults: 10,
+      pageToken: "token-1",
+    });
+
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(String(url)).toBe(
+      "http://localhost:3100/api/companies/11111111-1111-1111-1111-111111111111/gmail/mailboxes/board/messages?q=is%3Aunread&maxResults=10&pageToken=token-1",
+    );
+  });
+
+  it("reads a single gmail message by id", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "msg-1", bodyText: "Full body", bodyHtml: null }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("gmail_read_message");
+    const response = await tool.execute({ mailbox: "board", messageId: "msg-1" });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe(
+      "http://localhost:3100/api/companies/11111111-1111-1111-1111-111111111111/gmail/mailboxes/board/messages/msg-1",
+    );
+    expect(init.method).toBe("GET");
+    expect(response.content[0]?.text).toContain("Full body");
+  });
+
+  it("sends a gmail reply scoped to a mailbox", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "sent-1" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("gmail_send_reply");
+    await tool.execute({
+      mailbox: "board",
+      body: "Thanks, will do.",
+      replyToMessageId: "msg-1",
+    });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe(
+      "http://localhost:3100/api/companies/11111111-1111-1111-1111-111111111111/gmail/mailboxes/board/reply",
+    );
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({
+      body: "Thanks, will do.",
+      replyToMessageId: "msg-1",
+    });
+  });
 });

@@ -1199,6 +1199,25 @@ export function issueRoutes(
         });
         return { ok: true, mentionReply: true };
       }
+      const isPriorParticipant = await svc.wasAgentPriorParticipantInThread(issue.companyId, issue.id, actorAgentId);
+      if (isPriorParticipant) {
+        const actor = getActorInfo(req);
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          action: "issue.participant_reply",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            assigneeAgentId: issue.assigneeAgentId,
+            actorAgentId,
+          },
+        });
+        return { ok: true, mentionReply: true };
+      }
     }
     const allowed = await assertAgentIssueMutationAllowed(req, res, issue);
     if (!allowed) return false;

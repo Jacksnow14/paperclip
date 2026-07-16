@@ -5410,6 +5410,19 @@ export function issueService(db: Db) {
       return tokens.has(agentRow.name.toLowerCase());
     },
 
+    wasAgentPriorParticipantInThread: async (companyId: string, issueId: string, agentId: string): Promise<boolean> => {
+      const row = await db.select({ id: issueComments.id })
+        .from(issueComments)
+        .where(and(
+          eq(issueComments.issueId, issueId),
+          eq(issueComments.companyId, companyId),
+          eq(issueComments.authorAgentId, agentId),
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      return row !== null;
+    },
+
     findMentionedProjectIds: async (
       issueId: string,
       opts?: { includeCommentBodies?: boolean },

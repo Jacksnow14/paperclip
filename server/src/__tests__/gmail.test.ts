@@ -552,6 +552,91 @@ describe("createGmailService", () => {
     });
   });
 
+  describe("structured error mapping", () => {
+    it("maps an upstream 404 to a 404 HttpError instead of an opaque 500", async () => {
+      const notFoundErr = Object.assign(new Error("Requested entity was not found."), {
+        response: { status: 404 },
+      });
+      mockMessagesGet.mockRejectedValue(notFoundErr);
+      const service = createGmailService();
+
+      await expect(service.getMessage("board", "missing-id")).rejects.toMatchObject({
+        status: 404,
+      });
+      expect(mockMessagesGet).toHaveBeenCalledTimes(1);
+    });
+
+    it("maps an upstream 500 to a 502 HttpError after retries are exhausted", async () => {
+      vi.useFakeTimers();
+      const serverErr = Object.assign(new Error("backend error"), {
+        response: { status: 500 },
+      });
+      mockMessagesList.mockRejectedValue(serverErr);
+      const service = createGmailService();
+
+      const resultPromise = service.listMessages("board");
+      resultPromise.catch(() => {});
+      await vi.runAllTimersAsync();
+
+      await expect(resultPromise).rejects.toMatchObject({ status: 502 });
+      expect(mockMessagesList).toHaveBeenCalledTimes(3);
+    });
+
+    it("maps a persistent ENOTFOUND (DNS failure) to a 502 HttpError", async () => {
+      vi.useFakeTimers();
+      const dnsErr = Object.assign(new Error("getaddrinfo ENOTFOUND gmail.googleapis.com"), {
+        code: "ENOTFOUND",
+      });
+      mockMessagesList.mockRejectedValue(dnsErr);
+      const service = createGmailService();
+
+      const resultPromise = service.listMessages("board");
+      resultPromise.catch(() => {});
+      await vi.runAllTimersAsync();
+
+      await expect(resultPromise).rejects.toMatchObject({ status: 502 });
+      expect(mockMessagesList).toHaveBeenCalledTimes(3);
+    });
+
+    it("maps a persistent 429 to a 429 HttpError", async () => {
+      vi.useFakeTimers();
+      const rateLimitErr = Object.assign(new Error("rate limited"), { code: 429 });
+      mockMessagesList.mockRejectedValue(rateLimitErr);
+      const service = createGmailService();
+
+      const resultPromise = service.listMessages("board");
+      resultPromise.catch(() => {});
+      await vi.runAllTimersAsync();
+
+      await expect(resultPromise).rejects.toMatchObject({ status: 429 });
+      expect(mockMessagesList).toHaveBeenCalledTimes(3);
+    });
+
+    it("recovers via retry on a transient-then-success sequence without mapping an error", async () => {
+      vi.useFakeTimers();
+      const transientErr = Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+      mockMessagesList
+        .mockRejectedValueOnce(transientErr)
+        .mockResolvedValueOnce({ data: { messages: [{ id: "recovered" }] } });
+      const service = createGmailService();
+
+      const resultPromise = service.listMessages("board");
+      await vi.runAllTimersAsync();
+      const result = await resultPromise;
+
+      expect(result).toEqual({ messages: [{ id: "recovered" }] });
+      expect(mockMessagesList).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not remap a 4xx auth/config error (leaves 400/422 paths unaffected)", async () => {
+      const authErr = Object.assign(new Error("invalid_grant"), { code: 400 });
+      mockMessagesList.mockRejectedValue(authErr);
+      const service = createGmailService();
+
+      await expect(service.listMessages("board")).rejects.toBe(authErr);
+    });
+  });
+
   describe("updateVacationSettings", () => {
     it("calls gmail.users.settings.updateVacation with correct payload", async () => {
       mockSettingsUpdateVacation.mockResolvedValue({ data: { enableAutoReply: true } });

@@ -126,12 +126,30 @@ A send is **gated** (blocked by default) when either is true:
 **To unblock a gated send:** attach `ceoApprovalId` — the id of a
 `POST .../approvals` row with `type: "request_board_approval"` — to the request
 body. The route looks it up scoped to the calling company; only a row with
-`status: "approved"` counts as verified. If gated and no valid approval is
+`status: "approved"` counts as verified.
+
+**AUR-3628 — the approval must be scoped to this exact send.** It is not
+enough for the approval to be `approved`; its `payload` must carry a
+`gmailOutbound` block that matches the mailbox and target recipient (and, if
+present, subject) of the send being made:
+```json
+{
+  "type": "request_board_approval",
+  "payload": {
+    "gmailOutbound": { "mailbox": "board", "to": "report@bunq.com" }
+  }
+}
+```
+An approval that is `approved` but was granted for a different
+mailbox/recipient (or isn't `request_board_approval` with a `gmailOutbound`
+block at all) is treated the same as no approval — it cannot be reused to
+unblock an unrelated gated send. If gated and no validly-scoped approval is
 attached:
 - The request is rejected with **HTTP 403** (message references AUR-2525 and
   explains how to request approval).
 - A high-priority incident issue is filed (fire-and-forget) and assigned to the
-  calling agent, describing the classification, signals, and how to unblock.
+  calling agent, describing the classification, signals, and how to unblock
+  (including the required `gmailOutbound` payload shape).
 
 Non-gated sends (internal recipients, no risk signals) pass through unaffected —
 same behavior as before this gate existed. Every send is also `logger.info`- or
@@ -142,11 +160,17 @@ same behavior as before this gate existed. Every send is also `logger.info`- or
   "to": "report@bunq.com",
   "subject": "Fraud report",
   "body": "We are reporting an account takeover.",
-  "ceoApprovalId": "<id of an approved request_board_approval row>"
+  "ceoApprovalId": "<id of an approved request_board_approval row scoped via gmailOutbound.mailbox/to>"
 }
 ```
-Without a valid `ceoApprovalId` the call above returns 403 and files an incident
-issue; with one, it sends normally.
+Without a valid, correctly-scoped `ceoApprovalId` the call above returns 403
+and files an incident issue; with one, it sends normally.
+
+**Header injection (AUR-3628).** `to`, `cc`, `subject`, `replyTo`, and
+attachment `filename` are rejected with **HTTP 400** if they contain a CR or
+LF character, before being interpolated into the raw RFC822 message
+(defense-in-depth — the outbound guard's recipient scan already tokenizes
+CRLF-smuggled recipients for classification purposes).
 
 ## Limits
 

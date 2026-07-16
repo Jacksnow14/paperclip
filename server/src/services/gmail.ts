@@ -98,14 +98,50 @@ function normalizeRecipients(...groups: Array<string | string[] | undefined>): s
  * gated outbound (fraud/abuse/legal/chargeback/law-enforcement/blocklisted-
  * domain — see gmail-outbound-guard.ts) is allowed through `sendMessage` is
  * when a caller that has already verified an explicit CEO board approval
- * passes `approvalVerified: true` (see routes/gmail.ts).
+ * passes `approvalVerified: true` AND an `approvalScope` that matches this
+ * specific send (see routes/gmail.ts).
  *
  * AUR-2525/AUR-2682/AUR-3523: classification lives in sendMessage() itself —
  * not just the HTTP route — so any in-repo caller (intake auto-replies,
  * replyInThread, future scripts) is gated regardless of code path.
+ *
+ * AUR-3628: `approvalVerified: true` alone is no longer sufficient. Any
+ * `approved` approvals row (regardless of what it was actually approved for)
+ * used to satisfy the gate for every gated send in the company. `approvalScope`
+ * binds the approval to the mailbox/recipient (and, when present, subject) it
+ * was actually granted for, so an unrelated approved approval can't be reused.
  */
+export interface GmailApprovalScope {
+  mailbox?: string;
+  to?: string;
+  subject?: string;
+}
+
 export interface GmailSendGuardContext {
   approvalVerified?: boolean;
+  approvalScope?: GmailApprovalScope;
+}
+
+function normalizeEmailForScopeCompare(value: string | undefined): string {
+  return (value ?? "").trim().toLowerCase();
+}
+
+// True only when the verified approval's scope matches THIS send: same
+// mailbox, same target recipient, and (if the approval recorded one) the same
+// subject. Reject silently — the caller (sendMessage) treats a non-match the
+// same as no approval at all.
+function isApprovalScopedToSend(
+  guard: GmailSendGuardContext | undefined,
+  alias: GmailAlias,
+  opts: Pick<GmailSendOptions, "to" | "subject">,
+): boolean {
+  if (!guard?.approvalVerified) return false;
+  const scope = guard.approvalScope;
+  if (!scope) return false;
+  if (scope.mailbox !== alias) return false;
+  if (normalizeEmailForScopeCompare(scope.to) !== normalizeEmailForScopeCompare(opts.to)) return false;
+  if (scope.subject !== undefined && scope.subject.trim() !== opts.subject.trim()) return false;
+  return true;
 }
 
 export interface GmailAttachmentInput {
@@ -221,11 +257,36 @@ function buildMimeBoundary(): string {
   return `paperclip-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
+// Defense-in-depth (AUR-3628): reject CR/LF in any value interpolated into a
+// raw RFC822 header line before it reaches buildRawMessage's string
+// concatenation, so a crafted `to`/`cc`/`subject`/`replyTo`/attachment
+// filename can't smuggle extra header lines (e.g. a forged Bcc:) into the
+// outbound message. The outbound guard's tokenized recipient scan already
+// catches CRLF-smuggled blocked-domain/report-desk recipients — this closes
+// the header-injection surface itself, not just the recipient-classification
+// bypass.
+const HEADER_INJECTION_RE = /[\r\n]/;
+
+function assertNoHeaderInjection(value: string, field: string): void {
+  if (HEADER_INJECTION_RE.test(value)) {
+    throw badRequest(`${field} must not contain CR or LF characters`);
+  }
+}
+
 function buildRawMessage(opts: BuildRawMessageOptions): string {
+  assertNoHeaderInjection(opts.to, "to");
+  assertNoHeaderInjection(opts.subject, "subject");
+  if (opts.replyTo) assertNoHeaderInjection(opts.replyTo, "replyTo");
+  for (const attachment of opts.attachments ?? []) {
+    assertNoHeaderInjection(attachment.filename, "attachments[].filename");
+  }
+
   const isReply = Boolean(opts.inReplyTo);
   const subject =
     isReply && !/^re:/i.test(opts.subject.trim()) ? `Re: ${opts.subject}` : opts.subject;
-  const cc = normalizeRecipients(opts.cc).join(", ");
+  const ccRecipients = normalizeRecipients(opts.cc);
+  for (const recipient of ccRecipients) assertNoHeaderInjection(recipient, "cc");
+  const cc = ccRecipients.join(", ");
 
   const headers = [`From: ${opts.from}`, `To: ${opts.to}`];
   if (cc) headers.push(`Cc: ${cc}`);
@@ -334,10 +395,16 @@ export function createGmailService() {
       text: opts.body,
       cc: opts.cc,
     });
-    if (decision.gated && !guard?.approvalVerified) {
+    if (decision.gated && !isApprovalScopedToSend(guard, alias, opts)) {
       logger.error(
-        { alias, to: opts.to, category: decision.category, reasons: decision.reasons },
-        "gmail-guard: BLOCKED gated outbound at service chokepoint (AUR-2525/AUR-2682)",
+        {
+          alias,
+          to: opts.to,
+          category: decision.category,
+          reasons: decision.reasons,
+          hadApproval: Boolean(guard?.approvalVerified),
+        },
+        "gmail-guard: BLOCKED gated outbound at service chokepoint (AUR-2525/AUR-2682/AUR-3628)",
       );
       throw new GmailOutboundBlockedError(decision);
     }

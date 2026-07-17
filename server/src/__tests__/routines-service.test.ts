@@ -265,6 +265,47 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(routineIssues.map((issue) => issue.id)).toContain(run.linkedIssueId);
   });
 
+  it("threads a routine's assigneeAdapterOverrides onto its execution issue", async () => {
+    const { companyId, projectId, agentId, svc } = await seedFixture();
+
+    const cheapRoutine = await svc.create(
+      companyId,
+      {
+        projectId,
+        goalId: null,
+        parentIssueId: null,
+        title: "cheap-lane routine",
+        description: "Runs on the cheap model profile",
+        assigneeAgentId: agentId,
+        priority: "medium",
+        status: "active",
+        concurrencyPolicy: "coalesce_if_active",
+        catchUpPolicy: "skip_missed",
+        assigneeAdapterOverrides: { modelProfile: "cheap" },
+      },
+      {},
+    );
+    expect(cheapRoutine.assigneeAdapterOverrides).toEqual({ modelProfile: "cheap" });
+
+    const run = await svc.runRoutine(cheapRoutine.id, { source: "manual" });
+    const [issue] = await db
+      .select({ assigneeAdapterOverrides: issues.assigneeAdapterOverrides })
+      .from(issues)
+      .where(eq(issues.id, run.linkedIssueId as string));
+    expect(issue.assigneeAdapterOverrides).toEqual({ modelProfile: "cheap" });
+  });
+
+  it("leaves assigneeAdapterOverrides null on execution issues for routines that don't opt in", async () => {
+    const { routine, svc } = await seedFixture();
+
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
+    const [issue] = await db
+      .select({ assigneeAdapterOverrides: issues.assigneeAdapterOverrides })
+      .from(issues)
+      .where(eq(issues.id, run.linkedIssueId as string));
+    expect(issue.assigneeAdapterOverrides).toBeNull();
+  });
+
   it("creates draft routines without a project or default assignee", async () => {
     const { companyId, svc } = await seedFixture();
 
@@ -329,6 +370,21 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(revisions.map((revision) => revision.revisionNumber)).toEqual([2, 1]);
     expect(revisions[0]?.snapshot.routine.description).toBe("Run the frog routine with logs");
     expect(revisions[1]?.snapshot.routine.description).toBe("Run the frog routine");
+  });
+
+  it("persists assigneeAdapterOverrides set via routine update", async () => {
+    const { routine, svc } = await seedFixture();
+    expect(routine.assigneeAdapterOverrides).toBeNull();
+
+    const updated = await svc.update(
+      routine.id,
+      { assigneeAdapterOverrides: { modelProfile: "cheap" } },
+      {},
+    );
+    expect(updated?.assigneeAdapterOverrides).toEqual({ modelProfile: "cheap" });
+
+    const reloaded = await svc.getDetail(routine.id);
+    expect(reloaded?.assigneeAdapterOverrides).toEqual({ modelProfile: "cheap" });
   });
 
   it("rejects stale routine baseRevisionId updates", async () => {

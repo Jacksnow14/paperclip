@@ -27,6 +27,7 @@ describe("routine validators", () => {
         concurrencyPolicy: "coalesce_if_active",
         catchUpPolicy: "skip_missed",
         variables: [],
+        assigneeAdapterOverrides: null,
       },
       triggers: [{
         id: triggerId,
@@ -61,6 +62,7 @@ describe("routine validators", () => {
         concurrencyPolicy: "coalesce_if_active",
         catchUpPolicy: "skip_missed",
         variables: [],
+        assigneeAdapterOverrides: null,
       },
       triggers: [{
         id: triggerId,
@@ -82,5 +84,11 @@ describe("routine validators", () => {
       title: "Daily triage",
       baseRevisionId,
     }).baseRevisionId).toBe(baseRevisionId);
+  });
+
+  it("accepts a cheap modelProfile override on routine create/update", () => {
+    expect(updateRoutineSchema.parse({
+      assigneeAdapterOverrides: { modelProfile: "cheap" },
+    }).assigneeAdapterOverrides).toEqual({ modelProfile: "cheap" });
   });
 });

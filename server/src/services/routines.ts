@@ -406,6 +406,7 @@ function routineRevisionSnapshotRoutine(routine: RoutineRow): RoutineRevisionSna
     concurrencyPolicy: routine.concurrencyPolicy as RoutineRevisionSnapshotV1["routine"]["concurrencyPolicy"],
     catchUpPolicy: routine.catchUpPolicy as RoutineRevisionSnapshotV1["routine"]["catchUpPolicy"],
     variables: routine.variables ?? [],
+    assigneeAdapterOverrides: (routine.assigneeAdapterOverrides ?? null) as RoutineRevisionSnapshotV1["routine"]["assigneeAdapterOverrides"],
   };
 }
 
@@ -1307,6 +1308,7 @@ export function routineService(
             originRunId: createdRun.id,
             originFingerprint: dispatchFingerprint,
             billingCode: issueBillingCode,
+            assigneeAdapterOverrides: input.routine.assigneeAdapterOverrides ?? null,
             executionWorkspaceId: input.executionWorkspaceId ?? null,
             executionWorkspacePreference: input.executionWorkspacePreference ?? null,
             executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
@@ -1598,6 +1600,7 @@ export function routineService(
             concurrencyPolicy: input.concurrencyPolicy,
             catchUpPolicy: input.catchUpPolicy,
             variables,
+            assigneeAdapterOverrides: input.assigneeAdapterOverrides ?? null,
             createdByAgentId: actor.agentId ?? null,
             createdByUserId: actor.userId ?? null,
             updatedByAgentId: actor.agentId ?? null,
@@ -1678,6 +1681,9 @@ export function routineService(
           concurrencyPolicy: patch.concurrencyPolicy ?? locked.concurrencyPolicy,
           catchUpPolicy: patch.catchUpPolicy ?? locked.catchUpPolicy,
           variables: nextVariables,
+          assigneeAdapterOverrides: patch.assigneeAdapterOverrides === undefined
+            ? locked.assigneeAdapterOverrides
+            : patch.assigneeAdapterOverrides,
           updatedByAgentId: actor.agentId ?? null,
           updatedByUserId: actor.userId ?? null,
         };
@@ -1718,6 +1724,7 @@ export function routineService(
             concurrencyPolicy: candidate.concurrencyPolicy,
             catchUpPolicy: candidate.catchUpPolicy,
             variables: candidate.variables,
+            assigneeAdapterOverrides: candidate.assigneeAdapterOverrides,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
             updatedAt: new Date(),

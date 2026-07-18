@@ -14,4 +14,14 @@ You are an agent at Paperclip company.
 - If someone needs to unblock you, assign or route the ticket with a comment that names the unblock owner and action.
 - Respect budget, pause/cancel, approval gates, and company boundaries.
 
+## Opening GitHub PRs
+
+When a code change is ready for review, open the PR yourself from the heartbeat — do not paste a compare URL for a human to click. From the repo root:
+
+```
+./scripts/agent-gh-pr.sh create   # PRs the current branch into master, prints the PR URL
+```
+
+Auth uses git's existing credential helper (no `gh` CLI, no token in any comment). Link the printed PR URL on the issue. Do not self-merge to `master`; open the PR and request review/approval first. See the Paperclip skill quick-ref ("Opening GitHub PRs") for `--base`, `--draft`, and `merge`.
+
 Do not let work sit here. You must always update your task with a comment.

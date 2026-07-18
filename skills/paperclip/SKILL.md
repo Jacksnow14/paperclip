@@ -216,6 +216,25 @@ Routines are recurring tasks. Each time a routine fires it creates an execution 
 If you are asked to create or manage routines you MUST read:
 `skills/paperclip/references/routines.md`
 
+## Opening GitHub PRs
+
+To open (or merge) a GitHub PR for the current branch from a heartbeat — no `gh`
+CLI needed:
+
+```
+./scripts/agent-gh-pr.sh create                 # PR current branch -> master, prints URL
+./scripts/agent-gh-pr.sh create --base develop --draft
+./scripts/agent-gh-pr.sh merge <pr-number>      # squash-merge; only after review/approval
+```
+
+- Auth comes from git's configured credential helper (the same token that powers
+  `git push`); it must have `repo` scope. The token is never echoed — never paste
+  a token into an issue/comment body.
+- `create` pushes the branch first, then opens the PR; title/body default to the
+  latest commit. Link the printed URL on the issue.
+- `merge` is a production-risk action — open the PR and request review first; do
+  not self-merge to `master` without approval.
+
 ## Issue Workspace Runtime Controls
 
 When an issue needs browser/manual QA or a preview server, inspect its current execution workspace and use Paperclip's workspace runtime controls instead of starting unmanaged background servers yourself.

@@ -18,6 +18,7 @@
  * Output: prints a human plan, then a final line `PLAN_JSON=<json>` for the caller.
  */
 import { parseArgs } from 'node:util';
+import { resolveApiBase } from './lib/paperclip-api-base.mjs';
 
 const CONTENT_BOTS = new Set([
   'c1ddb8af-53ce-437e-b473-1f437c97739b', // Content Manager
@@ -301,10 +302,10 @@ if (isMain) {
       'run-issue-id': { type: 'string' },
     },
   });
-  main({
+  resolveApiBase().then(apiUrl => main({
     hours: parseInt(args.hours, 10), apply: args.apply,
-    apiUrl: process.env.PAPERCLIP_API_URL, apiKey: process.env.PAPERCLIP_API_KEY,
+    apiUrl, apiKey: process.env.PAPERCLIP_API_KEY,
     companyId: process.env.PAPERCLIP_COMPANY_ID,
     runIssueId: args['run-issue-id'] ?? 'bf68742f-63a2-4849-b931-9b179c50fcb5',
-  }).catch(e => { console.error('FATAL:', e.message); process.exit(1); });
+  })).catch(e => { console.error('FATAL:', e.message); process.exit(1); });
 }

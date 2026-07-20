@@ -68,6 +68,18 @@ export function approvalRoutes(
     res.json(redactApprovalPayload(approval));
   });
 
+  router.get("/companies/:companyId/approvals/:id", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    const id = req.params.id as string;
+    assertCompanyAccess(req, companyId);
+    const approval = await svc.getById(id);
+    if (!approval || approval.companyId !== companyId) {
+      res.status(404).json({ error: "Approval not found" });
+      return;
+    }
+    res.json(redactApprovalPayload(approval));
+  });
+
   router.post("/companies/:companyId/approvals", validate(createApprovalSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);

@@ -713,8 +713,10 @@ export interface RequestConfirmationPayload {
 
 export interface RequestConfirmationResult {
   version: 1;
-  outcome: "accepted" | "rejected" | "superseded_by_comment" | "stale_target";
+  outcome: "accepted" | "rejected" | "superseded_by_comment" | "stale_target" | "cancelled";
   reason?: string | null;
+  /** Optional reviewer note captured on acceptance (agent-to-agent review sign-off). */
+  note?: string | null;
   commentId?: string | null;
   staleTarget?: RequestConfirmationTarget | null;
 }

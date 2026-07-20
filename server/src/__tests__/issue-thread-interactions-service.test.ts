@@ -972,4 +972,202 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       },
     });
   });
+
+  it("lets a reviewer agent accept a peer's request_confirmation with a note and returns the issue to the creator", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const creatorAgentId = randomUUID();
+    const reviewerAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Agent-to-agent review handoff",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(agents).values([
+      {
+        id: creatorAgentId,
+        companyId,
+        name: "Implementer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: reviewerAgentId,
+        companyId,
+        name: "Reviewer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    // The issue is assigned to the reviewer agent (the designated reviewer) while
+    // it sits in review, and the confirmation is created by the implementer agent.
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "Ship the change",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: reviewerAgentId,
+    });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee_on_accept",
+      payload: {
+        version: 1,
+        prompt: "Verification passed — sign off on this change?",
+        acceptLabel: "Approve",
+        rejectLabel: "Request changes",
+      },
+    }, {
+      agentId: creatorAgentId,
+    });
+
+    expect(created.status).toBe("pending");
+    expect(created.createdByAgentId).toBe(creatorAgentId);
+
+    const accepted = await interactionsSvc.acceptInteraction({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, created.id, {
+      note: "LGTM — verified the round-trip on a fresh worktree.",
+    }, {
+      agentId: reviewerAgentId,
+    });
+
+    expect(accepted.interaction).toMatchObject({
+      id: created.id,
+      status: "accepted",
+      resolvedByAgentId: reviewerAgentId,
+      result: {
+        version: 1,
+        outcome: "accepted",
+        note: "LGTM — verified the round-trip on a fresh worktree.",
+      },
+    });
+
+    // Acceptance wakes the requester by returning the issue to the creator agent.
+    expect(accepted.continuationIssue).toEqual({
+      id: issueId,
+      assigneeAgentId: creatorAgentId,
+      assigneeUserId: null,
+      status: "todo",
+    });
+
+    const updatedIssue = (await db.select().from(issues)).find((issue) => issue.id === issueId);
+    expect(updatedIssue).toMatchObject({
+      id: issueId,
+      status: "todo",
+      assigneeAgentId: creatorAgentId,
+      assigneeUserId: null,
+    });
+  });
+
+  it("lets the creating agent cancel its own pending request_confirmation", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const creatorAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Cancel own confirmation",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(agents).values({
+      id: creatorAgentId,
+      companyId,
+      name: "Implementer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "Supersede a stale confirmation",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: creatorAgentId,
+    });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Confirm the stale draft?",
+      },
+    }, {
+      agentId: creatorAgentId,
+    });
+
+    const cancelled = await interactionsSvc.cancelInteraction({
+      id: issueId,
+      companyId,
+    }, created.id, {
+      reason: "Superseded by a newer confirmation.",
+    }, {
+      agentId: creatorAgentId,
+    });
+
+    expect(cancelled).toMatchObject({
+      id: created.id,
+      status: "cancelled",
+      resolvedByAgentId: creatorAgentId,
+      result: {
+        version: 1,
+        outcome: "cancelled",
+        reason: "Superseded by a newer confirmation.",
+      },
+    });
+
+    // The interaction is terminal; a second cancel is rejected.
+    await expect(interactionsSvc.cancelInteraction({
+      id: issueId,
+      companyId,
+    }, created.id, {}, {
+      agentId: creatorAgentId,
+    })).rejects.toThrow("Interaction has already been resolved");
+  });
 });

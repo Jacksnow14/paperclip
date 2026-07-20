@@ -4210,6 +4210,25 @@ export function issueRoutes(
     throw forbidden("Board access required");
   }
 
+  function assertCanCancelInteraction(
+    req: Request,
+    interaction: { createdByAgentId?: string | null; createdByUserId?: string | null },
+  ) {
+    // Board actors may cancel any interaction (existing behavior).
+    if (req.actor.type === "board") return;
+    // An agent may cancel/supersede its OWN pending interaction (the creator).
+    if (req.actor.type === "agent") {
+      if (!req.actor.agentId || interaction.createdByAgentId !== req.actor.agentId) {
+        throw forbidden("Only the interaction creator may cancel this interaction");
+      }
+      if (!req.actor.runId?.trim()) {
+        throw unauthorized("Agent run id required");
+      }
+      return;
+    }
+    throw forbidden("Board access required");
+  }
+
   router.get("/issues/:id/interactions", async (req, res) => {
     const id = req.params.id as string;
     const issue = await svc.getById(id);
@@ -4523,10 +4542,15 @@ export function issueRoutes(
         return;
       }
       assertCompanyAccess(req, issue.companyId);
-      assertBoard(req);
+      const interactionForAuthz = await issueThreadInteractionService(db).getByIdForIssue(issue.id, issue.companyId, interactionId);
+      if (!interactionForAuthz) {
+        res.status(404).json({ error: "Interaction not found" });
+        return;
+      }
+      assertCanCancelInteraction(req, interactionForAuthz);
 
       const actor = getActorInfo(req);
-      const interaction = await issueThreadInteractionService(db).cancelQuestions(issue, interactionId, req.body, {
+      const interaction = await issueThreadInteractionService(db).cancelInteraction(issue, interactionId, req.body, {
         agentId: actor.agentId,
         userId: actor.actorType === "user" ? actor.actorId : null,
       });
@@ -4547,7 +4571,9 @@ export function issueRoutes(
           cancellationReason:
             interaction.kind === "ask_user_questions"
               ? (interaction.result?.cancellationReason ?? null)
-              : null,
+              : interaction.kind === "request_confirmation"
+                ? (interaction.result?.reason ?? null)
+                : null,
         },
       });
 

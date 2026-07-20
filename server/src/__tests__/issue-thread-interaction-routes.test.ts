@@ -18,7 +18,7 @@ const mockInteractionService = vi.hoisted(() => ({
   rejectInteraction: vi.fn(),
   rejectSuggestedTasks: vi.fn(),
   answerQuestions: vi.fn(),
-  cancelQuestions: vi.fn(),
+  cancelInteraction: vi.fn(),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -269,7 +269,7 @@ describe.sequential("issue thread interaction routes", () => {
       updatedAt: "2026-04-20T12:06:00.000Z",
       resolvedAt: "2026-04-20T12:06:00.000Z",
     });
-    mockInteractionService.cancelQuestions.mockResolvedValue({
+    mockInteractionService.cancelInteraction.mockResolvedValue({
       id: "interaction-2",
       companyId: "company-1",
       issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -422,7 +422,7 @@ describe.sequential("issue thread interaction routes", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.status).toBe("cancelled");
-    expect(mockInteractionService.cancelQuestions).toHaveBeenCalledWith(
+    expect(mockInteractionService.cancelInteraction).toHaveBeenCalledWith(
       expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
       "interaction-2",
       {},
@@ -936,5 +936,92 @@ describe.sequential("issue thread interaction routes", () => {
 
     expect(res.status).toBe(200);
     expect(mockInteractionService.rejectInteraction).toHaveBeenCalled();
+  });
+
+  it("allows the creator agent to cancel its own pending request_confirmation", async () => {
+    mockInteractionService.getByIdForIssue.mockResolvedValueOnce({
+      id: "interaction-rc",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "none",
+      createdByAgentId: CREATED_AGENT_ID,
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:00:00.000Z",
+    });
+    mockInteractionService.cancelInteraction.mockResolvedValueOnce({
+      id: "interaction-rc",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "cancelled",
+      continuationPolicy: "none",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: null,
+      payload: { version: 1, prompt: "Confirm the stale draft?" },
+      result: { version: 1, outcome: "cancelled", reason: "Superseded" },
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:05:00.000Z",
+      resolvedAt: "2026-04-20T12:05:00.000Z",
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-creator-1",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-rc/cancel")
+      .send({ reason: "Superseded" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("cancelled");
+    expect(mockInteractionService.cancelInteraction).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      "interaction-rc",
+      { reason: "Superseded" },
+      expect.objectContaining({ agentId: CREATED_AGENT_ID }),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.thread_interaction_cancelled",
+        details: expect.objectContaining({
+          interactionKind: "request_confirmation",
+          cancellationReason: "Superseded",
+        }),
+      }),
+    );
+  });
+
+  it("returns 403 when a non-creator agent tries to cancel someone else's interaction", async () => {
+    const NON_CREATOR_AGENT_ID = "33333333-3333-4333-8333-333333333333";
+    mockInteractionService.getByIdForIssue.mockResolvedValueOnce({
+      id: "interaction-rc",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "none",
+      createdByAgentId: CREATED_AGENT_ID,
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:00:00.000Z",
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: NON_CREATOR_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-rc/cancel")
+      .send({});
+
+    expect(res.status).toBe(403);
+    expect(mockInteractionService.cancelInteraction).not.toHaveBeenCalled();
   });
 });

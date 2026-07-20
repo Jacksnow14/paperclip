@@ -702,6 +702,42 @@ export function issueThreadInteractionService(db: Db) {
     return hydrateInteraction(updated);
   }
 
+  async function cancelSuggestedTasks(args: {
+    issue: { id: string; companyId: string };
+    current: IssueThreadInteractionRow;
+    input: CancelIssueThreadInteraction;
+    actor: InteractionActor;
+  }): Promise<IssueThreadInteraction> {
+    const reason = args.input.reason?.trim() || null;
+    const now = new Date();
+    const [updated] = await db
+      .update(issueThreadInteractions)
+      .set({
+        status: "cancelled",
+        result: {
+          version: 1,
+          cancelled: true,
+          cancellationReason: reason,
+        },
+        resolvedByAgentId: args.actor.agentId ?? null,
+        resolvedByUserId: args.actor.userId ?? null,
+        resolvedAt: now,
+        updatedAt: now,
+      })
+      .where(and(
+        eq(issueThreadInteractions.id, args.current.id),
+        eq(issueThreadInteractions.status, "pending"),
+      ))
+      .returning();
+
+    if (!updated) {
+      throw conflict("Interaction has already been resolved");
+    }
+
+    await touchIssue(db, args.issue.id);
+    return hydrateInteraction(updated);
+  }
+
   return {
     listForIssue: async (issueId: string) => {
       const rows = await db
@@ -1282,6 +1318,8 @@ export function issueThreadInteractionService(db: Db) {
           return issueThreadInteractionService(db).cancelQuestions(issue, interactionId, data, actor);
         case "request_confirmation":
           return cancelRequestConfirmation({ issue, current, input: data, actor });
+        case "suggest_tasks":
+          return cancelSuggestedTasks({ issue, current, input: data, actor });
         default:
           throw unprocessable(`Interactions of kind ${current.kind} cannot be cancelled`);
       }

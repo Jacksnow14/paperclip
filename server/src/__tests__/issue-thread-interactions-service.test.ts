@@ -1170,4 +1170,84 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       agentId: creatorAgentId,
     })).rejects.toThrow("Interaction has already been resolved");
   });
+
+  it("lets the creating agent cancel its own pending suggest_tasks interaction", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const creatorAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Cancel own suggest_tasks",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(agents).values({
+      id: creatorAgentId,
+      companyId,
+      name: "Implementer",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "Withdraw a stale task suggestion",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: creatorAgentId,
+    });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "suggest_tasks",
+      payload: {
+        version: 1,
+        tasks: [
+          { clientKey: "root", title: "Follow-up task" },
+        ],
+      },
+    }, {
+      agentId: creatorAgentId,
+    });
+
+    const cancelled = await interactionsSvc.cancelInteraction({
+      id: issueId,
+      companyId,
+    }, created.id, {
+      reason: "No longer needed.",
+    }, {
+      agentId: creatorAgentId,
+    });
+
+    expect(cancelled).toMatchObject({
+      id: created.id,
+      status: "cancelled",
+      resolvedByAgentId: creatorAgentId,
+      result: {
+        version: 1,
+        cancelled: true,
+        cancellationReason: "No longer needed.",
+      },
+    });
+
+    const activeInteractions = await interactionsSvc.listForIssue(issueId);
+    expect(activeInteractions.find((entry) => entry.id === created.id && entry.status === "pending")).toBeUndefined();
+  });
 });

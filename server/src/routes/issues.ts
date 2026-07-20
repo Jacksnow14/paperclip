@@ -4569,7 +4569,7 @@ export function issueRoutes(
           interactionKind: interaction.kind,
           interactionStatus: interaction.status,
           cancellationReason:
-            interaction.kind === "ask_user_questions"
+            interaction.kind === "ask_user_questions" || interaction.kind === "suggest_tasks"
               ? (interaction.result?.cancellationReason ?? null)
               : interaction.kind === "request_confirmation"
                 ? (interaction.result?.reason ?? null)

@@ -58,7 +58,9 @@
  *   node scripts/sgi-loop-f2-retire-watchdog.mjs --window-days=14 # override scoring window
  */
 
-const API_URL = process.env.PAPERCLIP_API_URL;
+import { resolveApiBase } from './lib/paperclip-api-base.mjs';
+
+let API_URL = '';
 const API_KEY = process.env.PAPERCLIP_API_KEY;
 const COMPANY_ID = process.env.PAPERCLIP_COMPANY_ID;
 const AGENT_ID = process.env.PAPERCLIP_AGENT_ID;
@@ -318,6 +320,7 @@ function evaluateGates(windowed, accumulated, refDate) {
 // ---- Main ------------------------------------------------------------------
 
 async function main() {
+  API_URL = await resolveApiBase();
   const refDateStr = REF_DATE.toISOString().slice(0, 10);
   console.log(`SGI Loop F-2 Retire Watchdog — ref date ${refDateStr}`);
   console.log(`Mode: ${DRY_RUN ? 'DRY-RUN (no writes)' : 'LIVE'}`);

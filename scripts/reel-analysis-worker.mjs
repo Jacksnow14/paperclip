@@ -38,9 +38,10 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { resolveApiBase } from "./lib/paperclip-api-base.mjs";
 
 // ── Config ───────────────────────────────────────────────────────────────────
-const API_URL = process.env.PAPERCLIP_API_URL ?? "http://localhost:3000";
+let API_URL = "";
 const API_KEY = process.env.PAPERCLIP_API_KEY;
 const COMPANY_ID = process.env.PAPERCLIP_COMPANY_ID;
 const POLL_INTERVAL_MS = Number(process.env.ANALYSIS_POLL_INTERVAL_MS ?? 60_000);
@@ -385,6 +386,7 @@ async function processJob(job) {
 
 // ── Main loop ────────────────────────────────────────────────────────────────
 async function main() {
+  API_URL = await resolveApiBase();
   const cookiesStatus = existsSync(IG_COOKIES_PATH) ? `present (${IG_COOKIES_PATH})` : "absent";
   console.log(
     `reel-analysis-worker starting (AUR-2216/AUR-2363/AUR-2201) — queue: ${REEL_QUEUE_DIR}, ` +

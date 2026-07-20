@@ -47,6 +47,7 @@
  */
 
 import { parseArgs } from 'node:util';
+import { resolveApiBase } from './lib/paperclip-api-base.mjs';
 
 // ── Exported core utilities (used in tests) ──────────────────────────────────
 
@@ -503,23 +504,22 @@ if (isMain) {
     process.exit(0);
   }
 
-  const API_URL = process.env.PAPERCLIP_API_URL;
   const API_KEY = process.env.PAPERCLIP_API_KEY;
   const COMPANY_ID = process.env.PAPERCLIP_COMPANY_ID;
 
-  if (!API_URL || !API_KEY || !COMPANY_ID) {
-    console.error('ERROR: PAPERCLIP_API_URL, PAPERCLIP_API_KEY, and PAPERCLIP_COMPANY_ID must be set.');
+  if (!API_KEY || !COMPANY_ID) {
+    console.error('ERROR: PAPERCLIP_API_KEY and PAPERCLIP_COMPANY_ID must be set.');
     process.exit(2);
   }
 
-  main({
+  resolveApiBase().then(API_URL => main({
     windowMinutes: parseInt(args['window-minutes'], 10),
     maxNewFlags: parseInt(args['max-new-flags'], 10),
     apply: args.apply,
     apiUrl: API_URL,
     apiKey: API_KEY,
     companyId: COMPANY_ID,
-  }).then(code => process.exit(code)).catch(err => {
+  })).then(code => process.exit(code)).catch(err => {
     console.error('FATAL:', err.message);
     process.exit(2);
   });

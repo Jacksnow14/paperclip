@@ -57,8 +57,9 @@ import {
   measureExperimentScoped,
   filterScorecardsByScope,
 } from './sgi-loop-h-experiment-scope.mjs';
+import { resolveApiBase } from './lib/paperclip-api-base.mjs';
 
-const API_URL = process.env.PAPERCLIP_API_URL;
+let API_URL = '';
 const API_KEY = process.env.PAPERCLIP_API_KEY;
 const COMPANY_ID = process.env.PAPERCLIP_COMPANY_ID;
 const AGENT_ID = process.env.PAPERCLIP_AGENT_ID;
@@ -352,6 +353,7 @@ async function createLoopCIssue(exp) {
 // ---- Main ------------------------------------------------------------------
 
 async function main() {
+  API_URL = await resolveApiBase();
   // 1) Fetch experiments PROJECT-SCOPED (AUR-3266 requirement #1) — an
   // org-wide query sees 0 experiments (they're captured scope:{projectId}).
   const experiments = (await fetchAllByPrefix('experiment/', `&projectId=${PROJECT_ID}`))

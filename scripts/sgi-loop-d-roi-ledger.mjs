@@ -47,7 +47,9 @@
  *   node scripts/sgi-loop-d-roi-ledger.mjs --no-approval  # write ledgers + comment, skip approval
  */
 
-const API_URL = process.env.PAPERCLIP_API_URL;
+import { resolveApiBase } from './lib/paperclip-api-base.mjs';
+
+let API_URL = '';
 const API_KEY = process.env.PAPERCLIP_API_KEY;
 const COMPANY_ID = process.env.PAPERCLIP_COMPANY_ID;
 const AGENT_ID = process.env.PAPERCLIP_AGENT_ID;
@@ -281,6 +283,7 @@ function boardActionFor(row, prior) {
 // ---- Main ------------------------------------------------------------------
 
 async function main() {
+  API_URL = await resolveApiBase();
   const all = await fetchRecords();
   const adjusted = all.filter(r => cat(r) === 'scorecard_adjusted');
   const identifiers = [...new Set(adjusted.map(r => fields(r).issue_id).filter(Boolean))];

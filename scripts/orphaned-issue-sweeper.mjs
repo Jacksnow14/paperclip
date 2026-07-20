@@ -37,7 +37,9 @@
  *   node scripts/orphaned-issue-sweeper.mjs --apply --json
  */
 
-const API_URL = process.env.PAPERCLIP_API_URL;
+import { resolveApiBase } from './lib/paperclip-api-base.mjs';
+
+let API_URL = '';
 const API_KEY = process.env.PAPERCLIP_API_KEY;
 const COMPANY_ID = process.env.PAPERCLIP_COMPANY_ID;
 const RUN_ID = process.env.PAPERCLIP_RUN_ID;
@@ -47,8 +49,8 @@ const argv = process.argv.slice(2);
 const APPLY = argv.includes('--apply');
 const JSON_OUT = argv.includes('--json');
 
-if (!API_URL || !API_KEY || !COMPANY_ID) {
-  console.error('Missing PAPERCLIP_API_URL / PAPERCLIP_API_KEY / PAPERCLIP_COMPANY_ID in env.');
+if (!API_KEY || !COMPANY_ID) {
+  console.error('Missing PAPERCLIP_API_KEY / PAPERCLIP_COMPANY_ID in env.');
   process.exit(2);
 }
 
@@ -245,6 +247,7 @@ async function captureRationale(issue, owner) {
 // ---- Main ------------------------------------------------------------------
 
 async function main() {
+  API_URL = await resolveApiBase();
   const issues = await api(`/api/companies/${COMPANY_ID}/issues?status=todo,in_progress`);
   const list = Array.isArray(issues) ? issues : (issues.issues || []);
   const orphans = list.filter(i => !i.assigneeAgentId && !i.assigneeUserId);

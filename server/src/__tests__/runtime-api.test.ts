@@ -60,6 +60,7 @@ describe("runtime API discovery", () => {
       "http://198.51.100.10:3102",
       "http://runtime-host.example.test:3102",
       "http://203.0.113.42:3102",
+      "http://127.0.0.1:3102",
     ]);
   });
 
@@ -77,6 +78,7 @@ describe("runtime API discovery", () => {
       "https://agent-entry.example.test",
       "https://paperclip.example.test",
       "https://198.51.100.10:3102",
+      "http://127.0.0.1:3102",
     ]);
   });
 
@@ -93,6 +95,31 @@ describe("runtime API discovery", () => {
       "http://127.0.0.1:3102",
       "http://host.docker.internal:3102",
     ]);
+  });
+
+  it("always includes an on-host loopback candidate as the last entry", () => {
+    const candidates = buildRuntimeApiCandidateUrls({
+      authPublicBaseUrl: "https://paperclip.example.test/app",
+      allowedHostnames: ["198.51.100.10"],
+      bindHost: "10.0.0.5",
+      port: 3210,
+      networkInterfacesMap: {},
+    });
+
+    expect(candidates).toContain("http://127.0.0.1:3210");
+    expect(candidates[candidates.length - 1]).toBe("http://127.0.0.1:3210");
+  });
+
+  it("does not duplicate the loopback candidate when it is already present", () => {
+    const candidates = buildRuntimeApiCandidateUrls({
+      authPublicBaseUrl: "http://127.0.0.1:3102",
+      allowedHostnames: [],
+      bindHost: "127.0.0.1",
+      port: 3102,
+      networkInterfacesMap: {},
+    });
+
+    expect(candidates.filter((url) => url === "http://127.0.0.1:3102")).toHaveLength(1);
   });
 
   it("prefers usable interface hosts and skips link-local addresses", () => {

@@ -7,6 +7,8 @@ const ORIGINAL_PAPERCLIP_LISTEN_HOST = process.env.PAPERCLIP_LISTEN_HOST;
 const ORIGINAL_PAPERCLIP_LISTEN_PORT = process.env.PAPERCLIP_LISTEN_PORT;
 const ORIGINAL_HOST = process.env.HOST;
 const ORIGINAL_PORT = process.env.PORT;
+const ORIGINAL_PAPERCLIP_DISABLE_LOOPBACK_REWRITE = process.env.PAPERCLIP_DISABLE_LOOPBACK_REWRITE;
+const ORIGINAL_PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON;
 
 afterEach(() => {
   if (ORIGINAL_PAPERCLIP_RUNTIME_API_URL === undefined) delete process.env.PAPERCLIP_RUNTIME_API_URL;
@@ -26,6 +28,12 @@ afterEach(() => {
 
   if (ORIGINAL_PORT === undefined) delete process.env.PORT;
   else process.env.PORT = ORIGINAL_PORT;
+
+  if (ORIGINAL_PAPERCLIP_DISABLE_LOOPBACK_REWRITE === undefined) delete process.env.PAPERCLIP_DISABLE_LOOPBACK_REWRITE;
+  else process.env.PAPERCLIP_DISABLE_LOOPBACK_REWRITE = ORIGINAL_PAPERCLIP_DISABLE_LOOPBACK_REWRITE;
+
+  if (ORIGINAL_PAPERCLIP_RUNTIME_API_CANDIDATES_JSON === undefined) delete process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON;
+  else process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = ORIGINAL_PAPERCLIP_RUNTIME_API_CANDIDATES_JSON;
 });
 
 describe("buildPaperclipEnv", () => {
@@ -72,5 +80,79 @@ describe("buildPaperclipEnv", () => {
     const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" });
 
     expect(env.PAPERCLIP_API_URL).toBe("http://[::1]:3101");
+  });
+
+  it("does not rewrite the host by default (back-compat, no opts passed)", () => {
+    process.env.PAPERCLIP_RUNTIME_API_URL = "http://78.153.195.107:3210";
+
+    const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" });
+
+    expect(env.PAPERCLIP_API_URL).toBe("http://78.153.195.107:3210");
+  });
+
+  it("preferLoopback rewrites a public host to 127.0.0.1, preserving port and path", () => {
+    process.env.PAPERCLIP_RUNTIME_API_URL = "http://78.153.195.107:3210/base/path";
+
+    const env = buildPaperclipEnv(
+      { id: "agent-1", companyId: "company-1" },
+      { preferLoopback: true },
+    );
+
+    expect(env.PAPERCLIP_API_URL).toBe("http://127.0.0.1:3210/base/path");
+  });
+
+  it("preferLoopback leaves an already-loopback URL unchanged", () => {
+    process.env.PAPERCLIP_RUNTIME_API_URL = "http://localhost:3210";
+
+    const env = buildPaperclipEnv(
+      { id: "agent-1", companyId: "company-1" },
+      { preferLoopback: true },
+    );
+
+    expect(env.PAPERCLIP_API_URL).toBe("http://localhost:3210");
+
+    process.env.PAPERCLIP_RUNTIME_API_URL = "http://127.0.0.1:3210";
+    const env2 = buildPaperclipEnv(
+      { id: "agent-1", companyId: "company-1" },
+      { preferLoopback: true },
+    );
+    expect(env2.PAPERCLIP_API_URL).toBe("http://127.0.0.1:3210");
+  });
+
+  it("preferLoopback rewrites an IPv6/public host to the IPv4 literal 127.0.0.1", () => {
+    process.env.PAPERCLIP_RUNTIME_API_URL = "http://[2001:db8::1]:3210";
+
+    const env = buildPaperclipEnv(
+      { id: "agent-1", companyId: "company-1" },
+      { preferLoopback: true },
+    );
+
+    expect(env.PAPERCLIP_API_URL).toBe("http://127.0.0.1:3210");
+  });
+
+  it("PAPERCLIP_DISABLE_LOOPBACK_REWRITE=1 disables the rewrite even with preferLoopback", () => {
+    process.env.PAPERCLIP_RUNTIME_API_URL = "http://78.153.195.107:3210";
+    process.env.PAPERCLIP_DISABLE_LOOPBACK_REWRITE = "1";
+
+    const env = buildPaperclipEnv(
+      { id: "agent-1", companyId: "company-1" },
+      { preferLoopback: true },
+    );
+
+    expect(env.PAPERCLIP_API_URL).toBe("http://78.153.195.107:3210");
+  });
+
+  it("passes PAPERCLIP_RUNTIME_API_CANDIDATES_JSON through when present", () => {
+    process.env.PAPERCLIP_RUNTIME_API_URL = "http://78.153.195.107:3210";
+    process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = '["http://78.153.195.107:3210","http://127.0.0.1:3210"]';
+
+    const env = buildPaperclipEnv(
+      { id: "agent-1", companyId: "company-1" },
+      { preferLoopback: true },
+    );
+
+    expect(env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON).toBe(
+      '["http://78.153.195.107:3210","http://127.0.0.1:3210"]',
+    );
   });
 });

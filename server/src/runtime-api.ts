@@ -163,5 +163,10 @@ export function buildRuntimeApiCandidateUrls(input: {
     );
   }
 
+  // Always expose an on-host loopback candidate so agents/scripts running on the
+  // same machine as the API server have a reachable fallback even when the
+  // public/bind hosts hang due to hairpin-NAT or IPv6 resolution quirks.
+  pushCandidate(candidates, seen, formatOrigin("http:", "127.0.0.1", input.port));
+
   return candidates;
 }

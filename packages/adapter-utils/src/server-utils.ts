@@ -890,7 +890,28 @@ export function buildInvocationEnvForLogs(
   return redactEnvForLogs(merged);
 }
 
-export function buildPaperclipEnv(agent: { id: string; companyId: string }): Record<string, string> {
+function isLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.trim().toLowerCase();
+  return normalized === "127.0.0.1" || normalized === "localhost" || normalized === "::1";
+}
+
+function rewriteUrlHostToLoopback(rawUrl: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return rawUrl;
+  }
+  if (isLoopbackHostname(parsed.hostname)) return rawUrl;
+  const port = parsed.port ? `:${parsed.port}` : "";
+  const path = parsed.pathname === "/" ? "" : parsed.pathname;
+  return `${parsed.protocol}//127.0.0.1${port}${path}${parsed.search}${parsed.hash}`;
+}
+
+export function buildPaperclipEnv(
+  agent: { id: string; companyId: string },
+  opts: { preferLoopback?: boolean } = {},
+): Record<string, string> {
   const resolveHostForUrl = (rawHost: string): string => {
     const host = rawHost.trim();
     if (!host || host === "0.0.0.0" || host === "::") return "localhost";
@@ -905,11 +926,22 @@ export function buildPaperclipEnv(agent: { id: string; companyId: string }): Rec
     process.env.PAPERCLIP_LISTEN_HOST ?? process.env.HOST ?? "localhost",
   );
   const runtimePort = process.env.PAPERCLIP_LISTEN_PORT ?? process.env.PORT ?? "3100";
-  const apiUrl =
+  let apiUrl =
     process.env.PAPERCLIP_RUNTIME_API_URL ??
     process.env.PAPERCLIP_API_URL ??
     `http://${runtimeHost}:${runtimePort}`;
+
+  if (opts.preferLoopback && process.env.PAPERCLIP_DISABLE_LOOPBACK_REWRITE !== "1") {
+    apiUrl = rewriteUrlHostToLoopback(apiUrl);
+  }
+
   vars.PAPERCLIP_API_URL = apiUrl;
+
+  const runtimeCandidatesJson = process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON;
+  if (runtimeCandidatesJson) {
+    vars.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = runtimeCandidatesJson;
+  }
+
   return vars;
 }
 

@@ -24,10 +24,11 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { resolveApiBase } from "./lib/paperclip-api-base.mjs";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const API_URL = process.env.PAPERCLIP_API_URL ?? "http://localhost:3000";
+let API_URL = "";
 const API_KEY = process.env.PAPERCLIP_API_KEY;
 const COMPANY_ID = process.env.PAPERCLIP_COMPANY_ID;
 const STATE_FILE = process.env.STATE_FILE ?? new URL("telegram-bot-state.json", import.meta.url).pathname;
@@ -148,6 +149,7 @@ async function relayResults() {
 
 // ── Main loop ────────────────────────────────────────────────────────────────
 async function main() {
+  API_URL = await resolveApiBase();
   console.log("telegram-bot-worker: starting (AUR-2215/AUR-2201 queue mode)");
   const state = loadState();
 

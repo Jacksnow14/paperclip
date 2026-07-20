@@ -30,7 +30,9 @@
  *   node scripts/sgi-loop-e-nightly-synthesis.mjs --dry-run  # print, do not capture/comment
  */
 
-const API_URL = process.env.PAPERCLIP_API_URL;
+import { resolveApiBase } from './lib/paperclip-api-base.mjs';
+
+let API_URL = '';
 const API_KEY = process.env.PAPERCLIP_API_KEY;
 const COMPANY_ID = process.env.PAPERCLIP_COMPANY_ID;
 const AGENT_ID = process.env.PAPERCLIP_AGENT_ID;
@@ -296,6 +298,7 @@ ${deltaInfo.lines.map(l => `- ${l}`).join('\n')}
 // ---- Main ------------------------------------------------------------------
 
 async function main() {
+  API_URL = await resolveApiBase();
   const all = await fetchRecords();
   const today = all.filter(r => dayOf(r) === TARGET_DATE && cat(r) !== 'synthesis');
 

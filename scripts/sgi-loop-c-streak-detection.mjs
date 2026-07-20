@@ -19,7 +19,9 @@
  *   node scripts/sgi-loop-c-streak-detection.mjs --dry-run  # print only, no writes
  */
 
-const API_URL = process.env.PAPERCLIP_API_URL;
+import { resolveApiBase } from './lib/paperclip-api-base.mjs';
+
+let API_URL = '';
 const API_KEY = process.env.PAPERCLIP_API_KEY;
 const COMPANY_ID = process.env.PAPERCLIP_COMPANY_ID;
 const AGENT_ID = process.env.PAPERCLIP_AGENT_ID;
@@ -85,9 +87,10 @@ function parseTitle(title) {
 }
 
 async function main() {
-  for (const [k, v] of Object.entries({ API_URL, API_KEY, COMPANY_ID, AGENT_ID })) {
+  for (const [k, v] of Object.entries({ API_KEY, COMPANY_ID, AGENT_ID })) {
     if (!v) throw new Error(`Missing env ${k}`);
   }
+  API_URL = await resolveApiBase();
 
   const records = await fetchAllRecords();
   const scorecards = records.filter((r) => {

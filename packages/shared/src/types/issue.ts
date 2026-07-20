@@ -636,6 +636,8 @@ export interface SuggestTasksResult {
   createdTasks?: SuggestTasksResultCreatedTask[];
   skippedClientKeys?: string[];
   rejectionReason?: string | null;
+  cancelled?: true;
+  cancellationReason?: string | null;
 }
 
 export interface AskUserQuestionsQuestionOption {

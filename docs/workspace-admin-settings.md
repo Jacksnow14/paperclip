@@ -64,18 +64,25 @@ service-settings privilege is sufficient and preferred — least privilege).
 
 ### Settings agents have needed — real deep-links (captured live 2026-07-22, AUR-3769)
 
-Domain `tryauranode.com`, super-admin `board@tryauranode.com`, account index `/u/2/`.
+Domain `tryauranode.com`, super-admin `board@tryauranode.com`.
 Left-nav path: **Генеративный искусственный интеллект / Generative AI** → the entries
-below. Each service page is `admin.google.com/u/2/ac/managedsettings/<serviceId>`
-(the `/u/2/` is the account index; drop it and Google resolves the active account).
+below. Each service page is `admin.google.com/ac/managedsettings/<serviceId>`; append
+`/{SECTION}` to deep-link a specific sub-panel. **Normalize the URL by dropping any
+`/u/<N>/` account-index prefix** (it is per-login, e.g. `/u/2/`) — Google resolves the
+active account. Deep-links below are already normalized.
 
-| Setting | Real deep-link | Service / setting id |
+| Setting | Real deep-link | Service / section id |
 |---|---|---|
-| **Gemini app** — *Service status* (safe read) | `/u/2/ac/managedsettings/47208553126` | serviceId `47208553126` |
-| **My Avatar in Gemini** ("Аватар в Gemini") | `/u/2/ac/managedsettings/47208553126/AI_LIKENESS_SETTINGS` | setting key `AI_LIKENESS_SETTINGS` |
-| Gemini for Workspace | `/u/2/ac/managedsettings/793154499678` | serviceId `793154499678` |
-| Gemini Enterprise | `/u/2/ac/managedsettings/308858798364` | serviceId `308858798364` |
-| NotebookLM | `/u/2/ac/managedsettings/692380834322` | serviceId `692380834322` |
+| **Gemini app** — *Service status* (safe read) | `/ac/managedsettings/47208553126` | serviceId `47208553126` |
+| **My Avatar in Gemini** ("Аватар в Gemini") | `/ac/managedsettings/47208553126/AI_LIKENESS_SETTINGS` | section `AI_LIKENESS_SETTINGS` |
+| Gemini — Sharing (chat access, Gem-bots) | `/ac/managedsettings/47208553126/SHARING_SETTINGS` | section `SHARING_SETTINGS` |
+| Gemini for Workspace | `/ac/managedsettings/793154499678` | serviceId `793154499678` |
+| Gemini Enterprise | `/ac/managedsettings/308858798364` | serviceId `308858798364` |
+| NotebookLM | `/ac/managedsettings/692380834322` | serviceId `692380834322` |
+
+> Settings are applied at the **OU** level — org unit **Auranode e.U.** (with sub-OU
+> **Workspace Guests**). Confirm the OU selector in the left rail of the edit page targets
+> the intended OU before saving.
 
 > **Correction:** the old breadcrumbs "Apps → Google Workspace → Gemini" and the
 > placeholder `/ac/apps/gemini` are **wrong** — `/ac/apps/gemini` returns a Google 404.
@@ -115,6 +122,12 @@ The My Avatar control is a **checkbox** (not a switch), so the toggle + save sel
 | Toggle | `input[type=checkbox][aria-label="Включить аватар в Gemini"]` | `aria-label` is locale-dependent (this profile is RU). Locale-stable fallback: the single `form input[type=checkbox]` on the `/AI_LIKENESS_SETTINGS` deep-link. Checked = feature ON. |
 | Save | `button "Сохранить изменения"` (RU) / *Save changes* | **Disabled until a change is pending** — a no-op edit leaves it greyed, so an accidental save is impossible. |
 | Cancel | `button "Отменить изменения"` (RU) / *Cancel* | |
+
+**Interaction pattern proven live (CEO, board session):** navigate to the section
+deep-link → the setting row has a **pencil** icon to enter edit mode → toggle the checkbox
+→ **СОХРАНИТЬ / Save** → **reload** the deep-link and re-read to confirm persistence. (In
+the attended capture the section expanded directly to the checkbox; on some rows the
+pencil is the affordance to enter edit mode first — expect either.)
 
 1. **Verify current state** with `read_page` / `screenshot` (above).
 2. **Flip** with `fill_and_submit` (or `run_js` toggling the checkbox), then click Save:

@@ -1,6 +1,8 @@
 # Google Workspace Admin AI Settings — programmatic read/toggle
 
-**Status:** recipe documented; live use is **board-gated** (see [Credential & board gate](#credential--board-gate)).
+**Status:** recipe **verified live 2026-07-22** (AUR-3769) — admin console reached,
+read + real deep-links + selectors captured (below). The **non-interactive headless**
+read/flip still needs the host profile seeded (see [Unblock steps](#unblock-steps-owner-board--operator)).
 **Domain:** `tryauranode.com` (Workspace)
 **Source gap:** AUR-3726 (recurring tool-gap cluster). Unblocks AUR-3640's mechanics.
 
@@ -60,25 +62,34 @@ Profile name (proposed): **`gworkspace-admin`** at
 `tryauranode.com` **super administrator** (a delegated admin with only the relevant
 service-settings privilege is sufficient and preferred — least privilege).
 
-### Settings agents have needed (Admin console navigation)
+### Settings agents have needed — real deep-links (captured live 2026-07-22, AUR-3769)
 
-| Setting | Admin console path |
-|---|---|
-| Gemini app (on/off) | Apps → Google Workspace → **Gemini** → *Service status* |
-| **My Avatar in Gemini** | Apps → Google Workspace → **Gemini** → *Generative AI* / feature settings → My Avatar |
-| Google Pics (personal avatars) | Apps → Additional Google services → **Google Pics** → service settings |
-| Google Vids — personal avatars | Apps → Google Workspace → **Google Vids** → *Personal avatars* |
+Domain `tryauranode.com`, super-admin `board@tryauranode.com`, account index `/u/2/`.
+Left-nav path: **Генеративный искусственный интеллект / Generative AI** → the entries
+below. Each service page is `admin.google.com/u/2/ac/managedsettings/<serviceId>`
+(the `/u/2/` is the account index; drop it and Google resolves the active account).
 
-> The Admin console is a dynamic SPA; the stable `admin.google.com/ac/...` deep link and
-> the exact toggle selector for each setting must be captured during the first seeded
-> session and recorded back into this table (see [Hardening](#hardening)).
+| Setting | Real deep-link | Service / setting id |
+|---|---|---|
+| **Gemini app** — *Service status* (safe read) | `/u/2/ac/managedsettings/47208553126` | serviceId `47208553126` |
+| **My Avatar in Gemini** ("Аватар в Gemini") | `/u/2/ac/managedsettings/47208553126/AI_LIKENESS_SETTINGS` | setting key `AI_LIKENESS_SETTINGS` |
+| Gemini for Workspace | `/u/2/ac/managedsettings/793154499678` | serviceId `793154499678` |
+| Gemini Enterprise | `/u/2/ac/managedsettings/308858798364` | serviceId `308858798364` |
+| NotebookLM | `/u/2/ac/managedsettings/692380834322` | serviceId `692380834322` |
+
+> **Correction:** the old breadcrumbs "Apps → Google Workspace → Gemini" and the
+> placeholder `/ac/apps/gemini` are **wrong** — `/ac/apps/gemini` returns a Google 404.
+> Gemini settings live under **Generative AI**, not Apps → Google Workspace, and My Avatar
+> is a section *inside* the Gemini app page (not a separate app), reached by expanding
+> **"Аватар в Gemini"** which navigates to the `.../AI_LIKENESS_SETTINGS` deep-link above.
+> Google Pics / Google Vids deep-links are not yet captured (no live gap for them yet).
 
 ### Read a setting (state check)
 
 ```bash
 python3 /home/ievgen/paperclip/scripts/browser_bridge.py '{
   "command": "read_page",
-  "url": "https://admin.google.com/ac/apps/gemini",
+  "url": "https://admin.google.com/ac/managedsettings/47208553126",
   "profile": "gworkspace-admin",
   "timeout_ms": 45000,
   "max_text_chars": 16000
@@ -86,21 +97,35 @@ python3 /home/ievgen/paperclip/scripts/browser_bridge.py '{
 ```
 
 Inspect `data.page_text` (and a `screenshot` command for visual confirmation) to read the
-current on/off state of the target toggle.
+current state. The Gemini app page renders **all** its settings inline, so one `read_page`
+yields both:
+- **Service status** → text `Статус сервиса … Включено для всех` (EN: *Service status …
+  ON for everyone*). Baseline captured 2026-07-22: **ON for everyone**.
+- **My Avatar** → text `Аватар … Выключено: 'Включить аватар в Gemini'` (EN: *Avatar …
+  OFF: 'Enable avatar in Gemini'*). Baseline captured 2026-07-22: **OFF** (checkbox
+  `checked=false`), applied at OU `Auranode e.U.` — this is the **AUR-3640-compliant**
+  state (see note below).
 
 ### Toggle a setting (write) — verify → flip → re-verify
 
+The My Avatar control is a **checkbox** (not a switch), so the toggle + save selectors are:
+
+| Element | Selector (captured live 2026-07-22) | Notes |
+|---|---|---|
+| Toggle | `input[type=checkbox][aria-label="Включить аватар в Gemini"]` | `aria-label` is locale-dependent (this profile is RU). Locale-stable fallback: the single `form input[type=checkbox]` on the `/AI_LIKENESS_SETTINGS` deep-link. Checked = feature ON. |
+| Save | `button "Сохранить изменения"` (RU) / *Save changes* | **Disabled until a change is pending** — a no-op edit leaves it greyed, so an accidental save is impossible. |
+| Cancel | `button "Отменить изменения"` (RU) / *Cancel* | |
+
 1. **Verify current state** with `read_page` / `screenshot` (above).
-2. **Flip** with `fill_and_submit` (or `run_js` clicking the control), using the selector
-   captured during hardening:
+2. **Flip** with `fill_and_submit` (or `run_js` toggling the checkbox), then click Save:
 
 ```bash
 python3 /home/ievgen/paperclip/scripts/browser_bridge.py '{
   "command": "fill_and_submit",
-  "url": "https://admin.google.com/ac/apps/gemini",
+  "url": "https://admin.google.com/ac/managedsettings/47208553126/AI_LIKENESS_SETTINGS",
   "profile": "gworkspace-admin",
-  "fields": [{"selector": "<captured toggle selector>", "value": "on", "action": "check"}],
-  "submit_selector": "<captured save selector>",
+  "fields": [{"selector": "form input[type=checkbox]", "value": "on", "action": "check"}],
+  "submit_selector": "button[aria-label*=\"Сохранить\"], button:has-text(\"Сохранить\")",
   "timeout_ms": 45000
 }'
 ```
@@ -108,8 +133,16 @@ python3 /home/ievgen/paperclip/scripts/browser_bridge.py '{
 3. **Re-verify** with another `read_page`/`screenshot` and confirm the new state.
    Save the screenshot as evidence (`evidence_dir`).
 
+> ⚠️ **Do not flip My Avatar ON as a mere write-drill.** Per **AUR-3640** (done), the
+> company decision is to keep the Gemini face/voice avatar feature **OFF** (biometric
+> likeness). It is currently OFF and must stay OFF absent an explicit, recorded policy
+> exception. Use a **benign, reversible** setting for any flip-mechanic demonstration and
+> restore it; treat My Avatar as read-only unless a policy change is authorized.
+
 This "read → change → read-back" loop is the acceptance test: an agent confirms the flip
-without a human in the loop, once the profile is seeded.
+without a human in the loop, **once the host profile is seeded** (see seed note — the seed
+must live in the host profile dir driven by the headless bridge, not an operator's
+attended laptop browser).
 
 ---
 
@@ -130,23 +163,57 @@ without a human in the loop, once the profile is seeded.
 
 1. **Board:** lift the Phase-2 admin-write gate for a `gworkspace-admin` browser profile
    (read-only first is acceptable to satisfy the read half immediately; write requires the
-   full gate).
-2. **Operator:** seed the profile once via VNC on `78.153.195.107`
-   (`DISPLAY=:1 chromium-browser --user-data-dir=/home/ievgen/browser-profiles/gworkspace-admin https://admin.google.com`),
-   complete super-admin login + 2FA, close the browser (cookies persist).
+   full gate). — **Done 2026-07-22.**
+2. **Operator:** seed the profile once via VNC on `78.153.195.107`. Run the helper (it
+   auto-resolves Playwright's bundled Chromium — the exact binary the headless bridge
+   reuses — so there is no cookie-store/version skew):
+
+   ```bash
+   scripts/seed_admin_profile.sh          # profile: gworkspace-admin, DISPLAY=:99
+   ```
+
+   Complete super-admin login + 2FA in the window, then **close it** (cookies persist to
+   `/home/ievgen/browser-profiles/gworkspace-admin/`).
+
+   > **Two corrections vs. the earlier draft:** (a) the host's Xvfb display is **`:99`**,
+   > not `:1`; (b) the browser must be **Playwright's bundled Chromium**, not system
+   > `chromium-browser`/`google-chrome`. `seed_admin_profile.sh` handles both.
+   >
+   > **The seed must land in the HOST profile dir**, not an operator's laptop browser.
+   > Logging into `admin.google.com` in an attended browser (e.g. via a browser-MCP
+   > extension on a laptop) does **not** seed this profile — the headless bridge on the
+   > host reads only `/home/ievgen/browser-profiles/gworkspace-admin/`. Verify with a
+   > `read_page` at `admin.google.com`: if it still redirects to `accounts.google.com`,
+   > the host profile is not seeded yet.
 3. **Agent:** run the read/toggle recipe above; capture concrete deep-links + selectors
-   and harden this doc.
+   and harden this doc. — Read half + deep-links + selectors captured 2026-07-22 via an
+   attended browser-MCP session (AUR-3769); the headless non-interactive half is pending
+   the host-profile seed in step 2.
 
 ---
 
-## Hardening (first live run)
+## Hardening — captured live 2026-07-22 (AUR-3769)
 
-The recipe is written against menu breadcrumbs because selectors can't be known before the
-first seeded session. On the first successful live run, capture and commit back:
+Captured during the first live admin-console session (attended browser-MCP, super-admin
+`board@tryauranode.com`) and committed above:
 
-- The stable `admin.google.com/ac/...` deep link for each setting.
-- The exact toggle + save-button selectors (or a `run_js` snippet that flips the control).
-- A screenshot per setting in the evidence dir as a known-good baseline.
+- ✅ **Deep links** — real `admin.google.com/u/2/ac/managedsettings/<serviceId>` links for
+  Gemini app, My Avatar (`.../AI_LIKENESS_SETTINGS`), Gemini for Workspace, Gemini
+  Enterprise, NotebookLM (see the deep-link table). Replaced the 404 `/ac/apps/gemini`
+  placeholder.
+- ✅ **Selectors** — My Avatar toggle is a checkbox
+  `input[type=checkbox][aria-label="Включить аватар в Gemini"]` (locale-stable fallback:
+  the single `form input[type=checkbox]` on the `AI_LIKENESS_SETTINGS` page); Save button
+  `"Сохранить изменения"` is disabled until a change is pending.
+- ✅ **Read-state baselines** — Gemini Service status = **ON for everyone**; My Avatar =
+  **OFF** (`checked=false`), OU `Auranode e.U.`. Baseline screenshots captured in the
+  AUR-3769 session transcript (attended browser-MCP ran on the operator laptop, so those
+  images live with the run, not the host); the host evidence dir
+  `/home/ievgen/browser-bridge/evidence/aur3769/` holds the Phase-1 auth-wall screenshot.
+  Once the host profile is seeded, re-capture the two baselines on-host via
+  `browser_bridge.py screenshot … evidence_dir=…`.
 
-Until then, treat the toggle step as "navigate + screenshot + click by visible label",
-which is slower but functional under the seeded profile.
+**Still pending (one gate):** a headless, non-interactive read/flip via
+`browser_bridge.py` — blocked only on seeding the **host** profile dir (step 2 above). The
+write-mechanic demonstration should use a benign, reversible setting (My Avatar stays OFF
+per AUR-3640) and restore it.

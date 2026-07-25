@@ -893,6 +893,39 @@ describe("memory routes", () => {
       );
     });
 
+    it("allows an agent to revoke its own routing_rationale record (AUR-3990)", async () => {
+      mockMemoryService.getRecord.mockResolvedValue(makeRoutingRecord({ metadata: { category: "routing_rationale" } }));
+      mockMemoryService.revoke.mockResolvedValue(revokeResult);
+      const app = createApp({ type: "agent", agentId, companyId: companyA });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/records/${recordId}/revoke-own`)
+        .send({ reason: "AUR-3990 dedup of stale routing/* record" });
+
+      expect(res.status).toBe(200);
+      expect(res.body.revokedRecordIds).toEqual([recordId]);
+      expect(mockMemoryService.revoke).toHaveBeenCalledWith(
+        companyA,
+        { selector: { recordIds: [recordId] }, reason: "AUR-3990 dedup of stale routing/* record" },
+        expect.objectContaining({ actorType: "agent", agentId }),
+      );
+    });
+
+    it("returns 403 when agent tries to revoke another agent's routing_rationale record (AUR-3990)", async () => {
+      mockMemoryService.getRecord.mockResolvedValue(
+        makeRoutingRecord({ metadata: { category: "routing_rationale" }, owner: { type: "agent", id: otherAgent } }),
+      );
+      const app = createApp({ type: "agent", agentId, companyId: companyA });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/records/${recordId}/revoke-own`)
+        .send({ reason: "Testing non-owner routing_rationale revoke" });
+
+      expect(res.status).toBe(403);
+      expect(res.body).toEqual({ error: "Agent can only revoke memory records it owns" });
+      expect(mockMemoryService.revoke).not.toHaveBeenCalled();
+    });
+
     it("returns 403 when a board user tries to use the revoke-own endpoint", async () => {
       mockMemoryService.getRecord.mockResolvedValue(makeRoutingRecord());
       const app = createApp({

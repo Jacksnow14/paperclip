@@ -8,7 +8,8 @@
  * Agent self-service revoke (POST /memory/records/:id/revoke-own):
  *   Agents may revoke their own records when the record's metadata.category is in
  *   AGENT_MUTABLE_CATEGORIES (experiment, experiment_conclusion, hypothesis, observation,
- *   performance_scorecard, scorecard_adjusted, tool_gap, routing, synthesis, lesson).
+ *   performance_scorecard, scorecard_adjusted, tool_gap, routing, routing_rationale, synthesis,
+ *   lesson).
  *   Returns 403 for non-owner or off-allowlist categories.
  *   `synthesis` is agent-mutable (AUR-3072) so SGI loops that author synthesis records
  *   (Loop E nightly, Loop H quarterly) can PATCH-upsert / revoke-own their own duplicates.
@@ -400,7 +401,10 @@ export function memoryRoutes(
   });
 
   // Categories that agents are permitted to update (PATCH) or revoke-own on their own records.
-  // "routing" is included so agents can deduplicate stale routing/* records via revoke-own.
+  // "routing_rationale" is included so agents can deduplicate stale routing/* records via
+  // revoke-own — every routing/* record is captured with metadata.category = "routing_rationale"
+  // (see AUTO_ACCEPT_CATEGORIES in services/memory.ts and backfill-router-read-scope.mjs). The
+  // plain "routing" entry is kept for back-compat in case any legacy record used that string.
   const AGENT_MUTABLE_CATEGORIES = new Set([
     "experiment",
     "experiment_conclusion",
@@ -410,6 +414,7 @@ export function memoryRoutes(
     "scorecard_adjusted",
     "tool_gap",
     "routing",
+    "routing_rationale",
     // synthesis: agent-authored + auto-accepted; owning SGI loops must be able to
     // PATCH-upsert / revoke-own their own duplicate synthesis records (AUR-3072).
     "synthesis",

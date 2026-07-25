@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Paperclip unit restart-counter audit daily (AUR-3952/AUR-3961)
+
+[Timer]
+OnCalendar=daily
+OnBootSec=10min
+AccuracySec=10min
+Persistent=true
+Unit=paperclip-unit-audit.service
+
+[Install]
+WantedBy=timers.target

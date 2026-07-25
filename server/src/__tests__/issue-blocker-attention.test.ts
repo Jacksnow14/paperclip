@@ -428,12 +428,128 @@ describeEmbeddedPostgres("issue blocker attention", () => {
 
     expect(parent?.blockerAttention).toMatchObject({
       state: "needs_attention",
-      reason: "attention_required",
+      reason: "cancelled_blocker",
       coveredBlockerCount: 0,
       stalledBlockerCount: 1,
       attentionBlockerCount: 1,
+      sampleBlockerIdentifier: "PBQ-3",
       sampleStalledBlockerIdentifier: "PBQ-2",
     });
+  });
+
+  it("treats a cancelled-only child as fully resolved (AUR-3956 Defect 2)", async () => {
+    const { companyId, agentId } = await createCompany("PCC");
+    const parentId = await insertIssue({ companyId, identifier: "PCC-1", title: "Parent", status: "blocked" });
+    const cancelledChildId = await insertIssue({
+      companyId,
+      identifier: "PCC-2",
+      title: "Cancelled child",
+      status: "cancelled",
+      parentId,
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: cancelledChildId, blockedIssueId: parentId });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "none",
+      reason: null,
+      unresolvedBlockerCount: 0,
+      attentionBlockerCount: 0,
+    });
+  });
+
+  it("counts exactly one unresolved blocker when one child is cancelled and one is open (AUR-3956 Defect 2)", async () => {
+    const { companyId, agentId } = await createCompany("PCM");
+    const parentId = await insertIssue({ companyId, identifier: "PCM-1", title: "Parent", status: "blocked" });
+    const cancelledChildId = await insertIssue({
+      companyId,
+      identifier: "PCM-2",
+      title: "Cancelled child",
+      status: "cancelled",
+      parentId,
+      assigneeAgentId: agentId,
+    });
+    const openChildId = await insertIssue({
+      companyId,
+      identifier: "PCM-3",
+      title: "Open child",
+      status: "backlog",
+      parentId,
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: cancelledChildId, blockedIssueId: parentId });
+    await block({ companyId, blockerIssueId: openChildId, blockedIssueId: parentId });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      unresolvedBlockerCount: 1,
+      attentionBlockerCount: 1,
+      sampleBlockerIdentifier: "PCM-3",
+    });
+  });
+
+  it("keeps a cancelled explicit blocker unresolved with a cancelled_blocker reason (AUR-3956 Defect 2)", async () => {
+    const { companyId, agentId } = await createCompany("PCX");
+    const parentId = await insertIssue({ companyId, identifier: "PCX-1", title: "Parent", status: "blocked" });
+    const cancelledBlockerId = await insertIssue({
+      companyId,
+      identifier: "PCX-2",
+      title: "Cancelled explicit blocker",
+      status: "cancelled",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: cancelledBlockerId, blockedIssueId: parentId });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "cancelled_blocker",
+      unresolvedBlockerCount: 1,
+      attentionBlockerCount: 1,
+      sampleBlockerIdentifier: "PCX-2",
+    });
+  });
+
+  it("agrees with getWakeableParentAfterChildCompletion that a cancelled child completes the parent", async () => {
+    const { companyId, agentId } = await createCompany("PCW");
+    const parentId = await insertIssue({
+      companyId,
+      identifier: "PCW-1",
+      title: "Parent",
+      status: "blocked",
+      assigneeAgentId: agentId,
+    });
+    const doneChildId = await insertIssue({
+      companyId,
+      identifier: "PCW-2",
+      title: "Done child",
+      status: "done",
+      parentId,
+      assigneeAgentId: agentId,
+    });
+    const cancelledChildId = await insertIssue({
+      companyId,
+      identifier: "PCW-3",
+      title: "Cancelled child",
+      status: "cancelled",
+      parentId,
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: doneChildId, blockedIssueId: parentId });
+    await block({ companyId, blockerIssueId: cancelledChildId, blockedIssueId: parentId });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+    expect(parent?.blockerAttention).toMatchObject({ state: "none", reason: null });
+
+    const wakeableParent = await svc.getWakeableParentAfterChildCompletion(parentId);
+    expect(wakeableParent?.id).toBe(parentId);
+    expect(wakeableParent?.childIssueIds).toEqual(expect.arrayContaining([doneChildId, cancelledChildId]));
   });
 
   it("treats open liveness escalation blockers as covered waiting paths", async () => {

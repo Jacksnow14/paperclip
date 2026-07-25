@@ -148,6 +148,7 @@ export type IssueBlockerAttentionReason =
   | "active_dependency"
   | "stalled_review"
   | "attention_required"
+  | "cancelled_blocker"
   | null;
 
 export interface IssueBlockerAttention {

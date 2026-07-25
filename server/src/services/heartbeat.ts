@@ -1725,6 +1725,14 @@ function shouldQueueFollowupForRunningIssueWake(input: {
   wakeCommentId: string | null;
 }) {
   if (input.wakeCommentId) return true;
+  // Interaction resolution wakes (accept/reject/answer/cancel on a wake_assignee
+  // interaction) carry interactionId in the context snapshot (see
+  // normalizeInteractionContinuationWakeContext). The assignee's own run is
+  // typically still marked "running" in the DB when the answer lands — the
+  // agent asked the question and is winding down its turn concurrently with
+  // the reply. Coalescing into that dying run silently drops the wake instead
+  // of guaranteeing a followup once it actually finishes (AUR-3784).
+  if (readNonEmptyString(input.contextSnapshot?.interactionId)) return true;
   const wakeReason = readNonEmptyString(input.contextSnapshot?.wakeReason);
   return Boolean(wakeReason && RUNNING_ISSUE_WAKE_REASONS_REQUIRING_FOLLOWUP.has(wakeReason));
 }

@@ -21,6 +21,7 @@ import {
   DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
   PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX,
   PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+  PROCESS_LOST_ERROR_CODE,
   productivityReviewService,
 } from "../services/productivity-review.ts";
 
@@ -120,22 +121,30 @@ describeEmbeddedPostgres("productivity review service", () => {
     count: number;
     now: Date;
     withRunComments?: boolean;
+    startIndex?: number;
+    status?: string;
+    errorCode?: string | null;
+    error?: string | null;
   }) {
     const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
-    for (let index = 0; index < input.count; index += 1) {
+    const startIndex = input.startIndex ?? 0;
+    for (let offset = 0; offset < input.count; offset += 1) {
+      const index = startIndex + offset;
       const runId = randomUUID();
       const createdAt = new Date(input.now.getTime() - index * 60_000);
       runs.push({
         id: runId,
         companyId: input.companyId,
         agentId: input.agentId,
-        status: "succeeded",
+        status: input.status ?? "succeeded",
         invocationSource: "assignment",
         triggerDetail: "system",
         startedAt: createdAt,
         finishedAt: new Date(createdAt.getTime() + 30_000),
         contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
-        livenessState: "advanced",
+        livenessState: input.status && input.status !== "succeeded" ? "failed" : "advanced",
+        errorCode: input.errorCode ?? null,
+        error: input.error ?? null,
         nextAction: "Continue processing the next batch.",
         createdAt,
         updatedAt: createdAt,
@@ -158,6 +167,22 @@ describeEmbeddedPostgres("productivity review service", () => {
     }
 
     return runs;
+  }
+
+  async function insertProcessLostRuns(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    count: number;
+    now: Date;
+    startIndex?: number;
+  }) {
+    return insertRuns({
+      ...input,
+      status: "failed",
+      errorCode: PROCESS_LOST_ERROR_CODE,
+      error: "Process lost -- server may have restarted",
+    });
   }
 
   async function listProductivityReviews(companyId: string) {
@@ -562,5 +587,142 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.failed).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
+  });
+
+  // AUR-3926: the productivity watchdog counted every issue-linked run toward churn regardless of
+  // why the run ended. A control-plane restart (OOM kill etc.) orphans in-flight runs, which get
+  // recorded as "Process lost" failures and auto-retried -- the watchdog read that retry storm as
+  // the assignee being unproductive (AUR-3921 was the real-world false positive this reproduces).
+  describe("AUR-3926 infra-kill classification", () => {
+    it("excludes infra-killed (process_lost) runs from the no-comment streak and churn tallies while a genuine no-comment streak still fires", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+
+      // 9 infra-killed runs (would be indistinguishable from churn if counted) interleaved
+      // ahead of the genuine no-comment streak.
+      await insertProcessLostRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 9,
+        now,
+      });
+      // 10 genuinely-completed runs with no comment -- this is the real signal and must still
+      // cross the no-comment-streak threshold even with the infra noise sitting on top of it.
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+        startIndex: 9,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      expect(result.suppressedForInfraOutage).toBe(0);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+      expect(review?.description).toContain("No-comment completed-run streak: 10");
+      expect(review?.description).toContain(
+        "Terminal sampled runs: 19 (9 infra-killed `process_lost`, 10 attributable to the agent)",
+      );
+      expect(review?.description).toContain(
+        "contradiction: $0 in cost events despite 10 attributable terminal run(s) sampled",
+      );
+    });
+
+    it("does not fire a per-agent high_churn review when process_lost runs are synchronized across multiple agents (AUR-3921 shape)", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+
+      const managerIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: managerIssueId,
+        companyId: seeded.companyId,
+        title: "Unrelated in-progress work for the second agent",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: seeded.managerId,
+        issueNumber: 2,
+        identifier: `${seeded.issuePrefix}-2`,
+        startedAt: seeded.createdAt,
+        createdAt: seeded.createdAt,
+        updatedAt: seeded.createdAt,
+      });
+
+      // Reproduces the AUR-3921 shape: 10 runs total on the primary agent's issue, 9 of which are
+      // "Process lost" failures, 0 comments -- and a second, distinct agent also took process_lost
+      // damage in the same window, which is the synchronized cross-agent signal of a control-plane
+      // outage rather than one agent's churn.
+      await insertProcessLostRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 9,
+        now,
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 1,
+        now,
+        startIndex: 9,
+      });
+      await insertProcessLostRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.managerId,
+        issueId: managerIssueId,
+        count: 2,
+        now,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(0);
+      expect(result.suppressedForInfraOutage).toBeGreaterThanOrEqual(1);
+      expect(result.outageCompanyIds).toContain(seeded.companyId);
+      expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+
+      const outageActivity = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.action, "company.productivity_review_suppressed_for_infra_outage"));
+      expect(outageActivity).toHaveLength(1);
+    });
+
+    it("still fires high_churn for 10 genuinely-completed runs even though the classifier now exists (inverse of the AUR-3921 shape)", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 10,
+        now,
+        withRunComments: true,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      expect(result.suppressedForInfraOutage).toBe(0);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `high_churn`");
+      expect(review?.description).toContain(
+        "Terminal sampled runs: 10 (0 infra-killed `process_lost`, 10 attributable to the agent)",
+      );
+    });
   });
 });

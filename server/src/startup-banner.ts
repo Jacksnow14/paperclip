@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { readBuildInfo } from "./build-info.js";
 import { resolvePaperclipConfigPath, resolvePaperclipEnvPath } from "./paths.js";
 import type { BindMode, DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
 
@@ -143,10 +144,17 @@ export function printStartupBanner(opts: StartupBannerOptions): void {
     color("╚═╝     ╚═╝  ╚═╝╚═╝     ╚══════╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝╚═╝     ", "cyan"),
   ];
 
+  const buildInfo = readBuildInfo();
+  const build =
+    buildInfo.source === "release" && buildInfo.sha
+      ? `${color(buildInfo.sha.slice(0, 12), "green")} ${color(`(${buildInfo.ref ?? "?"}, built ${buildInfo.builtAt ?? "?"})`, "dim")}`
+      : color("untracked (not a pinned release — see AUR-3937)", "yellow");
+
   const lines = [
     "",
     ...art,
     color("  ───────────────────────────────────────────────────────", "blue"),
+    row("Build", build),
     row("Mode", `${dbMode}  |  ${uiMode}`),
     row("Deploy", `${opts.deploymentMode} (${opts.deploymentExposure})`),
     row("Bind", `${opts.bind} ${color(`(${opts.host})`, "dim")}`),

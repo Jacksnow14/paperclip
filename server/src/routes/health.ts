@@ -4,6 +4,7 @@ import type { Db } from "@paperclipai/db";
 import { and, count, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import { heartbeatRuns, instanceUserRoles, invites } from "@paperclipai/db";
 import type { DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
+import { readBuildInfo } from "../build-info.js";
 import { readPersistedDevServerStatus, toDevServerHealthStatus } from "../dev-server-status.js";
 import { logger } from "../middleware/logger.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -56,7 +57,7 @@ export function healthRoutes(
     if (!db) {
       res.json(
         exposeFullDetails
-          ? { status: "ok", version: serverVersion }
+          ? { status: "ok", version: serverVersion, build: readBuildInfo() }
           : { status: "ok", deploymentMode: opts.deploymentMode },
       );
       return;
@@ -133,6 +134,7 @@ export function healthRoutes(
     res.json({
       status: "ok",
       version: serverVersion,
+      build: readBuildInfo(),
       deploymentMode: opts.deploymentMode,
       deploymentExposure: opts.deploymentExposure,
       authReady: opts.authReady,

@@ -485,6 +485,143 @@ describe("issue graph liveness classifier", () => {
     }
   });
 
+  it("flags a blocked, unassigned, blocker-less child of an open blocked parent (AUR-3964 parent/child edge)", () => {
+    const parentId = "epic-1";
+    const childId = "child-1";
+
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue({
+          id: parentId,
+          identifier: "PAP-2156",
+          title: "Blocked epic",
+          status: "blocked",
+          assigneeAgentId: null,
+        }),
+        issue({
+          id: childId,
+          identifier: "PAP-3918",
+          title: "Blocked child work",
+          status: "blocked",
+          parentId,
+          assigneeAgentId: null,
+          assigneeUserId: null,
+        }),
+      ],
+      relations: [],
+      agents: [agent(), manager],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      issueId: parentId,
+      identifier: "PAP-2156",
+      state: "blocked_by_unassigned_issue",
+      recoveryIssueId: childId,
+      dependencyPath: [
+        expect.objectContaining({ issueId: parentId }),
+        expect.objectContaining({ issueId: childId }),
+      ],
+    });
+  });
+
+  it("does not flag a blocked child of an open parent once the child has a human owner", () => {
+    const parentId = "epic-1";
+    const childId = "child-1";
+
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue({
+          id: parentId,
+          identifier: "PAP-2156",
+          title: "Blocked epic",
+          status: "blocked",
+          assigneeAgentId: null,
+        }),
+        issue({
+          id: childId,
+          identifier: "PAP-3918",
+          title: "Blocked child work",
+          status: "blocked",
+          parentId,
+          assigneeAgentId: null,
+          assigneeUserId: "board-user-1",
+        }),
+      ],
+      relations: [],
+      agents: [agent(), manager],
+    });
+
+    expect(findings).toEqual([]);
+  });
+
+  it("does not flag a cancelled child of an open parent (parent/child edge treats cancelled as resolved)", () => {
+    const parentId = "epic-1";
+    const childId = "child-1";
+
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue({
+          id: parentId,
+          identifier: "PAP-2156",
+          title: "Blocked epic",
+          status: "blocked",
+          assigneeAgentId: null,
+        }),
+        issue({
+          id: childId,
+          identifier: "PAP-3918",
+          title: "Blocked child work",
+          status: "cancelled",
+          parentId,
+          assigneeAgentId: null,
+          assigneeUserId: null,
+        }),
+      ],
+      relations: [],
+      agents: [agent(), manager],
+    });
+
+    expect(findings).toEqual([]);
+  });
+
+  it("replays AUR-3918's exact shape: blocked, blockedBy=[], both assignees null, parented to an open blocked epic", () => {
+    const parentId = "aur-2156";
+    const childId = "aur-3918";
+
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue({
+          id: parentId,
+          identifier: "AUR-2156",
+          title: "First Mile Shopify identity hold",
+          status: "blocked",
+          assigneeAgentId: null,
+          assigneeUserId: null,
+        }),
+        issue({
+          id: childId,
+          identifier: "AUR-3918",
+          title: "AUR-3918 child work",
+          status: "blocked",
+          parentId,
+          assigneeAgentId: null,
+          assigneeUserId: null,
+        }),
+      ],
+      relations: [],
+      agents: [agent(), manager],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      issueId: parentId,
+      identifier: "AUR-2156",
+      state: "blocked_by_unassigned_issue",
+      recoveryIssueId: childId,
+    });
+  });
+
   it("ignores cross-company waiting paths for stalled in_review issues", () => {
     const reviewIssueId = "review-1";
 

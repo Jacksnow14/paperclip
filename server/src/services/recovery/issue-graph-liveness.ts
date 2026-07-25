@@ -356,6 +356,7 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   const issuesById = new Map(input.issues.map((issue) => [issue.id, issue]));
   const agentsById = new Map(input.agents.map((agent) => [agent.id, agent]));
   const blockersByBlockedIssueId = new Map<string, IssueLivenessRelationInput[]>();
+  const childrenByParentId = new Map<string, IssueLivenessIssueInput[]>();
   const unresolvedBlockers = new Set<string>();
   const findings: IssueLivenessFinding[] = [];
   const activeRuns = input.activeRuns ?? [];
@@ -384,14 +385,20 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     }
   }
 
-  for (const relations of blockersByBlockedIssueId.values()) {
-    relations.sort((left, right) => {
-      const leftIssue = issuesById.get(left.blockerIssueId);
-      const rightIssue = issuesById.get(right.blockerIssueId);
-      const leftLabel = leftIssue ? issueLabel(leftIssue) : left.blockerIssueId;
-      const rightLabel = rightIssue ? issueLabel(rightIssue) : right.blockerIssueId;
-      return leftLabel.localeCompare(rightLabel);
-    });
+  // Children are implicit blockers of their parent (mirrors listIssueBlockerAttentionMap's
+  // childRows edge in services/issues.ts): a parent can't complete until its open children do.
+  for (const issue of input.issues) {
+    if (!issue.parentId) continue;
+    const parent = issuesById.get(issue.parentId);
+    if (!parent || parent.companyId !== issue.companyId) continue;
+
+    const list = childrenByParentId.get(issue.parentId) ?? [];
+    list.push(issue);
+    childrenByParentId.set(issue.parentId, list);
+
+    if (issue.status !== "done" && issue.status !== "cancelled" && parent.status === "blocked") {
+      unresolvedBlockers.add(issue.id);
+    }
   }
 
   function hasExplicitWaitingPath(issue: IssueLivenessIssueInput) {
@@ -552,6 +559,36 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     return null;
   }
 
+  function blockerCandidatesFor(
+    source: IssueLivenessIssueInput,
+    current: IssueLivenessIssueInput,
+  ): IssueLivenessIssueInput[] {
+    const seenIds = new Set<string>();
+    const candidates: IssueLivenessIssueInput[] = [];
+
+    const relations = blockersByBlockedIssueId.get(current.id) ?? [];
+    for (const relation of relations) {
+      if (relation.companyId !== current.companyId || relation.companyId !== source.companyId) continue;
+      const blocker = issuesById.get(relation.blockerIssueId);
+      if (!blocker || blocker.companyId !== source.companyId || blocker.status === "done") continue;
+      if (seenIds.has(blocker.id)) continue;
+      seenIds.add(blocker.id);
+      candidates.push(blocker);
+    }
+
+    const children = childrenByParentId.get(current.id) ?? [];
+    for (const child of children) {
+      if (child.companyId !== current.companyId || child.companyId !== source.companyId) continue;
+      if (child.status === "done" || child.status === "cancelled") continue;
+      if (seenIds.has(child.id)) continue;
+      seenIds.add(child.id);
+      candidates.push(child);
+    }
+
+    candidates.sort((left, right) => issueLabel(left).localeCompare(issueLabel(right)));
+    return candidates;
+  }
+
   function firstBlockedChainFinding(
     source: IssueLivenessIssueInput,
     current: IssueLivenessIssueInput,
@@ -561,11 +598,8 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     if (seen.has(current.id)) return null;
     seen.add(current.id);
 
-    const relations = blockersByBlockedIssueId.get(current.id) ?? [];
-    for (const relation of relations) {
-      if (relation.companyId !== current.companyId || relation.companyId !== source.companyId) continue;
-      const blocker = issuesById.get(relation.blockerIssueId);
-      if (!blocker || blocker.companyId !== source.companyId || blocker.status === "done") continue;
+    const blockers = blockerCandidatesFor(source, current);
+    for (const blocker of blockers) {
       const path = [...dependencyPath, blocker];
 
       if (blocker.status === "blocked") {

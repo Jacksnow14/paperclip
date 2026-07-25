@@ -34,6 +34,23 @@ tail -20 /var/log/paperclip-mem-watch.log     # 5-min sampler installed under AU
 prints bare values in *its* order, not the order you asked for — on this box that is `NRestarts`
 first, then `LoadState`, which is exactly how you misread a healthy box at 3am. Keep the labels.)
 
+**Do not loosen that first command to a naive `journalctl ... | grep -i 'oom'`.** A bare
+substring match is not sufficient — `oom` shows up in plenty of `journalctl` lines that are
+not a kill. The AUR-4008 review (2026-07-25, repeating a trap first hit during the AUR-3924
+review) matched on `sudo` audit lines logging commands that merely *mention* OOM, not commands
+that *caused* one:
+
+```text
+sudo: ... COMMAND=/usr/bin/systemctl show -p OOMPolicy paperclip.service
+sudo: ... COMMAND=/usr/bin/lsof /tmp/aur-3924-oom-monitor.log
+```
+
+Both are innocuous diagnostic/monitoring commands an agent ran while investigating — not
+evidence of a kill. Match the actual kill/exit patterns shown above
+(`"killed by the OOM killer"`, `"Failed with result 'oom-kill'"`), never a generic `oom`
+substring, or you will manufacture a false-positive incident out of someone else's audit
+trail.
+
 How to read them:
 
 - **OOM count > 0 in the window** the reported run died in → infra event. Go to §2.

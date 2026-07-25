@@ -530,6 +530,38 @@ describeEmbeddedPostgres("productivity review service", () => {
       // that would contradict the "this is a dark issue, not churn" text above it.
       expect(review?.description).not.toContain("assignee-run comments in 1h; 30 runs");
     });
+
+    it("does not label the evidence block as the stall axis when a non-stall trigger wins precedence", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      // The whole no-comment streak lands 65-74 minutes ago, so the last hour is completely dark
+      // (zeroRecentActivity === true) while `no_comment_streak` still wins precedence and carries
+      // the generic (churn-shaped) manager menu.
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+        startIndex: 65,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+      // The zero-rate measurement itself is still reported -- it is evidence either way ...
+      expect(review?.description).toContain("Activity rate in the last hour: zero");
+      // ... but the editorial "this is the stall axis" claim is gated on the resolved trigger,
+      // exactly like triggerReasons: asserting a stall axis directly above a churn-shaped remedy
+      // menu hands the manager the same mixed axis signal AUR-4014 exists to remove.
+      expect(review?.description).not.toContain("this is a stall axis");
+      expect(review?.description).toContain("Continue with a snooze window");
+    });
   });
 
   it("creates a high-churn review even when every sampled run has a progress comment", async () => {

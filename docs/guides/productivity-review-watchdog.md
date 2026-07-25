@@ -38,8 +38,13 @@ assigneeRunCommentCountLastHour === 0 && activeRunCount === 0`) and splits the l
 - `zeroRecentActivity` false → `long_active_duration` unchanged, with the original generic menu --
   there is still measurable activity, so churn/inefficiency framing is still plausible.
 
-The evidence block always states which axis fired (`Activity rate in the last hour: zero (...)` vs
-`non-zero`), so the review body is self-explanatory even without reading this runbook.
+The evidence block always states the measured rate (`Activity rate in the last hour: zero (...)` vs
+`non-zero`), so the review body is self-explanatory even without reading this runbook. The extra
+"this is a stall axis, not a rate/churn axis" reading is only appended when the resolved trigger is
+`stalled_active_episode`: a zero last hour can coexist with a `no_comment_streak` (runs that all
+landed more than an hour ago) or a `high_churn` carried by its 6h window on a short/absent episode,
+and printing the stall reading above those triggers' churn-shaped remedy menu would recreate the
+same mixed-axis message this fix removes.
 
 `choosePrimaryTrigger` checks `stalled` **before** `high_churn`. `high_churn` looks at both a 1h and
 a 6h window (either can trip it), so an issue that churned 2-6h ago and has since gone dark for the

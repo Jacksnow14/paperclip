@@ -754,7 +754,17 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment completed-run streak: ${evidence.noCommentStreak}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
-      `- Activity rate in the last hour: ${evidence.zeroRecentActivity ? "zero (0 runs, 0 assignee comments, 0 active runs) -- this is a stall axis, not a rate/churn axis" : "non-zero"}`,
+      // The measurement is reported either way, but the "this is the stall axis" reading is gated
+      // on the resolved trigger for the same reason triggerReasons is: zeroRecentActivity can be
+      // true while a different trigger wins precedence (a no_comment_streak whose runs all landed
+      // >1h ago, or a high_churn carried by its 6h window on a short/absent episode). Printing the
+      // stall reading directly above that trigger's churn-shaped remedy menu hands the manager the
+      // same mixed axis signal AUR-4014 exists to remove.
+      `- Activity rate in the last hour: ${
+        evidence.zeroRecentActivity
+          ? `zero (0 runs, 0 assignee comments, 0 active runs)${evidence.trigger === "stalled_active_episode" ? " -- this is a stall axis, not a rate/churn axis" : ""}`
+          : "non-zero"
+      }`,
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
       `- Cost events total: ${evidence.costCents} cents`,

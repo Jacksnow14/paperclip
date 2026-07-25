@@ -30,6 +30,7 @@ import {
   parseObject,
   parseJson,
   applyPaperclipWorkspaceEnv,
+  buildChildProcessEnv,
   buildPaperclipEnv,
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
@@ -278,9 +279,9 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   }
 
   const runtimeEnv = Object.fromEntries(
-    Object.entries(ensureUserLocalBinInPath(ensurePathInEnv({ ...process.env, ...env }))).filter(
-      (entry): entry is [string, string] => typeof entry[1] === "string",
-    ),
+    Object.entries(
+      ensureUserLocalBinInPath(ensurePathInEnv(buildChildProcessEnv(process.env, env, { runId }))),
+    ).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
   );
   const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
     executionTarget,

@@ -23,6 +23,7 @@ import {
   asString,
   asNumber,
   parseObject,
+  buildChildProcessEnv,
   buildPaperclipEnv,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
@@ -500,7 +501,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
   }
   const effectiveEnv = Object.fromEntries(
-    Object.entries({ ...process.env, ...env }).filter(
+    Object.entries(buildChildProcessEnv(process.env, env, { runId })).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );

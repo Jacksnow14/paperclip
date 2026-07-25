@@ -89,7 +89,10 @@
           },
           {
             "group": "Runbooks",
-            "pages": ["runbooks/process-lost-and-oom"]
+            "pages": [
+              "runbooks/process-lost-and-oom",
+              "runbooks/production-deploy"
+            ]
           }
         ]
       },

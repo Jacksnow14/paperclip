@@ -48,21 +48,42 @@ export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review e
 // the control plane restarted or lost track of its child process; it carries no signal about the
 // assigned agent's behavior and must not count toward churn/no-comment thresholds.
 export const PROCESS_LOST_ERROR_CODE = "process_lost";
+// AUR-4016: provider-capacity/auth failures that never reach the agent process -- the run dies
+// (zero tokens, zero cost) before the model is invoked, so like PROCESS_LOST_ERROR_CODE it carries
+// no signal about the assigned agent's behavior. See packages/adapters/claude-local/src/server/execute.ts
+// for the code paths that emit these. Keep this list narrow and fail closed: only add codes proven
+// non-attributable (AUR-4016 forensics on AUR-3963's 11-run streak).
+export const NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES = [
+  PROCESS_LOST_ERROR_CODE,
+  "claude_transient_upstream",
+  "claude_auth_required",
+] as const;
 
 function isInfraKilledRun(run: Pick<HeartbeatRunRow, "errorCode" | "error">) {
-  return run.errorCode === PROCESS_LOST_ERROR_CODE || Boolean(run.error?.startsWith("Process lost"));
+  return (
+    (run.errorCode != null &&
+      (NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES as readonly string[]).includes(run.errorCode)) ||
+    Boolean(run.error?.startsWith("Process lost"))
+  );
+}
+
+function nonAttributableErrorCodeSqlList() {
+  return sql.join(
+    NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES.map((code) => sql`${code}`),
+    sql`, `,
+  );
 }
 
 function infraKilledRunSqlExclusion() {
   return sql`(
-    ${heartbeatRuns.errorCode} is distinct from ${PROCESS_LOST_ERROR_CODE}
+    coalesce(${heartbeatRuns.errorCode}, '') not in (${nonAttributableErrorCodeSqlList()})
     and (${heartbeatRuns.error} is null or ${heartbeatRuns.error} not like ${"Process lost%"})
   )`;
 }
 
 function infraKilledRunSqlPredicate() {
   return sql`(
-    ${heartbeatRuns.errorCode} = ${PROCESS_LOST_ERROR_CODE}
+    coalesce(${heartbeatRuns.errorCode}, '') in (${nonAttributableErrorCodeSqlList()})
     or ${heartbeatRuns.error} like ${"Process lost%"}
   )`;
 }
@@ -97,6 +118,7 @@ type ProductivityReviewEvidence = {
   totalRunCount: number;
   terminalRunCount: number;
   infraKilledTerminalRunCount: number;
+  infraKilledTerminalRunBreakdown: Array<{ errorCode: string; count: number }>;
   attributableTerminalRunCount: number;
   activeRunCount: number;
   runCountLastHour: number;
@@ -486,6 +508,15 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     // comment) so a retry storm during an outage cannot inflate the no-comment streak.
     const infraKilledTerminalRuns = terminalRuns.filter(isInfraKilledRun);
     const attributableTerminalRuns = terminalRuns.filter((run) => !isInfraKilledRun(run));
+    const infraKilledTerminalRunBreakdownMap = new Map<string, number>();
+    for (const run of infraKilledTerminalRuns) {
+      const key = run.errorCode ?? "(unlabeled Process lost)";
+      infraKilledTerminalRunBreakdownMap.set(key, (infraKilledTerminalRunBreakdownMap.get(key) ?? 0) + 1);
+    }
+    const infraKilledTerminalRunBreakdown = Array.from(
+      infraKilledTerminalRunBreakdownMap,
+      ([errorCode, count]) => ({ errorCode, count }),
+    ).sort((a, b) => b.count - a.count);
     let noCommentStreak = 0;
     for (const run of attributableTerminalRuns) {
       if (commentRunIds.has(run.id)) break;
@@ -571,6 +602,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       totalRunCount: latestRuns.length,
       terminalRunCount: terminalRuns.length,
       infraKilledTerminalRunCount: infraKilledTerminalRuns.length,
+      infraKilledTerminalRunBreakdown,
       attributableTerminalRunCount: attributableTerminalRuns.length,
       activeRunCount,
       runCountLastHour,
@@ -640,6 +672,9 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     const usage = evidence.usageSamples.length > 0
       ? evidence.usageSamples.map((sample) => `- \`${sample.runId}\`: \`${JSON.stringify(sample.usageJson).slice(0, 500)}\``).join("\n")
       : "- no usage payloads on sampled runs";
+    const infraKilledBreakdown = evidence.infraKilledTerminalRunBreakdown.length > 0
+      ? evidence.infraKilledTerminalRunBreakdown.map((entry) => `\`${entry.errorCode}\`: ${entry.count}`).join(", ")
+      : "none";
     return [
       "Paperclip detected an unusual productivity/progression pattern on an assigned issue.",
       "",
@@ -654,7 +689,8 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       "## Evidence",
       "",
       `- Total sampled issue-linked runs: ${evidence.totalRunCount}`,
-      `- Terminal sampled runs: ${evidence.terminalRunCount} (${evidence.infraKilledTerminalRunCount} infra-killed \`process_lost\`, ${evidence.attributableTerminalRunCount} attributable to the agent)`,
+      `- Terminal sampled runs: ${evidence.terminalRunCount} (${evidence.infraKilledTerminalRunCount} infra-killed/non-attributable, ${evidence.attributableTerminalRunCount} attributable to the agent)`,
+      `- Excluded-run breakdown by errorCode: ${infraKilledBreakdown}`,
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment completed-run streak: ${evidence.noCommentStreak}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,

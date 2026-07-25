@@ -629,8 +629,9 @@ describeEmbeddedPostgres("productivity review service", () => {
       expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
       expect(review?.description).toContain("No-comment completed-run streak: 10");
       expect(review?.description).toContain(
-        "Terminal sampled runs: 19 (9 infra-killed `process_lost`, 10 attributable to the agent)",
+        "Terminal sampled runs: 19 (9 infra-killed/non-attributable, 10 attributable to the agent)",
       );
+      expect(review?.description).toContain("Excluded-run breakdown by errorCode: `process_lost`: 9");
       expect(review?.description).toContain(
         "contradiction: $0 in cost events despite 10 attributable terminal run(s) sampled",
       );
@@ -721,8 +722,85 @@ describeEmbeddedPostgres("productivity review service", () => {
       const [review] = await listProductivityReviews(seeded.companyId);
       expect(review?.description).toContain("Primary trigger: `high_churn`");
       expect(review?.description).toContain(
-        "Terminal sampled runs: 10 (0 infra-killed `process_lost`, 10 attributable to the agent)",
+        "Terminal sampled runs: 10 (0 infra-killed/non-attributable, 10 attributable to the agent)",
       );
+      expect(review?.description).toContain("Excluded-run breakdown by errorCode: none");
+    });
+  });
+
+  describe("AUR-4016 provider-capacity classification", () => {
+    it("does not fire a no_comment_streak review for AUR-3963's exact run mix (9 claude_transient_upstream + 1 claude_auth_required + 1 process_lost, all zero-token)", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      const sessionLimitMessage =
+        "Claude run failed: subtype=success: You've hit your session limit · resets 2:40pm (UTC)";
+
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 9,
+        now,
+        status: "failed",
+        errorCode: "claude_transient_upstream",
+        error: sessionLimitMessage,
+        startIndex: 0,
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 1,
+        now,
+        status: "failed",
+        errorCode: "claude_auth_required",
+        error: sessionLimitMessage,
+        startIndex: 9,
+      });
+      await insertProcessLostRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 1,
+        now,
+        startIndex: 10,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(0);
+      expect(result.suppressedForInfraOutage).toBe(0);
+      expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+    });
+
+    it("still counts a genuine agent failure with an unrecognized errorCode toward the no-comment streak", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+        status: "failed",
+        errorCode: "some_other_agent_failure",
+        error: "the agent's own code threw an unhandled exception",
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+      expect(review?.description).toContain("No-comment completed-run streak: 10");
+      expect(review?.description).toContain("Excluded-run breakdown by errorCode: none");
     });
   });
 });

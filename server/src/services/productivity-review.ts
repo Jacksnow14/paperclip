@@ -30,6 +30,12 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS = 3;
 export const DEFAULT_PRODUCTIVITY_REVIEW_CREATION_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW = 3;
+// AUR-3926: infra-kill (control-plane restart / OOM) outage detection thresholds.
+// See "Process lost" classification in heartbeat.ts:2263-2277 (errorCode "process_lost").
+export const DEFAULT_PRODUCTIVITY_REVIEW_OUTAGE_WINDOW_MS = 60 * 60 * 1000;
+export const DEFAULT_PRODUCTIVITY_REVIEW_OUTAGE_MIN_DISTINCT_AGENTS = 2;
+export const DEFAULT_PRODUCTIVITY_REVIEW_OUTAGE_MIN_TERMINAL_RUNS = 5;
+export const DEFAULT_PRODUCTIVITY_REVIEW_OUTAGE_INFRA_SHARE = 0.5;
 
 const TERMINAL_RUN_STATUSES = ["succeeded", "failed", "cancelled", "timed_out"] as const;
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
@@ -37,6 +43,50 @@ const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
 const MAX_PARENT_WALK_DEPTH = 25;
 export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review evidence refreshed.";
+// Matches server/src/services/heartbeat.ts buildProcessLossMessage()/errorCode "process_lost" —
+// the only code path that produces these four message variants. A run in this state died because
+// the control plane restarted or lost track of its child process; it carries no signal about the
+// assigned agent's behavior and must not count toward churn/no-comment thresholds.
+export const PROCESS_LOST_ERROR_CODE = "process_lost";
+// AUR-4016: provider-capacity/auth failures that never reach the agent process -- the run dies
+// (zero tokens, zero cost) before the model is invoked, so like PROCESS_LOST_ERROR_CODE it carries
+// no signal about the assigned agent's behavior. See packages/adapters/claude-local/src/server/execute.ts
+// for the code paths that emit these. Keep this list narrow and fail closed: only add codes proven
+// non-attributable (AUR-4016 forensics on AUR-3963's 11-run streak).
+export const NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES = [
+  PROCESS_LOST_ERROR_CODE,
+  "claude_transient_upstream",
+  "claude_auth_required",
+] as const;
+
+function isInfraKilledRun(run: Pick<HeartbeatRunRow, "errorCode" | "error">) {
+  return (
+    (run.errorCode != null &&
+      (NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES as readonly string[]).includes(run.errorCode)) ||
+    Boolean(run.error?.startsWith("Process lost"))
+  );
+}
+
+function nonAttributableErrorCodeSqlList() {
+  return sql.join(
+    NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES.map((code) => sql`${code}`),
+    sql`, `,
+  );
+}
+
+function infraKilledRunSqlExclusion() {
+  return sql`(
+    coalesce(${heartbeatRuns.errorCode}, '') not in (${nonAttributableErrorCodeSqlList()})
+    and (${heartbeatRuns.error} is null or ${heartbeatRuns.error} not like ${"Process lost%"})
+  )`;
+}
+
+function infraKilledRunSqlPredicate() {
+  return sql`(
+    coalesce(${heartbeatRuns.errorCode}, '') in (${nonAttributableErrorCodeSqlList()})
+    or ${heartbeatRuns.error} like ${"Process lost%"}
+  )`;
+}
 
 type IssueRow = typeof issues.$inferSelect;
 type AgentRow = typeof agents.$inferSelect;
@@ -53,6 +103,10 @@ type ProductivityReviewThresholds = {
   maxRefreshComments: number;
   creationWindowMs: number;
   maxCreationsPerWindow: number;
+  outageWindowMs: number;
+  outageMinDistinctAgents: number;
+  outageMinTerminalRuns: number;
+  outageInfraShare: number;
 };
 
 type ProductivityReviewEvidence = {
@@ -63,6 +117,9 @@ type ProductivityReviewEvidence = {
   noCommentStreak: number;
   totalRunCount: number;
   terminalRunCount: number;
+  infraKilledTerminalRunCount: number;
+  infraKilledTerminalRunBreakdown: Array<{ errorCode: string; count: number }>;
+  attributableTerminalRunCount: number;
   activeRunCount: number;
   runCountLastHour: number;
   runCountLastSixHours: number;
@@ -133,6 +190,10 @@ function readPositiveInteger(value: number, fallback: number) {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
+function readFraction(value: number, fallback: number) {
+  return Number.isFinite(value) && value > 0 && value <= 1 ? value : fallback;
+}
+
 function coerceDate(value: Date | string | null | undefined) {
   if (!value) return null;
   return value instanceof Date ? value : new Date(value);
@@ -175,6 +236,22 @@ function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): Pro
     maxCreationsPerWindow: readPositiveInteger(
       overrides?.maxCreationsPerWindow ?? DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW,
       DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW,
+    ),
+    outageWindowMs: readPositiveInteger(
+      overrides?.outageWindowMs ?? DEFAULT_PRODUCTIVITY_REVIEW_OUTAGE_WINDOW_MS,
+      DEFAULT_PRODUCTIVITY_REVIEW_OUTAGE_WINDOW_MS,
+    ),
+    outageMinDistinctAgents: readPositiveInteger(
+      overrides?.outageMinDistinctAgents ?? DEFAULT_PRODUCTIVITY_REVIEW_OUTAGE_MIN_DISTINCT_AGENTS,
+      DEFAULT_PRODUCTIVITY_REVIEW_OUTAGE_MIN_DISTINCT_AGENTS,
+    ),
+    outageMinTerminalRuns: readPositiveInteger(
+      overrides?.outageMinTerminalRuns ?? DEFAULT_PRODUCTIVITY_REVIEW_OUTAGE_MIN_TERMINAL_RUNS,
+      DEFAULT_PRODUCTIVITY_REVIEW_OUTAGE_MIN_TERMINAL_RUNS,
+    ),
+    outageInfraShare: readFraction(
+      overrides?.outageInfraShare ?? DEFAULT_PRODUCTIVITY_REVIEW_OUTAGE_INFRA_SHARE,
+      DEFAULT_PRODUCTIVITY_REVIEW_OUTAGE_INFRA_SHARE,
     ),
   };
 }
@@ -347,6 +424,8 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
   }
 
   async function countIssueRunsSince(companyId: string, agentId: string, issueId: string, since: Date) {
+    // AUR-3926: infra-killed ("Process lost") runs are excluded so a control-plane
+    // restart storm cannot masquerade as agent churn. See infraKilledRunSqlExclusion().
     return db
       .select({ count: sql<number>`count(*)::int` })
       .from(heartbeatRuns)
@@ -356,6 +435,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
           eq(heartbeatRuns.agentId, agentId),
           issueRunScopeSql(issueId),
           sql`coalesce(${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) >= ${since.toISOString()}::timestamptz`,
+          infraKilledRunSqlExclusion(),
         ),
       )
       .then((rows) => rows[0]?.count ?? 0);
@@ -423,8 +503,22 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     const terminalRuns = latestRuns.filter((run) =>
       TERMINAL_RUN_STATUSES.includes(run.status as (typeof TERMINAL_RUN_STATUSES)[number]),
     );
+    // AUR-3926: a "Process lost" run died because the control plane restarted, not because the
+    // agent went silent. It is skipped entirely (not counted, not treated as a streak-breaking
+    // comment) so a retry storm during an outage cannot inflate the no-comment streak.
+    const infraKilledTerminalRuns = terminalRuns.filter(isInfraKilledRun);
+    const attributableTerminalRuns = terminalRuns.filter((run) => !isInfraKilledRun(run));
+    const infraKilledTerminalRunBreakdownMap = new Map<string, number>();
+    for (const run of infraKilledTerminalRuns) {
+      const key = run.errorCode ?? "(unlabeled Process lost)";
+      infraKilledTerminalRunBreakdownMap.set(key, (infraKilledTerminalRunBreakdownMap.get(key) ?? 0) + 1);
+    }
+    const infraKilledTerminalRunBreakdown = Array.from(
+      infraKilledTerminalRunBreakdownMap,
+      ([errorCode, count]) => ({ errorCode, count }),
+    ).sort((a, b) => b.count - a.count);
     let noCommentStreak = 0;
-    for (const run of terminalRuns) {
+    for (const run of attributableTerminalRuns) {
       if (commentRunIds.has(run.id)) break;
       noCommentStreak += 1;
     }
@@ -486,11 +580,16 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     if (!trigger) return null;
 
     const triggerReasons: string[] = [];
-    if (noComment) triggerReasons.push(`${noCommentStreak} consecutive completed issue-linked runs had no run-created issue comment`);
+    if (noComment) triggerReasons.push(`${noCommentStreak} consecutive completed issue-linked runs had no run-created issue comment (${infraKilledTerminalRuns.length} infra-killed runs in the sampled window were excluded from this streak)`);
     if (longActive) triggerReasons.push(`current active episode has lasted ${msToHuman(elapsedMs)}`);
     if (highChurn) {
       triggerReasons.push(
-        `${runCountLastHour} runs/${assigneeRunCommentCountLastHour} assignee-run comments in 1h; ${runCountLastSixHours} runs/${assigneeRunCommentCountLastSixHours} assignee-run comments in 6h`,
+        `${runCountLastHour} runs/${assigneeRunCommentCountLastHour} assignee-run comments in 1h; ${runCountLastSixHours} runs/${assigneeRunCommentCountLastSixHours} assignee-run comments in 6h (infra-killed runs already excluded from these counts)`,
+      );
+    }
+    if (costRow.costCents === 0 && (runCountLastHour > 0 || noCommentStreak > 0)) {
+      triggerReasons.push(
+        `contradiction: $0 in cost events despite ${attributableTerminalRuns.length} attributable terminal run(s) sampled -- verify these runs actually did billable work before treating this as agent churn`,
       );
     }
 
@@ -502,6 +601,9 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       noCommentStreak,
       totalRunCount: latestRuns.length,
       terminalRunCount: terminalRuns.length,
+      infraKilledTerminalRunCount: infraKilledTerminalRuns.length,
+      infraKilledTerminalRunBreakdown,
+      attributableTerminalRunCount: attributableTerminalRuns.length,
       activeRunCount,
       runCountLastHour,
       runCountLastSixHours,
@@ -570,6 +672,9 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     const usage = evidence.usageSamples.length > 0
       ? evidence.usageSamples.map((sample) => `- \`${sample.runId}\`: \`${JSON.stringify(sample.usageJson).slice(0, 500)}\``).join("\n")
       : "- no usage payloads on sampled runs";
+    const infraKilledBreakdown = evidence.infraKilledTerminalRunBreakdown.length > 0
+      ? evidence.infraKilledTerminalRunBreakdown.map((entry) => `\`${entry.errorCode}\`: ${entry.count}`).join(", ")
+      : "none";
     return [
       "Paperclip detected an unusual productivity/progression pattern on an assigned issue.",
       "",
@@ -584,7 +689,8 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       "## Evidence",
       "",
       `- Total sampled issue-linked runs: ${evidence.totalRunCount}`,
-      `- Terminal sampled runs: ${evidence.terminalRunCount}`,
+      `- Terminal sampled runs: ${evidence.terminalRunCount} (${evidence.infraKilledTerminalRunCount} infra-killed/non-attributable, ${evidence.attributableTerminalRunCount} attributable to the agent)`,
+      `- Excluded-run breakdown by errorCode: ${infraKilledBreakdown}`,
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment completed-run streak: ${evidence.noCommentStreak}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
@@ -758,6 +864,44 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     return { kind: "created" as const, reviewIssueId: review.id };
   }
 
+  // AUR-3926: distinguish a control-plane outage from per-agent churn. A single agent hammering
+  // retries is ambiguous; two or more *distinct* agents dying to "Process lost" in the same
+  // window is a control-plane death, categorically (see CTO forensics on AUR-3924/AUR-3926 --
+  // synchronized cross-agent timestamps are the tell). When that pattern is detected, no
+  // per-agent productivity review should fire for the company in this reconcile pass -- filing N
+  // false accusations during an outage is worse than a missed detection.
+  async function detectCompanyInfraOutage(
+    companyId: string,
+    thresholds: ProductivityReviewThresholds,
+    now: Date,
+  ): Promise<{ outage: boolean; infraRunCount: number; totalTerminalRunCount: number; distinctInfraAgentCount: number }> {
+    const windowStart = new Date(now.getTime() - thresholds.outageWindowMs);
+    const rows = await db
+      .select({
+        total: sql<number>`count(*)::int`,
+        infraCount: sql<number>`count(*) filter (where ${infraKilledRunSqlPredicate()})::int`,
+        distinctInfraAgents: sql<number>`count(distinct ${heartbeatRuns.agentId}) filter (where ${infraKilledRunSqlPredicate()})::int`,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          inArray(heartbeatRuns.status, TERMINAL_RUN_STATUSES),
+          sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) >= ${windowStart.toISOString()}::timestamptz`,
+        ),
+      );
+    const row = rows[0] ?? { total: 0, infraCount: 0, distinctInfraAgents: 0 };
+    const total = Number(row.total ?? 0);
+    const infraCount = Number(row.infraCount ?? 0);
+    const distinctInfraAgents = Number(row.distinctInfraAgents ?? 0);
+    const outage =
+      distinctInfraAgents >= thresholds.outageMinDistinctAgents &&
+      total >= thresholds.outageMinTerminalRuns &&
+      total > 0 &&
+      infraCount / total >= thresholds.outageInfraShare;
+    return { outage, infraRunCount: infraCount, totalTerminalRunCount: total, distinctInfraAgentCount: distinctInfraAgents };
+  }
+
   async function reconcileProductivityReviews(opts?: {
     now?: Date;
     companyId?: string;
@@ -790,14 +934,55 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       creationCapped: 0,
       skipped: 0,
       failed: 0,
+      suppressedForInfraOutage: 0,
+      outageCompanyIds: [] as string[],
       reviewIssueIds: [] as string[],
       failedIssueIds: [] as string[],
     };
 
     const prefixCache = new Map<string, string>();
+    const outageCache = new Map<string, boolean>();
     for (const candidate of candidates) {
       if (!candidate.assigneeAgentId) {
         result.skipped += 1;
+        continue;
+      }
+      let inOutage = outageCache.get(candidate.companyId);
+      if (inOutage === undefined) {
+        const outageState = await detectCompanyInfraOutage(candidate.companyId, thresholds, now);
+        inOutage = outageState.outage;
+        outageCache.set(candidate.companyId, inOutage);
+        if (inOutage) {
+          result.outageCompanyIds.push(candidate.companyId);
+          logger.warn(
+            {
+              companyId: candidate.companyId,
+              infraRunCount: outageState.infraRunCount,
+              totalTerminalRunCount: outageState.totalTerminalRunCount,
+              distinctInfraAgentCount: outageState.distinctInfraAgentCount,
+              windowMs: thresholds.outageWindowMs,
+            },
+            "productivity review reconciliation suppressed: infra outage detected (Process lost across multiple agents), filing one infra signal instead of per-agent reviews",
+          );
+          await logActivity(db, {
+            companyId: candidate.companyId,
+            actorType: "system",
+            actorId: "system",
+            action: "company.productivity_review_suppressed_for_infra_outage",
+            entityType: "company",
+            entityId: candidate.companyId,
+            details: {
+              source: "productivity_review.reconcile",
+              infraRunCount: outageState.infraRunCount,
+              totalTerminalRunCount: outageState.totalTerminalRunCount,
+              distinctInfraAgentCount: outageState.distinctInfraAgentCount,
+              windowMs: thresholds.outageWindowMs,
+            },
+          });
+        }
+      }
+      if (inOutage) {
+        result.suppressedForInfraOutage += 1;
         continue;
       }
       if (await isProductivityReviewDescendant(candidate)) {

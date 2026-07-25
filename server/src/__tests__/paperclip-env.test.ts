@@ -155,4 +155,38 @@ describe("buildPaperclipEnv", () => {
       '["http://78.153.195.107:3210","http://127.0.0.1:3210"]',
     );
   });
+
+  describe("per-agent git identity (AUR-4030)", () => {
+    it("does not set GIT_* vars when the agent has no name (back-compat)", () => {
+      const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" });
+
+      expect(env.GIT_AUTHOR_NAME).toBeUndefined();
+      expect(env.GIT_AUTHOR_EMAIL).toBeUndefined();
+      expect(env.GIT_COMMITTER_NAME).toBeUndefined();
+      expect(env.GIT_COMMITTER_EMAIL).toBeUndefined();
+    });
+
+    it("injects a GIT_AUTHOR_*/GIT_COMMITTER_* identity derived from the agent name and id", () => {
+      const env = buildPaperclipEnv({ id: "38c3252d-ef90-48e9-8969-5c2a7d337e54", companyId: "company-1", name: "Claude Code Fast" });
+
+      expect(env.GIT_AUTHOR_NAME).toBe("Claude Code Fast (agent 38c3252d)");
+      expect(env.GIT_AUTHOR_EMAIL).toBe("claude-code-fast-38c3252d@agents.paperclip.local");
+      expect(env.GIT_COMMITTER_NAME).toBe(env.GIT_AUTHOR_NAME);
+      expect(env.GIT_COMMITTER_EMAIL).toBe(env.GIT_AUTHOR_EMAIL);
+    });
+
+    it("gives two different agents two distinct, correct identities in the same call shape", () => {
+      const envA = buildPaperclipEnv({ id: "38c3252d-ef90-48e9-8969-5c2a7d337e54", companyId: "company-1", name: "Claude Code Fast" });
+      const envB = buildPaperclipEnv({ id: "e8f947d2-761e-44b2-b576-3dbcc85b24bf", companyId: "company-1", name: "Claude Code Max" });
+
+      expect(envA.GIT_AUTHOR_EMAIL).not.toBe(envB.GIT_AUTHOR_EMAIL);
+      expect(envA.GIT_AUTHOR_NAME).not.toBe(envB.GIT_AUTHOR_NAME);
+    });
+
+    it("slugifies unusual agent names into a safe email local-part", () => {
+      const env = buildPaperclipEnv({ id: "abc12345-0000-0000-0000-000000000000", companyId: "company-1", name: "Böö & Co. (v2)" });
+
+      expect(env.GIT_AUTHOR_EMAIL).toBe("b-co-v2-abc12345@agents.paperclip.local");
+    });
+  });
 });

@@ -5,6 +5,7 @@ import {
   withinCooldown,
   selectForCreation,
   hasOpenSelfEditIssue,
+  canonicalizeAgentKey,
 } from './sgi-loop-c-streak-detection.mjs';
 
 const REF_DATE = new Date('2026-07-25T00:00:00Z');
@@ -172,4 +173,57 @@ test('hasOpenSelfEditIssue matches on agent id regardless of task_type', () => {
   const open = [{ title: 'Prompt self-edit required — agent-x / bug', status: 'todo' }];
   assert.equal(hasOpenSelfEditIssue(open, 'agent-x'), true);
   assert.equal(hasOpenSelfEditIssue(open, 'agent-y'), false);
+});
+
+// ── (AUR-3856) agent-key canonicalization ───────────────────────────────────
+
+const LIVE_AGENTS = [
+  { id: '371a1b08-0286-4a12-a516-f587f42df5eb', name: 'CTO' },
+  { id: '3823a155-1111-4a12-a516-f587f42df5ee', name: 'CEO' },
+  { id: 'e8f947d2-2222-4a12-a516-f587f42df5ee', name: 'Predictor' },
+];
+
+test('(a) a bare uuid prefix and a decorated prefix both fold into the full uuid', () => {
+  const bare = canonicalizeAgentKey('371a1b08', LIVE_AGENTS);
+  const decorated = canonicalizeAgentKey('371a1b08 (CTO)', LIVE_AGENTS);
+  assert.equal(bare.resolved, '371a1b08-0286-4a12-a516-f587f42df5eb');
+  assert.equal(bare.method, 'prefix');
+  assert.equal(decorated.resolved, '371a1b08-0286-4a12-a516-f587f42df5eb');
+  assert.equal(decorated.method, 'prefix');
+});
+
+test('(a) a dash-suffixed prefix key resolves via prefix match', () => {
+  const result = canonicalizeAgentKey('3823a155-ceo', LIVE_AGENTS);
+  assert.equal(result.resolved, '3823a155-1111-4a12-a516-f587f42df5ee');
+});
+
+test('(b) cto/ceo fold in by case-insensitive name match', () => {
+  const cto = canonicalizeAgentKey('cto', LIVE_AGENTS);
+  const ceo = canonicalizeAgentKey('CEO', LIVE_AGENTS);
+  assert.equal(cto.resolved, '371a1b08-0286-4a12-a516-f587f42df5eb');
+  assert.equal(cto.method, 'name');
+  assert.equal(ceo.resolved, '3823a155-1111-4a12-a516-f587f42df5ee');
+  assert.equal(ceo.method, 'name');
+});
+
+test('(c) a prefix matching 2+ live agents stays unresolved and is never merged', () => {
+  const ambiguousAgents = [
+    { id: 'abcdef12-1111-4a12-a516-f587f42df5ee', name: 'agent-one' },
+    { id: 'abcdef12-2222-4a12-a516-f587f42df5ee', name: 'agent-two' },
+  ];
+  const result = canonicalizeAgentKey('abcdef12', ambiguousAgents);
+  assert.equal(result.resolved, null);
+  assert.equal(result.method, 'ambiguous-prefix');
+});
+
+test('(d) an unknown key with no uuid, prefix, or name match stays unresolved', () => {
+  const result = canonicalizeAgentKey('totally-unknown-key', LIVE_AGENTS);
+  assert.equal(result.resolved, null);
+  assert.equal(result.method, 'unresolved');
+});
+
+test('an exact uuid match (any case) resolves directly, not via prefix', () => {
+  const result = canonicalizeAgentKey('371A1B08-0286-4A12-A516-F587F42DF5EB', LIVE_AGENTS);
+  assert.equal(result.resolved, '371a1b08-0286-4a12-a516-f587f42df5eb');
+  assert.equal(result.method, 'exact');
 });

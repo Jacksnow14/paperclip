@@ -1372,6 +1372,43 @@ describe("memory routes", () => {
       expect(res.body.warnings).toBeInstanceOf(Array);
       expect(res.body.warnings.some((w: string) => w.includes("project-scoped"))).toBe(true);
     });
+
+    it("returns a dedup warning referencing the existing record id when the capture short-circuits (AUR-3991)", async () => {
+      mockMemoryService.capture.mockResolvedValue({
+        operation: { id: "op-4", bindingId: bindingId, source: { kind: "issue" }, resultJson: { dedup: true } },
+        records: [{
+          id: "11000000-0000-4000-8000-000000000000",
+          reviewState: "accepted",
+          scopeType: "org",
+          scope: {},
+        }],
+      });
+      const app = createApp({
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        companyIds: [companyA],
+        isInstanceAdmin: false,
+      });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({
+          ...captureBody,
+          title: "routing/AUR-9999",
+          // chosen_agent is required for routing_rationale captures (AUR-4280/AUR-4303).
+          metadata: { category: "routing_rationale", chosen_agent: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.warnings).toBeInstanceOf(Array);
+      expect(
+        res.body.warnings.some(
+          (w: string) => w.includes("already existed") && w.includes("11000000-0000-4000-8000-000000000000"),
+        ),
+      ).toBe(true);
+    });
   });
 
   // ── Part C.1: Destructive-upsert warning (AUR-4522) ─────────────────────────

@@ -529,6 +529,14 @@ export function memoryRoutes(
       ? "pending_review"
       : "visible";
     const firstRecord = result.records[0];
+    // Upsert dedups are excluded: an upsert re-capture DID update the existing
+    // record in place, so "no new record was captured" guidance would be wrong.
+    if (result.operation.resultJson?.dedup === true && result.operation.resultJson?.dedupKind !== "upsert") {
+      warnings.push(
+        `An accepted record already existed with this title (id=${firstRecord?.id ?? "unknown"}); ` +
+        "no new record was captured. Reference the existing record id instead of retrying the capture.",
+      );
+    }
     if (firstRecord) {
       if (firstRecord.reviewState === "pending") {
         warnings.push(

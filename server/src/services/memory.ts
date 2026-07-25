@@ -1100,7 +1100,7 @@ export function memoryService(
   ): Promise<{
     records: MemoryRecord[];
     dedup: boolean;
-    dedupKind?: "idempotency_key" | "upsert" | "tool_gap_window";
+    dedupKind?: "idempotency_key" | "upsert" | "tool_gap_window" | "routing_rationale_title";
     upsertOverwrite?: { recordId: string; previousIssueId: string; incomingIssueId: string };
   }> {
     const scopeType = input.scopeType ?? normalizeScopeType(scope);
@@ -1225,6 +1225,42 @@ export function memoryService(
       }
     }
 
+    // Idempotent dedup for routing_rationale captures (AUR-3991): query-first by
+    // companyId + title alone, NOT scoped to owner. Unlike tool_gap/upsert above,
+    // the writers racing to backfill a routing/{issueId} record are typically
+    // DIFFERENT agents (e.g. CEO and CTO both reacting to the same gap issue),
+    // so an owner-scoped dedup would miss the exact cross-agent race that caused
+    // AUR-3991 (3 competing records per key from 3 different writers within ~2
+    // minutes). routing/{issueId} is a single canonical record per issue
+    // regardless of who captures it, so any already-accepted, non-revoked record
+    // with the same title short-circuits this capture.
+    const isRoutingRationaleCapture = input.metadata?.category === "routing_rationale" && !!input.title;
+    const findAcceptedRoutingRationale = async () => {
+      const existing = await db
+        .select()
+        .from(memoryLocalRecords)
+        .where(
+          and(
+            eq(memoryLocalRecords.companyId, binding.companyId),
+            eq(memoryLocalRecords.title, input.title as string),
+            eq(memoryLocalRecords.reviewState, "accepted"),
+            isNull(memoryLocalRecords.revokedAt),
+            isNull(memoryLocalRecords.supersededByRecordId),
+            isNull(memoryLocalRecords.deletedAt),
+          ),
+        )
+        .orderBy(asc(memoryLocalRecords.createdAt))
+        .limit(1);
+      return existing[0] ?? null;
+    };
+
+    if (isRoutingRationaleCapture) {
+      const existing = await findAcceptedRoutingRationale();
+      if (existing) {
+        return { records: [mapRecord(existing)], dedup: true, dedupKind: "routing_rationale_title" };
+      }
+    }
+
     let row: RecordRow;
     try {
       [row] = await db
@@ -1293,6 +1329,18 @@ export function memoryService(
           .limit(1);
         if (existing.length > 0) {
           return { records: [mapRecord(existing[0])], dedup: true, dedupKind: "idempotency_key" };
+        }
+      }
+      // Two truly concurrent routing_rationale captures can both pass the
+      // query-first check above (both select "no existing record" before either
+      // has inserted). The partial unique index on (company_id, title) for
+      // accepted routing_rationale records turns that into a real DB-level
+      // guarantee: the loser here gets a 23505 instead of a second row, and
+      // falls back to reading the winner.
+      if (isRoutingRationaleCapture && isUniqueViolation(err, "memory_local_records_routing_rationale_title_uq")) {
+        const winner = await findAcceptedRoutingRationale();
+        if (winner) {
+          return { records: [mapRecord(winner)], dedup: true, dedupKind: "routing_rationale_title" };
         }
       }
       throw err;
@@ -2605,7 +2653,7 @@ export function memoryService(
       let usage: MemoryUsage[] = [];
       let providerResultJson: Record<string, unknown> | null = null;
       let isDedup = false;
-      let dedupKind: "idempotency_key" | "upsert" | "tool_gap_window" | undefined;
+      let dedupKind: "idempotency_key" | "upsert" | "tool_gap_window" | "routing_rationale_title" | undefined;
       let upsertOverwrite: { recordId: string; previousIssueId: string; incomingIssueId: string } | undefined;
 
       if (binding.providerKey === LOCAL_BASIC_PROVIDER_KEY) {

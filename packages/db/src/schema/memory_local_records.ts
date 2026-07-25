@@ -120,5 +120,18 @@ export const memoryLocalRecords = pgTable(
       "gin",
       sql`to_tsvector('english', coalesce(${table.title}, '') || ' ' || ${table.content})`,
     ),
+    // AUR-3991: one accepted routing_rationale record per (company, title) at the DB level,
+    // so two truly concurrent backfills of the same routing/{issueId} key can't both win the
+    // query-first check in captureLocalBasic() and both insert — the loser gets a unique
+    // violation and falls back to reading the winner instead.
+    routingRationaleTitleUq: uniqueIndex("memory_local_records_routing_rationale_title_uq")
+      .on(table.companyId, table.title)
+      .where(
+        sql`${table.metadata}->>'category' = 'routing_rationale'
+          and ${table.reviewState} = 'accepted'
+          and ${table.revokedAt} is null
+          and ${table.supersededByRecordId} is null
+          and ${table.deletedAt} is null`,
+      ),
   }),
 );

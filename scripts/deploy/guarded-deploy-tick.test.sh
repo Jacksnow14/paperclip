@@ -91,6 +91,9 @@ check "streak advanced to 1" "$(cat "$T/state/quiet_streak")" "1"
 run_tick >/dev/null
 check "second consecutive quiet tick deploys" "$(calls restart)" "1"
 check "success disarms the timer" "$(calls disarm)" "1"
+check "success is announced, not silent" "$(calls notify)" "1"
+check "serving proof is written for the next heartbeat" \
+      "$(grep -c 'serving_sha=bbbbbbbbbbbb' "$T/state/landed")" "1"
 check "log records the target resolved from the live symlink" \
       "$(grep -c 'target=bbbbbbbbbbbb' "$T/tick.log")" "1"
 
@@ -111,6 +114,9 @@ reset_state; serve bbbbbbbbbbbb
 run_tick >/dev/null
 check "no restart when target already serving" "$(calls restart)" "0"
 check "disarmed" "$(calls disarm)" "1"
+check "already-serving is announced once" "$(calls notify)" "1"
+run_tick >/dev/null
+check "announcement is not repeated on later ticks" "$(calls notify)" "1"
 serve aaaaaaaaaaaa
 
 echo "== 5. deadline alarm fires, and is rate-limited =="

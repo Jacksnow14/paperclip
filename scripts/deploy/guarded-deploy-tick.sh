@@ -38,7 +38,7 @@ set -uo pipefail
 
 # Every external effect is an overridable seam so the rarely-taken paths (deadline
 # alarm, rollback, disarm) can be exercised against fakes instead of shipped
-# unrun. aur3993-deploy-tick.test.sh drives all of them. Defaults are production.
+# unrun. guarded-deploy-tick.test.sh drives all of them. Defaults are production.
 HEALTH="${HEALTH:-http://127.0.0.1:3100/api/health}"
 CURRENT_LINK="${CURRENT_LINK:-/opt/paperclip/app/current}"
 RELEASES="${RELEASES:-/opt/paperclip/app/releases}"
@@ -111,6 +111,22 @@ disarm() {  # landed -> stop polling forever
   $DISARM_CMD >>"$LOG" 2>&1
 }
 
+# Success must be announced too. A deploy that lands silently is the same missing
+# signal as one that stalls silently — the AUR-3993 serving proof is owed to a
+# human either way, and the agent that armed this is not awake to notice (its own
+# run is one of the runs the quiet gate waits on, so it CANNOT be awake when this
+# fires). Written to a file the next CTO heartbeat reads, and pushed to Telegram.
+announce_landed() {  # $1 = sha now serving
+  local body; body=$(curl -sf --max-time 10 "$HEALTH" 2>/dev/null || echo '{}')
+  {
+    echo "landed_at=$(date -Is)"
+    echo "serving_sha=$1"
+    echo "health=$body"
+  } >"$STATE_DIR/landed"
+  log "LANDED: $1 -- proof written to $STATE_DIR/landed"
+  [ -x "$NOTIFY" ] && "$NOTIFY" "Paperclip deploy landed: now serving ${1:0:12}. AUR-3996 memory-capture guard is live. Post the /api/health proof on AUR-3993 to close it (proof in $STATE_DIR/landed)." >>"$LOG" 2>&1
+}
+
 [ -f "$ARM_STAMP" ] || now_epoch >"$ARM_STAMP"
 armed_at=$(cat "$ARM_STAMP")
 
@@ -119,6 +135,7 @@ cur=$(current_sha); srv=$(serving_sha)
 # --- terminal success -------------------------------------------------------
 if [ -n "$cur" ] && [ "$cur" = "$srv" ]; then
   log "SERVING activated release ${cur:0:12}; nothing to do"
+  [ -f "$STATE_DIR/landed" ] || announce_landed "$cur"
   disarm
   exit 0
 fi
@@ -192,6 +209,7 @@ done
 
 if [ "$ok" -eq 1 ]; then
   log "=== guarded deploy SUCCESS"
+  announce_landed "$(serving_sha)"
   disarm
   exit 0
 fi

@@ -13,6 +13,10 @@ import {
 import { sessionCodec as codexSessionCodec } from "@paperclipai/adapter-codex-local/server";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import {
+  buildWorkspaceRealizationRequest,
+  readWorkspaceRealizationRequest,
+} from "../services/workspace-realization.js";
+import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
@@ -738,4 +742,80 @@ describeEmbeddedPostgres("resolveWorkspaceForRun primary-first ordering (AUR-391
       "project_primary",
     );
   }, 15_000);
+});
+
+// Regression coverage for the "project_workspace" mislabel-on-round-trip blocker
+// raised in CTO review of PR #93: readWorkspaceRealizationRequest's deserialize
+// allowlist did not include "project_workspace", so a non-primary selection that
+// persisted this request to workspace metadata and was later read back would
+// silently re-emerge labelled "project_primary" — reintroducing the exact defect
+// this issue exists to eliminate, just one hop downstream of the original fix.
+describe("buildWorkspaceRealizationRequest / readWorkspaceRealizationRequest round-trip (AUR-3915)", () => {
+  it("preserves a non-primary project_workspace source label across a JSON persistence round-trip", () => {
+    const request = buildWorkspaceRealizationRequest({
+      adapterType: "claude_local",
+      companyId: randomUUID(),
+      environmentId: randomUUID(),
+      executionWorkspaceId: randomUUID(),
+      issueId: randomUUID(),
+      heartbeatRunId: randomUUID(),
+      requestedMode: null,
+      workspace: {
+        baseCwd: "/tmp/paperclip-aur3915-roundtrip",
+        source: "project_workspace",
+        projectId: randomUUID(),
+        workspaceId: randomUUID(),
+        repoUrl: null,
+        repoRef: null,
+        strategy: "project_primary",
+        cwd: "/tmp/paperclip-aur3915-roundtrip",
+        branchName: null,
+        worktreePath: null,
+        warnings: [],
+        created: false,
+      },
+      workspaceConfig: null,
+    });
+
+    expect(request.source.kind).toBe("project_workspace");
+
+    // Simulate persisting to (and reading back from) workspace metadata storage.
+    const persisted = JSON.parse(JSON.stringify(request));
+    const rehydrated = readWorkspaceRealizationRequest(persisted);
+
+    expect(rehydrated?.source.kind).toBe("project_workspace");
+  });
+
+  it("still coerces an unrecognized source kind to project_primary", () => {
+    const request = buildWorkspaceRealizationRequest({
+      adapterType: "claude_local",
+      companyId: randomUUID(),
+      environmentId: randomUUID(),
+      executionWorkspaceId: null,
+      issueId: null,
+      heartbeatRunId: randomUUID(),
+      requestedMode: null,
+      workspace: {
+        baseCwd: "/tmp/paperclip-aur3915-roundtrip-legacy",
+        source: "project_primary",
+        projectId: null,
+        workspaceId: null,
+        repoUrl: null,
+        repoRef: null,
+        strategy: "project_primary",
+        cwd: "/tmp/paperclip-aur3915-roundtrip-legacy",
+        branchName: null,
+        worktreePath: null,
+        warnings: [],
+        created: false,
+      },
+      workspaceConfig: null,
+    });
+
+    const legacyPersisted = { ...JSON.parse(JSON.stringify(request)) };
+    legacyPersisted.source = { ...legacyPersisted.source, kind: "some_future_value" };
+    const rehydrated = readWorkspaceRealizationRequest(legacyPersisted);
+
+    expect(rehydrated?.source.kind).toBe("project_primary");
+  });
 });

@@ -3575,7 +3575,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (projectCwdExists) {
           return {
             cwd: projectCwd,
-            source: (workspace.isPrimary ? "project_primary" : "project_workspace") as const,
+            source: workspace.isPrimary ? ("project_primary" as const) : ("project_workspace" as const),
             projectId: resolvedProjectId,
             workspaceId: workspace.id,
             repoUrl: workspace.repoUrl,
@@ -3614,7 +3614,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       return {
         cwd: fallbackCwd,
-        source: (projectWorkspaceRows[0]?.isPrimary ? "project_primary" : "project_workspace") as const,
+        source: projectWorkspaceRows[0]?.isPrimary
+          ? ("project_primary" as const)
+          : ("project_workspace" as const),
         projectId: resolvedProjectId,
         workspaceId: projectWorkspaceRows[0]?.id ?? null,
         repoUrl: projectWorkspaceRows[0]?.repoUrl ?? null,

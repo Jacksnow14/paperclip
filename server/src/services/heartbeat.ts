@@ -1024,7 +1024,7 @@ export interface ModelProfileApplication {
 
 export type ResolvedWorkspaceForRun = {
   cwd: string;
-  source: "project_primary" | "task_session" | "agent_home";
+  source: "project_primary" | "project_workspace" | "task_session" | "agent_home";
   projectId: string | null;
   workspaceId: string | null;
   repoUrl: string | null;
@@ -1482,7 +1482,7 @@ export function resolveRuntimeSessionParamsForWorkspace(input: {
       warning: null as string | null,
     };
   }
-  if (resolvedWorkspace.source !== "project_primary") {
+  if (resolvedWorkspace.source !== "project_primary" && resolvedWorkspace.source !== "project_workspace") {
     return {
       sessionParams: previousSessionParams,
       warning: null as string | null,
@@ -3519,7 +3519,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(projectWorkspaces.projectId, workspaceProjectId),
             ),
           )
-          .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
+          .orderBy(
+            desc(projectWorkspaces.isPrimary),
+            asc(projectWorkspaces.createdAt),
+            asc(projectWorkspaces.id),
+          )
       : [];
     const projectWorkspaceRows = prioritizeProjectWorkspaceCandidatesForRun(
       unorderedProjectWorkspaceRows,
@@ -3571,7 +3575,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (projectCwdExists) {
           return {
             cwd: projectCwd,
-            source: "project_primary" as const,
+            source: (workspace.isPrimary ? "project_primary" : "project_workspace") as const,
             projectId: resolvedProjectId,
             workspaceId: workspace.id,
             repoUrl: workspace.repoUrl,
@@ -3610,7 +3614,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       return {
         cwd: fallbackCwd,
-        source: "project_primary" as const,
+        source: (projectWorkspaceRows[0]?.isPrimary ? "project_primary" : "project_workspace") as const,
         projectId: resolvedProjectId,
         workspaceId: projectWorkspaceRows[0]?.id ?? null,
         repoUrl: projectWorkspaceRows[0]?.repoUrl ?? null,

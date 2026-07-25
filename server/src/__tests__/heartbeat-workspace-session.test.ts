@@ -1,7 +1,21 @@
-import { describe, expect, it } from "vitest";
-import type { agents } from "@paperclipai/db";
+import { randomUUID } from "node:crypto";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { eq } from "drizzle-orm";
+import {
+  agents,
+  companies,
+  createDb,
+  executionWorkspaces,
+  issues,
+  projects,
+  projectWorkspaces,
+} from "@paperclipai/db";
 import { sessionCodec as codexSessionCodec } from "@paperclipai/adapter-codex-local/server";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
 import {
   applyPersistedExecutionWorkspaceConfig,
   buildRealizedExecutionWorkspaceFromPersisted,
@@ -16,8 +30,33 @@ import {
   resolveRuntimeSessionParamsForWorkspace,
   stripWorkspaceRuntimeFromExecutionRunConfig,
   shouldResetTaskSessionForWake,
+  heartbeatService,
   type ResolvedWorkspaceForRun,
 } from "../services/heartbeat.ts";
+
+const mockAdapterExecute = vi.hoisted(() =>
+  vi.fn(async () => ({
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    sessionParams: { sessionId: "session-1" },
+    sessionDisplayId: "session-1",
+    provider: "test",
+    model: "test-model",
+  })),
+);
+
+vi.mock("../adapters/index.ts", async () => {
+  const actual = await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts");
+  return {
+    ...actual,
+    getServerAdapter: vi.fn(() => ({
+      type: "codex_local",
+      execute: mockAdapterExecute,
+      supportsLocalAgentJwt: false,
+    })),
+  };
+});
 
 function buildResolvedWorkspace(overrides: Partial<ResolvedWorkspaceForRun> = {}): ResolvedWorkspaceForRun {
   return {
@@ -564,4 +603,139 @@ describe("parseSessionCompactionPolicy", () => {
       maxSessionAgeHours: 0,
     });
   });
+});
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+if (!embeddedPostgresSupport.supported) {
+  console.warn(
+    `Skipping embedded Postgres workspace primary-order regression tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
+  );
+}
+
+// Regression coverage for AUR-3915: resolveWorkspaceForRun's run-path query ordered
+// project workspace candidates by createdAt only, so an unpinned issue landed in
+// whichever workspace was inserted first instead of the flagged primary — and the
+// selection was then mislabeled "project_primary" regardless of which one won.
+describeEmbeddedPostgres("resolveWorkspaceForRun primary-first ordering (AUR-3915)", () => {
+  let stopDb: (() => Promise<void>) | null = null;
+  let db!: ReturnType<typeof createDb>;
+
+  beforeAll(async () => {
+    const started = await startEmbeddedPostgresTestDatabase("heartbeat-workspace-primary-order");
+    stopDb = started.stop;
+    db = createDb(started.connectionString);
+  }, 20_000);
+
+  afterEach(() => {
+    mockAdapterExecute.mockClear();
+  });
+
+  afterAll(async () => {
+    await db.$client.end();
+    await stopDb?.();
+  });
+
+  it("selects the primary workspace over an older non-primary workspace for an unpinned issue and reports an accurate source", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const olderNonPrimaryWorkspaceId = randomUUID();
+    const primaryWorkspaceId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const olderNonPrimaryCwd = `/tmp/paperclip-aur3915-nonprimary-${randomUUID()}`;
+    const primaryCwd = `/tmp/paperclip-aur3915-primary-${randomUUID()}`;
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(olderNonPrimaryCwd, { recursive: true });
+    await mkdir(primaryCwd, { recursive: true });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Acme",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      status: "active",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace Primary Ordering Regression",
+      status: "active",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    // Non-primary workspace is inserted first (older createdAt) to reproduce the bug:
+    // an unpinned run must not fall back to insertion order once isPrimary is set elsewhere.
+    await db.insert(projectWorkspaces).values({
+      id: olderNonPrimaryWorkspaceId,
+      companyId,
+      projectId,
+      name: "Non-primary (older)",
+      cwd: olderNonPrimaryCwd,
+      isPrimary: false,
+      createdAt: new Date(Date.now() - 60_000),
+      updatedAt: new Date(Date.now() - 60_000),
+    });
+    await db.insert(projectWorkspaces).values({
+      id: primaryWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary (newer)",
+      cwd: primaryCwd,
+      isPrimary: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      title: "Unpinned issue",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const run = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      contextSnapshot: { issueId },
+    });
+
+    expect(run).not.toBeNull();
+    await vi.waitFor(async () => {
+      const latest = await heartbeat.getRun(run!.id);
+      expect(latest?.status).toBe("succeeded");
+    }, { timeout: 5_000 });
+
+    const executionWorkspace = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.sourceIssueId, issueId))
+      .then((rows) => rows[0] ?? null);
+
+    expect(executionWorkspace?.projectWorkspaceId).toBe(primaryWorkspaceId);
+    expect(executionWorkspace?.cwd).toBe(primaryCwd);
+    expect((executionWorkspace?.metadata as Record<string, unknown> | null)?.source).toBe(
+      "project_primary",
+    );
+  }, 15_000);
 });

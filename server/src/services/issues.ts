@@ -45,6 +45,7 @@ import {
   clampIssueRequestDepth,
   extractAgentMentionIds,
   extractProjectMentionIds,
+  isRoutingRationaleAutoStampEligible,
   issueCommentAuthorTypeSchema,
   issueCommentMetadataSchema,
   issueCommentPresentationSchema,
@@ -54,6 +55,7 @@ import {
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
+import { memoryService } from "./memory.js";
 import {
   defaultIssueExecutionWorkspaceSettingsForProject,
   gateProjectExecutionWorkspacePolicy,
@@ -2790,6 +2792,77 @@ export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
   const recoveryActionsSvc = issueRecoveryActionService(db);
+  const memory = memoryService(db);
+
+  // Best-effort structural compliance for the routing-rationale registry
+  // (AUR-3987b): write a skeleton `routing/{identifier}` record the moment
+  // a manager routes a high/critical issue to a different agent, instead of
+  // relying on the manager to remember a manual capture step. A manager who
+  // later captures a narrative rationale upserts this record in place
+  // (same title + owner, `upsert: true` in the capture path).
+  //
+  // Must never fail the assignment it stamps: any error here (missing
+  // memory binding, provider outage, etc.) is caught and logged, never
+  // thrown, so a Memory outage can't block issue create/update.
+  async function autoStampRoutingRationale(issue: typeof issues.$inferSelect) {
+    if (
+      !isRoutingRationaleAutoStampEligible({
+        priority: issue.priority,
+        assigneeAgentId: issue.assigneeAgentId,
+        createdByAgentId: issue.createdByAgentId,
+        originKind: issue.originKind,
+      })
+    ) {
+      return;
+    }
+    const identifier = issue.identifier;
+    if (!identifier) return;
+    try {
+      await memory.capture(
+        issue.companyId,
+        {
+          source: { kind: "issue", issueId: issue.id },
+          title: `routing/${identifier}`,
+          content:
+            `Auto-stamped at assignment time: ${identifier} (priority ${issue.priority}) was routed to ` +
+            `agent ${issue.assigneeAgentId} by agent ${issue.createdByAgentId}. No narrative rationale has ` +
+            "been captured yet — this is a structural placeholder, not a routing justification.",
+          metadata: {
+            category: "routing_rationale",
+            chosen_agent: issue.assigneeAgentId,
+            candidates_considered: [issue.assigneeAgentId],
+            manager_agent_id: issue.createdByAgentId,
+            issue_identifier: identifier,
+            issue_priority: issue.priority,
+            rationale_source: "auto-stamped",
+            // Honest about what this record does and doesn't contain: the
+            // assignment transaction only knows who was chosen, not what
+            // alternatives were weighed or why. A manager upgrading this
+            // record with a narrative rationale should flip these to true.
+            data_available: {
+              candidate_comparison: false,
+              scorecard_snapshot: false,
+              narrative_rationale: false,
+            },
+          },
+          upsert: true,
+        },
+        {
+          actorType: "agent",
+          actorId: issue.createdByAgentId as string,
+          agentId: issue.createdByAgentId,
+          userId: null,
+          runId: null,
+        },
+        "hook",
+      );
+    } catch (err) {
+      logger.error(
+        { err, issueId: issue.id, identifier },
+        "routing-rationale auto-stamp capture failed; issue assignment unaffected",
+      );
+    }
+  }
 
   async function getIssueByUuid(id: string) {
     const row = await db
@@ -4384,6 +4457,11 @@ export function issueService(db: Db) {
         }
         const [enriched] = await withIssueLabels(tx, [issue]);
         return enriched;
+      }).then(async (enriched) => {
+        // Outside the transaction: a memory outage must never roll back or
+        // fail an issue creation (see autoStampRoutingRationale doc comment).
+        await autoStampRoutingRationale(enriched);
+        return enriched;
       });
     },
 
@@ -4511,6 +4589,12 @@ export function issueService(db: Db) {
         patch.executionAgentNameKey = null;
         patch.executionLockedAt = null;
       }
+
+      // Only the transition where assigneeAgentId is first set or changed
+      // should trigger a routing-rationale auto-stamp attempt below — not
+      // every PATCH to an already-assigned issue (AUR-3987b).
+      const assigneeAgentIdTransitioned =
+        issueData.assigneeAgentId !== undefined && issueData.assigneeAgentId !== existing.assigneeAgentId;
 
       const runUpdate = async (tx: any) => {
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, existing.companyId);
@@ -4690,7 +4774,13 @@ export function issueService(db: Db) {
         return enriched;
       };
 
-      return dbOrTx === db ? db.transaction(runUpdate) : runUpdate(dbOrTx);
+      const result = await (dbOrTx === db ? db.transaction(runUpdate) : runUpdate(dbOrTx));
+      if (result && assigneeAgentIdTransitioned) {
+        // Outside the transaction: a memory outage must never roll back or
+        // fail an issue update (see autoStampRoutingRationale doc comment).
+        await autoStampRoutingRationale(result);
+      }
+      return result;
     },
 
     clearExecutionWorkspaceEnvironmentSelection: async (companyId: string, environmentId: string) => {

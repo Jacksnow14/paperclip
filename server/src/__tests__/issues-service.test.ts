@@ -16,6 +16,10 @@ import {
   issueInboxArchives,
   issueRelations,
   issues,
+  memoryBindings,
+  memoryBindingTargets,
+  memoryLocalRecords,
+  memoryOperations,
   projectWorkspaces,
   projects,
 } from "@paperclipai/db";
@@ -3690,5 +3694,251 @@ describeEmbeddedPostgres("issueService completedByRunId provenance (AUR-4333)", 
       priority: "low",
     });
     expect((await readIssueRow(doneWithoutRun.id))!.completedByRunId).toBeNull();
+  });
+});
+
+describeEmbeddedPostgres("issueService routing-rationale auto-stamp (AUR-3987b)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-service-routing-rationale-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(memoryOperations);
+    await db.delete(memoryLocalRecords);
+    await db.delete(memoryBindingTargets);
+    await db.delete(memoryBindings);
+    await db.delete(issues);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedCompanyWithAgents(opts: { withMemoryBinding: boolean }) {
+    const companyId = randomUUID();
+    const managerAgentId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const otherAssigneeAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values([
+      {
+        id: managerAgentId,
+        companyId,
+        name: "Manager",
+        role: "manager",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: assigneeAgentId,
+        companyId,
+        name: "Assignee",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: otherAssigneeAgentId,
+        companyId,
+        name: "OtherAssignee",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+
+    if (opts.withMemoryBinding) {
+      const bindingId = randomUUID();
+      await db.insert(memoryBindings).values({
+        id: bindingId,
+        companyId,
+        key: "default",
+        providerKey: "local_basic",
+        config: {},
+        enabled: true,
+      });
+      await db.insert(memoryBindingTargets).values({
+        id: randomUUID(),
+        companyId,
+        bindingId,
+        targetType: "company",
+        targetId: companyId,
+      });
+    }
+
+    return { companyId, managerAgentId, assigneeAgentId, otherAssigneeAgentId };
+  }
+
+  async function routingRationaleRecords(companyId: string, identifier: string) {
+    return db
+      .select()
+      .from(memoryLocalRecords)
+      .where(eq(memoryLocalRecords.companyId, companyId))
+      .then((rows) => rows.filter((row) => row.title === `routing/${identifier}`));
+  }
+
+  it("stamps routing/{identifier} when a manager assigns a high-priority issue to a different agent", async () => {
+    const { companyId, managerAgentId, assigneeAgentId } = await seedCompanyWithAgents({ withMemoryBinding: true });
+
+    const issue = await svc.create(companyId, {
+      title: "Fix the thing",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId,
+      createdByAgentId: managerAgentId,
+    });
+
+    const records = await routingRationaleRecords(companyId, issue.identifier!);
+    expect(records).toHaveLength(1);
+    expect(records[0].reviewState).toBe("accepted");
+    expect(records[0].metadata).toMatchObject({
+      category: "routing_rationale",
+      chosen_agent: assigneeAgentId,
+      manager_agent_id: managerAgentId,
+      rationale_source: "auto-stamped",
+      data_available: {
+        candidate_comparison: false,
+        scorecard_snapshot: false,
+        narrative_rationale: false,
+      },
+    });
+  });
+
+  it("does not stamp a self-assigned issue", async () => {
+    const { companyId, managerAgentId } = await seedCompanyWithAgents({ withMemoryBinding: true });
+
+    const issue = await svc.create(companyId, {
+      title: "Self-assigned high priority work",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: managerAgentId,
+      createdByAgentId: managerAgentId,
+    });
+
+    expect(await routingRationaleRecords(companyId, issue.identifier!)).toHaveLength(0);
+  });
+
+  it("does not stamp a routine/system-originated issue (no creator agent)", async () => {
+    const { companyId, assigneeAgentId } = await seedCompanyWithAgents({ withMemoryBinding: true });
+
+    const issue = await svc.create(companyId, {
+      title: "Routine-spawned high priority work",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId,
+    });
+
+    expect(await routingRationaleRecords(companyId, issue.identifier!)).toHaveLength(0);
+  });
+
+  it("does not stamp a medium-priority issue", async () => {
+    const { companyId, managerAgentId, assigneeAgentId } = await seedCompanyWithAgents({ withMemoryBinding: true });
+
+    const issue = await svc.create(companyId, {
+      title: "Medium priority work",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId,
+      createdByAgentId: managerAgentId,
+    });
+
+    expect(await routingRationaleRecords(companyId, issue.identifier!)).toHaveLength(0);
+  });
+
+  it("stamps on the update path when assigneeAgentId transitions from unset to set", async () => {
+    const { companyId, managerAgentId, assigneeAgentId } = await seedCompanyWithAgents({ withMemoryBinding: true });
+
+    const issue = await svc.create(companyId, {
+      title: "Unassigned high priority work",
+      status: "backlog",
+      priority: "high",
+      createdByAgentId: managerAgentId,
+    });
+    expect(await routingRationaleRecords(companyId, issue.identifier!)).toHaveLength(0);
+
+    await svc.update(issue.id, { assigneeAgentId, status: "todo" });
+
+    const records = await routingRationaleRecords(companyId, issue.identifier!);
+    expect(records).toHaveLength(1);
+    expect(records[0].metadata).toMatchObject({ chosen_agent: assigneeAgentId });
+  });
+
+  it("does not duplicate the stamp on a repeated PATCH that leaves the assignee unchanged", async () => {
+    const { companyId, managerAgentId, assigneeAgentId } = await seedCompanyWithAgents({ withMemoryBinding: true });
+
+    const issue = await svc.create(companyId, {
+      title: "Reassign-adjacent PATCHes",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId,
+      createdByAgentId: managerAgentId,
+    });
+    expect(await routingRationaleRecords(companyId, issue.identifier!)).toHaveLength(1);
+
+    // Unrelated PATCH that doesn't touch assigneeAgentId must not re-stamp.
+    await svc.update(issue.id, { description: "Adding more detail" });
+
+    expect(await routingRationaleRecords(companyId, issue.identifier!)).toHaveLength(1);
+  });
+
+  it("upserts in place (no duplicate record) when the assignee changes again", async () => {
+    const { companyId, managerAgentId, assigneeAgentId, otherAssigneeAgentId } = await seedCompanyWithAgents({
+      withMemoryBinding: true,
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Reassigned high priority work",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId,
+      createdByAgentId: managerAgentId,
+    });
+    expect(await routingRationaleRecords(companyId, issue.identifier!)).toHaveLength(1);
+
+    await svc.update(issue.id, { assigneeAgentId: otherAssigneeAgentId });
+
+    const records = await routingRationaleRecords(companyId, issue.identifier!);
+    expect(records).toHaveLength(1);
+    expect(records[0].metadata).toMatchObject({ chosen_agent: otherAssigneeAgentId });
+  });
+
+  it("still creates the issue when memory capture fails (no binding configured)", async () => {
+    const { companyId, managerAgentId, assigneeAgentId } = await seedCompanyWithAgents({ withMemoryBinding: false });
+
+    const issue = await svc.create(companyId, {
+      title: "High priority work with no memory binding configured",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId,
+      createdByAgentId: managerAgentId,
+    });
+
+    expect(issue).toBeTruthy();
+    expect(issue.assigneeAgentId).toBe(assigneeAgentId);
+    expect(await routingRationaleRecords(companyId, issue.identifier!)).toHaveLength(0);
   });
 });

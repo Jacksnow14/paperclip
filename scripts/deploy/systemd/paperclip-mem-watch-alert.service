@@ -1,0 +1,17 @@
+# AUR-4025: reads paperclip-mem-watch.log and escalates a standing-threshold
+# breach to the founder via notify_founder.sh. Installed by
+# scripts/deploy/install-mem-watch-alert-timer.sh to /usr/local/sbin, same as
+# paperclip-mem-watch.sh and paperclip-oom-guard.sh -- deliberately NOT run from
+# an app release, so a broken deploy can't take the monitor down with it.
+[Unit]
+Description=Paperclip host-memory breach alert (AUR-4025, reads AUR-3924 sampler log)
+Documentation=https://paperclip/AUR/issues/AUR-4025
+
+[Service]
+Type=oneshot
+User=ievgen
+Group=ievgen
+ExecStart=/usr/local/sbin/paperclip-mem-watch-alert.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=paperclip-mem-watch-alert

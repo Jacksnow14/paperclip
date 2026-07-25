@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, ne } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   documents,
@@ -16,6 +16,7 @@ import type {
   CancelIssueThreadInteraction,
   CreateIssueThreadInteraction,
   IssueThreadInteraction,
+  IssueThreadInteractionResult,
   RequestConfirmationInteraction,
   RequestConfirmationTarget,
   RejectIssueThreadInteraction,
@@ -438,6 +439,132 @@ async function expireStaleRequestConfirmationTarget(db: Db | any, args: {
   return hydrateInteraction(updated);
 }
 
+const PENDING_INTERACTION_AGE_CEILING_MS = 14 * 24 * 60 * 60 * 1000;
+
+function buildExpiredInteractionResult(
+  kind: string,
+  reason: "superseded" | "age_ceiling",
+  supersededBy: string | null,
+): IssueThreadInteractionResult {
+  switch (kind) {
+    case "ask_user_questions":
+      return { version: 1, answers: [], expiredReason: reason, supersededBy };
+    case "request_confirmation":
+      return {
+        version: 1,
+        outcome: reason,
+        supersededBy,
+      };
+    case "suggest_tasks":
+    default:
+      return { version: 1, expiredReason: reason, supersededBy };
+  }
+}
+
+/**
+ * When a new pending interaction is created, any older pending interaction on the same issue
+ * of the same kind by the same creator is dead by construction (AUR-3928) — expire it rather
+ * than let it keep rendering as a live claim on the founder's/reviewer's attention.
+ */
+async function expireSupersededPendingInteractionsByCreator(db: Db, args: {
+  companyId: string;
+  issueId: string;
+  kind: string;
+  createdByAgentId: string | null;
+  createdByUserId: string | null;
+  supersedingInteractionId: string;
+}): Promise<IssueThreadInteraction[]> {
+  if (!args.createdByAgentId && !args.createdByUserId) return [];
+
+  const creatorCondition = args.createdByAgentId
+    ? eq(issueThreadInteractions.createdByAgentId, args.createdByAgentId)
+    : eq(issueThreadInteractions.createdByUserId, args.createdByUserId as string);
+
+  const rows = await db
+    .select()
+    .from(issueThreadInteractions)
+    .where(and(
+      eq(issueThreadInteractions.companyId, args.companyId),
+      eq(issueThreadInteractions.issueId, args.issueId),
+      eq(issueThreadInteractions.kind, args.kind),
+      eq(issueThreadInteractions.status, "pending"),
+      creatorCondition,
+      ne(issueThreadInteractions.id, args.supersedingInteractionId),
+    ));
+
+  if (rows.length === 0) return [];
+
+  const now = new Date();
+  const expired: IssueThreadInteraction[] = [];
+  for (const row of rows) {
+    const [updated] = await db
+      .update(issueThreadInteractions)
+      .set({
+        status: "expired",
+        result: buildExpiredInteractionResult(row.kind, "superseded", args.supersedingInteractionId),
+        resolvedAt: now,
+        updatedAt: now,
+      })
+      .where(and(
+        eq(issueThreadInteractions.id, row.id),
+        eq(issueThreadInteractions.status, "pending"),
+      ))
+      .returning();
+    if (updated) expired.push(hydrateInteraction(updated));
+  }
+
+  return expired;
+}
+
+/**
+ * Sweep run on read: a pending interaction older than the age ceiling on an issue that has a
+ * newer pending interaction (any kind/creator) is stale by construction — expire it so it stops
+ * burying whatever is actually live.
+ */
+async function expireAgedPendingInteractionsForIssue(db: Db, issueId: string): Promise<IssueThreadInteraction[]> {
+  const rows = await db
+    .select()
+    .from(issueThreadInteractions)
+    .where(and(
+      eq(issueThreadInteractions.issueId, issueId),
+      eq(issueThreadInteractions.status, "pending"),
+    ));
+
+  if (rows.length < 2) return [];
+
+  const now = Date.now();
+  const ceiling = now - PENDING_INTERACTION_AGE_CEILING_MS;
+  const toExpire = rows.filter((row) => {
+    const createdAtMs = row.createdAt.getTime();
+    if (createdAtMs > ceiling) return false;
+    return rows.some((other) => other.id !== row.id && other.createdAt.getTime() > createdAtMs);
+  });
+
+  if (toExpire.length === 0) return [];
+
+  const resolvedAt = new Date();
+  const expired: IssueThreadInteraction[] = [];
+  for (const row of toExpire) {
+    const [updated] = await db
+      .update(issueThreadInteractions)
+      .set({
+        status: "expired",
+        result: buildExpiredInteractionResult(row.kind, "age_ceiling", null),
+        resolvedAt,
+        updatedAt: resolvedAt,
+      })
+      .where(and(
+        eq(issueThreadInteractions.id, row.id),
+        eq(issueThreadInteractions.status, "pending"),
+      ))
+      .returning();
+    if (updated) expired.push(hydrateInteraction(updated));
+  }
+
+  await touchIssue(db, issueId);
+  return expired;
+}
+
 export function issueThreadInteractionService(db: Db) {
   async function getIdempotentInteraction(args: {
     issueId: string;
@@ -740,6 +867,8 @@ export function issueThreadInteractionService(db: Db) {
 
   return {
     listForIssue: async (issueId: string) => {
+      await expireAgedPendingInteractionsForIssue(db, issueId);
+
       const rows = await db
         .select()
         .from(issueThreadInteractions)
@@ -870,6 +999,14 @@ export function issueThreadInteractionService(db: Db) {
       }
 
       await touchIssue(db, issue.id);
+      await expireSupersededPendingInteractionsByCreator(db, {
+        companyId: issue.companyId,
+        issueId: issue.id,
+        kind: created.kind,
+        createdByAgentId: actor.agentId ?? null,
+        createdByUserId: actor.userId ?? null,
+        supersedingInteractionId: created.id,
+      });
       return hydrateInteraction(created);
     },
 
@@ -1116,6 +1253,10 @@ export function issueThreadInteractionService(db: Db) {
 
       await touchIssue(db, issue.id);
       return hydrateInteraction(updated);
+    },
+
+    expireAgedPendingInteractions: async (issueId: string) => {
+      return expireAgedPendingInteractionsForIssue(db, issueId);
     },
 
     expireRequestConfirmationsSupersededByComment: async (

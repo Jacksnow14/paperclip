@@ -1250,4 +1250,409 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     const activeInteractions = await interactionsSvc.listForIssue(issueId);
     expect(activeInteractions.find((entry) => entry.id === created.id && entry.status === "pending")).toBeUndefined();
   });
+
+  it("auto-expires an older pending interaction of the same kind by the same creator when a replacement is created (AUR-3928)", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const creatorAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Supersession sweep",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(agents).values({
+      id: creatorAgentId,
+      companyId,
+      name: "FirstMileRunner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "Founder-gated go-live step",
+      status: "in_progress",
+      priority: "medium",
+    });
+
+    const first = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Finish Shopify admin login?",
+      },
+    }, {
+      agentId: creatorAgentId,
+    });
+
+    const second = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "One-time Shopify access?",
+      },
+    }, {
+      agentId: creatorAgentId,
+    });
+
+    expect(second.status).toBe("pending");
+
+    const interactions = await interactionsSvc.listForIssue(issueId);
+    const pending = interactions.filter((entry) => entry.status === "pending");
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.id).toBe(second.id);
+
+    const supersededFirst = interactions.find((entry) => entry.id === first.id);
+    expect(supersededFirst).toMatchObject({
+      status: "expired",
+      result: {
+        version: 1,
+        outcome: "superseded",
+        supersededBy: second.id,
+      },
+    });
+  });
+
+  it("never auto-expires a pending interaction created by a different agent", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const agentAId = randomUUID();
+    const agentBId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Cross-creator isolation",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(agents).values([
+      {
+        id: agentAId,
+        companyId,
+        name: "CEO",
+        role: "ceo",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: agentBId,
+        companyId,
+        name: "CTO",
+        role: "cto",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "Shared issue with two askers",
+      status: "in_progress",
+      priority: "medium",
+    });
+
+    const fromAgentA = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "CEO's ask",
+      },
+    }, {
+      agentId: agentAId,
+    });
+
+    const fromAgentB = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "CTO's ask",
+      },
+    }, {
+      agentId: agentBId,
+    });
+
+    expect(fromAgentA.status).toBe("pending");
+    expect(fromAgentB.status).toBe("pending");
+
+    const interactions = await interactionsSvc.listForIssue(issueId);
+    const pendingIds = interactions.filter((entry) => entry.status === "pending").map((entry) => entry.id);
+    expect(pendingIds.sort()).toEqual([fromAgentA.id, fromAgentB.id].sort());
+  });
+
+  it("expires a pending interaction older than the age ceiling once the issue has a newer pending interaction", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const creatorAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Age ceiling sweep",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(agents).values({
+      id: creatorAgentId,
+      companyId,
+      name: "FirstMileRunner",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "Founder-gated go-live step",
+      status: "in_progress",
+      priority: "medium",
+    });
+
+    const old = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "ask_user_questions",
+      payload: {
+        version: 1,
+        questions: [
+          {
+            id: "path",
+            prompt: "Which path for the first test order?",
+            selectionMode: "single",
+            options: [
+              { id: "a", label: "Path A" },
+              { id: "b", label: "Path B" },
+            ],
+          },
+        ],
+      },
+    }, {
+      agentId: creatorAgentId,
+    });
+
+    const fifteenDaysAgo = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000);
+    await db
+      .update(issueThreadInteractions)
+      .set({ createdAt: fifteenDaysAgo })
+      .where(eq(issueThreadInteractions.id, old.id));
+
+    const fresh = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Finish the live Shopify ID re-upload?",
+      },
+    }, {
+      agentId: creatorAgentId,
+    });
+
+    expect(fresh.status).toBe("pending");
+
+    const interactions = await interactionsSvc.listForIssue(issueId);
+    const pending = interactions.filter((entry) => entry.status === "pending");
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.id).toBe(fresh.id);
+
+    const expiredOld = interactions.find((entry) => entry.id === old.id);
+    expect(expiredOld).toMatchObject({
+      status: "expired",
+      result: {
+        version: 1,
+        expiredReason: "age_ceiling",
+      },
+    });
+  });
+
+  it("replays the AUR-2156 interaction jam (18 asks, 2 creators) and ends with 3 pending instead of 12+ (AUR-3928)", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const runnerAgentId = randomUUID();
+    const secondAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "First Mile go-live replay",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(agents).values([
+      {
+        id: runnerAgentId,
+        companyId,
+        name: "FirstMileRunner",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: secondAgentId,
+        companyId,
+        name: "SecondRunner",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "First Mile go-live",
+      status: "in_progress",
+      priority: "medium",
+    });
+
+    // Chronology mirrors the real AUR-2156 history (2026-06-13 -> 2026-07-02): kind, creator,
+    // and hour-offset-from-first-ask are taken from the live records; prompts are synthetic.
+    // "runner" = the agent that opened 17 of the 18 asks; "second" = the one that opened 1.
+    const timeline: Array<{ kind: "request_confirmation" | "ask_user_questions"; creator: "runner" | "second"; offsetHours: number }> = [
+      { kind: "request_confirmation", creator: "runner", offsetHours: 0 },
+      { kind: "ask_user_questions", creator: "runner", offsetHours: 0.1461 },
+      { kind: "request_confirmation", creator: "runner", offsetHours: 14.2515 },
+      { kind: "request_confirmation", creator: "runner", offsetHours: 27.0023 },
+      { kind: "request_confirmation", creator: "runner", offsetHours: 27.1577 },
+      { kind: "request_confirmation", creator: "runner", offsetHours: 27.8055 },
+      { kind: "ask_user_questions", creator: "runner", offsetHours: 306.7639 },
+      { kind: "ask_user_questions", creator: "runner", offsetHours: 456.2599 },
+      { kind: "request_confirmation", creator: "runner", offsetHours: 456.5445 },
+      { kind: "request_confirmation", creator: "runner", offsetHours: 456.7805 },
+      { kind: "request_confirmation", creator: "runner", offsetHours: 456.8804 },
+      { kind: "request_confirmation", creator: "runner", offsetHours: 456.9915 },
+      { kind: "request_confirmation", creator: "runner", offsetHours: 457.0641 },
+      { kind: "request_confirmation", creator: "runner", offsetHours: 457.2359 },
+      { kind: "request_confirmation", creator: "runner", offsetHours: 457.292 },
+      { kind: "request_confirmation", creator: "runner", offsetHours: 457.508 },
+      { kind: "request_confirmation", creator: "second", offsetHours: 457.5172 },
+      { kind: "request_confirmation", creator: "runner", offsetHours: 457.9075 },
+    ];
+
+    const created: Array<{ id: string; offsetHours: number }> = [];
+    for (const [index, step] of timeline.entries()) {
+      const agentId = step.creator === "runner" ? runnerAgentId : secondAgentId;
+      const payload = step.kind === "request_confirmation"
+        ? { version: 1 as const, prompt: `Founder action #${index + 1}` }
+        : {
+          version: 1 as const,
+          questions: [
+            {
+              id: "path",
+              prompt: `Which path #${index + 1}?`,
+              selectionMode: "single" as const,
+              options: [
+                { id: "a", label: "Path A" },
+                { id: "b", label: "Path B" },
+              ],
+            },
+          ],
+        };
+      const interaction = await interactionsSvc.create({
+        id: issueId,
+        companyId,
+      }, {
+        kind: step.kind,
+        payload,
+      } as Parameters<typeof interactionsSvc.create>[1], {
+        agentId,
+      });
+      created.push({ id: interaction.id, offsetHours: step.offsetHours });
+    }
+
+    // Anchor the timeline so the last ask lands at "now" and earlier asks are backdated by the
+    // same real-time deltas as the live AUR-2156 history, so the 14-day age ceiling evaluates
+    // the same way it would have at the time.
+    const lastOffsetHours = timeline[timeline.length - 1].offsetHours;
+    const nowMs = Date.now();
+    for (const entry of created) {
+      const createdAt = new Date(nowMs - (lastOffsetHours - entry.offsetHours) * 60 * 60 * 1000);
+      await db
+        .update(issueThreadInteractions)
+        .set({ createdAt })
+        .where(eq(issueThreadInteractions.id, entry.id));
+    }
+
+    const interactions = await interactionsSvc.listForIssue(issueId);
+    const pending = interactions.filter((entry) => entry.status === "pending");
+
+    // Replayed against the new logic: 3 pending survive (the live ask, the isolated
+    // second-creator ask, and the last ask_user_questions with no same-kind successor) instead
+    // of the 12+ that actually accumulated before AUR-3927's manual cleanup.
+    expect(pending).toHaveLength(3);
+    expect(pending.map((entry) => entry.id).sort()).toEqual(
+      [created[7].id, created[16].id, created[17].id].sort(),
+    );
+  });
 });

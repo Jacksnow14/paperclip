@@ -46,6 +46,7 @@ const mockProjectService = vi.hoisted(() => ({
 
 const mockIssueService = vi.hoisted(() => ({
   getByIdentifier: vi.fn(),
+  getById: vi.fn(),
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
@@ -100,6 +101,10 @@ describe("memory routes", () => {
       companyId: companyA,
       name: "Project A",
     });
+    // Default: resolve any id (identifier or UUID) back to itself in companyA.
+    // Tests exercising a specific resolution outcome (miss, cross-company, etc.)
+    // override with mockResolvedValueOnce.
+    mockIssueService.getById.mockImplementation(async (id: string) => ({ id, companyId: companyA }));
     mockLogActivity.mockResolvedValue(undefined);
   });
 
@@ -657,7 +662,7 @@ describe("memory routes", () => {
     };
 
     it("resolves AUR-NNNN to UUID before persisting", async () => {
-      mockIssueService.getByIdentifier.mockResolvedValue({ id: issueUuid, companyId: companyA });
+      mockIssueService.getById.mockResolvedValueOnce({ id: issueUuid, companyId: companyA });
       mockMemoryService.capture.mockResolvedValue(captureResult);
       const app = createApp(boardActor);
 
@@ -667,7 +672,7 @@ describe("memory routes", () => {
         .send(captureBody);
 
       expect(res.status).toBe(201);
-      expect(mockIssueService.getByIdentifier).toHaveBeenCalledWith("AUR-1234");
+      expect(mockIssueService.getById).toHaveBeenCalledWith("AUR-1234");
       expect(mockMemoryService.capture).toHaveBeenCalledWith(
         companyA,
         expect.objectContaining({ source: { kind: "issue", issueId: issueUuid } }),
@@ -675,7 +680,7 @@ describe("memory routes", () => {
       );
     });
 
-    it("passes through a valid UUID without extra lookup", async () => {
+    it("resolves a UUID-shaped issueId against the DB before persisting (AUR-3996: never trust shape alone)", async () => {
       mockMemoryService.capture.mockResolvedValue(captureResult);
       const app = createApp(boardActor);
 
@@ -685,7 +690,7 @@ describe("memory routes", () => {
         .send({ ...captureBody, source: { kind: "issue", issueId: issueUuid } });
 
       expect(res.status).toBe(201);
-      expect(mockIssueService.getByIdentifier).not.toHaveBeenCalled();
+      expect(mockIssueService.getById).toHaveBeenCalledWith(issueUuid);
       expect(mockMemoryService.capture).toHaveBeenCalledWith(
         companyA,
         expect.objectContaining({ source: { kind: "issue", issueId: issueUuid } }),
@@ -693,8 +698,24 @@ describe("memory routes", () => {
       );
     });
 
+    it("returns 422 for a fabricated UUID-shaped issueId that does not resolve to a real issue", async () => {
+      const fabricatedUuid = "10000000-f2f2-4f2f-8f2f-f2f2f2f2f2f2";
+      mockIssueService.getById.mockResolvedValueOnce(null);
+      const app = createApp(boardActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...captureBody, source: { kind: "issue", issueId: fabricatedUuid } });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toMatch(new RegExp(fabricatedUuid));
+      expect(mockIssueService.getById).toHaveBeenCalledWith(fabricatedUuid);
+      expect(mockMemoryService.capture).not.toHaveBeenCalled();
+    });
+
     it("returns 422 for an unknown AUR-NNNN identifier", async () => {
-      mockIssueService.getByIdentifier.mockResolvedValue(null);
+      mockIssueService.getById.mockResolvedValueOnce(null);
       const app = createApp(boardActor);
 
       const res = await request(app)
@@ -708,7 +729,7 @@ describe("memory routes", () => {
     });
 
     it("returns 422 when the resolved issue belongs to a different company", async () => {
-      mockIssueService.getByIdentifier.mockResolvedValue({ id: issueUuid, companyId: companyB });
+      mockIssueService.getById.mockResolvedValueOnce({ id: issueUuid, companyId: companyB });
       const app = createApp(boardActor);
 
       const res = await request(app)
@@ -1182,7 +1203,7 @@ describe("memory routes", () => {
     it.each(["performance_scorecard", "scorecard_adjusted"])(
       "returns 422 for category '%s' with an unresolvable issue_id (TEST-0)",
       async (category) => {
-        mockIssueService.getByIdentifier.mockResolvedValue(null);
+        mockIssueService.getById.mockResolvedValueOnce(null);
         const app = createApp(agentActor);
 
         const res = await request(app)
@@ -1195,6 +1216,22 @@ describe("memory routes", () => {
         expect(mockMemoryService.capture).not.toHaveBeenCalled();
       },
     );
+
+    it("returns 422 for a UUID-shaped issue_id that does not resolve to a real issue (AUR-3996 CTO finding)", async () => {
+      const fabricatedUuid = "10000000-f2f2-4f2f-8f2f-f2f2f2f2f2f2";
+      mockIssueService.getById.mockResolvedValueOnce(null);
+      const app = createApp(agentActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...scorecardBaseBody, metadata: { ...completeMetadata, issue_id: fabricatedUuid } });
+
+      expect(res.status).toBe(422);
+      expect(res.body.details.errors.some((e: string) => e.includes(fabricatedUuid))).toBe(true);
+      expect(mockIssueService.getById).toHaveBeenCalledWith(fabricatedUuid);
+      expect(mockMemoryService.capture).not.toHaveBeenCalled();
+    });
 
     it("returns 422 when metadata.issue_id is absent", async () => {
       const app = createApp(agentActor);
@@ -1242,6 +1279,7 @@ describe("memory routes", () => {
     });
 
     it("returns 201 for a scorecard with a real resolvable issue_id and all required fields", async () => {
+      mockIssueService.getById.mockResolvedValueOnce({ id: validIssueUuid, companyId: companyA });
       mockMemoryService.capture.mockResolvedValue(scorecardCaptureResult);
       const app = createApp(agentActor);
 
@@ -1251,7 +1289,7 @@ describe("memory routes", () => {
         .send({ ...scorecardBaseBody, metadata: completeMetadata });
 
       expect(res.status).toBe(201);
-      expect(mockIssueService.getByIdentifier).not.toHaveBeenCalled();
+      expect(mockIssueService.getById).toHaveBeenCalledWith(validIssueUuid);
       expect(mockMemoryService.capture).toHaveBeenCalledTimes(1);
     });
 

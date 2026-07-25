@@ -54,7 +54,6 @@ import {
 import { validate } from "../middleware/validate.js";
 import { forbidden, notFound, unprocessable } from "../errors.js";
 import { agentService, issueService, logActivity, memoryService, projectService } from "../services/index.js";
-import { isUuidLike, normalizeIssueIdentifier } from "@paperclipai/shared";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 
 /**
@@ -188,11 +187,17 @@ export function memoryRoutes(
   const projectsSvc = projectService(db);
   const issuesSvc = issueService(db);
 
+  /**
+   * Resolves an `AUR-NNNN` identifier or a UUID to a real issue id in this
+   * company. Always DB-backed: a UUID-shaped string is never trusted on
+   * shape alone (CTO review, AUR-3996) — `issuesSvc.getById` looks it up by
+   * primary key the same way it looks up an identifier, so a fabricated
+   * UUID with no matching row is rejected just like a fabricated `AUR-NNNN`.
+   */
   async function resolveSourceIssueId(companyId: string, issueId: string): Promise<string | null> {
-    if (isUuidLike(issueId)) return issueId;
-    const normalized = normalizeIssueIdentifier(issueId);
-    if (!normalized) return null;
-    const issue = await issuesSvc.getByIdentifier(normalized);
+    const trimmed = issueId.trim();
+    if (!trimmed) return null;
+    const issue = await issuesSvc.getById(trimmed);
     if (!issue || issue.companyId !== companyId) return null;
     return issue.id;
   }

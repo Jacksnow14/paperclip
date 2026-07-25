@@ -31,7 +31,7 @@ vi.mock("../services/issues.js", () => ({
   }),
 }));
 
-const { createGmailIntakeService, INTAKE_LABELS } = await import(
+const { createGmailIntakeService, INTAKE_LABELS, repairUtf8Mojibake } = await import(
   "../services/gmail-intake.js"
 );
 
@@ -815,5 +815,67 @@ describe("sender-based routing: Google Payments → CFO", () => {
     await svc.processMailbox(COMPANY_ID, "board");
 
     expect(mockSendMessage).not.toHaveBeenCalled();
+  });
+});
+
+// Helper: produce a double-UTF-8-encoded (mojibaked) version of a string,
+// simulating the Gmail API returning UTF-8 header bytes interpreted twice as Latin-1.
+function doubleMojibake(input: string): string {
+  const singleMojibake = Buffer.from(input, "utf-8").toString("latin1");
+  return Buffer.from(singleMojibake, "utf-8").toString("latin1");
+}
+
+describe("repairUtf8Mojibake (LAR-570)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("repairs double-encoded Søren Ø. Test subject", () => {
+    const original = "Søren Ø. Test";
+    const mojibaked = doubleMojibake(original);
+    expect(repairUtf8Mojibake(mojibaked)).toBe(original);
+  });
+
+  it("repairs double-encoded em-dash", () => {
+    const original = "Meeting — follow-up";
+    const mojibaked = doubleMojibake(original);
+    expect(repairUtf8Mojibake(mojibaked)).toBe(original);
+  });
+
+  it("leaves already-correct UTF-8 input unchanged (idempotent)", () => {
+    const correct = "Søren Ø.";
+    expect(repairUtf8Mojibake(correct)).toBe(correct);
+  });
+
+  it("leaves pure ASCII input unchanged", () => {
+    const ascii = "Hello world - no special chars";
+    expect(repairUtf8Mojibake(ascii)).toBe(ascii);
+  });
+
+  it("repairs mixed ASCII + non-ASCII (only the non-ASCII parts change)", () => {
+    const original = "Invoice for Søren — due 2026-08-01";
+    const mojibaked = doubleMojibake(original);
+    expect(repairUtf8Mojibake(mojibaked)).toBe(original);
+  });
+
+  it("stores repaired subject in issue title when subject arrives double-encoded", async () => {
+    const original = "Søren Ø. Test";
+    const mojibaked = doubleMojibake(original);
+
+    const msg = makeMessage("msg-moji", "thread-moji", mojibaked);
+    mockListMessages.mockResolvedValue({ messages: [{ id: "msg-moji" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([]);
+    mockCreateLabel.mockResolvedValue({ id: "lbl-moji" });
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-moji" });
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    await svc.processMailbox(COMPANY_ID, "board");
+
+    const title = mockIssueCreate.mock.calls[0][1].title as string;
+    expect(title).toContain(original);
+    expect(title).not.toContain(mojibaked);
   });
 });

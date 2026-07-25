@@ -25,10 +25,14 @@ Run these four commands:
 
 ```bash
 journalctl --since "-6h" | grep -cE "killed by the OOM killer|Failed with result 'oom-kill'"
-systemctl show paperclip.service -p LoadState -p NRestarts --value
-systemctl --user show paperclip.service -p LoadState -p NRestarts --value
+systemctl show paperclip.service -p LoadState -p NRestarts
+systemctl --user show paperclip.service -p LoadState -p NRestarts
 tail -20 /var/log/paperclip-mem-watch.log     # 5-min sampler installed under AUR-3924
 ```
+
+(Deliberately no `--value` on the two `systemctl show` calls: with more than one `-p`, systemd
+prints bare values in *its* order, not the order you asked for — on this box that is `NRestarts`
+first, then `LoadState`, which is exactly how you misread a healthy box at 3am. Keep the labels.)
 
 How to read them:
 

@@ -7,8 +7,10 @@ import { __testing } from "./test-embedded-postgres.js";
 
 const {
   activeEmbeddedPostgresDataDirs,
+  EMBEDDED_POSTGRES_TEMP_DIR_MARKER,
   handleProcessExit,
   handleTerminationSignal,
+  installProcessExitHandlers,
   reapDataDirSync,
   reapStaleEmbeddedPostgresTempDirs,
 } = __testing;
@@ -20,6 +22,19 @@ function makeTempDir(prefix: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   dirsToClean.push(dir);
   return dir;
+}
+
+/** Builds a dir under the helper's shared marker with real Postgres data-dir markers. */
+function makePostgresDataDir(label: string): string {
+  const dir = makeTempDir(`${EMBEDDED_POSTGRES_TEMP_DIR_MARKER}${label}`);
+  fs.writeFileSync(path.join(dir, "PG_VERSION"), "16\n");
+  fs.writeFileSync(path.join(dir, "postgresql.conf"), "# test fixture\n");
+  return dir;
+}
+
+function makeStale(dir: string): void {
+  const oldTime = new Date(Date.now() - 7 * 60 * 60 * 1000);
+  fs.utimesSync(dir, oldTime, oldTime);
 }
 
 function spawnLiveProcess(): ChildProcess {
@@ -78,13 +93,30 @@ describe("crash-safe teardown", () => {
     expect(fs.existsSync(dataDir)).toBe(false);
   });
 
-  it("re-raises termination signals as process.exit so the exit handler runs", () => {
-    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((): never => undefined as never));
+  it("actually registers handleProcessExit as an exit listener, not just as a callable function", () => {
+    // The crash-path test above proves handleProcessExit works when invoked directly, but
+    // that alone doesn't prove installProcessExitHandlers wires it up for a real crash. Assert
+    // the registration side explicitly.
+    installProcessExitHandlers();
+    expect(process.listeners("exit")).toContain(handleProcessExit);
+  });
 
-    handleTerminationSignal();
+  it("reaps active data dirs, unregisters itself, and re-raises the signal instead of hard-exiting", () => {
+    const dataDir = makeTempDir("crash-signal-test-");
+    fs.writeFileSync(path.join(dataDir, "PG_VERSION"), "16\n");
+    activeEmbeddedPostgresDataDirs.add(dataDir);
 
-    expect(exitSpy).toHaveBeenCalledWith(128);
-    exitSpy.mockRestore();
+    const killSpy = vi.spyOn(process, "kill").mockImplementation((() => true) as never);
+    const removeListenerSpy = vi.spyOn(process, "removeListener");
+
+    handleTerminationSignal("SIGTERM");
+
+    expect(fs.existsSync(dataDir)).toBe(false);
+    expect(removeListenerSpy).toHaveBeenCalledWith("SIGTERM", handleTerminationSignal);
+    expect(killSpy).toHaveBeenCalledWith(process.pid, "SIGTERM");
+
+    killSpy.mockRestore();
+    removeListenerSpy.mockRestore();
   });
 
   it("stops a live postmaster before removing the data dir, and removes dirs with no postmaster.pid", async () => {
@@ -101,46 +133,87 @@ describe("crash-safe teardown", () => {
 });
 
 describe("reapStaleEmbeddedPostgresTempDirs", () => {
-  const prefix = "reaper-test-prefix-";
+  it("reaps an old Postgres data dir with no live postmaster", () => {
+    const staleDir = makePostgresDataDir("reaper-test-");
+    makeStale(staleDir);
 
-  it("reaps an old dir with no live postmaster", () => {
-    const staleDir = makeTempDir(prefix);
-    const oldTime = new Date(Date.now() - 7 * 60 * 60 * 1000);
-    fs.utimesSync(staleDir, oldTime, oldTime);
-
-    reapStaleEmbeddedPostgresTempDirs(prefix);
+    reapStaleEmbeddedPostgresTempDirs();
 
     expect(fs.existsSync(staleDir)).toBe(false);
   });
 
-  it("does not reap an old dir with a live postmaster.pid", async () => {
-    const staleDir = makeTempDir(prefix);
+  it("does not reap an old Postgres data dir with a live postmaster.pid", async () => {
+    const staleDir = makePostgresDataDir("reaper-test-");
     const child = spawnLiveProcess();
     await new Promise((resolve) => setTimeout(resolve, 50));
     fs.writeFileSync(path.join(staleDir, "postmaster.pid"), `${child.pid}\n`);
-    const oldTime = new Date(Date.now() - 7 * 60 * 60 * 1000);
-    fs.utimesSync(staleDir, oldTime, oldTime);
+    makeStale(staleDir);
 
-    reapStaleEmbeddedPostgresTempDirs(prefix);
+    reapStaleEmbeddedPostgresTempDirs();
 
     expect(fs.existsSync(staleDir)).toBe(true);
   });
 
-  it("does not reap a recent dir even without a live postmaster", () => {
-    const recentDir = makeTempDir(prefix);
+  it("does not reap a recent Postgres data dir even without a live postmaster", () => {
+    const recentDir = makePostgresDataDir("reaper-test-");
 
-    reapStaleEmbeddedPostgresTempDirs(prefix);
+    reapStaleEmbeddedPostgresTempDirs();
 
     expect(fs.existsSync(recentDir)).toBe(true);
   });
 
-  it("ignores entries that do not match the prefix", () => {
-    const unrelatedDir = makeTempDir("some-other-prefix-");
-    const oldTime = new Date(Date.now() - 7 * 60 * 60 * 1000);
-    fs.utimesSync(unrelatedDir, oldTime, oldTime);
+  it("ignores entries that do not carry the shared embedded-postgres marker", () => {
+    const unrelatedDir = makeTempDir("some-unrelated-prefix-");
+    makeStale(unrelatedDir);
 
-    reapStaleEmbeddedPostgresTempDirs(prefix);
+    reapStaleEmbeddedPostgresTempDirs();
 
     expect(fs.existsSync(unrelatedDir)).toBe(true);
+  });
+
+  it("regression (blocker 1): never reaps a marker-prefixed dir that is not an actual Postgres data dir", () => {
+    // A caller's label is just a string it chose — matching the marker prefix is not proof
+    // initdb ever ran there. Seed a dir that looks eligible by name/age/no-postmaster alone,
+    // but carries none of the files initdb always writes, and assert it survives.
+    const collateralDir = makeTempDir(`${EMBEDDED_POSTGRES_TEMP_DIR_MARKER}environment-service-`);
+    fs.writeFileSync(path.join(collateralDir, "unrelated-file.txt"), "not a postgres data dir");
+    makeStale(collateralDir);
+
+    reapStaleEmbeddedPostgresTempDirs();
+
+    expect(fs.existsSync(collateralDir)).toBe(true);
+  });
+
+  it("regression (blocker 2): reaps a stale dir left by a different caller label than the one currently starting up", () => {
+    // Before the fix, the reap sweep was scoped to the exact label the *current* caller
+    // passed in, so a leaked dir from any of the 60+ other distinct labels in this repo
+    // could only ever be reclaimed by a re-run of its own originating test. Any caller's
+    // startup sweep must be able to reclaim any other caller's stale dir.
+    const otherCallersLeak = makePostgresDataDir("environment-runtime-contract-");
+    makeStale(otherCallersLeak);
+
+    // Simulates a *different* label's helper invocation doing its own startup sweep.
+    reapStaleEmbeddedPostgresTempDirs();
+
+    expect(fs.existsSync(otherCallersLeak)).toBe(false);
+  });
+
+  it("regression (blocker 2): a live dir survives even when its label extends another label as a substring prefix", async () => {
+    // "environment-runtime" is a string-prefix of "environment-runtime-contract". Assert that
+    // collision no longer matters: the longer-named dir is judged purely on its own liveness,
+    // never on whether some other, shorter label happens to be a substring of its name.
+    const shortLabelStaleDir = makePostgresDataDir("environment-runtime-");
+    makeStale(shortLabelStaleDir);
+
+    const longLabelLiveDir = makePostgresDataDir("environment-runtime-contract-");
+    const child = spawnLiveProcess();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    fs.writeFileSync(path.join(longLabelLiveDir, "postmaster.pid"), `${child.pid}\n`);
+    makeStale(longLabelLiveDir);
+
+    reapStaleEmbeddedPostgresTempDirs();
+
+    expect(fs.existsSync(shortLabelStaleDir)).toBe(false);
+    expect(fs.existsSync(longLabelLiveDir)).toBe(true);
   });
 });

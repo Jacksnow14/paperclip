@@ -1220,18 +1220,59 @@ export function sanitizeInheritedSecretEnv(
   return env;
 }
 
+// AUR-4046: Paperclip's OWN host-owned infrastructure credentials (server-side
+// Gmail SA, object-storage keys). Unlike ordinary tenant secret_ref vault
+// bindings, no agent child process is entitled to hold these ambiently — the
+// server process reads them directly from its own process.env. A vault
+// binding can still legitimately resolve one of these names into runEnv (e.g.
+// a project- or agent-scoped config.env entry), so this is a narrow,
+// name-based denylist — NOT a blanket runEnv filter — and it is escapable
+// per call via opts.allowRunEnvKeys for a reviewed, intentional exception.
+const RUN_ENV_HOST_CREDENTIAL_DENYLIST = new Set([
+  "GOOGLE_WORKSPACE_SA_KEY",
+  "INTEROP_R2_ACCESS_KEY_ID",
+  "INTEROP_R2_SECRET_ACCESS_KEY",
+]);
+
 // The one supported way to build a child-process env from the host env plus the
-// per-run env. Scrubs identity and secret-shaped vars from the inherited side
-// only; per-run values (which include tenant-scoped vault bindings) always win
-// and are never filtered here.
+// per-run env. Scrubs identity and secret-shaped vars from the inherited side,
+// and separately default-denies the small set of host-owned credential names
+// above from the per-run side (opt-in only, see RUN_ENV_HOST_CREDENTIAL_DENYLIST).
+// All other per-run values (tenant-scoped vault bindings) always win and are
+// never filtered here.
 export function buildChildProcessEnv(
   baseEnv: NodeJS.ProcessEnv,
   runEnv: Record<string, string | undefined>,
-  opts: { runId?: string; mode?: InheritedSecretEnvScrubMode; log?: (message: string) => void } = {},
+  opts: {
+    runId?: string;
+    mode?: InheritedSecretEnvScrubMode;
+    log?: (message: string) => void;
+    allowRunEnvKeys?: Iterable<string>;
+  } = {},
 ): NodeJS.ProcessEnv {
+  const mode = opts.mode ?? resolveInheritedSecretEnvScrubMode();
+  const allowed = new Set(opts.allowRunEnvKeys ?? []);
+  const scrubbedRunEnv: Record<string, string | undefined> = {};
+  const blocked: string[] = [];
+  for (const [key, value] of Object.entries(runEnv)) {
+    if (RUN_ENV_HOST_CREDENTIAL_DENYLIST.has(key) && !allowed.has(key)) {
+      blocked.push(key);
+      if (mode === "enforce") continue;
+    }
+    scrubbedRunEnv[key] = value;
+  }
+  if (blocked.length > 0) {
+    const log = opts.log ?? ((message: string) => console.info(message));
+    const runSuffix = opts.runId ? ` run=${opts.runId}` : "";
+    log(
+      `[paperclip] env-scrub mode=${mode}${runSuffix} ${
+        mode === "enforce" ? "blocked" : "would block"
+      } host-credential keys from runEnv (not opted in): ${blocked.sort().join(", ")}`,
+    );
+  }
   return {
     ...sanitizeInheritedSecretEnv(sanitizeInheritedPaperclipEnv(baseEnv), opts),
-    ...runEnv,
+    ...scrubbedRunEnv,
   };
 }
 

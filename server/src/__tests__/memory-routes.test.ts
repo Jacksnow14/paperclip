@@ -893,6 +893,39 @@ describe("memory routes", () => {
       );
     });
 
+    it("allows an agent to revoke its own routing_rationale record (AUR-3990)", async () => {
+      mockMemoryService.getRecord.mockResolvedValue(makeRoutingRecord({ metadata: { category: "routing_rationale" } }));
+      mockMemoryService.revoke.mockResolvedValue(revokeResult);
+      const app = createApp({ type: "agent", agentId, companyId: companyA });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/records/${recordId}/revoke-own`)
+        .send({ reason: "AUR-3990 dedup of stale routing/* record" });
+
+      expect(res.status).toBe(200);
+      expect(res.body.revokedRecordIds).toEqual([recordId]);
+      expect(mockMemoryService.revoke).toHaveBeenCalledWith(
+        companyA,
+        { selector: { recordIds: [recordId] }, reason: "AUR-3990 dedup of stale routing/* record" },
+        expect.objectContaining({ actorType: "agent", agentId }),
+      );
+    });
+
+    it("returns 403 when agent tries to revoke another agent's routing_rationale record (AUR-3990)", async () => {
+      mockMemoryService.getRecord.mockResolvedValue(
+        makeRoutingRecord({ metadata: { category: "routing_rationale" }, owner: { type: "agent", id: otherAgent } }),
+      );
+      const app = createApp({ type: "agent", agentId, companyId: companyA });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/records/${recordId}/revoke-own`)
+        .send({ reason: "Testing non-owner routing_rationale revoke" });
+
+      expect(res.status).toBe(403);
+      expect(res.body).toEqual({ error: "Agent can only revoke memory records it owns" });
+      expect(mockMemoryService.revoke).not.toHaveBeenCalled();
+    });
+
     it("returns 403 when a board user tries to use the revoke-own endpoint", async () => {
       mockMemoryService.getRecord.mockResolvedValue(makeRoutingRecord());
       const app = createApp({
@@ -1004,6 +1037,108 @@ describe("memory routes", () => {
       expect(res.status).toBe(201);
       expect(res.body.warnings).toBeInstanceOf(Array);
       expect(res.body.warnings.some((w: string) => w.includes("project-scoped"))).toBe(true);
+    });
+  });
+
+  // ── Part D: Router-read category scope guard (AUR-3925) ────────────────────
+
+  describe("POST /companies/:companyId/memory/capture — router-read scope guard", () => {
+    const projectId = "88888888-8888-4888-8888-888888888888";
+    const baseBody = {
+      source: { kind: "issue", issueId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" },
+      content: "Test capture content",
+    };
+
+    it.each(["routing_rationale", "performance_scorecard", "scorecard_adjusted"])(
+      "rejects a project-scoped capture (scope.projectId) for category '%s' before calling memory.capture",
+      async (category) => {
+        const app = createApp({
+          type: "agent",
+          agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          companyId: companyA,
+        });
+
+        const res = await request(app)
+          .post(`/api/companies/${companyA}/memory/capture`)
+          .set("Origin", "http://localhost:3100")
+          .send({ ...baseBody, metadata: { category }, scope: { projectId } });
+
+        expect(res.status).toBe(422);
+        expect(res.body.error).toMatch(new RegExp(category));
+        expect(res.body.error).toMatch(/metadata\.project_id/);
+        expect(mockMemoryService.capture).not.toHaveBeenCalled();
+      },
+    );
+
+    it("rejects a project-scoped capture via top-level scopeType/scopeId for a router-read category", async () => {
+      const app = createApp({
+        type: "agent",
+        agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        companyId: companyA,
+      });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({
+          ...baseBody,
+          metadata: { category: "performance_scorecard" },
+          scopeType: "project",
+          scopeId: projectId,
+        });
+
+      expect(res.status).toBe(422);
+      expect(mockMemoryService.capture).not.toHaveBeenCalled();
+    });
+
+    it("allows an org-wide (unscoped) capture for a router-read category", async () => {
+      mockMemoryService.capture.mockResolvedValue({
+        operation: { id: "op-4", bindingId: bindingId, source: { kind: "issue" } },
+        records: [{
+          id: "11100000-0000-4000-8000-000000000000",
+          reviewState: "accepted",
+          scopeType: "org",
+          scope: {},
+        }],
+      });
+      const app = createApp({
+        type: "agent",
+        agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        companyId: companyA,
+      });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...baseBody, metadata: { category: "performance_scorecard", project_id: projectId } });
+
+      expect(res.status).toBe(201);
+      expect(mockMemoryService.capture).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not reject a project-scoped capture for a non-router-read category", async () => {
+      mockMemoryService.capture.mockResolvedValue({
+        operation: { id: "op-5", bindingId: bindingId, source: { kind: "issue" } },
+        records: [{
+          id: "22200000-0000-4000-8000-000000000000",
+          reviewState: "accepted",
+          scopeType: "project",
+          scope: { projectId },
+        }],
+      });
+      const app = createApp({
+        type: "agent",
+        agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        companyId: companyA,
+      });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...baseBody, metadata: { category: "retrospective" }, scope: { projectId } });
+
+      expect(res.status).toBe(201);
+      expect(mockMemoryService.capture).toHaveBeenCalledTimes(1);
     });
   });
 

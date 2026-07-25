@@ -8,7 +8,8 @@
  * Agent self-service revoke (POST /memory/records/:id/revoke-own):
  *   Agents may revoke their own records when the record's metadata.category is in
  *   AGENT_MUTABLE_CATEGORIES (experiment, experiment_conclusion, hypothesis, observation,
- *   performance_scorecard, scorecard_adjusted, tool_gap, routing, synthesis, lesson).
+ *   performance_scorecard, scorecard_adjusted, tool_gap, routing, routing_rationale, synthesis,
+ *   lesson).
  *   Returns 403 for non-owner or off-allowlist categories.
  *   `synthesis` is agent-mutable (AUR-3072) so SGI loops that author synthesis records
  *   (Loop E nightly, Loop H quarterly) can PATCH-upsert / revoke-own their own duplicates.
@@ -48,6 +49,46 @@ import { forbidden, notFound, unprocessable } from "../errors.js";
 import { agentService, issueService, logActivity, memoryService, projectService } from "../services/index.js";
 import { isUuidLike, normalizeIssueIdentifier } from "@paperclipai/shared";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
+
+/**
+ * Categories consumed by org-wide `titlePrefix` sweeps (routing-rationale
+ * watchdog, performance/scorecard-adjusted routing queries — see AGENTS.md
+ * "Before Closing Any Issue"). A record in one of these categories captured
+ * with a project scope is invisible to those sweeps, which never pass
+ * `?projectId=`, so the record silently fails to satisfy its consumer
+ * (AUR-3849 for routing_rationale; generalized to all three by AUR-3925,
+ * which found 241 pre-existing violations). Project affiliation belongs in
+ * `metadata.project_id` instead — a plain field the org-wide query still
+ * returns.
+ */
+export const ROUTER_READ_ONLY_ORG_SCOPE_CATEGORIES = new Set([
+  "routing_rationale",
+  "performance_scorecard",
+  "scorecard_adjusted",
+]);
+
+/**
+ * Returns a rejection message if `payload` would capture a router-read
+ * category record with a project scope, or null if the capture is fine.
+ * Checked against both the nested `scope.projectId` shorthand and the
+ * top-level `scopeType`/`scopeId` pair the capture schema also accepts.
+ */
+export function checkRouterReadScopeViolation(payload: {
+  metadata?: Record<string, unknown>;
+  scope?: { projectId?: string | null };
+  scopeType?: string | null;
+}): string | null {
+  const category = payload.metadata?.category;
+  if (typeof category !== "string" || !ROUTER_READ_ONLY_ORG_SCOPE_CATEGORIES.has(category)) return null;
+  const isProjectScoped = Boolean(payload.scope?.projectId) || payload.scopeType === "project";
+  if (!isProjectScoped) return null;
+  return (
+    `metadata.category '${category}' is a router-read class queried org-wide by titlePrefix sweeps ` +
+    "(routing-rationale watchdog, performance/scorecard-adjusted routing queries) that never pass " +
+    "?projectId=, so a project-scoped record is invisible to them (AUR-3849, AUR-3925). " +
+    "Omit scope.projectId / scopeType and put the project id in metadata.project_id instead."
+  );
+}
 
 function actorInfoFromReq(req: any) {
   if (req.actor.type === "agent") {
@@ -260,6 +301,10 @@ export function memoryRoutes(
     if (req.actor.type === "agent" && payload.scope?.agentId && payload.scope.agentId !== req.actor.agentId) {
       throw forbidden("Agent cannot capture memory for another agent scope");
     }
+    const routerReadScopeViolation = checkRouterReadScopeViolation(payload);
+    if (routerReadScopeViolation) {
+      throw unprocessable(routerReadScopeViolation);
+    }
     if (payload.source?.issueId) {
       const resolvedId = await resolveSourceIssueId(companyId, payload.source.issueId);
       if (!resolvedId) {
@@ -356,7 +401,10 @@ export function memoryRoutes(
   });
 
   // Categories that agents are permitted to update (PATCH) or revoke-own on their own records.
-  // "routing" is included so agents can deduplicate stale routing/* records via revoke-own.
+  // "routing_rationale" is included so agents can deduplicate stale routing/* records via
+  // revoke-own — every routing/* record is captured with metadata.category = "routing_rationale"
+  // (see AUTO_ACCEPT_CATEGORIES in services/memory.ts and backfill-router-read-scope.mjs). The
+  // plain "routing" entry is kept for back-compat in case any legacy record used that string.
   const AGENT_MUTABLE_CATEGORIES = new Set([
     "experiment",
     "experiment_conclusion",
@@ -366,6 +414,7 @@ export function memoryRoutes(
     "scorecard_adjusted",
     "tool_gap",
     "routing",
+    "routing_rationale",
     // synthesis: agent-authored + auto-accepted; owning SGI loops must be able to
     // PATCH-upsert / revoke-own their own duplicate synthesis records (AUR-3072).
     "synthesis",

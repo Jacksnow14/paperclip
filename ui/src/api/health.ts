@@ -15,6 +15,12 @@ export type DevServerHealthStatus = {
 export type HealthStatus = {
   status: "ok";
   version?: string;
+  build?: {
+    source: "release" | "untracked";
+    sha: string | null;
+    ref: string | null;
+    builtAt: string | null;
+  };
   deploymentMode?: "local_trusted" | "authenticated";
   deploymentExposure?: "private" | "public";
   authReady?: boolean;

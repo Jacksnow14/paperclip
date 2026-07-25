@@ -730,6 +730,13 @@ function mapExtractionJob(row: ExtractionJobRow): MemoryExtractionJob {
   };
 }
 
+function isUniqueViolation(error: unknown, constraintName: string): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const err = error as { code?: string; constraint?: string; constraint_name?: string };
+  const constraint = err.constraint ?? err.constraint_name;
+  return err.code === "23505" && constraint === constraintName;
+}
+
 function buildRecordVisibilityConditions(
   companyId: string,
   bindingId: string,
@@ -1041,13 +1048,35 @@ export function memoryService(
       metadata?: Record<string, unknown>;
       reviewState?: MemoryRecord["reviewState"];
       upsert?: boolean;
+      idempotencyKey?: string | null;
     },
     operationId: string | null,
-  ): Promise<{ records: MemoryRecord[]; dedup: boolean }> {
+  ): Promise<{ records: MemoryRecord[]; dedup: boolean; dedupKind?: "idempotency_key" | "upsert" | "tool_gap_window" }> {
     const scopeType = input.scopeType ?? normalizeScopeType(scope);
     const scopeId = input.scopeId ?? normalizeScopeId(binding.companyId, scopeType, scope);
     const createdBy = actorPrincipal(input.actor);
     const owner = normalizePrincipal(input.owner, createdBy);
+
+    // Idempotency-key dedup (AUR-4022): an explicit, caller-chosen exactly-once guard.
+    // A second capture with the same companyId + idempotencyKey returns the first record
+    // instead of creating a duplicate — this is for accidental double-submits (identical
+    // request retried), NOT a substitute for `upsert`-by-title, which intentionally keeps
+    // one bucket per title across many distinct captures.
+    if (input.idempotencyKey) {
+      const existing = await db
+        .select()
+        .from(memoryLocalRecords)
+        .where(
+          and(
+            eq(memoryLocalRecords.companyId, binding.companyId),
+            eq(memoryLocalRecords.idempotencyKey, input.idempotencyKey),
+          ),
+        )
+        .limit(1);
+      if (existing.length > 0) {
+        return { records: [mapRecord(existing[0])], dedup: true, dedupKind: "idempotency_key" };
+      }
+    }
 
     // Upsert-by-title: when caller requests upsert and provides a title, find the latest
     // non-revoked, non-deleted record with the same title and owner and update it in-place.
@@ -1084,7 +1113,7 @@ export function memoryService(
           })
           .where(eq(memoryLocalRecords.id, existing[0].id))
           .returning();
-        return { records: [mapRecord(updated)], dedup: true };
+        return { records: [mapRecord(updated)], dedup: true, dedupKind: "upsert" };
       }
     }
 
@@ -1108,11 +1137,13 @@ export function memoryService(
         )
         .limit(1);
       if (existing.length > 0) {
-        return { records: [mapRecord(existing[0])], dedup: true };
+        return { records: [mapRecord(existing[0])], dedup: true, dedupKind: "tool_gap_window" };
       }
     }
 
-    const [row] = await db
+    let row: RecordRow;
+    try {
+      [row] = await db
       .insert(memoryLocalRecords)
       .values({
         id: randomUUID(),
@@ -1150,8 +1181,33 @@ export function memoryService(
         reviewState: input.reviewState ?? resolveReviewState(input.metadata),
         citationJson: normalizeCitation(input.citation),
         createdByOperationId: operationId,
+        idempotencyKey: input.idempotencyKey ?? null,
       })
       .returning();
+    } catch (err) {
+      // Race: two concurrent captures with the same idempotencyKey both pass the
+      // pre-check above and hit the partial unique index on (companyId, idempotencyKey).
+      // Treat the loser as a dedup replay instead of surfacing a 500.
+      if (
+        input.idempotencyKey &&
+        isUniqueViolation(err, "memory_local_records_company_idempotency_uq")
+      ) {
+        const existing = await db
+          .select()
+          .from(memoryLocalRecords)
+          .where(
+            and(
+              eq(memoryLocalRecords.companyId, binding.companyId),
+              eq(memoryLocalRecords.idempotencyKey, input.idempotencyKey),
+            ),
+          )
+          .limit(1);
+        if (existing.length > 0) {
+          return { records: [mapRecord(existing[0])], dedup: true, dedupKind: "idempotency_key" };
+        }
+      }
+      throw err;
+    }
 
     return { records: [mapRecord(row)], dedup: false };
   }
@@ -2456,6 +2512,7 @@ export function memoryService(
       let usage: MemoryUsage[] = [];
       let providerResultJson: Record<string, unknown> | null = null;
       let isDedup = false;
+      let dedupKind: "idempotency_key" | "upsert" | "tool_gap_window" | undefined;
 
       if (binding.providerKey === LOCAL_BASIC_PROVIDER_KEY) {
         const captureResult = await captureLocalBasic(
@@ -2477,11 +2534,13 @@ export function memoryService(
             metadata: data.metadata ?? {},
             reviewState: data.reviewState,
             upsert: data.upsert ?? false,
+            idempotencyKey: data.idempotencyKey ?? null,
           },
           null,
         );
         records = captureResult.records;
         isDedup = captureResult.dedup;
+        dedupKind = captureResult.dedupKind;
       } else {
         if (!pluginMemoryProviders) {
           throw unprocessable(`Unknown memory provider: ${binding.providerKey}`);
@@ -2514,7 +2573,7 @@ export function memoryService(
         companyId,
         binding,
         actor,
-        operationType: data.title || data.summary ? "upsert" : "capture",
+        operationType: dedupKind === "upsert" ? "upsert" : "capture",
         triggerKind,
         hookKind,
         scope: data.scope ?? {},
@@ -2537,7 +2596,7 @@ export function memoryService(
         resultJson: {
           recordIds: records.map((record) => record.id),
           providerResult: providerResultJson,
-          ...(isDedup && { dedup: true }),
+          ...(isDedup && { dedup: true, dedupKind }),
         },
         recordCount: records.length,
         usage,
@@ -2545,7 +2604,7 @@ export function memoryService(
       if (!isDedup) {
         records = await attachCreatedByOperation(companyId, records, operation.id);
       }
-      return { operation, records } satisfies MemoryCaptureResult;
+      return { operation, records, dedup: isDedup } satisfies MemoryCaptureResult;
     },
 
     forget: async (companyId: string, data: MemoryForget, actor: ActorInfo, triggerKind: MemoryOperation["triggerKind"] = "manual") => {

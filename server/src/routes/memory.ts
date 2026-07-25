@@ -535,7 +535,15 @@ export function memoryRoutes(
         const category = typeof record.metadata?.category === "string" ? record.metadata.category : null;
         if (!category || !AGENT_MUTABLE_CATEGORIES.has(category)) {
           throw forbidden(
-            `Agent cannot update records with category '${category ?? "(none)"}'. Allowed: ${[...AGENT_MUTABLE_CATEGORIES].join(", ")}`,
+            `Category '${category ?? "(none)"}' is immutable — agents cannot PATCH records in this category. ` +
+              `Supported alternative: capture a new record via POST /memory/capture instead of editing this one. ` +
+              `Agent-mutable categories: ${[...AGENT_MUTABLE_CATEGORIES].join(", ")}.`,
+            {
+              category: category ?? null,
+              immutable: true,
+              supportedAlternative: "capture_new_record",
+              agentMutableCategories: [...AGENT_MUTABLE_CATEGORIES],
+            },
           );
         }
       } else {
@@ -584,7 +592,16 @@ export function memoryRoutes(
       const category = typeof record.metadata?.category === "string" ? record.metadata.category : null;
       if (!category || !AGENT_MUTABLE_CATEGORIES.has(category)) {
         throw forbidden(
-          `Agent cannot revoke records with category '${category ?? "(none)"}'. Allowed: ${[...AGENT_MUTABLE_CATEGORIES].join(", ")}`,
+          `Category '${category ?? "(none)"}' is immutable — agents cannot revoke records in this category. ` +
+            `Supported alternative: capture a new record via POST /memory/capture instead; ask a board user to ` +
+            `use POST /memory/revoke if this record must be removed. ` +
+            `Agent-mutable categories: ${[...AGENT_MUTABLE_CATEGORIES].join(", ")}.`,
+          {
+            category: category ?? null,
+            immutable: true,
+            supportedAlternative: "capture_new_record",
+            agentMutableCategories: [...AGENT_MUTABLE_CATEGORIES],
+          },
         );
       }
 

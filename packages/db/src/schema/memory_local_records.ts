@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { pgTable, uuid, text, timestamp, jsonb, index } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, jsonb, index, uniqueIndex } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 import { projects } from "./projects.js";
@@ -65,10 +65,14 @@ export const memoryLocalRecords = pgTable(
     revocationReason: text("revocation_reason"),
     createdByOperationId: uuid("created_by_operation_id").references(() => memoryOperations.id, { onDelete: "set null" }),
     deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    idempotencyKey: text("idempotency_key"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    companyIdempotencyKeyUq: uniqueIndex("memory_local_records_company_idempotency_uq")
+      .on(table.companyId, table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} IS NOT NULL`),
     companyBindingCreatedIdx: index("memory_local_records_company_binding_created_idx").on(
       table.companyId,
       table.bindingId,

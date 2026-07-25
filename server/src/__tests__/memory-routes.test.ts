@@ -551,7 +551,7 @@ describe("memory routes", () => {
       expect(mockMemoryService.agentUpdate).not.toHaveBeenCalled();
     });
 
-    it("blocks an agent from updating a record with a non-allowlisted category", async () => {
+    it("blocks an agent from updating a record with a non-allowlisted category with an actionable 403 (AUR-4022)", async () => {
       mockMemoryService.getRecord.mockResolvedValue(makeRecord({ metadata: { category: "misc" } }));
       const app = createApp({ type: "agent", agentId, companyId: companyA });
 
@@ -560,7 +560,17 @@ describe("memory routes", () => {
         .send({ metadata: { status: "approved" } });
 
       expect(res.status).toBe(403);
+      // Names the category and states it's immutable, not a bare 403 (AUR-3938 regression:
+      // a silent-403 PATCH was mistaken for success and left a stale runbook live for ~6h).
       expect(res.body.error).toMatch(/misc/);
+      expect(res.body.error).toMatch(/immutable/i);
+      expect(res.body.error).toMatch(/capture a new record/i);
+      expect(res.body.details).toMatchObject({
+        category: "misc",
+        immutable: true,
+        supportedAlternative: "capture_new_record",
+      });
+      expect(res.body.details.agentMutableCategories).toEqual(expect.arrayContaining(["lesson", "experiment"]));
       expect(mockMemoryService.agentUpdate).not.toHaveBeenCalled();
     });
 
@@ -850,7 +860,7 @@ describe("memory routes", () => {
       expect(mockMemoryService.revoke).not.toHaveBeenCalled();
     });
 
-    it("returns 403 when agent tries to revoke its own record with off-allowlist category", async () => {
+    it("returns an actionable 403 when agent tries to revoke its own record with off-allowlist category (AUR-4022)", async () => {
       mockMemoryService.getRecord.mockResolvedValue(makeRoutingRecord({ metadata: { category: "misc" } }));
       const app = createApp({ type: "agent", agentId, companyId: companyA });
 
@@ -860,6 +870,13 @@ describe("memory routes", () => {
 
       expect(res.status).toBe(403);
       expect(res.body.error).toMatch(/misc/);
+      expect(res.body.error).toMatch(/immutable/i);
+      expect(res.body.error).toMatch(/capture a new record/i);
+      expect(res.body.details).toMatchObject({
+        category: "misc",
+        immutable: true,
+        supportedAlternative: "capture_new_record",
+      });
       expect(mockMemoryService.revoke).not.toHaveBeenCalled();
     });
 

@@ -547,7 +547,7 @@ describe("memory routes", () => {
     });
 
     it("blocks an agent from updating a record with a non-allowlisted category", async () => {
-      mockMemoryService.getRecord.mockResolvedValue(makeRecord({ metadata: { category: "lesson" } }));
+      mockMemoryService.getRecord.mockResolvedValue(makeRecord({ metadata: { category: "misc" } }));
       const app = createApp({ type: "agent", agentId, companyId: companyA });
 
       const res = await request(app)
@@ -555,7 +555,42 @@ describe("memory routes", () => {
         .send({ metadata: { status: "approved" } });
 
       expect(res.status).toBe(403);
-      expect(res.body.error).toMatch(/lesson/);
+      expect(res.body.error).toMatch(/misc/);
+      expect(mockMemoryService.agentUpdate).not.toHaveBeenCalled();
+    });
+
+    it("allows an owner agent to update its own lesson record (AUR-3865)", async () => {
+      mockMemoryService.getRecord.mockResolvedValue(makeRecord({ metadata: { category: "lesson" } }));
+      mockMemoryService.agentUpdate.mockResolvedValue({
+        operation: { id: "op-update-lesson-1" },
+        record: makeRecord({ metadata: { category: "lesson", content: "corrected" } }),
+      });
+      const app = createApp({ type: "agent", agentId, companyId: companyA });
+
+      const res = await request(app)
+        .patch(`/api/companies/${companyA}/memory/records/${recordId}`)
+        .send({ content: "corrected lesson text" });
+
+      expect(res.status).toBe(200);
+      expect(mockMemoryService.agentUpdate).toHaveBeenCalledWith(
+        companyA,
+        recordId,
+        { content: "corrected lesson text" },
+        expect.objectContaining({ actorType: "agent", agentId }),
+      );
+    });
+
+    it("blocks a non-owner agent from updating another agent's lesson record", async () => {
+      const otherAgent = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      mockMemoryService.getRecord.mockResolvedValue(makeRecord({ metadata: { category: "lesson" } }));
+      const app = createApp({ type: "agent", agentId: otherAgent, companyId: companyA });
+
+      const res = await request(app)
+        .patch(`/api/companies/${companyA}/memory/records/${recordId}`)
+        .send({ content: "attempted correction" });
+
+      expect(res.status).toBe(403);
+      expect(res.body).toEqual({ error: "Agent can only update memory records it owns" });
       expect(mockMemoryService.agentUpdate).not.toHaveBeenCalled();
     });
 
@@ -795,7 +830,7 @@ describe("memory routes", () => {
     });
 
     it("returns 403 when agent tries to revoke its own record with off-allowlist category", async () => {
-      mockMemoryService.getRecord.mockResolvedValue(makeRoutingRecord({ metadata: { category: "lesson" } }));
+      mockMemoryService.getRecord.mockResolvedValue(makeRoutingRecord({ metadata: { category: "misc" } }));
       const app = createApp({ type: "agent", agentId, companyId: companyA });
 
       const res = await request(app)
@@ -803,7 +838,40 @@ describe("memory routes", () => {
         .send({ reason: "Testing off-allowlist revoke" });
 
       expect(res.status).toBe(403);
-      expect(res.body.error).toMatch(/lesson/);
+      expect(res.body.error).toMatch(/misc/);
+      expect(mockMemoryService.revoke).not.toHaveBeenCalled();
+    });
+
+    it("allows an agent to revoke its own lesson record (AUR-3865)", async () => {
+      mockMemoryService.getRecord.mockResolvedValue(makeRoutingRecord({ metadata: { category: "lesson" } }));
+      mockMemoryService.revoke.mockResolvedValue(revokeResult);
+      const app = createApp({ type: "agent", agentId, companyId: companyA });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/records/${recordId}/revoke-own`)
+        .send({ reason: "AUR-3865 retracting wrong lesson" });
+
+      expect(res.status).toBe(200);
+      expect(res.body.revokedRecordIds).toEqual([recordId]);
+      expect(mockMemoryService.revoke).toHaveBeenCalledWith(
+        companyA,
+        { selector: { recordIds: [recordId] }, reason: "AUR-3865 retracting wrong lesson" },
+        expect.objectContaining({ actorType: "agent", agentId }),
+      );
+    });
+
+    it("returns 403 when agent tries to revoke another agent's lesson record", async () => {
+      mockMemoryService.getRecord.mockResolvedValue(
+        makeRoutingRecord({ metadata: { category: "lesson" }, owner: { type: "agent", id: otherAgent } }),
+      );
+      const app = createApp({ type: "agent", agentId, companyId: companyA });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/records/${recordId}/revoke-own`)
+        .send({ reason: "Testing non-owner lesson revoke" });
+
+      expect(res.status).toBe(403);
+      expect(res.body).toEqual({ error: "Agent can only revoke memory records it owns" });
       expect(mockMemoryService.revoke).not.toHaveBeenCalled();
     });
 

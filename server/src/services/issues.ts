@@ -1344,7 +1344,13 @@ async function listIssueBlockerAttentionMap(
   const explicitWaitCandidateIds = [...nodesById.values()]
     .filter((node) => node.status !== "done")
     .map((node) => node.id);
-  const explicitWaitingIssueIds = new Set<string>();
+  // Split into two sets rather than one: a pending interaction/approval on a *cancelled*
+  // issue is never going to be answered (AUR-3927/AUR-3928 stale-interaction class) and
+  // must not cover it, but an active recovery/liveness-escalation path is genuinely doing
+  // work against the cancelled blocker right now and must still cover it (CTO review on
+  // PR #112, AUR-3959 — collapsing these into one set broke the liveness-escalation test).
+  const pendingInteractionApprovalIssueIds = new Set<string>();
+  const activeRecoveryWaitIssueIds = new Set<string>();
   if (explicitWaitCandidateIds.length > 0) {
     for (const chunk of chunkList(explicitWaitCandidateIds, ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
       const interactionRows: Array<{ issueId: string }> = await dbOrTx
@@ -1357,7 +1363,7 @@ async function listIssueBlockerAttentionMap(
             inArray(issueThreadInteractions.issueId, chunk),
           ),
         );
-      for (const row of interactionRows) explicitWaitingIssueIds.add(row.issueId);
+      for (const row of interactionRows) pendingInteractionApprovalIssueIds.add(row.issueId);
 
       const approvalRows: Array<{ issueId: string }> = await dbOrTx
         .select({ issueId: issueApprovals.issueId })
@@ -1370,7 +1376,7 @@ async function listIssueBlockerAttentionMap(
             inArray(issueApprovals.issueId, chunk),
           ),
         );
-      for (const row of approvalRows) explicitWaitingIssueIds.add(row.issueId);
+      for (const row of approvalRows) pendingInteractionApprovalIssueIds.add(row.issueId);
     }
 
     // Recovery rows are intentionally company-wide: a liveness escalation for
@@ -1390,9 +1396,9 @@ async function listIssueBlockerAttentionMap(
     for (const row of recoveryRows) {
       const parsed = parseIssueGraphLivenessIncidentKey(row.originId);
       if (!parsed || parsed.companyId !== companyId) continue;
-      explicitWaitingIssueIds.add(row.id);
-      explicitWaitingIssueIds.add(parsed.issueId);
-      explicitWaitingIssueIds.add(parsed.leafIssueId);
+      activeRecoveryWaitIssueIds.add(row.id);
+      activeRecoveryWaitIssueIds.add(parsed.issueId);
+      activeRecoveryWaitIssueIds.add(parsed.leafIssueId);
     }
 
     const recoveryActionRows: Array<{ sourceIssueId: string }> = await dbOrTx
@@ -1405,7 +1411,7 @@ async function listIssueBlockerAttentionMap(
           inArray(issueRecoveryActions.sourceIssueId, explicitWaitCandidateIds),
         ),
       );
-    for (const row of recoveryActionRows) explicitWaitingIssueIds.add(row.sourceIssueId);
+    for (const row of recoveryActionRows) activeRecoveryWaitIssueIds.add(row.sourceIssueId);
   }
 
   const agentRows: IssueBlockerAttentionAgentRow[] = agentIds.size > 0
@@ -1443,7 +1449,13 @@ async function listIssueBlockerAttentionMap(
     if (node.status === "done") {
       return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null, sampleBlockerCancelled: false };
     }
-    if (explicitWaitingIssueIds.has(node.id)) {
+    // An active recovery/liveness-escalation path is real work happening against this
+    // blocker right now, so it covers even a cancelled node. A pending interaction or
+    // approval on a cancelled issue, by contrast, is never going to be answered
+    // (AUR-3927/AUR-3928 stale-interaction class) — exclude cancelled there so it falls
+    // through to the explicit cancelled_blocker branch below (CTO review nit on PR #112,
+    // AUR-3959).
+    if (activeRecoveryWaitIssueIds.has(node.id) || (node.status !== "cancelled" && pendingInteractionApprovalIssueIds.has(node.id))) {
       return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null, sampleBlockerCancelled: false };
     }
     if (node.assigneeUserId && node.status !== "cancelled") {
@@ -1520,12 +1532,14 @@ async function listIssueBlockerAttentionMap(
     const allTopLevelEdges = edgesByIssueId.get(root.id) ?? [];
     const topLevelEdges = allTopLevelEdges.filter((edge) => !isBlockerAttentionEdgeResolved(edge, nodesById));
     if (topLevelEdges.length === 0) {
-      // A root with recorded edges that all resolved (done, or a cancelled child) has
-      // nothing left to flag. A root with no recorded edges at all is the pre-existing
-      // anomalous case (status "blocked" with no known blocker) and still needs attention.
-      attentionMap.set(root.id, allTopLevelEdges.length > 0
-        ? createIssueBlockerAttention()
-        : createIssueBlockerAttention({ state: "needs_attention", reason: "attention_required" }));
+      // A "blocked" root with no live blocker edge needs attention regardless of how it
+      // got there: no recorded blocker at all (the pre-existing anomalous case), all
+      // blockers went "done", or all blockers were "cancelled". Done blockers never reach
+      // this graph (both frontier queries exclude "done" status), so we cannot distinguish
+      // "had a done blocker" from "never had one" without spending the node budget on
+      // resolved rows — and we must not treat cancelled as more resolving than done
+      // (CTO review on PR #112, AUR-3959): same operator signal either way, one state.
+      attentionMap.set(root.id, createIssueBlockerAttention({ state: "needs_attention", reason: "attention_required" }));
       continue;
     }
 

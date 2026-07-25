@@ -58,7 +58,7 @@ export function healthRoutes(
       res.json(
         exposeFullDetails
           ? { status: "ok", version: serverVersion, build: readBuildInfo() }
-          : { status: "ok", deploymentMode: opts.deploymentMode },
+          : { status: "ok", deploymentMode: opts.deploymentMode, build: readBuildInfo() },
       );
       return;
     }
@@ -124,6 +124,11 @@ export function healthRoutes(
       res.json({
         status: "ok",
         deploymentMode: opts.deploymentMode,
+        // Deliberately included in the limited response: unauthenticated deploy
+        // monitors (AUR-3924 sampler, AUR-3937 drift check) must be able to ask
+        // what production is running. The SHA of a GitHub-hosted commit is not
+        // sensitive; five days of silent staleness was (AUR-3937).
+        build: readBuildInfo(),
         bootstrapStatus,
         bootstrapInviteActive,
         ...(devServer ? { devServer } : {}),

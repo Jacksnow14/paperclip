@@ -836,6 +836,7 @@ const PRODUCTIVITY_REVIEW_TRIGGERS: readonly IssueProductivityReviewTrigger[] = 
   "no_comment_streak",
   "long_active_duration",
   "high_churn",
+  "stalled_active_episode",
 ];
 const BLOCKER_ATTENTION_OPEN_RECOVERY_TERMINAL_STATUSES = ["done", "cancelled"];
 // Statuses that resolve a *child* blocker-attention edge outright (see

@@ -240,7 +240,8 @@ export interface IssueBlockedInboxAttention {
 export type IssueProductivityReviewTrigger =
   | "no_comment_streak"
   | "long_active_duration"
-  | "high_churn";
+  | "high_churn"
+  | "stalled_active_episode";
 
 export interface IssueProductivityReview {
   reviewIssueId: string;

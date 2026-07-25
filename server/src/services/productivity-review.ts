@@ -91,7 +91,11 @@ function infraKilledRunSqlPredicate() {
 type IssueRow = typeof issues.$inferSelect;
 type AgentRow = typeof agents.$inferSelect;
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
-type ProductivityReviewTrigger = "no_comment_streak" | "long_active_duration" | "high_churn";
+type ProductivityReviewTrigger =
+  | "no_comment_streak"
+  | "long_active_duration"
+  | "high_churn"
+  | "stalled_active_episode";
 
 type ProductivityReviewThresholds = {
   noCommentStreakRuns: number;
@@ -127,6 +131,7 @@ type ProductivityReviewEvidence = {
   commentCountLastHour: number;
   commentCountLastSixHours: number;
   elapsedMs: number | null;
+  zeroRecentActivity: boolean;
   latestRuns: HeartbeatRunRow[];
   latestComments: Array<typeof issueComments.$inferSelect>;
   costCents: number;
@@ -260,8 +265,21 @@ function choosePrimaryTrigger(input: {
   noComment: boolean;
   longActive: boolean;
   highChurn: boolean;
+  stalled: boolean;
 }): ProductivityReviewTrigger | null {
   if (input.noComment) return "no_comment_streak";
+  // AUR-4014: a long-running episode with zero runs, zero assignee comments, and zero active
+  // runs in the last hour is a stall (the issue went dark), not churn -- report it as its own
+  // trigger with wake/block remedies instead of the churn-shaped menu. Only fires when the
+  // episode is also long-lived; a short silent gap is just "between heartbeats" (see the
+  // zeroRecentActivity guard in collectEvidence, which requires longActive as well).
+  //
+  // Checked BEFORE highChurn: highChurn's 6h window can still be true from a burst that happened
+  // 2-6h ago even though the last hour (zeroRecentActivity) is completely dark. Checking highChurn
+  // first would reclassify a currently-dark issue as churn whenever it happened to churn earlier
+  // in its own 6h window -- reproducing the exact "dark issue gets a churn-shaped menu" failure
+  // (AUR-3924) this trigger exists to prevent, just via the 6h path instead of elapsedMs alone.
+  if (input.stalled) return "stalled_active_episode";
   if (input.highChurn) return "high_churn";
   if (input.longActive) return "long_active_duration";
   return null;
@@ -274,6 +292,7 @@ function isSoftStopTrigger(trigger: ProductivityReviewTrigger) {
 function formatTrigger(trigger: ProductivityReviewTrigger) {
   if (trigger === "no_comment_streak") return "No-comment streak";
   if (trigger === "high_churn") return "High churn";
+  if (trigger === "stalled_active_episode") return "Stalled active episode";
   return "Long active duration";
 }
 
@@ -571,18 +590,39 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
     const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
+    // AUR-4014: episode age and activity rate are orthogonal. A long-active episode with zero
+    // runs, zero assignee comments, and zero active runs in the last hour is a stall (the issue
+    // went dark) -- a completely different failure from a long episode that is still producing
+    // runs/comments below the churn threshold. See "stalled" below and choosePrimaryTrigger().
+    const zeroRecentActivity =
+      runCountLastHour === 0 && assigneeRunCommentCountLastHour === 0 && activeRunCount === 0;
+    const stalled = longActive && zeroRecentActivity;
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
       runCountLastSixHours >= thresholds.highChurnSixHours ||
       assigneeRunCommentCountLastSixHours >= thresholds.highChurnSixHours;
-    const trigger = choosePrimaryTrigger({ noComment, longActive, highChurn });
+    const trigger = choosePrimaryTrigger({ noComment, longActive, highChurn, stalled });
     if (!trigger) return null;
 
     const triggerReasons: string[] = [];
     if (noComment) triggerReasons.push(`${noCommentStreak} consecutive completed issue-linked runs had no run-created issue comment (${infraKilledTerminalRuns.length} infra-killed runs in the sampled window were excluded from this streak)`);
-    if (longActive) triggerReasons.push(`current active episode has lasted ${msToHuman(elapsedMs)}`);
-    if (highChurn) {
+    if (trigger === "stalled_active_episode") {
+      // Gated on the resolved `trigger`, not the raw `stalled` boolean: if a different trigger
+      // (e.g. no_comment_streak) won precedence while `stalled` also happens to be true, we must
+      // not assert "this is a dark issue, not churn" next to that trigger's own (non-stall) remedy
+      // menu -- see choosePrimaryTrigger for the precedence rationale.
+      triggerReasons.push(
+        `stalled active episode: ${msToHuman(elapsedMs)} elapsed with zero runs, zero assignee comments, and zero active runs in the last hour -- this is a dark issue, not churn`,
+      );
+    } else if (longActive) {
+      triggerReasons.push(`current active episode has lasted ${msToHuman(elapsedMs)}`);
+    }
+    if (trigger === "high_churn") {
+      // Gated on the resolved `trigger`, same reasoning as the stalled/longActive block above: a
+      // stale 6h churn burst can leave `highChurn` true even when `stalled` won precedence (the
+      // last hour is dark), and listing churn stats as a "reason" next to a stall-shaped review
+      // would contradict the "this is a dark issue, not churn" text above.
       triggerReasons.push(
         `${runCountLastHour} runs/${assigneeRunCommentCountLastHour} assignee-run comments in 1h; ${runCountLastSixHours} runs/${assigneeRunCommentCountLastSixHours} assignee-run comments in 6h (infra-killed runs already excluded from these counts)`,
       );
@@ -611,6 +651,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       commentCountLastHour: assigneeRunCommentCountLastHour,
       commentCountLastSixHours: assigneeRunCommentCountLastSixHours,
       elapsedMs,
+      zeroRecentActivity,
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
       costCents: costRow.costCents,
@@ -658,6 +699,25 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     return null;
   }
 
+  // AUR-4014: the churn-shaped menu ("snooze", "decompose", "the work is inefficient") is wrong
+  // guidance for a stall -- nothing is churning, the issue just went dark. Give the manager
+  // remedies that actually apply to each trigger instead of one generic list for all three.
+  function buildManagerDecisionMenu(trigger: ProductivityReviewTrigger): string[] {
+    if (trigger === "stalled_active_episode") {
+      return [
+        "- Wake the assignee agent to resume work, or reassign to a live agent if it cannot resume.",
+        "- If a wake/monitor check is already scheduled, confirm it and let it run rather than duplicating it.",
+        "- Set status to `blocked` with a named unblock owner if something external is blocking progress.",
+        "- Close the issue if the work is actually complete and just needs its status updated.",
+      ];
+    }
+    return [
+      "- Close as productive if this pattern is expected.",
+      "- Continue with a snooze window if the current work should keep running without repeat review spam.",
+      "- Request decomposition, reroute, block with an unblock owner, or stop/cancel the source work if the work is inefficient.",
+    ];
+  }
+
   function buildReviewMarkdown(evidence: ProductivityReviewEvidence, prefix: string) {
     const latestRuns = evidence.latestRuns.length > 0
       ? evidence.latestRuns.map((run) =>
@@ -694,6 +754,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
       `- No-comment completed-run streak: ${evidence.noCommentStreak}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
+      `- Activity rate in the last hour: ${evidence.zeroRecentActivity ? "zero (0 runs, 0 assignee comments, 0 active runs) -- this is a stall axis, not a rate/churn axis" : "non-zero"}`,
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
       `- Cost events total: ${evidence.costCents} cents`,
@@ -720,9 +781,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       "",
       "## Manager Decision",
       "",
-      "- Close as productive if this pattern is expected.",
-      "- Continue with a snooze window if the current work should keep running without repeat review spam.",
-      "- Request decomposition, reroute, block with an unblock owner, or stop/cancel the source work if the work is inefficient.",
+      ...buildManagerDecisionMenu(evidence.trigger),
     ].join("\n");
   }
 

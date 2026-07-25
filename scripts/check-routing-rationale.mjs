@@ -40,10 +40,14 @@
  *      pool, so no routing decision to document (AUR-1632)
  *
  * Exit codes:
- *   0 — clean (nothing to do, or all actions applied)
+ *   0 — clean (nothing to do, or all intended actions applied — a partial
+ *       run where SOME mutations failed still exits 0; see the Failed count
+ *       in the run summary for what to retry)
  *   1 — dry-run with pending actions (apply to execute)
  *   2 — configuration/API error
  *   3 — BLOCKED: Memory API unavailable (watchdog cannot run this cycle)
+ *   4 — every intended mutation this run failed (e.g. all targets locked by
+ *       a stale checkout) — nothing was accomplished, surface it as an error
  */
 
 import { parseArgs } from 'node:util';
@@ -164,6 +168,23 @@ export function resolveGapOwner(issue) {
 }
 
 /**
+ * `titlePrefix` is a true PREFIX match server-side, so a short identifier
+ * collides with longer ones that merely start with it: `titlePrefix=routing/
+ * AUR-27` also matches `routing/AUR-2756`, `routing/AUR-2749`, etc. With
+ * `limit=1` the first (arbitrary) hit could be one of those collisions, so
+ * the watchdog would report "found" for a record that doesn't actually exist
+ * (AUR-3855 — the same class of wrong-question lookup bug AUR-3852 fixed for
+ * org/project scope). Fetch a generous batch under the prefix and assert an
+ * EXACT `title === 'routing/{targetId}'` match client-side — never
+ * `startsWith`.
+ */
+export const ROUTING_RECORD_LOOKUP_LIMIT = 50;
+
+function extractRecords(response) {
+  return Array.isArray(response) ? response : (response?.records ?? []);
+}
+
+/**
  * The Paperclip memory list route returns ONLY org-scoped records unless
  * `projectId=<uuid>` is passed. A `routing/{id}` record captured with
  * `scope.projectId` (per AGENTS.md §12) is therefore invisible to an org-wide
@@ -177,22 +198,22 @@ export function resolveGapOwner(issue) {
  * @returns {Promise<{ found: boolean, scope: 'org'|'project'|null }>}
  */
 export async function lookupRoutingRecord({ companyId, targetId, projectId, apiGet }) {
+  const exactTitle = `routing/${targetId}`;
+
   const orgRecords = await apiGet(
-    `/api/companies/${companyId}/memory/records?titlePrefix=routing/${targetId}&limit=1`
+    `/api/companies/${companyId}/memory/records?titlePrefix=routing/${targetId}&limit=${ROUTING_RECORD_LOOKUP_LIMIT}`
   );
-  const orgHas = Array.isArray(orgRecords)
-    ? orgRecords.length > 0
-    : (orgRecords?.records?.length ?? 0) > 0;
-  if (orgHas) return { found: true, scope: 'org' };
+  if (extractRecords(orgRecords).some(r => r.title === exactTitle)) {
+    return { found: true, scope: 'org' };
+  }
 
   if (projectId) {
     const projectRecords = await apiGet(
-      `/api/companies/${companyId}/memory/records?titlePrefix=routing/${targetId}&limit=1&projectId=${projectId}`
+      `/api/companies/${companyId}/memory/records?titlePrefix=routing/${targetId}&limit=${ROUTING_RECORD_LOOKUP_LIMIT}&projectId=${projectId}`
     );
-    const projectHas = Array.isArray(projectRecords)
-      ? projectRecords.length > 0
-      : (projectRecords?.records?.length ?? 0) > 0;
-    if (projectHas) return { found: true, scope: 'project' };
+    if (extractRecords(projectRecords).some(r => r.title === exactTitle)) {
+      return { found: true, scope: 'project' };
+    }
   }
 
   return { found: false, scope: null };
@@ -251,6 +272,35 @@ function makeApiHelpers(API_URL, headers) {
  * and Phase B never counts them as open (it files duplicates). See AUR-1581.
  */
 export const ISSUE_STATUS_FILTER = 'backlog,todo,in_progress,in_review,blocked';
+
+/**
+ * Extracts the HTTP status code apiPatch/apiPost embed in their thrown error
+ * message (`METHOD path → STATUS statusText`), falling back to 'unknown' for
+ * network-level failures that never reached a response.
+ */
+export function extractStatusCode(errorMessage) {
+  const match = /→\s*(\d+)/.exec(errorMessage ?? '');
+  return match ? match[1] : 'unknown';
+}
+
+/**
+ * Runs one mutation (a cancel or a file) in isolation: a failure — most
+ * commonly a 409 from a stale checkout lock on the target issue (see
+ * ops_stale_checkout_lock_after_transient_retry) — is logged and recorded,
+ * not thrown, so one locked/conflicting issue never aborts the rest of the
+ * run (AUR-3855). `label` identifies the mutation for the run summary.
+ */
+async function runMutation(label, fn, failures) {
+  try {
+    await fn();
+    return true;
+  } catch (err) {
+    const status = extractStatusCode(err.message);
+    console.error(`    FAILED (${status}): ${label} — ${err.message}`);
+    failures.push({ label, status, message: err.message });
+    return false;
+  }
+}
 
 export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, maxNewFlags = 20 }) {
   const windowStart = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
@@ -316,6 +366,10 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
   // surfaced in the summary so the org/project scoping drift stays visible
   // rather than being silently papered over (AUR-3852).
   const projectScopedHits = [];
+  // Per-mutation failures (e.g. a 409 from a stale checkout lock) — collected
+  // rather than thrown so one bad issue never aborts the rest of the run
+  // (AUR-3855). Surfaced in the run summary with issue id + status code.
+  const failedMutations = [];
 
   for (const flag of flagIssues) {
     const match = FLAG_REGEX.exec(flag.title);
@@ -353,11 +407,18 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
   } else {
     for (const { flag, targetId, reason } of toCancel) {
       const flagId = flag.id ?? flag.identifier;
-      console.log(`  CANCEL ${flag.identifier ?? flagId} → ${targetId}: ${reason}`);
+      const flagLabel = flag.identifier ?? flagId;
+      console.log(`  CANCEL ${flagLabel} → ${targetId}: ${reason}`);
       if (apply) {
-        await apiPatch(`/api/issues/${flagId}`, { status: 'cancelled' });
-        await apiPost(`/api/issues/${flagId}/comments`, { body: reason });
-        console.log(`    → cancelled + commented.`);
+        const ok = await runMutation(
+          `cancel ${flagLabel} (target ${targetId})`,
+          async () => {
+            await apiPatch(`/api/issues/${flagId}`, { status: 'cancelled' });
+            await apiPost(`/api/issues/${flagId}/comments`, { body: reason });
+          },
+          failedMutations,
+        );
+        if (ok) console.log(`    → cancelled + commented.`);
       }
     }
     console.log();
@@ -506,13 +567,19 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
         // auto-resolve and dedup. See AUR-1581.
         // assigneeAgentId is mandatory: an unassigned flag is an orphan the
         // daily sweeper has to re-catch forever (AUR-1818).
-        await apiPost(`/api/companies/${companyId}/issues`, {
-          title,
-          description,
-          status: 'todo',
-          assigneeAgentId: owner.agentId,
-        });
-        console.log(`    → filed (assignee ${owner.agentId}).`);
+        const ok = await runMutation(
+          `file gap for ${id}`,
+          async () => {
+            await apiPost(`/api/companies/${companyId}/issues`, {
+              title,
+              description,
+              status: 'todo',
+              assigneeAgentId: owner.agentId,
+            });
+          },
+          failedMutations,
+        );
+        if (ok) console.log(`    → filed (assignee ${owner.agentId}).`);
       }
     }
     console.log();
@@ -526,12 +593,29 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
   console.log(`  Skipped-dedup: ${skippedDedup.length}`);
   console.log(`  Exempt:        ${exemptIssues.length}`);
   console.log(`  Project-scoped hits (hidden from org reads): ${projectScopedHits.length}`);
+  console.log(`  Failed:        ${failedMutations.length}`);
+  if (failedMutations.length > 0) {
+    for (const { label, status } of failedMutations) {
+      console.log(`    - ${label} → ${status}`);
+    }
+    console.log(`  Re-run the watchdog to retry the above (idempotent).`);
+  }
 
   const hasPendingActions = toCancel.length > 0 || toFileThisRun.length > 0;
   if (!apply && hasPendingActions) {
     console.log('\n[DRY-RUN] Pass --apply to execute the above actions.');
     return 1;
   }
+
+  // Every intended mutation failed this run — nothing was accomplished, so
+  // surface it distinctly from the normal "some things failed, rest went
+  // through" case (which still exits 0; see Failed count above) (AUR-3855).
+  const attemptedMutations = apply ? toCancel.length + toFileThisRun.length : 0;
+  if (attemptedMutations > 0 && failedMutations.length === attemptedMutations) {
+    console.log('\nERROR: every intended mutation failed this run — see Failed list above.');
+    return 4;
+  }
+
   return 0;
 }
 

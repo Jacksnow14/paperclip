@@ -356,6 +356,14 @@ See [doc/DEVELOPING.md](doc/DEVELOPING.md) for the full development guide.
 
 <br/>
 
+## Operations
+
+- [Process lost / OOM on the control plane](docs/runbooks/process-lost-and-oom.md) — diagnose
+  whether a `Process lost -- server may have restarted` report is an infra event or agent
+  behavior, in under a minute.
+
+<br/>
+
 ## Roadmap
 
 - ✅ Plugin system (e.g. add a knowledge base, custom tracing, queues, etc)

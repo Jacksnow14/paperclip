@@ -30,6 +30,8 @@ REMOTE_URL=https://github.com/Jacksnow14/paperclip.git
 REF=origin/master
 FORCE=0
 ACTIVATE=0
+# AUR-4042: retention policy is active + this many rollback releases.
+KEEP_ROLLBACKS=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -136,17 +138,12 @@ if [[ "$ACTIVATE" -eq 1 ]]; then
   sudo mv -T "$APP_ROOT/current.next" "$APP_ROOT/current"
 fi
 
-# AUR-4134: retention that never reaps a running release, `current`, or
-# `previous`. Keeps 2 BEYOND that protected set — the protected releases are
-# not charged against the budget, which is what the old "keep active + 2 most
-# recent" wording got wrong: on 25 Jul it kept two builds nobody was running
-# and reaped the one production was executing.
-echo "==> pruning old releases (keep running + current + previous, then 2 most recent)"
-prune_releases "$APP_ROOT" 2
-
-# The invariant, checked independently of how the protected set was computed,
-# so it still fires on a kill path nobody thought of.
-assert_running_releases_intact "$APP_ROOT" || exit 1
+# AUR-4042: entry point owns the fail-closed skip on unresolvable `current`
+# and the non-blocking concurrent-deploy lock; it sources release-guard.sh
+# itself and delegates the protected set (running/current/previous) and the
+# actual deletions to prune_releases — one definition, not restated here.
+KEEP_ROLLBACKS="$KEEP_ROLLBACKS" PAPERCLIP_DEPLOY_APP_ROOT="$APP_ROOT" \
+  "$SCRIPT_DIR/prune-releases.sh"
 
 echo "release ready: $RELEASE (sha $SHA)"
 [[ "$ACTIVATE" -eq 1 ]] && echo "activated: $APP_ROOT/current -> releases/$SHA12 (applies on next service start)"

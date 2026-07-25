@@ -114,9 +114,9 @@ export function isExempt(issue) {
  * Returns a cancel reason string if the flag should be resolved, or null if
  * the flag is still valid and should remain open.
  *
- * @param {{ target: object|null, hasRecord: boolean }} opts
+ * @param {{ target: object|null, targetId: string, hasRecord: boolean, recordScope?: 'org'|'project'|null }} opts
  */
-export function resolveCancelReason({ target, targetId, hasRecord }) {
+export function resolveCancelReason({ target, targetId, hasRecord, recordScope = null }) {
   if (!target || ['done', 'cancelled'].includes(target.status)) {
     return target
       ? `Auto-resolved by routing-rationale-watchdog: ${targetId} is ${target.status} — routing rationale moot.`
@@ -126,7 +126,8 @@ export function resolveCancelReason({ target, targetId, hasRecord }) {
     return `Auto-resolved by routing-rationale-watchdog: ${targetId} is exempt from routing rationale (exec.routing-rationale: skip, content-slot, daily-brief, or single-owner sign-off/approval gate).`;
   }
   if (hasRecord) {
-    return `Auto-resolved by routing-rationale-watchdog: routing/${targetId} record now exists.`;
+    const scopeTag = recordScope === 'project' ? ' — project-scoped (hidden from org reads)' : '';
+    return `Auto-resolved by routing-rationale-watchdog: routing/${targetId} record now exists.${scopeTag}`;
   }
   return null;
 }
@@ -160,6 +161,41 @@ export function resolveGapOwner(issue) {
     return { agentId: creator, source: 'target.createdByAgentId' };
   }
   return { agentId: CEO_AGENT_ID, source: 'fallback:CEO' };
+}
+
+/**
+ * The Paperclip memory list route returns ONLY org-scoped records unless
+ * `projectId=<uuid>` is passed. A `routing/{id}` record captured with
+ * `scope.projectId` (per AGENTS.md §12) is therefore invisible to an org-wide
+ * query alone. Query org scope first (cheap, covers the common case), then
+ * fall back to a project-scoped query only when the target issue has a
+ * `projectId` and the org query missed — this avoids a wasted second call for
+ * the (majority) org-scoped/no-project case. Either scope hitting counts as
+ * "found": the rationale exists, it was just written to a narrower scope.
+ *
+ * @param {{ companyId: string, targetId: string, projectId?: string|null, apiGet: (path: string) => Promise<any> }} opts
+ * @returns {Promise<{ found: boolean, scope: 'org'|'project'|null }>}
+ */
+export async function lookupRoutingRecord({ companyId, targetId, projectId, apiGet }) {
+  const orgRecords = await apiGet(
+    `/api/companies/${companyId}/memory/records?titlePrefix=routing/${targetId}&limit=1`
+  );
+  const orgHas = Array.isArray(orgRecords)
+    ? orgRecords.length > 0
+    : (orgRecords?.records?.length ?? 0) > 0;
+  if (orgHas) return { found: true, scope: 'org' };
+
+  if (projectId) {
+    const projectRecords = await apiGet(
+      `/api/companies/${companyId}/memory/records?titlePrefix=routing/${targetId}&limit=1&projectId=${projectId}`
+    );
+    const projectHas = Array.isArray(projectRecords)
+      ? projectRecords.length > 0
+      : (projectRecords?.records?.length ?? 0) > 0;
+    if (projectHas) return { found: true, scope: 'project' };
+  }
+
+  return { found: false, scope: null };
 }
 
 // ── API helpers ───────────────────────────────────────────────────────────────
@@ -276,6 +312,10 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
   const openFlagTargets = new Set(); // target identifiers with still-valid open flags
 
   const toCancel = [];
+  // Tracks routing/{id} records only visible via a project-scoped lookup —
+  // surfaced in the summary so the org/project scoping drift stays visible
+  // rather than being silently papered over (AUR-3852).
+  const projectScopedHits = [];
 
   for (const flag of flagIssues) {
     const match = FLAG_REGEX.exec(flag.title);
@@ -286,16 +326,20 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
 
     // Check routing record only when target is open and non-exempt
     let hasRecord = false;
+    let recordScope = null;
     if (target && !['done', 'cancelled'].includes(target.status) && !isExempt(target)) {
-      const records = await apiGet(
-        `/api/companies/${companyId}/memory/records?titlePrefix=routing/${targetId}&limit=1`
-      );
-      hasRecord = Array.isArray(records)
-        ? records.length > 0
-        : (records?.records?.length ?? 0) > 0;
+      const lookup = await lookupRoutingRecord({
+        companyId, targetId, projectId: target.projectId, apiGet,
+      });
+      hasRecord = lookup.found;
+      recordScope = lookup.scope;
     }
 
-    const cancelReason = resolveCancelReason({ target, targetId, hasRecord });
+    if (recordScope === 'project') {
+      projectScopedHits.push({ targetId, source: 'phase-a' });
+    }
+
+    const cancelReason = resolveCancelReason({ target, targetId, hasRecord, recordScope });
 
     if (cancelReason) {
       toCancel.push({ flag, targetId, reason: cancelReason });
@@ -365,6 +409,7 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
   const toFile = [];
   const skippedDedup = [];
   const skippedHasRecord = [];
+  const skippedHasRecordProjectScoped = [];
 
   await Promise.all(candidates.map(async (issue) => {
     const id = issue.identifier ?? issue.id;
@@ -375,15 +420,17 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
       return;
     }
 
-    const records = await apiGet(
-      `/api/companies/${companyId}/memory/records?titlePrefix=routing/${id}&limit=1`
-    );
-    const hasRecord = Array.isArray(records)
-      ? records.length > 0
-      : (records?.records?.length ?? 0) > 0;
+    const lookup = await lookupRoutingRecord({
+      companyId, targetId: id, projectId: issue.projectId, apiGet,
+    });
 
-    if (hasRecord) {
-      skippedHasRecord.push(issue);
+    if (lookup.found) {
+      if (lookup.scope === 'project') {
+        projectScopedHits.push({ targetId: id, source: 'phase-b' });
+        skippedHasRecordProjectScoped.push(issue);
+      } else {
+        skippedHasRecord.push(issue);
+      }
     } else {
       toFile.push(issue);
     }
@@ -401,6 +448,14 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
     console.log(`  HAS RECORD — routing rationale present (${skippedHasRecord.length}):`);
     for (const issue of skippedHasRecord) {
       console.log(`    - ${issue.identifier ?? issue.id}: ${issue.title}`);
+    }
+    console.log();
+  }
+
+  if (skippedHasRecordProjectScoped.length > 0) {
+    console.log(`  SKIPPED-HAS-RECORD (project-scoped) — hidden from org reads (${skippedHasRecordProjectScoped.length}):`);
+    for (const issue of skippedHasRecordProjectScoped) {
+      console.log(`    - ${issue.identifier ?? issue.id}: ${issue.title} — project-scoped (hidden from org reads)`);
     }
     console.log();
   }
@@ -470,6 +525,7 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
   console.log(`  Deferred:      ${deferred.length}`);
   console.log(`  Skipped-dedup: ${skippedDedup.length}`);
   console.log(`  Exempt:        ${exemptIssues.length}`);
+  console.log(`  Project-scoped hits (hidden from org reads): ${projectScopedHits.length}`);
 
   const hasPendingActions = toCancel.length > 0 || toFileThisRun.length > 0;
   if (!apply && hasPendingActions) {

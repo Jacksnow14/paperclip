@@ -3,35 +3,61 @@
  * check-routing-rationale.mjs
  *
  * Self-cleaning, deterministic watchdog for the routing-rationale convention
- * (AGENTS.md §12). Runs as a scheduled routine every 6 hours with --apply.
- * The default --window-minutes MUST stay >= the firing cadence or issues
- * updated between fires go unchecked (AUR-1816: 60-min default vs 6h cadence
- * silently missed ~83% of issues). Default is 1440 (24h) to comfortably
- * exceed the cadence; the watchdog is idempotent so a wide window only
- * re-confirms already-clean issues.
+ * (AGENTS.md § "Routing rationale capture (enforcement)"). Runs as a
+ * scheduled routine every 6 hours with --apply.
+ *
+ * AUR-3994/AUR-3987a root cause: the old Phase B only ever looked at issues
+ * updated within --window-minutes on the OPEN-status working set. High/
+ * critical issues usually close within a day, so a gap routinely closed
+ * before the next 6h fire ever saw it — a measured ~2% detection rate
+ * (86 high/critical assigned issues, 55 eligible, 21 missing a record, 20 of
+ * those already done/cancelled by the time the watchdog looked). Fix: the
+ * measurement pass below scans the FULL population (all statuses, paginated)
+ * every run instead of a recency window, so a gap is counted the moment it
+ * exists rather than only while it happens to be "recently updated" and
+ * open. --window-minutes is still accepted for CLI back-compat with the
+ * existing routine invocation but is no longer used to filter anything.
  *
  * Lifecycle:
- *   Phase A — Auto-resolve stale flags (always runs, ignores window):
- *     Cancel open flag issues whose target is done/cancelled, already has a
- *     routing/{id} memory record, or is now exempt. Posts a one-line reason.
+ *   Phase A — Auto-resolve stale legacy per-gap flags (always runs):
+ *     Cancel open flag issues (title matches FLAG_REGEX, from the pre-
+ *     AUR-3994 one-issue-per-gap era) whose target is done/cancelled,
+ *     already has a routing/{id} memory record, or is now exempt. Posts a
+ *     one-line reason. Kept so legacy flags already on the board drain.
  *
- *   Phase B — Detect + file (within --window-minutes):
- *     Flag high/critical assigned manual issues updated in the window that are
- *     still missing routing/{id} records, deduplicating against Phase A's
- *     remaining open flags.
+ *   Full-population measurement (paginated, all statuses):
+ *     Compute eligible / have-record / missing counts across every
+ *     high/critical assigned manual-routing issue the company has ever had,
+ *     not just the open ones. Missing gaps on done/cancelled issues are
+ *     counted and listed in the console report ONLY — their rationale is
+ *     unrecoverable, and filing on them would just manufacture retro-
+ *     fabricated records (the AUR-3956 pattern).
+ *
+ *   Phase B — Sync rolling gap-aggregate issue (open gaps only):
+ *     Find-or-create a single issue titled `routing-rationale gaps —
+ *     YYYY-MM-DD` for today, rewrite its body with the current outstanding
+ *     OPEN-and-missing list (anti-flood capped, drops logged), and auto-
+ *     close it once the list is empty. Replaces the old one-issue-per-gap
+ *     filing so the board doesn't accumulate a flag issue per gap.
  *
  * Usage:
  *   node scripts/check-routing-rationale.mjs [--window-minutes N] [--apply]
  *
  *   Without --apply: dry-run — prints full plan, writes nothing.
- *   With --apply:    executes cancellations and files new flags (idempotent).
+ *   With --apply:    executes cancellations and syncs the rolling gap issue
+ *                     (idempotent).
  *
  * Env vars required:
  *   PAPERCLIP_API_URL    Base URL (e.g. http://localhost:3000)
  *   PAPERCLIP_API_KEY    Bearer token
  *   PAPERCLIP_COMPANY_ID Company UUID
  *
- * Exemption rules (no flag filed; existing open flags auto-resolved):
+ * Exemption rules (isExempt — no gap listed/filed; existing open legacy
+ * flags auto-resolved):
+ *   0. isRoutingDecision(issue) is false — no createdByAgentId, a non-manual
+ *      originKind, or assigneeAgentId === createdByAgentId (self-assigned).
+ *      These are issues where no routing decision was actually made, so no
+ *      rationale is owed (AUR-3994/AUR-3987a).
  *   1. Issue description contains token `exec.routing-rationale: skip`
  *   2. Issue title matches /content slot/i (and content-pipeline children)
  *   3. Recurring daily-brief publication tasks
@@ -73,10 +99,39 @@ export function mayBeTruncated(description) {
 }
 
 /**
+ * Returns true when a routing DECISION was actually made for this issue —
+ * an agent created it, routed it through the normal manual-assignment path,
+ * and handed it to someone other than itself. False means there is no
+ * decision to document, so no routing/{id} rationale is owed:
+ *   - `createdByAgentId` is missing — no agent filed it, so no agent routed
+ *     it (e.g. user-filed issues).
+ *   - `originKind` is set and isn't 'manual' — routine/system-generated
+ *     (e.g. `routine_execution`, plugin operations); nobody compared
+ *     candidates.
+ *   - `assigneeAgentId === createdByAgentId` — self-assigned; the creator
+ *     kept the work, no candidate pool was compared.
+ *
+ * Extracted as its own predicate (AUR-3994/AUR-3987a) from checks that used
+ * to be split between an inline pool filter and isExempt's tail, so it is
+ * independently unit-testable. The CTO's 2026-07-22..25 measurement found
+ * 12 self-assigned + 20 routine/no-creator issues in the eligible pool that
+ * this predicate correctly excludes.
+ *
+ * @param {{ createdByAgentId?: string|null, originKind?: string|null, assigneeAgentId?: string|null }} issue
+ */
+export function isRoutingDecision(issue) {
+  if (!issue.createdByAgentId) return false;
+  if (issue.originKind && issue.originKind !== 'manual') return false;
+  if (issue.assigneeAgentId && issue.assigneeAgentId === issue.createdByAgentId) return false;
+  return true;
+}
+
+/**
  * Returns true if an issue is exempt from the routing-rationale convention.
  * Exempt issues are never flagged and any existing open flags are auto-resolved.
  */
 export function isExempt(issue) {
+  if (!isRoutingDecision(issue)) return true;
   if (issue.description && issue.description.includes('exec.routing-rationale: skip')) return true;
   if (/content slot/i.test(issue.title ?? '')) return true;
   // Recurring daily-brief publication tasks (e.g. "Post 2026-05-29 daily AI brief
@@ -106,11 +161,9 @@ export function isExempt(issue) {
   // that merely BUILD such a feature ("Add approval gate to deploy pipeline",
   // "Implement sign-off flow") — those have no gate delimiter after the phrase.
   if (/\b(?:sign[-\s]?off|approval(?:\s+gate)?)\s*[:—]/i.test(title)) return true;
-  // Self-assigned issues (creator kept the work) involve no delegation and no
-  // candidate-routing decision, so a routing/{id} rationale carries no signal.
-  // Recurring false-positive class: AUR-869, AUR-1829, AUR-801/802 (AUR-1550).
-  if (issue.assigneeAgentId && issue.createdByAgentId &&
-      issue.assigneeAgentId === issue.createdByAgentId) return true;
+  // Self-assigned / no-creator / routine-origin issues are covered by
+  // isRoutingDecision() above (recurring false-positive class: AUR-869,
+  // AUR-1829, AUR-801/802, AUR-1550).
   return false;
 }
 
@@ -127,7 +180,7 @@ export function resolveCancelReason({ target, targetId, hasRecord, recordScope =
       : `Auto-resolved by routing-rationale-watchdog: ${targetId} not found among open issues — routing rationale moot.`;
   }
   if (isExempt(target)) {
-    return `Auto-resolved by routing-rationale-watchdog: ${targetId} is exempt from routing rationale (exec.routing-rationale: skip, content-slot, daily-brief, or single-owner sign-off/approval gate).`;
+    return `Auto-resolved by routing-rationale-watchdog: ${targetId} is exempt from routing rationale (no routing decision made, exec.routing-rationale: skip, content-slot, daily-brief, or single-owner sign-off/approval gate).`;
   }
   if (hasRecord) {
     const scopeTag = recordScope === 'project' ? ' — project-scoped (hidden from org reads)' : '';
@@ -187,7 +240,8 @@ function extractRecords(response) {
 /**
  * The Paperclip memory list route returns ONLY org-scoped records unless
  * `projectId=<uuid>` is passed. A `routing/{id}` record captured with
- * `scope.projectId` (per AGENTS.md §12) is therefore invisible to an org-wide
+ * `scope.projectId` (per AGENTS.md § "Routing rationale capture
+ * (enforcement)") is therefore invisible to an org-wide
  * query alone. Query org scope first (cheap, covers the common case), then
  * fall back to a project-scoped query only when the target issue has a
  * `projectId` and the org query missed — this avoids a wasted second call for
@@ -274,6 +328,45 @@ function makeApiHelpers(API_URL, headers) {
 export const ISSUE_STATUS_FILTER = 'backlog,todo,in_progress,in_review,blocked';
 
 /**
+ * Safety cap on pagination: 50 pages * 500/page = 25,000 issues. A real run
+ * should never get near this; it exists so a pagination bug degrades to a
+ * loud warning (population undercounted) instead of an infinite loop.
+ */
+export const FETCH_ALL_ISSUES_MAX_PAGES = 50;
+
+/**
+ * Pages through the issues LIST endpoint with `limit`/`offset` until a short
+ * page is returned, instead of a single `limit=500` fetch. A single fetch is
+ * a silent cliff: it happens to fit today (open-only is 146 issues, well
+ * under 500) but truncates without warning the moment the matched set grows
+ * past the page size — and the full-population scan below can match
+ * thousands (AUR-3994/AUR-3987a). `status` is passed through verbatim
+ * (comma-joined list, or omitted entirely to fetch every status).
+ *
+ * @param {{ companyId: string, apiGet: (path: string) => Promise<any>, status?: string|null, pageSize?: number }} opts
+ * @returns {Promise<object[]>}
+ */
+export async function fetchAllIssues({ companyId, apiGet, status = null, pageSize = 500 }) {
+  const all = [];
+  let offset = 0;
+  const statusParam = status ? `&status=${status}` : '';
+  for (let page = 0; page < FETCH_ALL_ISSUES_MAX_PAGES; page++) {
+    const batch = await apiGet(
+      `/api/companies/${companyId}/issues?limit=${pageSize}${statusParam}&offset=${offset}`
+    );
+    const rows = Array.isArray(batch) ? batch : (batch?.issues ?? []);
+    all.push(...rows);
+    if (rows.length < pageSize) return all;
+    offset += pageSize;
+  }
+  console.error(
+    `  WARNING: fetchAllIssues hit the ${FETCH_ALL_ISSUES_MAX_PAGES}-page safety cap ` +
+    `(offset=${offset}) — population may be undercounted. Investigate before trusting this run's counts.`
+  );
+  return all;
+}
+
+/**
  * Extracts the HTTP status code apiPatch/apiPost embed in their thrown error
  * message (`METHOD path → STATUS statusText`), falling back to 'unknown' for
  * network-level failures that never reached a response.
@@ -302,8 +395,158 @@ async function runMutation(label, fn, failures) {
   }
 }
 
-export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, maxNewFlags = 20 }) {
-  const windowStart = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
+// ── Phase B v2: rolling gap-aggregate issue ──────────────────────────────────
+
+/** Title prefix for the rolling daily gap-aggregate issue. */
+export const ROLLING_ISSUE_TITLE_PREFIX = 'routing-rationale gaps — ';
+
+/** Search across every status so a same-day auto-closed rolling issue is still found (and reopened if needed). */
+export const ROLLING_ISSUE_ALL_STATUSES = 'backlog,todo,in_progress,in_review,blocked,done,cancelled';
+
+export function rollingIssueTitle(dateKey) {
+  return `${ROLLING_ISSUE_TITLE_PREFIX}${dateKey}`;
+}
+
+/** UTC date key (YYYY-MM-DD) — stable across a single day regardless of firing time. */
+export function todayDateKey(now = new Date()) {
+  return now.toISOString().slice(0, 10);
+}
+
+/**
+ * Renders the rolling issue body from the current outstanding open-gap list.
+ * `maxListed` bounds how many individual gaps are named (anti-flood guard);
+ * anything beyond that is summarized as a held-back count, never silently
+ * dropped. `closedGapCount` (from the full-population measurement) is
+ * surfaced for visibility only — those gaps are unrecoverable and never
+ * listed individually here.
+ */
+export function buildRollingIssueBody(missingOpen, { maxListed, closedGapCount }) {
+  const listed = missingOpen.slice(0, maxListed);
+  const held = missingOpen.length - listed.length;
+  const lines = [
+    '## Routing-rationale gaps — outstanding',
+    '',
+    `${missingOpen.length} open eligible issue(s) currently missing a \`routing/{id}\` rationale record.`,
+    '',
+  ];
+  if (listed.length === 0) {
+    lines.push('_No outstanding open gaps._');
+  } else {
+    for (const issue of listed) {
+      const id = issue.identifier ?? issue.id;
+      const owner = resolveGapOwner(issue);
+      lines.push(
+        `- **${id}** (\`${issue.priority}\`, assignee \`${issue.assigneeAgentId}\`) — "${issue.title}" — rationale owed by \`${owner.agentId}\` (${owner.source})`
+      );
+    }
+  }
+  if (held > 0) {
+    lines.push('', `_...and ${held} more held back by the anti-flood cap (max-listed=${maxListed}). Re-run once the list drains to surface the rest._`);
+  }
+  if (closedGapCount > 0) {
+    lines.push(
+      '',
+      `${closedGapCount} additional gap(s) exist on already-closed (done/cancelled) issues. Their rationale is unrecoverable, so they are intentionally NOT listed or filed here — see the watchdog run's console summary for the list.`
+    );
+  }
+  lines.push(
+    '',
+    'The manager that assigned each issue above must capture a `routing/{id}` rationale record per AGENTS.md § "Routing rationale capture (enforcement)".',
+    '',
+    'This issue is rewritten in place every watchdog run and auto-closes once the list empties.',
+    '',
+    'exec.preflight: skip',
+    'exec.routing-rationale: skip',
+  );
+  return lines.join('\n');
+}
+
+/** Finds today's rolling issue by exact title match (search is a loose ILIKE contains — assert exact client-side, same pattern as lookupRoutingRecord). */
+export async function findRollingIssue({ companyId, apiGet, title }) {
+  const results = await apiGet(
+    `/api/companies/${companyId}/issues?q=${encodeURIComponent(title)}&status=${ROLLING_ISSUE_ALL_STATUSES}&limit=20`
+  );
+  const rows = Array.isArray(results) ? results : (results?.issues ?? []);
+  return rows.find(issue => issue.title === title) ?? null;
+}
+
+/**
+ * Find-or-create + rewrite-in-place for the rolling gap issue, replacing the
+ * old one-issue-per-gap filing. Priority is deliberately 'medium' (not
+ * high/critical) so the rolling issue never becomes a routing-rationale
+ * target of itself.
+ */
+async function syncRollingGapIssue({
+  companyId, apiGet, apiPatch, apiPost, apply, missingOpen, closedGapCount, maxListed, dateKey, failedMutations,
+}) {
+  const title = rollingIssueTitle(dateKey);
+  const existing = await findRollingIssue({ companyId, apiGet, title });
+  const body = buildRollingIssueBody(missingOpen, { maxListed, closedGapCount });
+
+  if (missingOpen.length === 0) {
+    if (existing && !['done', 'cancelled'].includes(existing.status)) {
+      console.log(`  ROLLING-ISSUE: CLOSE ${existing.identifier ?? existing.id} — no outstanding open gaps.`);
+      if (apply) {
+        const ok = await runMutation(
+          `close rolling issue ${existing.identifier ?? existing.id}`,
+          async () => {
+            await apiPatch(`/api/issues/${existing.id}`, { status: 'done' });
+            await apiPost(`/api/issues/${existing.id}/comments`, {
+              body: 'Auto-closed by routing-rationale-watchdog: no outstanding open gaps.',
+            });
+          },
+          failedMutations,
+        );
+        if (ok) console.log('    → closed.');
+      }
+      return { action: 'close', issue: existing };
+    }
+    console.log('  ROLLING-ISSUE: no outstanding open gaps, nothing to sync.');
+    return { action: 'none', issue: existing };
+  }
+
+  if (existing) {
+    console.log(`  ROLLING-ISSUE: UPDATE ${existing.identifier ?? existing.id} (${missingOpen.length} outstanding).`);
+    if (apply) {
+      const patch = { description: body };
+      if (['done', 'cancelled'].includes(existing.status)) patch.status = 'todo';
+      const ok = await runMutation(
+        `update rolling issue ${existing.identifier ?? existing.id}`,
+        async () => { await apiPatch(`/api/issues/${existing.id}`, patch); },
+        failedMutations,
+      );
+      if (ok) console.log('    → updated.');
+    }
+    return { action: 'update', issue: existing };
+  }
+
+  console.log(`  ROLLING-ISSUE: FILE "${title}" (${missingOpen.length} outstanding) → owner ${CEO_AGENT_ID}.`);
+  if (apply) {
+    const ok = await runMutation(
+      `file rolling issue ${title}`,
+      async () => {
+        await apiPost(`/api/companies/${companyId}/issues`, {
+          title,
+          description: body,
+          status: 'todo',
+          priority: 'medium',
+          assigneeAgentId: CEO_AGENT_ID,
+        });
+      },
+      failedMutations,
+    );
+    if (ok) console.log('    → filed.');
+  }
+  return { action: 'file', issue: null };
+}
+
+export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, maxNewFlags = 20, now = new Date() }) {
+  // windowMinutes is accepted for CLI back-compat with the existing routine
+  // invocation but is no longer used to filter anything — the full-
+  // population measurement pass below scans every status every run instead
+  // (AUR-3994/AUR-3987a: window-based filtering was the root cause of the
+  // ~2% detection rate).
+  void windowMinutes;
 
   const headers = {
     Authorization: `Bearer ${apiKey}`,
@@ -343,11 +586,9 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
     return 3;
   }
 
-  // Fetch all open issues once — used by both phases
-  const issuesBatch = await apiGet(
-    `/api/companies/${companyId}/issues?status=${ISSUE_STATUS_FILTER}&limit=500`
-  );
-  const rawIssues = Array.isArray(issuesBatch) ? issuesBatch : (issuesBatch.issues ?? []);
+  // Fetch all open issues once, paginated — used by Phase A and to dedupe
+  // Phase B's rolling issue against still-valid legacy flags.
+  const rawIssues = await fetchAllIssues({ companyId, apiGet, status: ISSUE_STATUS_FILTER });
 
   // Build lookup by identifier
   const issueByIdentifier = new Map();
@@ -428,170 +669,88 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
     console.log(`  Keeping ${openFlagTargets.size} flag(s) still valid: ${[...openFlagTargets].join(', ')}\n`);
   }
 
-  // ── Phase B: Detect + file ─────────────────────────────────────────────────
-  console.log('── Phase B: Detect and file new flags ──');
+  // ── Full-population measurement (paginated, ALL statuses) ──────────────────
+  // Fixes the AUR-3994/AUR-3987a blind spot: the old Phase B only ever looked
+  // at the open-status working set within a recency window, so a gap that
+  // closed between 6h fires was never counted. Scan every high/critical
+  // assigned manual-routing issue the company has ever had instead.
+  console.log('── Full-population measurement (all statuses, paginated) ──');
 
-  // Pool of issues subject to §12, then hydrate full descriptions so the
-  // exemption token is not missed due to list-endpoint truncation.
-  const pool = await Promise.all(
-    rawIssues
-      .filter(issue =>
-        ['high', 'critical'].includes(issue.priority) &&
-        issue.assigneeAgentId &&
-        (!issue.originKind || issue.originKind === 'manual'))
-      .map(withFullDescription)
+  const allIssuesEver = await fetchAllIssues({ companyId, apiGet, status: null });
+
+  const priorityPool = allIssuesEver.filter(issue =>
+    ['high', 'critical'].includes(issue.priority) && issue.assigneeAgentId
   );
+  // Hydrate full descriptions only for the (bounded) priority pool so the
+  // exemption token isn't missed due to list-endpoint truncation, without
+  // paying that cost for the entire company's issue history.
+  const hydratedPool = await Promise.all(priorityPool.map(withFullDescription));
 
-  const exemptIssues = pool.filter(isExempt);
+  const eligible = hydratedPool.filter(issue => !isExempt(issue));
+  const exemptCount = hydratedPool.length - eligible.length;
 
-  const seen = new Set();
-  const candidates = pool.filter(issue => {
-    if (isExempt(issue)) return false;
-    const key = issue.id ?? issue.identifier;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    const updated = issue.updatedAt ?? issue.assignedAt;
-    if (!updated) return true;
-    return new Date(updated) >= new Date(windowStart);
-  });
-
-  if (exemptIssues.length > 0) {
-    console.log(`  EXEMPT (${exemptIssues.length}):`);
-    for (const issue of exemptIssues) {
-      console.log(`    - ${issue.identifier ?? issue.id}: ${issue.title}`);
-    }
-    console.log();
-  }
-
-  if (candidates.length === 0) {
-    console.log(`  No high/critical assigned manual issues updated in the last ${windowMinutes} minutes.\n`);
-  }
-
-  const toFile = [];
-  const skippedDedup = [];
-  const skippedHasRecord = [];
-  const skippedHasRecordProjectScoped = [];
-
-  await Promise.all(candidates.map(async (issue) => {
+  const missing = [];
+  let hasRecordCount = 0;
+  await Promise.all(eligible.map(async (issue) => {
     const id = issue.identifier ?? issue.id;
-
-    // Dedup: an open flag for this target already exists (Phase A kept it)
-    if (openFlagTargets.has(id)) {
-      skippedDedup.push(issue);
-      return;
-    }
-
     const lookup = await lookupRoutingRecord({
       companyId, targetId: id, projectId: issue.projectId, apiGet,
     });
-
     if (lookup.found) {
-      if (lookup.scope === 'project') {
-        projectScopedHits.push({ targetId: id, source: 'phase-b' });
-        skippedHasRecordProjectScoped.push(issue);
-      } else {
-        skippedHasRecord.push(issue);
-      }
+      hasRecordCount += 1;
+      if (lookup.scope === 'project') projectScopedHits.push({ targetId: id, source: 'measurement' });
     } else {
-      toFile.push(issue);
+      missing.push(issue);
     }
   }));
 
-  if (skippedDedup.length > 0) {
-    console.log(`  SKIPPED-DEDUP — open flag exists (${skippedDedup.length}):`);
-    for (const issue of skippedDedup) {
+  const missingClosed = missing.filter(issue => ['done', 'cancelled'].includes(issue.status));
+  // Of the still-open missing gaps, exclude any target that already has a
+  // still-valid open legacy per-gap flag (Phase A kept it) — otherwise the
+  // same gap would be reported twice (once via the legacy flag, once via the
+  // rolling issue).
+  const missingOpenAll = missing.filter(issue => !['done', 'cancelled'].includes(issue.status));
+  const missingOpenDedupSkipped = missingOpenAll.filter(issue => openFlagTargets.has(issue.identifier ?? issue.id));
+  const missingOpen = missingOpenAll.filter(issue => !openFlagTargets.has(issue.identifier ?? issue.id));
+
+  console.log(`  Total issues scanned:  ${allIssuesEver.length}`);
+  console.log(`  Priority pool (high/critical, assigned): ${hydratedPool.length}`);
+  console.log(`  Exempt:                ${exemptCount}`);
+  console.log(`  Eligible:               ${eligible.length}`);
+  console.log(`  Have routing/{id} record: ${hasRecordCount}`);
+  console.log(`  Missing:                ${missing.length} (open: ${missingOpenAll.length}, closed/unrecoverable: ${missingClosed.length})`);
+  if (missingOpenDedupSkipped.length > 0) {
+    console.log(`  SKIPPED-DEDUP — open legacy flag already covers this target (${missingOpenDedupSkipped.length}):`);
+    for (const issue of missingOpenDedupSkipped) {
       console.log(`    - ${issue.identifier ?? issue.id}: ${issue.title}`);
     }
-    console.log();
   }
-
-  if (skippedHasRecord.length > 0) {
-    console.log(`  HAS RECORD — routing rationale present (${skippedHasRecord.length}):`);
-    for (const issue of skippedHasRecord) {
-      console.log(`    - ${issue.identifier ?? issue.id}: ${issue.title}`);
+  if (missingClosed.length > 0) {
+    console.log(`  CLOSED GAPS (unrecoverable — counted here only, never filed):`);
+    for (const issue of missingClosed) {
+      console.log(`    - ${issue.identifier ?? issue.id} (${issue.status}): ${issue.title}`);
     }
-    console.log();
   }
+  console.log();
 
-  if (skippedHasRecordProjectScoped.length > 0) {
-    console.log(`  SKIPPED-HAS-RECORD (project-scoped) — hidden from org reads (${skippedHasRecordProjectScoped.length}):`);
-    for (const issue of skippedHasRecordProjectScoped) {
-      console.log(`    - ${issue.identifier ?? issue.id}: ${issue.title} — project-scoped (hidden from org reads)`);
-    }
-    console.log();
-  }
+  // ── Phase B: Sync rolling gap-aggregate issue (open gaps only) ─────────────
+  console.log('── Phase B: Sync rolling gap-aggregate issue ──');
 
-  // Anti-flood cap: after a Memory outage, every legitimate gap will be missing
-  // its routing/{id} record, so Phase B could file dozens of flags at once.
-  // Cap new filings per run and log deferred ones so the backlog drains
-  // gradually over subsequent runs rather than flooding the board.
-  const toFileThisRun = toFile.slice(0, maxNewFlags);
-  const deferred = toFile.slice(maxNewFlags);
-
-  if (deferred.length > 0) {
-    console.log(`  DEFERRED — cap reached (max-new-flags=${maxNewFlags}), held back ${deferred.length}:`);
-    for (const issue of deferred) {
-      console.log(`    - ${issue.identifier ?? issue.id}: ${issue.title}`);
-    }
-    console.log(`  Re-run the watchdog to process the remainder.\n`);
-  }
-
-  if (toFileThisRun.length === 0) {
-    console.log('  No new flags to file.\n');
-  } else {
-    for (const issue of toFileThisRun) {
-      const id = issue.identifier ?? issue.id;
-      const assignee = issue.assigneeAgentId ?? 'unknown';
-      const title = `routing-rationale gap: ${id} missing routing/${id} record`;
-      const description = [
-        `## Routing rationale gap detected`,
-        ``,
-        `Issue **${id}** ("${issue.title}") is \`${issue.priority}\` priority, assigned to agent \`${assignee}\`, but is missing a \`routing/${id}\` rationale record in Paperclip Memory.`,
-        ``,
-        `The manager that assigned this issue must capture a routing rationale record per AGENTS.md §12.`,
-        ``,
-        `**Required record key:** \`routing/${id}\``,
-        ``,
-        `exec.preflight: skip`,
-      ].join('\n');
-      // Resolve a non-null owner so the gap issue is never orphaned
-      // (AUR-1817/AUR-1818). The owner is the router that owes the rationale —
-      // the target's creator, or the CEO as the high/critical-routing default.
-      const owner = resolveGapOwner(issue);
-      console.log(`  FILE: "${title}" → owner ${owner.agentId} (${owner.source})`);
-      if (apply) {
-        // File in `todo`, not the server default `backlog`: these flags are
-        // actionable (a manager must add the routing record) and should be
-        // visible in the working set by default. The filter above also covers
-        // `backlog` defensively so pre-existing/manually-moved flags still
-        // auto-resolve and dedup. See AUR-1581.
-        // assigneeAgentId is mandatory: an unassigned flag is an orphan the
-        // daily sweeper has to re-catch forever (AUR-1818).
-        const ok = await runMutation(
-          `file gap for ${id}`,
-          async () => {
-            await apiPost(`/api/companies/${companyId}/issues`, {
-              title,
-              description,
-              status: 'todo',
-              assigneeAgentId: owner.agentId,
-            });
-          },
-          failedMutations,
-        );
-        if (ok) console.log(`    → filed (assignee ${owner.agentId}).`);
-      }
-    }
-    console.log();
-  }
+  const dateKey = todayDateKey(now);
+  const rollingResult = await syncRollingGapIssue({
+    companyId, apiGet, apiPatch, apiPost, apply,
+    missingOpen, closedGapCount: missingClosed.length,
+    maxListed: maxNewFlags, dateKey, failedMutations,
+  });
+  console.log();
 
   // ── Summary ────────────────────────────────────────────────────────────────
   console.log('── Summary ──');
-  console.log(`  Resolved:      ${toCancel.length}`);
-  console.log(`  Filed:         ${toFileThisRun.length}`);
-  console.log(`  Deferred:      ${deferred.length}`);
-  console.log(`  Skipped-dedup: ${skippedDedup.length}`);
-  console.log(`  Exempt:        ${exemptIssues.length}`);
+  console.log(`  Legacy flags resolved: ${toCancel.length}`);
+  console.log(`  Eligible / have record / missing (full population): ${eligible.length} / ${hasRecordCount} / ${missing.length}`);
+  console.log(`  Missing open (listed in rolling issue): ${missingOpen.length}`);
+  console.log(`  Missing closed (unrecoverable, report-only): ${missingClosed.length}`);
+  console.log(`  Rolling issue action: ${rollingResult.action}`);
   console.log(`  Project-scoped hits (hidden from org reads): ${projectScopedHits.length}`);
   console.log(`  Failed:        ${failedMutations.length}`);
   if (failedMutations.length > 0) {
@@ -601,7 +760,7 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
     console.log(`  Re-run the watchdog to retry the above (idempotent).`);
   }
 
-  const hasPendingActions = toCancel.length > 0 || toFileThisRun.length > 0;
+  const hasPendingActions = toCancel.length > 0 || rollingResult.action !== 'none';
   if (!apply && hasPendingActions) {
     console.log('\n[DRY-RUN] Pass --apply to execute the above actions.');
     return 1;
@@ -610,7 +769,7 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
   // Every intended mutation failed this run — nothing was accomplished, so
   // surface it distinctly from the normal "some things failed, rest went
   // through" case (which still exits 0; see Failed count above) (AUR-3855).
-  const attemptedMutations = apply ? toCancel.length + toFileThisRun.length : 0;
+  const attemptedMutations = apply ? toCancel.length + (rollingResult.action !== 'none' ? 1 : 0) : 0;
   if (attemptedMutations > 0 && failedMutations.length === attemptedMutations) {
     console.log('\nERROR: every intended mutation failed this run — see Failed list above.');
     return 4;
@@ -638,8 +797,11 @@ if (isMain) {
 
   if (args.help) {
     console.log('Usage: node scripts/check-routing-rationale.mjs [--window-minutes N] [--max-new-flags N] [--apply]');
-    console.log('  --window-minutes N  Only check issues updated in last N minutes (default: 1440 = 24h, must be >= routine firing cadence)');
-    console.log('  --max-new-flags N   Cap new flags filed per run (default: 20, anti-flood guard)');
+    console.log('  --window-minutes N  Accepted for CLI back-compat; NO LONGER USED (AUR-3994 — the');
+    console.log('                      measurement pass now scans the full population every run,');
+    console.log('                      not just issues updated within a window).');
+    console.log('  --max-new-flags N   Cap how many outstanding gaps are individually listed in the');
+    console.log('                      rolling gap-aggregate issue body (default: 20, anti-flood guard).');
     console.log('  --apply             Execute changes (default: dry-run, exit 1 if actions pending)');
     process.exit(0);
   }

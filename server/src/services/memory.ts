@@ -1058,10 +1058,13 @@ export function memoryService(
     const owner = normalizePrincipal(input.owner, createdBy);
 
     // Idempotency-key dedup (AUR-4022): an explicit, caller-chosen exactly-once guard.
-    // A second capture with the same companyId + idempotencyKey returns the first record
-    // instead of creating a duplicate — this is for accidental double-submits (identical
-    // request retried), NOT a substitute for `upsert`-by-title, which intentionally keeps
-    // one bucket per title across many distinct captures.
+    // A second capture with the same (companyId, owner, idempotencyKey) returns the first
+    // record instead of creating a duplicate — this is for accidental double-submits
+    // (identical request retried), NOT a substitute for `upsert`-by-title, which
+    // intentionally keeps one bucket per title across many distinct captures.
+    // Scoped by owner so two agents sharing an obvious key (e.g. "synthesis/2026-07-25")
+    // don't collide, and excludes revoked/deleted/superseded records so a revoked record
+    // can't permanently block re-capture under the same key.
     if (input.idempotencyKey) {
       const existing = await db
         .select()
@@ -1069,7 +1072,12 @@ export function memoryService(
         .where(
           and(
             eq(memoryLocalRecords.companyId, binding.companyId),
+            eq(memoryLocalRecords.ownerType, owner.type),
+            eq(memoryLocalRecords.ownerId, owner.id),
             eq(memoryLocalRecords.idempotencyKey, input.idempotencyKey),
+            isNull(memoryLocalRecords.revokedAt),
+            isNull(memoryLocalRecords.deletedAt),
+            isNull(memoryLocalRecords.supersededByRecordId),
           ),
         )
         .limit(1);
@@ -1198,7 +1206,12 @@ export function memoryService(
           .where(
             and(
               eq(memoryLocalRecords.companyId, binding.companyId),
+              eq(memoryLocalRecords.ownerType, owner.type),
+              eq(memoryLocalRecords.ownerId, owner.id),
               eq(memoryLocalRecords.idempotencyKey, input.idempotencyKey),
+              isNull(memoryLocalRecords.revokedAt),
+              isNull(memoryLocalRecords.deletedAt),
+              isNull(memoryLocalRecords.supersededByRecordId),
             ),
           )
           .limit(1);

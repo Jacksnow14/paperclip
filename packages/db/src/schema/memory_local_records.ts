@@ -70,9 +70,15 @@ export const memoryLocalRecords = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    // Scoped to (companyId, ownerType, ownerId, idempotencyKey) — a company-wide key would
+    // let two agents sharing an obvious key (e.g. "synthesis/2026-07-25") silently collide.
+    // Revoked/deleted/superseded rows are excluded so a revoked record can't permanently
+    // block re-capture under the same key (AUR-4022 CTO review).
     companyIdempotencyKeyUq: uniqueIndex("memory_local_records_company_idempotency_uq")
-      .on(table.companyId, table.idempotencyKey)
-      .where(sql`${table.idempotencyKey} IS NOT NULL`),
+      .on(table.companyId, table.ownerType, table.ownerId, table.idempotencyKey)
+      .where(
+        sql`${table.idempotencyKey} IS NOT NULL AND ${table.revokedAt} IS NULL AND ${table.deletedAt} IS NULL AND ${table.supersededByRecordId} IS NULL`,
+      ),
     companyBindingCreatedIdx: index("memory_local_records_company_binding_created_idx").on(
       table.companyId,
       table.bindingId,

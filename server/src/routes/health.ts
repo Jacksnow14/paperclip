@@ -4,6 +4,7 @@ import type { Db } from "@paperclipai/db";
 import { and, count, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import { heartbeatRuns, instanceUserRoles, invites } from "@paperclipai/db";
 import type { DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
+import { readBuildInfo } from "../build-info.js";
 import { readPersistedDevServerStatus, toDevServerHealthStatus } from "../dev-server-status.js";
 import { logger } from "../middleware/logger.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -56,8 +57,8 @@ export function healthRoutes(
     if (!db) {
       res.json(
         exposeFullDetails
-          ? { status: "ok", version: serverVersion }
-          : { status: "ok", deploymentMode: opts.deploymentMode },
+          ? { status: "ok", version: serverVersion, build: readBuildInfo() }
+          : { status: "ok", deploymentMode: opts.deploymentMode, build: readBuildInfo() },
       );
       return;
     }
@@ -123,6 +124,11 @@ export function healthRoutes(
       res.json({
         status: "ok",
         deploymentMode: opts.deploymentMode,
+        // Deliberately included in the limited response: unauthenticated deploy
+        // monitors (AUR-3924 sampler, AUR-3937 drift check) must be able to ask
+        // what production is running. The SHA of a GitHub-hosted commit is not
+        // sensitive; five days of silent staleness was (AUR-3937).
+        build: readBuildInfo(),
         bootstrapStatus,
         bootstrapInviteActive,
         ...(devServer ? { devServer } : {}),
@@ -133,6 +139,7 @@ export function healthRoutes(
     res.json({
       status: "ok",
       version: serverVersion,
+      build: readBuildInfo(),
       deploymentMode: opts.deploymentMode,
       deploymentExposure: opts.deploymentExposure,
       authReady: opts.authReady,

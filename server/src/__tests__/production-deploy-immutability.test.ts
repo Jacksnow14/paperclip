@@ -22,6 +22,14 @@ const APP_ROOT = process.env.PAPERCLIP_DEPLOY_APP_ROOT ?? "/opt/paperclip/app";
 const CURRENT = path.join(APP_ROOT, "current");
 const onProductionBox = existsSync(CURRENT) && process.getuid?.() !== 0;
 
+// The release repo is root-owned, so plain git refuses it ("dubious ownership").
+// Every probe overrides safe.directory deliberately: an agent can trivially add
+// that exception to their own gitconfig, so the barrier these tests must prove
+// is the kernel permission check behind it, not git's ownership heuristic.
+function gitArgs(release: string, ...args: string[]): string[] {
+  return ["-c", `safe.directory=${release}`, "-C", release, ...args];
+}
+
 describe.skipIf(!onProductionBox)("production deploy immutability (AUR-3937)", () => {
   // Guarded: the describe body is collected even when skipIf is true.
   const release = onProductionBox ? realpathSync(CURRENT) : "";
@@ -65,17 +73,19 @@ describe.skipIf(!onProductionBox)("production deploy immutability (AUR-3937)", (
   });
 
   it("agent cannot branch-switch the release git tree", () => {
-    const result = spawnSync("git", ["-C", release, "checkout", "-b", "aur3937-probe-branch"], {
+    const result = spawnSync("git", gitArgs(release, "checkout", "-b", "aur3937-probe-branch"), {
       encoding: "utf8",
     });
     if (result.status === 0) {
-      spawnSync("git", ["-C", release, "checkout", "--detach"], { encoding: "utf8" });
-      spawnSync("git", ["-C", release, "branch", "-D", "aur3937-probe-branch"], { encoding: "utf8" });
+      spawnSync("git", gitArgs(release, "checkout", "--detach"), { encoding: "utf8" });
+      spawnSync("git", gitArgs(release, "branch", "-D", "aur3937-probe-branch"), { encoding: "utf8" });
       expect.fail("agent user was able to create and switch branches in the production release");
     }
     expect(result.status).not.toBe(0);
+    // Prove it failed on permissions, not on git's bypassable ownership heuristic.
+    expect(result.stderr).not.toMatch(/dubious ownership/);
     // The failed attempt must leave the release exactly as it was: detached at its pinned SHA.
-    const head = spawnSync("git", ["-C", release, "symbolic-ref", "-q", "HEAD"], { encoding: "utf8" });
+    const head = spawnSync("git", gitArgs(release, "symbolic-ref", "-q", "HEAD"), { encoding: "utf8" });
     expect(head.status).not.toBe(0); // still detached, not on any branch
   });
 
@@ -112,7 +122,7 @@ describe.skipIf(!onProductionBox)("production deploy immutability (AUR-3937)", (
     ) as { sha?: string };
     expect(info.sha).toMatch(/^[0-9a-f]{40}$/);
     // build-info must agree with the git tree it ships inside.
-    const head = spawnSync("git", ["-C", release, "rev-parse", "HEAD"], { encoding: "utf8" });
+    const head = spawnSync("git", gitArgs(release, "rev-parse", "HEAD"), { encoding: "utf8" });
     expect(head.stdout.trim()).toBe(info.sha);
   });
 });

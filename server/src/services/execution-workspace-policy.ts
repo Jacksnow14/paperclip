@@ -176,21 +176,38 @@ export function resolveExecutionWorkspaceMode(input: {
   projectPolicy: ProjectExecutionWorkspacePolicy | null;
   issueSettings: IssueExecutionWorkspaceSettings | null;
   legacyUseProjectWorkspace: boolean | null;
+  // Whether the project workspace the issue is actually pinned to has a git
+  // remote (repoUrl). Pass `null`/omit when unknown so callers that haven't
+  // been updated to resolve this stay a no-op. `false` degrades a
+  // git-requiring mode to shared_workspace below, since git_worktree/branch
+  // strategies cannot be applied to a plain data directory.
+  workspaceHasGitAncestor?: boolean | null;
 }): ParsedExecutionWorkspaceMode {
-  const issueMode = input.issueSettings?.mode;
-  if (issueMode && issueMode !== "inherit" && issueMode !== "reuse_existing") {
-    return issueMode;
-  }
-  if (input.projectPolicy?.enabled) {
-    if (input.projectPolicy.defaultMode === "isolated_workspace") return "isolated_workspace";
-    if (input.projectPolicy.defaultMode === "operator_branch") return "operator_branch";
-    if (input.projectPolicy.defaultMode === "adapter_default") return "agent_default";
+  const resolved = ((): ParsedExecutionWorkspaceMode => {
+    const issueMode = input.issueSettings?.mode;
+    if (issueMode && issueMode !== "inherit" && issueMode !== "reuse_existing") {
+      return issueMode;
+    }
+    if (input.projectPolicy?.enabled) {
+      if (input.projectPolicy.defaultMode === "isolated_workspace") return "isolated_workspace";
+      if (input.projectPolicy.defaultMode === "operator_branch") return "operator_branch";
+      if (input.projectPolicy.defaultMode === "adapter_default") return "agent_default";
+      return "shared_workspace";
+    }
+    if (input.legacyUseProjectWorkspace === false) {
+      return "agent_default";
+    }
+    return "shared_workspace";
+  })();
+
+  if (
+    input.workspaceHasGitAncestor === false &&
+    (resolved === "isolated_workspace" || resolved === "operator_branch")
+  ) {
     return "shared_workspace";
   }
-  if (input.legacyUseProjectWorkspace === false) {
-    return "agent_default";
-  }
-  return "shared_workspace";
+
+  return resolved;
 }
 
 export function buildExecutionWorkspaceAdapterConfig(input: {

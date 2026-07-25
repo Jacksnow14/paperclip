@@ -1,0 +1,30 @@
+[Unit]
+Description=Polymarket BTC 5m Taker — GBM Scoring Sidecar
+After=network.target
+Wants=network-online.target
+Before=polymarket-btc-5m-taker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ievgen/polymarket-btc-5m-taker-bot
+
+# Trains GBM on Deribit minute history at startup, then serves /score on
+# 127.0.0.1:8765. The taker bot calls this once per tick; on any sidecar
+# error the bot skips the tick (no Gaussian fallback).
+ExecStart=/usr/bin/python3 /home/ievgen/polymarket-btc-5m-taker-bot/gbm_sidecar/serve.py \
+    --host 127.0.0.1 --port 8765 \
+    --train-months 6 --refit-hours 168
+
+# Initial Deribit fetch + GBM fit takes ~1 minute. systemd readiness needs
+# a longer than default startup window.
+TimeoutStartSec=300
+
+Restart=on-failure
+RestartSec=15
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gbm-sidecar
+
+[Install]
+WantedBy=default.target

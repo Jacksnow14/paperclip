@@ -1170,6 +1170,14 @@ describe("memory routes", () => {
       agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: companyA,
     };
+    const completeMetadata = {
+      category: "performance_scorecard",
+      issue_id: validIssueUuid,
+      quality_signal: 4,
+      token_cost: 12000,
+      agent_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      task_type: "bug",
+    };
 
     it.each(["performance_scorecard", "scorecard_adjusted"])(
       "returns 422 for category '%s' with an unresolvable issue_id (TEST-0)",
@@ -1180,7 +1188,7 @@ describe("memory routes", () => {
         const res = await request(app)
           .post(`/api/companies/${companyA}/memory/capture`)
           .set("Origin", "http://localhost:3100")
-          .send({ ...scorecardBaseBody, metadata: { category, issue_id: "TEST-0" } });
+          .send({ ...scorecardBaseBody, metadata: { ...completeMetadata, category, issue_id: "TEST-0" } });
 
         expect(res.status).toBe(422);
         expect(res.body.details.errors.some((e: string) => e.includes("TEST-0"))).toBe(true);
@@ -1190,27 +1198,60 @@ describe("memory routes", () => {
 
     it("returns 422 when metadata.issue_id is absent", async () => {
       const app = createApp(agentActor);
+      const { issue_id: _omit, ...metadataWithoutIssueId } = completeMetadata;
 
       const res = await request(app)
         .post(`/api/companies/${companyA}/memory/capture`)
         .set("Origin", "http://localhost:3100")
-        .send({ ...scorecardBaseBody, metadata: { category: "performance_scorecard" } });
+        .send({ ...scorecardBaseBody, metadata: metadataWithoutIssueId });
 
       expect(res.status).toBe(422);
       expect(res.body.details.errors.some((e: string) => e.includes("metadata.issue_id"))).toBe(true);
       expect(mockMemoryService.capture).not.toHaveBeenCalled();
     });
 
-    it("returns 201 for a scorecard with a real resolvable issue_id", async () => {
+    it.each(["quality_signal", "token_cost", "agent_id", "task_type"])(
+      "returns 422 when metadata.%s is absent",
+      async (field) => {
+        const app = createApp(agentActor);
+        const metadata: Record<string, unknown> = { ...completeMetadata };
+        delete metadata[field];
+
+        const res = await request(app)
+          .post(`/api/companies/${companyA}/memory/capture`)
+          .set("Origin", "http://localhost:3100")
+          .send({ ...scorecardBaseBody, metadata });
+
+        expect(res.status).toBe(422);
+        expect(res.body.details.errors.some((e: string) => e.includes(`metadata.${field}`))).toBe(true);
+        expect(mockMemoryService.capture).not.toHaveBeenCalled();
+      },
+    );
+
+    it("returns 422 when metadata.test_data is true, even with all required fields present", async () => {
+      const app = createApp(agentActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...scorecardBaseBody, metadata: { ...completeMetadata, test_data: true } });
+
+      expect(res.status).toBe(422);
+      expect(res.body.details.errors.some((e: string) => e.includes("test_data"))).toBe(true);
+      expect(mockMemoryService.capture).not.toHaveBeenCalled();
+    });
+
+    it("returns 201 for a scorecard with a real resolvable issue_id and all required fields", async () => {
       mockMemoryService.capture.mockResolvedValue(scorecardCaptureResult);
       const app = createApp(agentActor);
 
       const res = await request(app)
         .post(`/api/companies/${companyA}/memory/capture`)
         .set("Origin", "http://localhost:3100")
-        .send({ ...scorecardBaseBody, metadata: { category: "performance_scorecard", issue_id: validIssueUuid } });
+        .send({ ...scorecardBaseBody, metadata: completeMetadata });
 
       expect(res.status).toBe(201);
+      expect(mockIssueService.getByIdentifier).not.toHaveBeenCalled();
       expect(mockMemoryService.capture).toHaveBeenCalledTimes(1);
     });
 
@@ -1225,6 +1266,19 @@ describe("memory routes", () => {
 
       expect(res.status).toBe(201);
       expect(mockMemoryService.capture).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns all violations together in details.errors[]", async () => {
+      const app = createApp(agentActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...scorecardBaseBody, metadata: { category: "scorecard_adjusted" } });
+
+      expect(res.status).toBe(422);
+      expect(res.body.details.errors.length).toBeGreaterThanOrEqual(5);
+      expect(mockMemoryService.capture).not.toHaveBeenCalled();
     });
   });
 

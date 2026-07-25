@@ -23,8 +23,10 @@
  *
  * Scorecard integrity guard (POST /memory/capture, AUR-3993/AUR-3996):
  *   A capture with metadata.category `performance_scorecard` or `scorecard_adjusted` is
- *   rejected with 422 unless metadata.issue_id is present and resolves to a real issue
- *   in this company. Violations are returned in `details.errors[]`.
+ *   rejected with 422 unless metadata.issue_id/quality_signal/token_cost/agent_id/task_type
+ *   are all present, metadata.issue_id resolves to a real issue in this company, and
+ *   metadata.test_data is not `true`. All violations are returned together in
+ *   `details.errors[]`. `outcome` and `value_signal` stay optional.
  */
 import { Router } from "express";
 import type { Db } from "@paperclipai/db";
@@ -99,34 +101,57 @@ export function checkRouterReadScopeViolation(payload: {
  * Categories subject to the scorecard integrity guard (AUR-3993 found 218
  * synthetic performance_scorecard/scorecard_adjusted records polluting the
  * routing registry's quartile math; AUR-3996 closes the write path that let
- * them in). A capture in one of these categories must carry an issue_id that
- * resolves to a real issue — otherwise it is unusable by construction and
- * should never have been written.
+ * them in). A capture in one of these categories must carry the fields the
+ * router groups and scores on, and must resolve to a real issue — otherwise
+ * it is unusable by construction and should never have been written.
  */
 export const SCORECARD_INTEGRITY_CATEGORIES = new Set(["performance_scorecard", "scorecard_adjusted"]);
+
+/**
+ * `outcome` and `value_signal` are deliberately NOT required here: a sweep of
+ * the live registry (AUR-3993 thread, CTO, 2026-07-25) found `outcome` absent
+ * on 1,872 of 3,896 scorecards — 48% of the entire registry — so requiring it
+ * would 422 roughly every other honest capture. `issue_id` is checked
+ * separately below because it also needs DB-backed resolution, not just
+ * presence.
+ */
+const SCORECARD_REQUIRED_METADATA_FIELDS = ["issue_id", "quality_signal", "token_cost", "agent_id", "task_type"] as const;
 
 function isBlankMetadataValue(value: unknown): boolean {
   return value === undefined || value === null || (typeof value === "string" && value.trim().length === 0);
 }
 
 /**
- * Synchronous half of the scorecard integrity guard: checks metadata.issue_id
- * is present and string-typed (the DB-backed resolution check runs
- * separately, below, since it needs to await). Returns an empty array when
- * metadata.category isn't a scorecard category, or when the check passes.
+ * Synchronous half of the scorecard integrity guard: checks the metadata
+ * fields the router groups/scores on are present, that `issue_id` is a
+ * string (so the caller-facing message can tell them to fix it before the
+ * DB-backed resolution check runs), and rejects a capture self-declared as
+ * test data (AUR-3993 thread: 46 live fixtures self-declared
+ * `metadata.test_data: true`, all traced to the same synthetic burst this
+ * guard exists to stop recurring). Returns an empty array when
+ * `metadata.category` isn't a scorecard category, or when every check passes.
  */
 export function checkScorecardMetadataViolations(metadata: Record<string, unknown> | undefined): string[] {
   const category = metadata?.category;
   if (typeof category !== "string" || !SCORECARD_INTEGRITY_CATEGORIES.has(category)) return [];
 
-  const issueId = metadata?.issue_id;
-  if (isBlankMetadataValue(issueId)) {
-    return [`metadata.issue_id is required for category '${category}' — the router groups and scores on it.`];
+  const errors: string[] = [];
+  for (const field of SCORECARD_REQUIRED_METADATA_FIELDS) {
+    const value = metadata?.[field];
+    if (isBlankMetadataValue(value)) {
+      errors.push(
+        `metadata.${field} is required for category '${category}' — the router groups and scores on it.`,
+      );
+    } else if (field === "issue_id" && typeof value !== "string") {
+      errors.push("metadata.issue_id must be a string identifier (AUR-NNNN or UUID)");
+    }
   }
-  if (typeof issueId !== "string") {
-    return ["metadata.issue_id must be a string identifier (AUR-NNNN or UUID)"];
+  if (metadata?.test_data === true) {
+    errors.push(
+      `metadata.test_data: true is not permitted on a '${category}' capture; use a scoped test company, not production.`,
+    );
   }
-  return [];
+  return errors;
 }
 
 function actorInfoFromReq(req: any) {

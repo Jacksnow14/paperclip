@@ -92,6 +92,32 @@ function sanitizeHeaderValue(value: string): string {
   return value.replace(/[\r\n\0]/g, " ").trim();
 }
 
+// Detect and reverse double-UTF-8 encoding ("mojibake") caused by the Gmail
+// API returning header bytes that were decoded as Latin-1 instead of UTF-8.
+// Each pass: re-encode the string as Latin-1 bytes, then decode as UTF-8.
+// If the result is shorter in byte length (fewer multi-byte sequences) and
+// contains no replacement characters, the string was mojibaked — accept it.
+// Up to 2 passes handles the double-encoding case (AUR-3569 / LAR-570).
+export function repairUtf8Mojibake(input: string): string {
+  let current = input;
+  for (let pass = 0; pass < 2; pass++) {
+    let decoded: string;
+    try {
+      const bytes = Buffer.from(current, "latin1");
+      decoded = bytes.toString("utf-8");
+    } catch {
+      break;
+    }
+    if (decoded.includes("�")) break;
+    if (Buffer.byteLength(decoded, "utf-8") < Buffer.byteLength(current, "utf-8")) {
+      current = decoded;
+    } else {
+      break;
+    }
+  }
+  return current;
+}
+
 function parseMessage(
   msg: {
     id?: string | null;
@@ -111,8 +137,10 @@ function parseMessage(
 
   const headers = msg.payload?.headers ?? [];
   // Sanitize at parse time so all downstream paths (title, DB fields, comments) receive clean values.
-  const from = sanitizeHeaderValue(extractHeader(headers, "from"));
-  const subject = sanitizeHeaderValue(extractHeader(headers, "subject")) || "(no subject)";
+  // repairUtf8Mojibake reverses double-Latin-1 encoding that the Gmail API sometimes produces for
+  // non-ASCII header values (LAR-570).
+  const from = repairUtf8Mojibake(sanitizeHeaderValue(extractHeader(headers, "from")));
+  const subject = repairUtf8Mojibake(sanitizeHeaderValue(extractHeader(headers, "subject"))) || "(no subject)";
   const dateStr = extractHeader(headers, "date");
   const dateMs = dateStr ? new Date(dateStr).getTime() : null;
 

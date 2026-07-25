@@ -329,6 +329,13 @@ function wrapBase64(data: string): string {
   return data.replace(/.{1,76}/g, "$&\r\n").trimEnd();
 }
 
+// RFC 2047 §4.1 encoded-word for non-ASCII header values: =?utf-8?b?<base64>?=
+// Required so that mail clients don't misinterpret raw UTF-8 bytes in the header.
+function encodeRfc2047(value: string): string {
+  if (!/[^\x00-\x7F]/.test(value)) return value;
+  return `=?utf-8?b?${Buffer.from(value, "utf-8").toString("base64")}?=`;
+}
+
 function buildMimeBoundary(): string {
   return `paperclip-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
@@ -358,8 +365,10 @@ function buildRawMessage(opts: BuildRawMessageOptions): string {
   }
 
   const isReply = Boolean(opts.inReplyTo);
-  const subject =
+  const rawSubject =
     isReply && !/^re:/i.test(opts.subject.trim()) ? `Re: ${opts.subject}` : opts.subject;
+  // RFC 2047-encode so mail clients receive valid structured headers for non-ASCII subjects.
+  const subject = encodeRfc2047(rawSubject);
   const ccRecipients = normalizeRecipients(opts.cc);
   for (const recipient of ccRecipients) assertNoHeaderInjection(recipient, "cc");
   const cc = ccRecipients.join(", ");

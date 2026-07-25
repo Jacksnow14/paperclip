@@ -169,6 +169,27 @@ Rules:
 - Audit-tagged: `comment.metadata.mentionReply === true` and `comment.metadata.mentionRepliedByAgentId` carries the replying agent's ID; an `issue.mention_reply` activity log entry is emitted.
 - Resolution order: the `tasks:comment_cross_issue` bypass is evaluated first; the mention path only applies when the actor lacks that grant.
 
+### Issue ownership gate — assigning is a one-way door (AUR-4002/AUR-4010)
+
+Nothing below was documented before AUR-4010; this section is the first write-up of the ownership gate's actual behavior. Read it before assuming that delegating an issue keeps you any rights over it.
+
+The core mutation gate (`assertAgentIssueMutationAllowed`) compares **only** `issue.assigneeAgentId` against the calling agent. It does **not** know who created the issue. Once you assign an issue away, you lose comment and mutation rights over it — including on issues you wrote yourself — unless one of the narrow bypasses below applies. The apparent "managers can comment down, peers/upward can't" behavior is a side effect of the checkout-intervention override (`hasActiveCheckoutManagementOverride`, which walks the assignee's `reportsTo` chain), not a designed authorship concept — it does not help a delegator, only a manager overriding a report's active checkout.
+
+**The one-line rule: you may always amend what you said; you may never change what someone else is doing.**
+
+| Actor relationship to the issue | Comment rights | PATCH rights |
+|---|---|---|
+| Assignee | Full | Full |
+| Author (`createdByAgentId === actorAgentId`), not assignee | Always allowed — non-mutating reply (`issue.author_reply` activity) | `description`, `blockedByIssueIds`, `priority` only — any other field in the same request body refuses the **whole** request (no partial write), and an empty body always falls through to the normal gate. This path deliberately bypasses the `in_progress` checkout-lock 409 — an author can amend these three fields even while the issue is actively checked out by its assignee. Amending `description` to an actually-different value posts a one-line comment (naming the author, not a raw agent id) and logs `issue.brief_amended_by_author` **after** the update commits, so a no-op edit or a request that aborts partway through never leaves a stale "amended" record. |
+| Reporting-chain manager of the assignee, active checkout only | Not a distinct path — covered by the general gate | May intervene in the report's active checkout without taking it over |
+| `tasks:comment_cross_issue` grant or `role=ceo` | Coordination-only comment on any issue (see above) | No |
+| @mentioned or prior thread participant | Non-mutating reply | No |
+| Anyone else | 403/409 | 403/409 |
+
+A 403 from the gate now names the rule that fired, whether the actor is the issue's author, and the available alternatives (`@mention` the assignee, add a blocker, or escalate to the assignee's reporting-chain manager) in `details` — the top-level `error` string (`"Agent cannot mutate another agent's issue"`) is unchanged and must not be relied on to change, since several tests assert on it byte-for-byte.
+
+**Practical workaround if you haven't shipped past this yet:** comment once on your own issue's thread (or @mention yourself) *before* assigning it away — that earns permanent prior-participant reply rights independent of authorship. Assigning away without ever commenting first is the one-way door.
+
 ### Gmail I/O (agent-callable mailbox)
 
 Use the first-class Gmail API — do not hand-roll raw SA-key/urllib scripts to

@@ -1163,6 +1163,78 @@ export function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJ
   return env;
 }
 
+// AUR-4003: default-deny inheritance of secret-shaped host env vars into agent
+// child processes. Company-scoped vault bindings (resolveEnvBindings -> config.env
+// -> opts.env) are the only supported way an agent receives a credential, so this
+// filter must only ever be applied to the inherited process.env side of a spawn
+// merge — never to opts.env / config.env.
+const INHERITED_SECRET_ENV_EXPLICIT_DENYLIST = new Set([
+  // Secret-bearing names SENSITIVE_ENV_KEY does not match.
+  "SUPABASE_DB_URL",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "GOOGLE_WORKSPACE_SA_KEY",
+]);
+
+// Runtime-auth vars the spawned agent CLI itself consumes. Every entry here is
+// ambient credential surface shared with all tenants — keep it minimal and
+// justify additions in review.
+const INHERITED_SECRET_ENV_KEEPLIST = new Set([
+  "ANTHROPIC_API_KEY",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+]);
+
+export type InheritedSecretEnvScrubMode = "enforce" | "report";
+
+export function resolveInheritedSecretEnvScrubMode(
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): InheritedSecretEnvScrubMode {
+  return baseEnv.PAPERCLIP_ENV_SCRUB_MODE === "report" ? "report" : "enforce";
+}
+
+export function sanitizeInheritedSecretEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  opts: {
+    runId?: string;
+    mode?: InheritedSecretEnvScrubMode;
+    log?: (message: string) => void;
+  } = {},
+): NodeJS.ProcessEnv {
+  const mode = opts.mode ?? resolveInheritedSecretEnvScrubMode();
+  const env: NodeJS.ProcessEnv = { ...baseEnv };
+  const stripped: string[] = [];
+  for (const key of Object.keys(env)) {
+    if (INHERITED_SECRET_ENV_KEEPLIST.has(key)) continue;
+    if (!SENSITIVE_ENV_KEY.test(key) && !INHERITED_SECRET_ENV_EXPLICIT_DENYLIST.has(key)) continue;
+    stripped.push(key);
+    if (mode === "enforce") delete env[key];
+  }
+  if (stripped.length > 0) {
+    const log = opts.log ?? ((message: string) => console.info(message));
+    const runSuffix = opts.runId ? ` run=${opts.runId}` : "";
+    log(
+      `[paperclip] env-scrub mode=${mode}${runSuffix} ${
+        mode === "enforce" ? "stripped" : "would strip"
+      } inherited env keys: ${stripped.sort().join(", ")}`,
+    );
+  }
+  return env;
+}
+
+// The one supported way to build a child-process env from the host env plus the
+// per-run env. Scrubs identity and secret-shaped vars from the inherited side
+// only; per-run values (which include tenant-scoped vault bindings) always win
+// and are never filtered here.
+export function buildChildProcessEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  runEnv: Record<string, string | undefined>,
+  opts: { runId?: string; mode?: InheritedSecretEnvScrubMode; log?: (message: string) => void } = {},
+): NodeJS.ProcessEnv {
+  return {
+    ...sanitizeInheritedSecretEnv(sanitizeInheritedPaperclipEnv(baseEnv), opts),
+    ...runEnv,
+  };
+}
+
 export function defaultPathForPlatform() {
   if (process.platform === "win32") {
     return "C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\Wbem";
@@ -2024,10 +2096,7 @@ export async function runChildProcess(
 ): Promise<RunProcessResult> {
   const onLogError = opts.onLogError ?? ((err, id, msg) => console.warn({ err, runId: id }, msg));
   return new Promise<RunProcessResult>((resolve, reject) => {
-    const rawMerged: NodeJS.ProcessEnv = {
-      ...sanitizeInheritedPaperclipEnv(process.env),
-      ...opts.env,
-    };
+    const rawMerged: NodeJS.ProcessEnv = buildChildProcessEnv(process.env, opts.env, { runId });
 
     // Strip Claude Code nesting-guard env vars so spawned `claude` processes
     // don't refuse to start with "cannot be launched inside another session".

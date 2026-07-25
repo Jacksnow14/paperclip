@@ -1096,7 +1096,7 @@ export function issueRoutes(
   async function assertAgentIssueMutationAllowed(
     req: Request,
     res: Response,
-    issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null },
+    issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null; createdByAgentId?: string | null },
   ) {
     if (req.actor.type !== "agent") return true;
     const actorAgentId = req.actor.agentId;
@@ -1121,6 +1121,7 @@ export function issueRoutes(
           },
         });
       } else {
+        const isAuthor = issue.createdByAgentId != null && issue.createdByAgentId === actorAgentId;
         res.status(403).json({
           error: "Agent cannot mutate another agent's issue",
           details: {
@@ -1128,6 +1129,13 @@ export function issueRoutes(
             assigneeAgentId: issue.assigneeAgentId,
             actorAgentId,
             status: issue.status,
+            rule: "issue is assigned to another agent; you are not its author",
+            isAuthor,
+            alternatives: [
+              "@mention the assignee in a comment",
+              "add a blocker with blockedByIssueIds",
+              "escalate to the assignee's reporting-chain manager",
+            ],
             securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
           },
         });
@@ -1161,6 +1169,56 @@ export function issueRoutes(
     return true;
   }
 
+  // Field-scoped author amendment (AUR-4002/AUR-4010): the agent that created an
+  // issue may always amend what it said (description, blockers, priority), even
+  // after assigning the issue away, but may never change what the assignee is
+  // doing (status, assigneeAgentId, or anything else). A mixed body containing
+  // any out-of-allowlist key is refused wholesale — no partial application.
+  const AUTHOR_AMENDMENT_ALLOWED_FIELDS = new Set(["description", "blockedByIssueIds", "priority"]);
+
+  async function assertAgentAuthorAmendmentAllowed(
+    req: Request,
+    _res: Response,
+    issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null; createdByAgentId: string | null },
+  ): Promise<"handled" | "fallthrough"> {
+    if (req.actor.type !== "agent") return "fallthrough";
+    const actorAgentId = req.actor.agentId;
+    if (!actorAgentId) return "fallthrough";
+    if (issue.createdByAgentId !== actorAgentId) return "fallthrough";
+    if (issue.assigneeAgentId === actorAgentId) return "fallthrough";
+
+    const bodyKeys = Object.keys(req.body ?? {});
+    const hasDisallowedField = bodyKeys.some((key) => !AUTHOR_AMENDMENT_ALLOWED_FIELDS.has(key));
+    if (hasDisallowedField) return "fallthrough";
+
+    if (Object.prototype.hasOwnProperty.call(req.body ?? {}, "description")) {
+      const actor = getActorInfo(req);
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.brief_amended_by_author",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          assigneeAgentId: issue.assigneeAgentId,
+          actorAgentId,
+        },
+      });
+      const authorLabel = actor.agentId ?? actorAgentId;
+      const amendmentComment = await svc.addComment(issue.id, `Author (${authorLabel}) amended the brief description.`, {
+        agentId: actor.agentId ?? undefined,
+        userId: undefined,
+        runId: actor.runId,
+      }, { authorType: "agent" });
+      await issueReferencesSvc.syncComment(amendmentComment.id);
+    }
+
+    return "handled";
+  }
+
   // Mention-scoped reply path (AUR-2825): an agent explicitly @mentioned in a
   // thread it does not own may post a non-mutating reply comment, even on a
   // closed issue, without a standing grant. This composes with the permission-
@@ -1171,7 +1229,7 @@ export function issueRoutes(
   async function assertAgentCommentAllowed(
     req: Request,
     res: Response,
-    issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null },
+    issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null; createdByAgentId: string | null },
   ): Promise<{ ok: true; mentionReply: boolean } | false> {
     if (req.actor.type !== "agent") return { ok: true, mentionReply: false };
     const actorAgentId = req.actor.agentId;
@@ -1180,6 +1238,24 @@ export function issueRoutes(
       return false;
     }
     if (issue.assigneeAgentId !== null && issue.assigneeAgentId !== actorAgentId) {
+      if (issue.createdByAgentId === actorAgentId) {
+        const actor = getActorInfo(req);
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          action: "issue.author_reply",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            assigneeAgentId: issue.assigneeAgentId,
+            actorAgentId,
+          },
+        });
+        return { ok: true, mentionReply: true };
+      }
       const isMentioned = await svc.wasAgentMentionedInThread(issue.companyId, issue.id, actorAgentId);
       if (isMentioned) {
         const actor = getActorInfo(req);
@@ -3000,7 +3076,10 @@ export function issueRoutes(
     }
     assertCompanyAccess(req, existing.companyId);
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
-    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
+    const authorAmendmentResult = await assertAgentAuthorAmendmentAllowed(req, res, existing);
+    if (authorAmendmentResult !== "handled") {
+      if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
+    }
 
     const actor = getActorInfo(req);
     const isClosed = isClosedIssueStatus(existing.status);

@@ -8,6 +8,9 @@ const companyId = "22222222-2222-4222-8222-222222222222";
 const ownerAgentId = "33333333-3333-4333-8333-333333333333";
 const peerAgentId = "44444444-4444-4444-8444-444444444444";
 const ownerRunId = "55555555-5555-4555-8555-555555555555";
+const authorAgentId = "77777777-1111-4111-8111-777777777777";
+const ceoAgentId = "88888888-2222-4222-8222-888888888888";
+const authorRunId = "99999999-3333-4333-8333-999999999999";
 
 const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
@@ -65,6 +68,7 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
 const mockIssueRecoveryActionService = vi.hoisted(() => ({
   getActiveForIssue: vi.fn(async () => null),
 }));
+const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 
 function registerRouteMocks() {
   vi.doMock("@paperclipai/shared/telemetry", () => ({
@@ -145,7 +149,7 @@ function registerRouteMocks() {
     }),
     issueService: () => mockIssueService,
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
-    logActivity: vi.fn(async () => undefined),
+    logActivity: mockLogActivity,
     projectService: () => ({}),
     routineService: () => ({
       syncRunStatusForIssue: vi.fn(async () => undefined),
@@ -166,8 +170,10 @@ function makeIssue(overrides: Record<string, unknown> = {}) {
     assigneeAgentId: ownerAgentId,
     assigneeUserId: null,
     createdByUserId: "board-user",
+    createdByAgentId: null,
     identifier: "PAP-1649",
     title: "Owned active issue",
+    description: "Original description",
     executionPolicy: null,
     executionState: null,
     hiddenAt: null,
@@ -223,6 +229,17 @@ function ownerActor() {
   };
 }
 
+function authorActor(overrides: Record<string, unknown> = {}) {
+  return {
+    type: "agent",
+    agentId: authorAgentId,
+    companyId,
+    source: "agent_key",
+    runId: authorRunId,
+    ...overrides,
+  };
+}
+
 function boardActor() {
   return {
     type: "board",
@@ -267,6 +284,8 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.listWakeableBlockedDependents.mockReset();
     mockIssueRecoveryActionService.getActiveForIssue.mockReset();
     mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(null);
+    mockLogActivity.mockReset();
+    mockLogActivity.mockResolvedValue(undefined);
     mockIssueService.remove.mockReset();
     mockIssueService.removeAttachment.mockReset();
     mockIssueService.update.mockReset();
@@ -284,11 +303,15 @@ describe("agent issue mutation checkout ownership", () => {
     mockAgentService.getById.mockImplementation(async (id: string) => {
       if (id === ownerAgentId) return makeAgent(ownerAgentId);
       if (id === peerAgentId) return makeAgent(peerAgentId);
+      if (id === authorAgentId) return makeAgent(authorAgentId, { role: "cto" });
+      if (id === ceoAgentId) return makeAgent(ceoAgentId, { role: "ceo" });
       return null;
     });
     mockAgentService.list.mockResolvedValue([
       makeAgent(ownerAgentId),
       makeAgent(peerAgentId),
+      makeAgent(authorAgentId, { role: "cto" }),
+      makeAgent(ceoAgentId, { role: "ceo" }),
     ]);
     mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: null });
     mockCompanyService.getById.mockResolvedValue({ id: companyId, issuePrefix: "PAP" });
@@ -762,6 +785,180 @@ describe("agent issue mutation checkout ownership", () => {
 
       expect(res.status, JSON.stringify(res.body)).toBe(201);
       expect(mockIssueService.wasAgentPriorParticipantInThread).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("author comment and amendment rights (AUR-4002/AUR-4010)", () => {
+    it("AUR-3998 regression: author (CTO role) can comment on an issue assigned upward to a CEO-role agent with no reporting-chain override", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "todo", assigneeAgentId: ceoAgentId, createdByAgentId: authorAgentId }),
+      );
+      mockIssueService.wasAgentMentionedInThread.mockResolvedValue(false);
+      mockIssueService.wasAgentPriorParticipantInThread.mockResolvedValue(false);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        issueId,
+        companyId,
+        body: "author follow-up",
+      });
+
+      const res = await request(await createApp(authorActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "author follow-up" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalledWith(
+        issueId,
+        "author follow-up",
+        expect.objectContaining({ agentId: authorAgentId }),
+        expect.objectContaining({ authorType: "agent" }),
+      );
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.author_reply",
+          entityId: issueId,
+          details: expect.objectContaining({ assigneeAgentId: ceoAgentId, actorAgentId: authorAgentId }),
+        }),
+      );
+    });
+
+    it("allows author comment on an issue assigned to an unrelated peer too, not just upward", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "todo", assigneeAgentId: peerAgentId, createdByAgentId: authorAgentId }),
+      );
+      mockIssueService.wasAgentMentionedInThread.mockResolvedValue(false);
+      mockIssueService.wasAgentPriorParticipantInThread.mockResolvedValue(false);
+
+      const res = await request(await createApp(authorActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "checking in" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalled();
+    });
+
+    it("still rejects a stranger who is neither author, assignee, mentioned, prior participant, nor reporting-chain manager", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, createdByAgentId: authorAgentId }),
+      );
+      mockIssueService.wasAgentMentionedInThread.mockResolvedValue(false);
+      mockIssueService.wasAgentPriorParticipantInThread.mockResolvedValue(false);
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "stranger note" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    it("allows the author to amend description via PATCH and logs the brief-amended activity + comment", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, createdByAgentId: authorAgentId }),
+      );
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, createdByAgentId: authorAgentId }),
+        ...patch,
+      }));
+
+      const res = await request(await createApp(authorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ description: "Revised description" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ description: "Revised description" }),
+      );
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.brief_amended_by_author",
+          entityId: issueId,
+          details: expect.objectContaining({ assigneeAgentId: ownerAgentId, actorAgentId: authorAgentId }),
+        }),
+      );
+      expect(mockIssueService.addComment).toHaveBeenCalledWith(
+        issueId,
+        expect.stringContaining("amended the brief"),
+        expect.objectContaining({ agentId: authorAgentId }),
+        expect.objectContaining({ authorType: "agent" }),
+      );
+    });
+
+    it("rejects the author's attempt to change status via PATCH", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, createdByAgentId: authorAgentId }),
+      );
+
+      const res = await request(await createApp(authorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "cancelled" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects a mixed author PATCH { description, status } wholesale — no partial write, description unchanged", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, createdByAgentId: authorAgentId }),
+      );
+
+      const res = await request(await createApp(authorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ description: "Sneaky rewrite", status: "cancelled" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.brief_amended_by_author" }),
+      );
+    });
+
+    it("allows the author to amend blockedByIssueIds via PATCH", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, createdByAgentId: authorAgentId }),
+      );
+      const blockerId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, createdByAgentId: authorAgentId }),
+        ...patch,
+      }));
+
+      const res = await request(await createApp(authorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ blockedByIssueIds: [blockerId] });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ blockedByIssueIds: [blockerId] }),
+      );
+    });
+
+    it("allows the author to amend priority via PATCH", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, createdByAgentId: authorAgentId }),
+      );
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, createdByAgentId: authorAgentId }),
+        ...patch,
+      }));
+
+      const res = await request(await createApp(authorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ priority: "low" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ priority: "low" }),
+      );
     });
   });
 });

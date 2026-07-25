@@ -137,11 +137,11 @@ export function isRoutingDecision(issue) {
 }
 
 /**
- * Returns true if an issue is exempt from the routing-rationale convention.
- * Exempt issues are never flagged and any existing open flags are auto-resolved.
+ * Exemption reasons that are intrinsic to the issue's content (title/description)
+ * and therefore hold regardless of who is currently assigned. Safe to re-check at
+ * any time, including when re-evaluating a flag filed in the past (AUR-3854).
  */
-export function isExempt(issue) {
-  if (!isRoutingDecision(issue)) return true;
+function isStaticallyExempt(issue) {
   if (issue.description && issue.description.includes('exec.routing-rationale: skip')) return true;
   if (/content slot/i.test(issue.title ?? '')) return true;
   // Recurring daily-brief publication tasks (e.g. "Post 2026-05-29 daily AI brief
@@ -171,10 +171,45 @@ export function isExempt(issue) {
   // that merely BUILD such a feature ("Add approval gate to deploy pipeline",
   // "Implement sign-off flow") — those have no gate delimiter after the phrase.
   if (/\b(?:sign[-\s]?off|approval(?:\s+gate)?)\s*[:—]/i.test(title)) return true;
-  // Self-assigned / no-creator / routine-origin issues are covered by
-  // isRoutingDecision() above (recurring false-positive class: AUR-869,
-  // AUR-1829, AUR-801/802, AUR-1550).
   return false;
+}
+
+/**
+ * Returns true if an issue is exempt from the routing-rationale convention.
+ * Exempt issues are never flagged. Used by the measurement pass / Phase B
+ * candidate-pool filter, where isRoutingDecision's self-assigned check
+ * reflects the CURRENT assignee and is a valid no-delegation signal.
+ * (Self-assigned / no-creator / routine-origin issues are covered by
+ * isRoutingDecision — recurring false-positive class: AUR-869, AUR-1829,
+ * AUR-801/802, AUR-1550.)
+ *
+ * Do NOT use this to auto-resolve an EXISTING flag (see isExemptForResolvedFlag):
+ * the self-assigned check is assignee-snapshot-dependent, and an issue that was
+ * delegated then handed back to its creator for review is NOT retroactively
+ * exempt just because the current assignee matches the creator again (AUR-3854).
+ */
+export function isExempt(issue) {
+  if (!isRoutingDecision(issue)) return true;
+  return isStaticallyExempt(issue);
+}
+
+/**
+ * Exemption check for Phase A re-evaluation of an ALREADY-FILED flag. Excludes
+ * isRoutingDecision's self-assigned rule: a flag only ever gets filed for a
+ * genuinely delegated issue (the pool filter already applied `isExempt`), so
+ * the flag's mere existence proves delegation happened. A later handback to
+ * the creator for review (assigneeAgentId reverting to createdByAgentId)
+ * doesn't undo that — only immutable properties (createdByAgentId, originKind)
+ * and the static, content-based exemptions can still legitimately apply
+ * (e.g. the issue was edited to add the skip token after filing) (AUR-3854).
+ */
+export function isExemptForResolvedFlag(issue) {
+  // Stable (non-assignee-snapshot) parts of isRoutingDecision: creator and
+  // origin are immutable, so re-checking them can never retroactively void a
+  // flag the way the self-assigned check can.
+  if (!issue.createdByAgentId) return true;
+  if (issue.originKind && issue.originKind !== 'manual') return true;
+  return isStaticallyExempt(issue);
 }
 
 /**
@@ -189,15 +224,21 @@ export function resolveCancelReason({ target, targetId, hasRecord, recordScope =
       ? `Auto-resolved by routing-rationale-watchdog: ${targetId} is ${target.status} — routing rationale moot.`
       : `Auto-resolved by routing-rationale-watchdog: ${targetId} not found among open issues — routing rationale moot.`;
   }
-  if (isExempt(target)) {
+  // Check hasRecord before exemption so a captured record is reported as the
+  // resolution reason instead of being misattributed to exemption when both
+  // happen to be true at once (AUR-3854 secondary defect).
+  if (hasRecord) {
+    const scopeTag = recordScope === 'project' ? ' — project-scoped (hidden from org reads)' : '';
+    return `Auto-resolved by routing-rationale-watchdog: routing/${targetId} record now exists.${scopeTag}`;
+  }
+  // Use isExemptForResolvedFlag, not isExempt: this flag was only ever filed for
+  // a genuinely delegated issue, so a handback-to-creator reassignment must not
+  // retroactively exempt it via the self-assigned rule (AUR-3854).
+  if (isExemptForResolvedFlag(target)) {
     return `Auto-resolved by routing-rationale-watchdog: ${targetId} is exempt from routing rationale (no routing decision made, exec.routing-rationale: skip, content-slot, daily-brief, or single-owner sign-off/approval gate).`;
   }
   if (isPreRule(target, ruleEffectiveDate)) {
     return `Auto-resolved by routing-rationale-watchdog: ${targetId} was created before the routing-rationale rule took effect (${ruleEffectiveDate.toISOString()}) — rationale is unrecoverable and not owed (AUR-4006).`;
-  }
-  if (hasRecord) {
-    const scopeTag = recordScope === 'project' ? ' — project-scoped (hidden from org reads)' : '';
-    return `Auto-resolved by routing-rationale-watchdog: routing/${targetId} record now exists.${scopeTag}`;
   }
   return null;
 }
@@ -731,12 +772,15 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
     const rawTarget = issueByIdentifier.get(targetId) ?? null;
     const target = rawTarget ? await withFullDescription(rawTarget) : null;
 
-    // Check routing record only when target is open and non-exempt
+    // Check routing record only when target is open and non-exempt. Uses
+    // isExemptForResolvedFlag (not isExempt) so a handback-to-creator
+    // reassignment doesn't short-circuit the lookup via the self-assigned
+    // rule — we still need to know whether the rationale was captured (AUR-3854).
     let hasRecord = false;
     let recordScope = null;
     if (
       target && !['done', 'cancelled'].includes(target.status) &&
-      !isExempt(target) && !isPreRule(target, ruleEffectiveDate)
+      !isExemptForResolvedFlag(target) && !isPreRule(target, ruleEffectiveDate)
     ) {
       const lookup = await lookupRoutingRecord({
         companyId, targetId, projectId: target.projectId, apiGet,

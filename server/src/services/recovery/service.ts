@@ -558,10 +558,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .where(
         and(
           eq(issueRelations.type, "blocks"),
-          // A `blocked` (or `cancelled`) issue is already correctly dispositioned — being
-          // someone else's blocker is not a reason to auto-assign and wake it. Only "todo"
-          // orphans (no owner, nobody will ever pick them up) are real orphan blockers.
-          eq(issues.status, "todo"),
+          inArray(issues.status, ["todo", "blocked"]),
           isNull(issues.assigneeAgentId),
           isNull(issues.assigneeUserId),
           sql`${issues.createdByAgentId} is not null`,

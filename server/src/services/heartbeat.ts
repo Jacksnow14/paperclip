@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
@@ -220,6 +221,42 @@ const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
+// AUR-3929: a process-lost run must not be re-dispatched immediately. An
+// infrastructure death (OOM kill, control-plane restart) fails many runs in
+// the same second, and instant re-queue multiplies concurrent adapter
+// processes exactly when the host can least absorb them. Delays are short
+// relative to transient-failure retries (the work is healthy; the host needed
+// room), with wide ±50% jitter so a synchronized mass-death event fans back
+// in as a trickle instead of a thundering herd.
+export const PROCESS_LOST_RETRY_DELAYS_MS = [
+  30 * 1000,
+  2 * 60 * 1000,
+  8 * 60 * 1000,
+] as const;
+const PROCESS_LOST_RETRY_JITTER_RATIO = 0.5;
+export const PROCESS_LOST_RETRY_MAX_ATTEMPTS = PROCESS_LOST_RETRY_DELAYS_MS.length;
+export const PROCESS_LOST_RETRY_REASON = "process_lost";
+export const PROCESS_LOST_RETRY_WAKE_REASON = "process_lost_retry";
+// AUR-3929: host-wide ceiling on simultaneously-running agent runs. The
+// per-agent cap (heartbeat.maxConcurrentRuns, default 20) never bounded the
+// fleet: 18 agents × 20 slots is unbounded in practice, and each local
+// `claude` child holds ~200–300 MB RSS at rest with peaks approaching 1 GB
+// (session compaction, git operations, MCP children). Derived default:
+// reserve 3 GB for OS + Postgres + control plane(s), budget 1 GB per
+// concurrent run, floor the remainder. On the 7.7 GB incident host that is
+// floor((7900 MB − 3072 MB) / 1024 MB) = 4 concurrent runs. Every
+// control-plane instance sharing one database shares this ceiling, because
+// admission counts `running` rows in heartbeat_runs under an advisory lock.
+export const GLOBAL_MAX_CONCURRENT_RUNS_ENV_VAR = "PAPERCLIP_GLOBAL_MAX_CONCURRENT_RUNS";
+const GLOBAL_MAX_CONCURRENT_RUNS_OVERRIDE_MIN = 1;
+const GLOBAL_MAX_CONCURRENT_RUNS_OVERRIDE_MAX = 64;
+const GLOBAL_MAX_CONCURRENT_RUNS_DERIVED_MIN = 2;
+const GLOBAL_MAX_CONCURRENT_RUNS_DERIVED_MAX = 12;
+const GLOBAL_RUN_RESERVED_SYSTEM_MEMORY_MB = 3 * 1024;
+const GLOBAL_RUN_MEMORY_BUDGET_MB = 1024;
+// Arbitrary-but-fixed advisory lock id serializing run admission across every
+// control-plane instance connected to the same database.
+const GLOBAL_RUN_ADMISSION_LOCK_ID = 739_241_101;
 export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
 export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
@@ -456,6 +493,50 @@ export function computeBoundedTransientHeartbeatRetrySchedule(
     dueAt: new Date(now.getTime() + delayMs),
     maxAttempts: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
   };
+}
+
+export function computeProcessLostRetrySchedule(
+  attempt: number,
+  now = new Date(),
+  random: () => number = Math.random,
+) {
+  if (!Number.isInteger(attempt) || attempt <= 0) return null;
+  const baseDelayMs = PROCESS_LOST_RETRY_DELAYS_MS[attempt - 1];
+  if (typeof baseDelayMs !== "number") return null;
+  const sample = Math.min(1, Math.max(0, random()));
+  const jitterMultiplier = 1 + (((sample * 2) - 1) * PROCESS_LOST_RETRY_JITTER_RATIO);
+  const delayMs = Math.max(1_000, Math.round(baseDelayMs * jitterMultiplier));
+  return {
+    attempt,
+    baseDelayMs,
+    delayMs,
+    dueAt: new Date(now.getTime() + delayMs),
+    maxAttempts: PROCESS_LOST_RETRY_MAX_ATTEMPTS,
+  };
+}
+
+export function resolveGlobalMaxConcurrentRuns(
+  env: Record<string, string | undefined> = process.env,
+  totalMemoryBytes: number = os.totalmem(),
+): number {
+  const raw = env[GLOBAL_MAX_CONCURRENT_RUNS_ENV_VAR];
+  if (raw != null && raw.trim() !== "") {
+    const parsed = Math.floor(Number(raw));
+    if (Number.isFinite(parsed)) {
+      return Math.max(
+        GLOBAL_MAX_CONCURRENT_RUNS_OVERRIDE_MIN,
+        Math.min(GLOBAL_MAX_CONCURRENT_RUNS_OVERRIDE_MAX, parsed),
+      );
+    }
+  }
+  const totalMemoryMb = totalMemoryBytes / (1024 * 1024);
+  const derived = Math.floor(
+    (totalMemoryMb - GLOBAL_RUN_RESERVED_SYSTEM_MEMORY_MB) / GLOBAL_RUN_MEMORY_BUDGET_MB,
+  );
+  return Math.max(
+    GLOBAL_MAX_CONCURRENT_RUNS_DERIVED_MIN,
+    Math.min(GLOBAL_MAX_CONCURRENT_RUNS_DERIVED_MAX, derived),
+  );
 }
 
 async function resolveRunScopedMentionedSkillKeys(input: {
@@ -2378,6 +2459,8 @@ export interface HeartbeatServiceOptions {
   environmentRuntime?: HeartbeatEnvironmentRuntime;
   /** When provided, non-critical run admission is throttled while it returns true. */
   isDiskPressureActive?: () => boolean;
+  /** Host-wide cap on concurrently running runs. Defaults to resolveGlobalMaxConcurrentRuns(). */
+  globalMaxConcurrentRuns?: number;
 }
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
@@ -2386,6 +2469,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
   });
   const checkDiskPressure = options.isDiskPressureActive ?? (() => false);
+  const resolveGlobalRunCap = () => options.globalMaxConcurrentRuns ?? resolveGlobalMaxConcurrentRuns();
 
   const runLogStore = getRunLogStore();
   const secretsSvc = secretService(db);
@@ -4703,6 +4787,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     now: Date,
   ) {
+    // AUR-3929: the retry waits out a jittered backoff as a scheduled_retry
+    // run instead of re-entering the queue immediately, so a mass
+    // process-loss event (OOM kill sweep, control-plane restart) cannot
+    // respawn its entire cohort of adapter processes in the same second.
+    const attempt = (run.processLossRetryCount ?? 0) + 1;
+    const schedule = computeProcessLostRetrySchedule(attempt, now);
+    if (!schedule) return null;
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
@@ -4710,8 +4801,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const retryContextSnapshot = withRecoveryModelProfileHint({
       ...contextSnapshot,
       retryOfRunId: run.id,
-      wakeReason: "process_lost_retry",
-      retryReason: "process_lost",
+      wakeReason: PROCESS_LOST_RETRY_WAKE_REASON,
+      retryReason: PROCESS_LOST_RETRY_REASON,
+      scheduledRetryAttempt: schedule.attempt,
+      scheduledRetryAt: schedule.dueAt.toISOString(),
     });
 
     const queued = await db.transaction(async (tx) => {
@@ -4722,10 +4815,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId: run.agentId,
           source: "automation",
           triggerDetail: "system",
-          reason: "process_lost_retry",
+          reason: PROCESS_LOST_RETRY_WAKE_REASON,
           payload: withRecoveryModelProfileHint({
             ...(issueId ? { issueId } : {}),
             retryOfRunId: run.id,
+            scheduledRetryAttempt: schedule.attempt,
+            scheduledRetryAt: schedule.dueAt.toISOString(),
           }),
           status: "queued",
           requestedByActorType: "system",
@@ -4742,12 +4837,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId: run.agentId,
           invocationSource: "automation",
           triggerDetail: "system",
-          status: "queued",
+          status: "scheduled_retry",
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: retryContextSnapshot,
           sessionIdBefore: sessionBefore,
           retryOfRunId: run.id,
-          processLossRetryCount: (run.processLossRetryCount ?? 0) + 1,
+          processLossRetryCount: attempt,
+          scheduledRetryAt: schedule.dueAt,
+          // Shares the generic bounded-retry attempt counter: a later
+          // transient-failure chain on this run starts one index further into
+          // its delay table, which is the conservative direction.
+          scheduledRetryAttempt: schedule.attempt,
+          scheduledRetryReason: PROCESS_LOST_RETRY_REASON,
           updatedAt: now,
         })
         .returning()
@@ -4792,9 +4893,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       eventType: "lifecycle",
       stream: "system",
       level: "warn",
-      message: "Queued automatic retry after orphaned child process was confirmed dead",
+      message: `Scheduled backoff retry ${schedule.attempt}/${schedule.maxAttempts} for ${schedule.dueAt.toISOString()} after orphaned child process was confirmed dead`,
       payload: {
         retryOfRunId: run.id,
+        scheduledRetryAttempt: schedule.attempt,
+        scheduledRetryAt: schedule.dueAt.toISOString(),
+        baseDelayMs: schedule.baseDelayMs,
+        delayMs: schedule.delayMs,
       },
     });
 
@@ -5967,6 +6072,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(count ?? 0);
   }
 
+  // AUR-3929: the global ceiling counts every running run across all agents
+  // and companies — it is a host-resource cap, not a fairness mechanism.
+  async function countRunningRunsGlobal() {
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "running"));
+    return Number(count ?? 0);
+  }
+
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
@@ -6043,16 +6158,42 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const claimedAt = new Date();
-    const claimed = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "running",
-        startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
-      })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const globalCap = resolveGlobalRunCap();
+    const claimOutcome = await db.transaction(async (tx) => {
+      // AUR-3929: this is the single queued→running transition, so no dispatch
+      // path can bypass the global ceiling. The advisory lock serializes
+      // admission across every control-plane instance sharing this database,
+      // so racing claims cannot overshoot the cap.
+      await tx.execute(sql`select pg_advisory_xact_lock(${GLOBAL_RUN_ADMISSION_LOCK_ID})`);
+      const [{ count }] = await tx
+        .select({ count: sql<number>`count(*)` })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.status, "running"));
+      const runningCount = Number(count ?? 0);
+      if (runningCount >= globalCap) {
+        return { kind: "global_cap_reached" as const, runningCount };
+      }
+      const row = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "running",
+          startedAt: run.startedAt ?? claimedAt,
+          updatedAt: claimedAt,
+        })
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      return { kind: "claimed" as const, row };
+    });
+    if (claimOutcome.kind === "global_cap_reached") {
+      // Leave the run queued — resumeQueuedRuns re-drives it once a slot frees.
+      logger.info(
+        { runId: run.id, agentId: run.agentId, globalCap, runningCount: claimOutcome.runningCount },
+        "claimQueuedRun: global concurrency ceiling reached; run left queued",
+      );
+      return null;
+    }
+    const claimed = claimOutcome.row;
     if (!claimed) return null;
 
     publishLiveEvent({
@@ -6709,11 +6850,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
-      const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
+      const retryAttempt = (run.processLossRetryCount ?? 0) + 1;
+      const shouldRetry =
+        tracksLocalChild &&
+        (!!run.processPid || !!run.processGroupId) &&
+        retryAttempt <= PROCESS_LOST_RETRY_MAX_ATTEMPTS;
       const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      const retryNote = `scheduling backoff retry ${retryAttempt}/${PROCESS_LOST_RETRY_MAX_ATTEMPTS}`;
 
       let finalizedRun = await setRunStatus(run.id, "failed", {
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+        error: shouldRetry ? `${baseMessage}; ${retryNote}` : baseMessage,
         errorCode: "process_lost",
         finishedAt: now,
         resultJson: mergeRunStopMetadataForAgent(
@@ -6722,13 +6868,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           {
             resultJson: parseObject(run.resultJson),
             errorCode: "process_lost",
-            errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+            errorMessage: shouldRetry ? `${baseMessage}; ${retryNote}` : baseMessage,
           },
         ),
       });
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+        error: shouldRetry ? `${baseMessage}; ${retryNote}` : baseMessage,
       });
       if (!finalizedRun) finalizedRun = await getRun(run.id);
       if (!finalizedRun) continue;
@@ -6747,7 +6893,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (agent) {
           retriedRun = await enqueueProcessLossRetry(finalizedRun, agent, now);
         }
-      } else {
+      }
+      if (!retriedRun) {
         await releaseIssueExecutionAndPromote(finalizedRun);
       }
 
@@ -6755,14 +6902,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         eventType: "lifecycle",
         stream: "system",
         level: "error",
-        message: shouldRetry
-          ? `${baseMessage}; queued retry ${retriedRun?.id ?? ""}`.trim()
+        message: retriedRun
+          ? `${baseMessage}; scheduled backoff retry ${retriedRun.id}`
           : baseMessage,
         payload: {
           ...(run.processPid ? { processPid: run.processPid } : {}),
           ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
           ...(descendantOnlyCleanup ? { descendantOnlyCleanup: true } : {}),
           ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
+          ...(retriedRun?.scheduledRetryAt
+            ? { scheduledRetryAt: new Date(retriedRun.scheduledRetryAt).toISOString() }
+            : {}),
         },
       });
 
@@ -6901,7 +7051,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       const policy = parseHeartbeatPolicy(agent);
       const runningCount = await countRunningRunsForAgent(agentId);
-      const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
+      // Global ceiling (AUR-3929): per-agent slots must never admit a run once
+      // the host-wide ceiling is reached. claimQueuedRun re-checks under an
+      // advisory lock; this pre-check only avoids pointless claim attempts.
+      const globalCap = resolveGlobalRunCap();
+      const globalRunningCount = await countRunningRunsGlobal();
+      const availableSlots = Math.max(
+        0,
+        Math.min(policy.maxConcurrentRuns - runningCount, globalCap - globalRunningCount),
+      );
       if (availableSlots <= 0) return [];
 
       const queuedRuns = await db
@@ -6981,7 +7139,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (run.status === "queued") {
       const claimed = await claimQueuedRun(run);
       if (!claimed) {
-        // claimQueuedRun can also leave the run queued when dependencies are unresolved.
+        // claimQueuedRun can also leave the run queued when dependencies are
+        // unresolved or the global concurrency ceiling is reached.
         return;
       }
       run = claimed;
@@ -9981,6 +10140,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     cancelSupersededRetryRunsForSourceRun,
 
     resumeQueuedRuns,
+    startNextQueuedRunForAgent,
 
     scheduleBoundedRetry: async (
       runId: string,

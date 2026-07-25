@@ -19,6 +19,7 @@ All environment variables that Paperclip uses for server configuration.
 | `PAPERCLIP_DEPLOYMENT_MODE` | `local_trusted` | Runtime mode override |
 | `PAPERCLIP_DEPLOYMENT_EXPOSURE` | `private` | Exposure policy when deployment mode is `authenticated` |
 | `PAPERCLIP_API_URL` | (auto-derived) | Paperclip API base URL. When set externally (e.g., via Kubernetes ConfigMap, load balancer, or reverse proxy), the server preserves the value instead of deriving it from the listen host and port. Useful for deployments where the public-facing URL differs from the local bind address. |
+| `PAPERCLIP_GLOBAL_MAX_CONCURRENT_RUNS` | (derived from memory) | Host-wide cap on simultaneously running agent runs, enforced in addition to each agent's `maxConcurrentRuns`. Default: `floor((total RAM − 3 GB reserved) / 1 GB per run)`, clamped to 2–12 (a 7.7 GB host derives 4). Override accepts 1–64. See `docs/process-lost-runbook.md` for the memory arithmetic. |
 
 ## Secrets
 

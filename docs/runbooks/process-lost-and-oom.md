@@ -203,11 +203,42 @@ has been OOM-killed in the last few minutes.
 
 ---
 
+## 6. What AUR-3929 added: the concurrency cap and retry backoff
+
+Everything above (§1–5) is diagnostic. This section is the structural fix that makes the
+amplification loop in §2 impossible rather than merely slower — read it if you're asking
+"why didn't retries make this worse" during an incident.
+
+- **Global concurrency ceiling.** Admission of every run passes a host-wide cap in addition
+  to the per-agent `maxConcurrentRuns`. Default is derived from memory:
+  `floor((total RAM − 3 GB reserved) / 1 GB per-run budget)`, clamped to 2–12 — on this
+  7.7 GB host that is **4** concurrent runs. The reserve covers OS + Postgres + control
+  plane(s); the 1 GB budget covers a `claude` child's ~250 MB baseline plus peak headroom.
+  Override with `PAPERCLIP_GLOBAL_MAX_CONCURRENT_RUNS` (1–64). The gate counts `running`
+  rows in `heartbeat_runs` under a Postgres advisory lock, so every control-plane instance
+  sharing the database shares the ceiling.
+- **Backoff on `process_lost` retries.** A reaped run is retried at most 3 times, waiting
+  30 s / 2 m / 8 m (±50% jitter) as a `scheduled_retry` run before re-entering the queue. A
+  mass process-loss event (a control-plane restart — see §1) therefore fans back in as a
+  spread-out trickle, not a synchronized stampede, and re-admission is still subject to the
+  global ceiling. Exhausted retries fall through to the normal stranded-issue recovery path.
+
+Why this breaks the loop rather than slowing it: the loop in §2 required
+`OOM kill → retries → more concurrent processes → worse OOM`. Retries can no longer add
+concurrency — total adapter processes are bounded by the ceiling no matter how many runs are
+queued or retrying — and they can't even reach the queue in the same second, so memory
+pressure from agent runs has a hard upper bound of `cap × per-run budget`.
+
+Do not raise `PAPERCLIP_GLOBAL_MAX_CONCURRENT_RUNS` above the derived default on a
+memory-constrained host without redoing the arithmetic above.
+
+---
+
 ## See also
 
 - [AUR-3924](/AUR/issues/AUR-3924) — the incident and the guard/mem-watch mitigations
-- [AUR-3929](/AUR/issues/AUR-3929) — regression tests for the concurrency cap and
-  `process_lost` backoff
+- [AUR-3929](/AUR/issues/AUR-3929) — the concurrency cap + `process_lost` backoff (§6) and
+  their regression tests
 - [AUR-3931](/AUR/issues/AUR-3931) — extracted Postgres into its own unit (§3)
 - [AUR-3921](/AUR/issues/AUR-3921) — the false-positive productivity review this runbook
   exists to prevent a repeat of

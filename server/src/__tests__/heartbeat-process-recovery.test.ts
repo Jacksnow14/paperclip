@@ -74,6 +74,8 @@ vi.mock("../adapters/index.ts", async () => {
 import {
   heartbeatService,
   redactDetectedSuccessfulRunProgressSummaryForBoard,
+  PROCESS_LOST_RETRY_DELAYS_MS,
+  PROCESS_LOST_RETRY_MAX_ATTEMPTS,
 } from "../services/heartbeat.ts";
 import {
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
@@ -916,12 +918,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(wakeup?.status).toBe("claimed");
   });
 
-  it("queues exactly one retry when the recorded local pid is dead", async () => {
+  it("schedules exactly one backoff retry when the recorded local pid is dead", async () => {
     const { agentId, runId, issueId } = await seedRunFixture({
       processPid: 999_999_999,
     });
     const heartbeat = heartbeatService(db);
 
+    const reapStartedAt = Date.now();
     const result = await heartbeat.reapOrphanedRuns();
     expect(result.reaped).toBe(1);
     expect(result.runIds).toEqual([runId]);
@@ -943,9 +946,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       timeoutConfigured: false,
       timeoutFired: false,
     });
-    expect(retryRun?.status).toBe("queued");
+    expect(retryRun?.status).toBe("scheduled_retry");
     expect(retryRun?.retryOfRunId).toBe(runId);
     expect(retryRun?.processLossRetryCount).toBe(1);
+    expect(retryRun?.scheduledRetryReason).toBe("process_lost");
+    expect(retryRun?.scheduledRetryAttempt).toBe(1);
+    // Attempt 1 backs off 30s with ±50% jitter — never an immediate re-dispatch.
+    const dueInMs = new Date(retryRun!.scheduledRetryAt!).getTime() - reapStartedAt;
+    expect(dueInMs).toBeGreaterThanOrEqual(PROCESS_LOST_RETRY_DELAYS_MS[0] * 0.5 - 5_000);
+    expect(dueInMs).toBeLessThanOrEqual(PROCESS_LOST_RETRY_DELAYS_MS[0] * 1.5 + 5_000);
     const issue = await db
       .select()
       .from(issues)
@@ -1008,7 +1017,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(failedRun?.error).toContain("descendant process group");
 
     const retryRun = runs.find((row) => row.id !== runId);
-    expect(retryRun?.status).toBe("queued");
+    expect(retryRun?.status).toBe("scheduled_retry");
+    expect(retryRun?.scheduledRetryReason).toBe("process_lost");
 
     const issue = await db
       .select()
@@ -1024,7 +1034,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const { companyId, agentId, runId, issueId } = await seedRunFixture({
       agentStatus: "idle",
       processPid: 999_999_999,
-      processLossRetryCount: 1,
+      processLossRetryCount: PROCESS_LOST_RETRY_MAX_ATTEMPTS,
     });
     const resolvedBlockerId = randomUUID();
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
@@ -1098,7 +1108,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const { companyId, agentId, runId, issueId } = await seedRunFixture({
       agentStatus: "idle",
       processPid: 999_999_999,
-      processLossRetryCount: 1,
+      processLossRetryCount: PROCESS_LOST_RETRY_MAX_ATTEMPTS,
       runErrorCode: "process_lost",
       runError: "Authorization: Bearer sk-test-recovery-secret",
     });
@@ -1172,7 +1182,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const { companyId, agentId, runId, issueId } = await seedRunFixture({
       agentStatus: "idle",
       processPid: 999_999_999,
-      processLossRetryCount: 1,
+      processLossRetryCount: PROCESS_LOST_RETRY_MAX_ATTEMPTS,
     });
     await db.insert(issueTreeHolds).values({
       companyId,

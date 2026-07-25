@@ -424,6 +424,20 @@ const productivityReviewFixtures: ProductivityReviewFixture[] = [
       updatedAt: new Date("2026-04-28T13:55:00.000Z"),
     },
   },
+  {
+    label: "Stalled",
+    description: "Source issue has been active for over 6 hours with zero runs, comments, or active runs in the last hour.",
+    review: {
+      reviewIssueId: "review-issue-4",
+      reviewIdentifier: "PAP-2705",
+      status: "todo",
+      priority: "high",
+      trigger: "stalled_active_episode",
+      noCommentStreak: null,
+      createdAt: new Date("2026-04-28T08:30:00.000Z"),
+      updatedAt: new Date("2026-04-28T13:00:00.000Z"),
+    },
+  },
 ];
 
 const productivityReviewIssueRowFixtures = productivityReviewFixtures.map((fixture, index) =>

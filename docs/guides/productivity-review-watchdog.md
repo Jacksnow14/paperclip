@@ -3,20 +3,55 @@
 `server/src/services/productivity-review.ts` scans in-progress/todo issues and files a
 `Review productivity for {issue}` child issue against an issue's owner (manager/CTO/CEO) when it
 sees a pattern that looks like the assignee is stuck: a no-comment run streak, an unusually long
-active episode, or high run/comment churn. This runbook covers how to read its output and how it
-avoids blaming agents for infrastructure failures.
+active episode (with or without a stalled/zero-activity signal), or high run/comment churn. This
+runbook covers how to read its output and how it avoids blaming agents for infrastructure failures.
 
 ## Triggers
 
 | Trigger | Condition |
 |---|---|
 | `no_comment_streak` | N consecutive terminal, agent-attributable runs with no run-linked issue comment (default 10) |
-| `long_active_duration` | Issue has been `in_progress` continuously past a threshold (default 6h) |
+| `long_active_duration` | Issue has been `in_progress` continuously past a threshold (default 6h) **and** the last hour still shows some runs, assignee comments, or active runs |
+| `stalled_active_episode` | Issue has been `in_progress` continuously past the same threshold (default 6h) **and** the last hour shows zero runs, zero assignee comments, and zero active runs -- the issue has gone dark (AUR-4014) |
 | `high_churn` | Run count or assignee-run-comment count in the last 1h/6h exceeds a threshold (default 10/1h, 30/6h) |
 
 `no_comment_streak` and `high_churn` are "soft stop" triggers: while a review is open on one of
 these, `isProductivityReviewContinuationHoldActive` can be used by the heartbeat loop to hold the
-agent's continuation until a manager decides.
+agent's continuation until a manager decides. `stalled_active_episode` is deliberately **not** a
+soft-stop trigger -- there is nothing running to hold, and the correct remedy (wake the assignee)
+would be self-defeating if continuation were blocked the moment it woke up.
+
+## Stall vs. churn (AUR-4014)
+
+Episode age (`elapsedMs`, wall-clock time since `in_progress`) and activity rate (runs/comments in
+the last hour) are orthogonal axes. Before this fix, `long_active_duration` fired on episode age
+alone, so a `critical` issue that had gone completely dark (0 runs, 0 comments, 0 active runs in
+1h) got the same churn-shaped "snooze / decompose / the work is inefficient" remedy menu as an
+issue that was still actively (if slowly) working -- pointing the reviewing manager at the wrong
+failure. AUR-3924 sat dark for ~5 hours before a wall-clock timer happened to trip and mislabel it.
+
+`collectEvidence` now computes `zeroRecentActivity` (`runCountLastHour === 0 &&
+assigneeRunCommentCountLastHour === 0 && activeRunCount === 0`) and splits the long-active case:
+
+- `zeroRecentActivity` true → `stalled_active_episode`, with a remedy menu of *wake the assignee /
+  confirm a scheduled monitor check / block with a named unblock owner / close if actually done*.
+- `zeroRecentActivity` false → `long_active_duration` unchanged, with the original generic menu --
+  there is still measurable activity, so churn/inefficiency framing is still plausible.
+
+The evidence block always states the measured rate (`Activity rate in the last hour: zero (...)` vs
+`non-zero`), so the review body is self-explanatory even without reading this runbook. The extra
+"this is a stall axis, not a rate/churn axis" reading is only appended when the resolved trigger is
+`stalled_active_episode`: a zero last hour can coexist with a `no_comment_streak` (runs that all
+landed more than an hour ago) or a `high_churn` carried by its 6h window on a short/absent episode,
+and printing the stall reading above those triggers' churn-shaped remedy menu would recreate the
+same mixed-axis message this fix removes.
+
+`choosePrimaryTrigger` checks `stalled` **before** `high_churn`. `high_churn` looks at both a 1h and
+a 6h window (either can trip it), so an issue that churned 2-6h ago and has since gone dark for the
+last hour would otherwise still resolve to `high_churn` from the stale 6h count alone -- reproducing
+the exact "dark issue gets a churn-shaped menu" failure via the 6h path instead of the elapsedMs
+path. `triggerReasons` text is gated on the resolved `trigger`, not the raw per-axis booleans, so a
+review never asserts "this is a dark issue, not churn" next to churn stats or a churn remedy menu.
 
 ## Infra-kill exclusion (AUR-3926)
 

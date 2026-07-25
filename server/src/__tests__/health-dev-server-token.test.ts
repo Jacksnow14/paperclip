@@ -96,6 +96,7 @@ describe("GET /health dev-server supervisor access", () => {
       expect(res.body).toEqual({
         status: "ok",
         deploymentMode: "authenticated",
+        build: { source: "untracked", sha: null, ref: null, builtAt: null },
         bootstrapStatus: "ready",
         bootstrapInviteActive: false,
         devServer: {

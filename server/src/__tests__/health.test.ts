@@ -6,6 +6,9 @@ import { healthRoutes } from "../routes/health.js";
 import * as devServerStatus from "../dev-server-status.js";
 import { serverVersion } from "../version.js";
 
+// Outside a pinned release there is no build-info.json (AUR-3937).
+const untrackedBuild = { source: "untracked", sha: null, ref: null, builtAt: null };
+
 const mockReadPersistedDevServerStatus = vi.hoisted(() => vi.fn());
 
 vi.mock("../dev-server-status.js", () => ({
@@ -32,7 +35,7 @@ describe("GET /health", () => {
     const app = createApp();
     const res = await request(app).get("/health");
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ status: "ok", version: serverVersion });
+    expect(res.body).toEqual({ status: "ok", version: serverVersion, build: untrackedBuild });
   }, 15_000);
 
   it("returns 200 when the database probe succeeds", async () => {
@@ -97,6 +100,7 @@ describe("GET /health", () => {
     expect(res.body).toEqual({
       status: "ok",
       deploymentMode: "authenticated",
+      build: untrackedBuild,
       bootstrapStatus: "ready",
       bootstrapInviteActive: false,
     });
@@ -131,6 +135,7 @@ describe("GET /health", () => {
     expect(res.body).toEqual({
       status: "ok",
       deploymentMode: "authenticated",
+      build: untrackedBuild,
       bootstrapStatus: "ready",
       bootstrapInviteActive: false,
     });

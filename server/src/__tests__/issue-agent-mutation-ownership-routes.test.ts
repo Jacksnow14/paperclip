@@ -902,6 +902,57 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
+    it("the 403 rule string does not contradict isAuthor:true when the author's own out-of-scope PATCH is refused", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, createdByAgentId: authorAgentId }),
+      );
+
+      const res = await request(await createApp(authorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "cancelled" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details.isAuthor).toBe(true);
+      expect(res.body.details.rule).not.toMatch(/you are not its author/);
+    });
+
+    it("falls through an empty author PATCH body to the normal gate instead of treating it as handled", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, createdByAgentId: authorAgentId }),
+      );
+
+      const res = await request(await createApp(authorActor())).patch(`/api/issues/${issueId}`).send({});
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("does not announce a no-op author description amendment (same value as existing)", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({
+          status: "todo",
+          assigneeAgentId: ownerAgentId,
+          createdByAgentId: authorAgentId,
+          description: "Original description",
+        }),
+      );
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, createdByAgentId: authorAgentId }),
+        ...patch,
+      }));
+
+      const res = await request(await createApp(authorActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ description: "Original description" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.brief_amended_by_author" }),
+      );
+    });
+
     it("rejects a mixed author PATCH { description, status } wholesale — no partial write, description unchanged", async () => {
       mockIssueService.getById.mockResolvedValue(
         makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, createdByAgentId: authorAgentId }),

@@ -1110,7 +1110,18 @@ describe("memory routes", () => {
       const res = await request(app)
         .post(`/api/companies/${companyA}/memory/capture`)
         .set("Origin", "http://localhost:3100")
-        .send({ ...baseBody, metadata: { category: "performance_scorecard", project_id: projectId } });
+        .send({
+          ...baseBody,
+          metadata: {
+            category: "performance_scorecard",
+            project_id: projectId,
+            issue_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            quality_signal: 4,
+            token_cost: 12000,
+            agent_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            task_type: "bug",
+          },
+        });
 
       expect(res.status).toBe(201);
       expect(mockMemoryService.capture).toHaveBeenCalledTimes(1);
@@ -1136,6 +1147,81 @@ describe("memory routes", () => {
         .post(`/api/companies/${companyA}/memory/capture`)
         .set("Origin", "http://localhost:3100")
         .send({ ...baseBody, metadata: { category: "retrospective" }, scope: { projectId } });
+
+      expect(res.status).toBe(201);
+      expect(mockMemoryService.capture).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ── Part E: Scorecard integrity guard (AUR-3993/AUR-3996) ──────────────────
+
+  describe("POST /companies/:companyId/memory/capture — scorecard integrity guard", () => {
+    const scorecardBaseBody = {
+      source: { kind: "issue", issueId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" },
+      content: "Test capture content",
+    };
+    const scorecardCaptureResult = {
+      operation: { id: "op-scorecard-1", bindingId: bindingId, source: { kind: "issue" } },
+      records: [{ id: "ee000000-0000-4000-8000-000000000000", reviewState: "accepted", scopeType: "org", scope: {} }],
+    };
+    const validIssueUuid = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const agentActor = {
+      type: "agent",
+      agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: companyA,
+    };
+
+    it.each(["performance_scorecard", "scorecard_adjusted"])(
+      "returns 422 for category '%s' with an unresolvable issue_id (TEST-0)",
+      async (category) => {
+        mockIssueService.getByIdentifier.mockResolvedValue(null);
+        const app = createApp(agentActor);
+
+        const res = await request(app)
+          .post(`/api/companies/${companyA}/memory/capture`)
+          .set("Origin", "http://localhost:3100")
+          .send({ ...scorecardBaseBody, metadata: { category, issue_id: "TEST-0" } });
+
+        expect(res.status).toBe(422);
+        expect(res.body.details.errors.some((e: string) => e.includes("TEST-0"))).toBe(true);
+        expect(mockMemoryService.capture).not.toHaveBeenCalled();
+      },
+    );
+
+    it("returns 422 when metadata.issue_id is absent", async () => {
+      const app = createApp(agentActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...scorecardBaseBody, metadata: { category: "performance_scorecard" } });
+
+      expect(res.status).toBe(422);
+      expect(res.body.details.errors.some((e: string) => e.includes("metadata.issue_id"))).toBe(true);
+      expect(mockMemoryService.capture).not.toHaveBeenCalled();
+    });
+
+    it("returns 201 for a scorecard with a real resolvable issue_id", async () => {
+      mockMemoryService.capture.mockResolvedValue(scorecardCaptureResult);
+      const app = createApp(agentActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...scorecardBaseBody, metadata: { category: "performance_scorecard", issue_id: validIssueUuid } });
+
+      expect(res.status).toBe(201);
+      expect(mockMemoryService.capture).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not leak the guard to a non-scorecard category with no issue_id", async () => {
+      mockMemoryService.capture.mockResolvedValue(scorecardCaptureResult);
+      const app = createApp(agentActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...scorecardBaseBody, metadata: { category: "lesson" } });
 
       expect(res.status).toBe(201);
       expect(mockMemoryService.capture).toHaveBeenCalledTimes(1);

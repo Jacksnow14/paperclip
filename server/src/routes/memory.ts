@@ -20,6 +20,11 @@
  *   The response includes a non-breaking `warnings: string[]` field when the captured
  *   record(s) won't appear in the default GET /memory/records or memory/query response
  *   (e.g. reviewState=pending, project-scoped, or agent-scoped to a different agent).
+ *
+ * Scorecard integrity guard (POST /memory/capture, AUR-3993/AUR-3996):
+ *   A capture with metadata.category `performance_scorecard` or `scorecard_adjusted` is
+ *   rejected with 422 unless metadata.issue_id is present and resolves to a real issue
+ *   in this company. Violations are returned in `details.errors[]`.
  */
 import { Router } from "express";
 import type { Db } from "@paperclipai/db";
@@ -88,6 +93,40 @@ export function checkRouterReadScopeViolation(payload: {
     "?projectId=, so a project-scoped record is invisible to them (AUR-3849, AUR-3925). " +
     "Omit scope.projectId / scopeType and put the project id in metadata.project_id instead."
   );
+}
+
+/**
+ * Categories subject to the scorecard integrity guard (AUR-3993 found 218
+ * synthetic performance_scorecard/scorecard_adjusted records polluting the
+ * routing registry's quartile math; AUR-3996 closes the write path that let
+ * them in). A capture in one of these categories must carry an issue_id that
+ * resolves to a real issue — otherwise it is unusable by construction and
+ * should never have been written.
+ */
+export const SCORECARD_INTEGRITY_CATEGORIES = new Set(["performance_scorecard", "scorecard_adjusted"]);
+
+function isBlankMetadataValue(value: unknown): boolean {
+  return value === undefined || value === null || (typeof value === "string" && value.trim().length === 0);
+}
+
+/**
+ * Synchronous half of the scorecard integrity guard: checks metadata.issue_id
+ * is present and string-typed (the DB-backed resolution check runs
+ * separately, below, since it needs to await). Returns an empty array when
+ * metadata.category isn't a scorecard category, or when the check passes.
+ */
+export function checkScorecardMetadataViolations(metadata: Record<string, unknown> | undefined): string[] {
+  const category = metadata?.category;
+  if (typeof category !== "string" || !SCORECARD_INTEGRITY_CATEGORIES.has(category)) return [];
+
+  const issueId = metadata?.issue_id;
+  if (isBlankMetadataValue(issueId)) {
+    return [`metadata.issue_id is required for category '${category}' — the router groups and scores on it.`];
+  }
+  if (typeof issueId !== "string") {
+    return ["metadata.issue_id must be a string identifier (AUR-NNNN or UUID)"];
+  }
+  return [];
 }
 
 function actorInfoFromReq(req: any) {
@@ -304,6 +343,28 @@ export function memoryRoutes(
     const routerReadScopeViolation = checkRouterReadScopeViolation(payload);
     if (routerReadScopeViolation) {
       throw unprocessable(routerReadScopeViolation);
+    }
+    const scorecardErrors = checkScorecardMetadataViolations(payload.metadata);
+    const scorecardIssueId = payload.metadata?.issue_id;
+    if (
+      typeof payload.metadata?.category === "string" &&
+      SCORECARD_INTEGRITY_CATEGORIES.has(payload.metadata.category) &&
+      typeof scorecardIssueId === "string" &&
+      scorecardIssueId.trim().length > 0
+    ) {
+      const resolved = await resolveSourceIssueId(companyId, scorecardIssueId);
+      if (!resolved) {
+        scorecardErrors.push(
+          `metadata.issue_id '${scorecardIssueId}' does not resolve to a real issue in this company; ` +
+          "use a scoped test company, not production.",
+        );
+      }
+    }
+    if (scorecardErrors.length > 0) {
+      throw unprocessable(
+        `Invalid '${payload.metadata?.category}' capture: ${scorecardErrors.length} validation error(s)`,
+        { errors: scorecardErrors },
+      );
     }
     if (payload.source?.issueId) {
       const resolvedId = await resolveSourceIssueId(companyId, payload.source.issueId);

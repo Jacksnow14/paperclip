@@ -2,7 +2,11 @@
 /**
  * SGI Loop C — Scorecard Streak Detection (Prompt Self-Edit detector)
  *
- * Fetches all `performance_scorecard` memory records, groups them by
+ * Fetches all `performance_scorecard` memory records, canonicalizes each
+ * record's raw `metadata.agent_id` (or title-derived) key to a live agent
+ * UUID (AUR-3856 — some agents write non-canonical ids like a bare UUID
+ * prefix or a name, which used to split one agent's records across
+ * multiple buckets), groups the canonicalized records by
  * {agent_id}/{task_type}, and evaluates each bucket against four
  * independent detectors (AUR-3850 — replaces the original strict-3-sample
  * monotone test, which fired once in 1,574 scorecards):
@@ -110,6 +114,54 @@ function parseTitle(title) {
     return { agent_id: parts[1], task_type: parts[2] };
   }
   return { agent_id: null, task_type: null };
+}
+
+// ---- Agent-key canonicalization (AUR-3856) ---------------------------------
+
+// Malformed keys observed live are always an 8-hex-char UUID-segment prefix
+// (e.g. '371a1b08', 'e8f947d2'). Anything shorter risks an accidental match
+// against an unrelated agent, so prefix-matching only kicks in at this length;
+// shorter strings (e.g. 'cto', 'ceo') fall through to the name-match step.
+const MIN_HEX_PREFIX_LEN = 6;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function leadingHexRun(key) {
+  const m = /^[0-9a-f]+/i.exec(String(key).trim());
+  return m ? m[0].toLowerCase() : '';
+}
+
+/**
+ * Resolves a raw `agent_id` bucket key to a canonical agent UUID.
+ * `liveAgents` items: { id: string, name: string }.
+ *
+ * Resolution order: exact UUID *format* match wins outright (an agent that
+ * has since been deleted still wrote a well-formed id — that's a
+ * skippedNoAgent case downstream, not a hygiene problem); else a
+ * case-insensitive UNIQUE prefix match against live agents (after stripping
+ * non-hex trailing junk, e.g. '371a1b08 (CTO)' -> '371a1b08'); else a
+ * case-insensitive match against agent name; else unresolved. A prefix
+ * matching 2+ live agents is never merged.
+ *
+ * Returns { resolved: string|null, method: 'exact'|'prefix'|'name'|'ambiguous-prefix'|'unresolved' }.
+ */
+export function canonicalizeAgentKey(rawKey, liveAgents) {
+  const key = String(rawKey ?? '').trim();
+  if (!key) return { resolved: null, method: 'unresolved' };
+  const keyLower = key.toLowerCase();
+
+  if (UUID_RE.test(key)) return { resolved: keyLower, method: 'exact' };
+
+  const hexPrefix = leadingHexRun(key);
+  if (hexPrefix.length >= MIN_HEX_PREFIX_LEN) {
+    const matches = liveAgents.filter((a) => a.id.toLowerCase().startsWith(hexPrefix));
+    if (matches.length === 1) return { resolved: matches[0].id, method: 'prefix' };
+    if (matches.length > 1) return { resolved: null, method: 'ambiguous-prefix' };
+  }
+
+  const byName = liveAgents.find((a) => (a.name || '').toLowerCase() === keyLower);
+  if (byName) return { resolved: byName.id, method: 'name' };
+
+  return { resolved: null, method: 'unresolved' };
 }
 
 // ---- Pure detector logic (testable without the API) ------------------------
@@ -257,14 +309,34 @@ async function main() {
   // Verification: paginated fetch should see the full corpus, not a capped 200.
   console.log(`Records fetched (deduped): ${records.length}, performance scorecards: ${scorecards.length}`);
 
-  // Group into {agent_id}/{task_type} buckets.
+  // Resolve which agents still exist (needed up front to canonicalize bucket keys).
+  const agentsData = await apiFetch(`/api/companies/${COMPANY_ID}/agents`);
+  const allAgents = asArray(agentsData, 'agents').map((a) => ({ id: a.id, name: a.name || '' }));
+  const liveAgents = new Set(allAgents.map((a) => a.id));
+
+  // Group into {agent_id}/{task_type} buckets, canonicalizing each record's
+  // raw agent key to a live agent UUID first (AUR-3856) so non-canonical
+  // ids (uuid prefix, name, decorated prefix) don't split one agent's
+  // records into multiple buckets.
+  const malformedAgentKeys = {};
+  const unresolvedAgentKeys = {};
   const buckets = new Map();
   for (const r of scorecards) {
     const m = r.metadata || {};
     const fromTitle = parseTitle(r.title);
-    const agent_id = m.agent_id || fromTitle.agent_id;
+    const rawAgentKey = m.agent_id || fromTitle.agent_id;
     const task_type = m.task_type || fromTitle.task_type;
-    if (!agent_id || !task_type) continue;
+    if (!rawAgentKey || !task_type) continue;
+
+    const canon = canonicalizeAgentKey(rawAgentKey, allAgents);
+    const agent_id = canon.resolved || rawAgentKey;
+    if (canon.method !== 'exact') {
+      malformedAgentKeys[rawAgentKey] = (malformedAgentKeys[rawAgentKey] || 0) + 1;
+    }
+    if (!canon.resolved) {
+      unresolvedAgentKeys[rawAgentKey] = (unresolvedAgentKeys[rawAgentKey] || 0) + 1;
+    }
+
     const key = `${agent_id}/${task_type}`;
     if (!buckets.has(key)) buckets.set(key, { agent_id, task_type, recs: [] });
     buckets.get(key).recs.push({
@@ -274,10 +346,12 @@ async function main() {
       createdAt: r.createdAt || r.created_at || '',
     });
   }
-
-  // Resolve which agents still exist.
-  const agentsData = await apiFetch(`/api/companies/${COMPANY_ID}/agents`);
-  const liveAgents = new Set(asArray(agentsData, 'agents').map((a) => a.id));
+  if (Object.keys(malformedAgentKeys).length) {
+    console.log(`  malformed agent keys: ${JSON.stringify(malformedAgentKeys)}`);
+  }
+  if (Object.keys(unresolvedAgentKeys).length) {
+    console.log(`  unresolved agent keys (left ungrouped): ${JSON.stringify(unresolvedAgentKeys)}`);
+  }
 
   const triggered = [];
   const skippedTooFew = [];
@@ -415,6 +489,8 @@ async function main() {
     skippedStale,
     skippedNoAgent,
     parentResolved: !!parentId,
+    malformedAgentKeys,
+    unresolvedAgentKeys,
   }, null, 2));
 }
 

@@ -65,6 +65,16 @@
  *      "{subject} sign-off: ..." / "... approval gate — ...") — no candidate
  *      pool, so no routing decision to document (AUR-1632)
  *
+ * Separately (isPreRule, AUR-4006 — not part of isExempt, tracked as its own
+ * pool bucket so the run summary shows exempt_nondecision and exempt_prerule
+ * as distinct counts):
+ *   5. issue.createdAt is strictly before RULE_EFFECTIVE_DATE (default
+ *      2026-06-15T00:00:00Z, commit b78456e6/AUR-2301) — the requirement did
+ *      not exist yet, so a faithful routing/{id} record is unrecoverable.
+ *      Override the cutoff with --rule-effective-date. The boundary is
+ *      inclusive of the rule date: an issue created exactly at the cutoff
+ *      IS owed a rationale.
+ *
  * Exit codes:
  *   0 — clean (nothing to do, or all intended actions applied — a partial
  *       run where SOME mutations failed still exits 0; see the Failed count
@@ -171,9 +181,9 @@ export function isExempt(issue) {
  * Returns a cancel reason string if the flag should be resolved, or null if
  * the flag is still valid and should remain open.
  *
- * @param {{ target: object|null, targetId: string, hasRecord: boolean, recordScope?: 'org'|'project'|null }} opts
+ * @param {{ target: object|null, targetId: string, hasRecord: boolean, recordScope?: 'org'|'project'|null, ruleEffectiveDate?: Date }} opts
  */
-export function resolveCancelReason({ target, targetId, hasRecord, recordScope = null }) {
+export function resolveCancelReason({ target, targetId, hasRecord, recordScope = null, ruleEffectiveDate = RULE_EFFECTIVE_DATE }) {
   if (!target || ['done', 'cancelled'].includes(target.status)) {
     return target
       ? `Auto-resolved by routing-rationale-watchdog: ${targetId} is ${target.status} — routing rationale moot.`
@@ -182,11 +192,60 @@ export function resolveCancelReason({ target, targetId, hasRecord, recordScope =
   if (isExempt(target)) {
     return `Auto-resolved by routing-rationale-watchdog: ${targetId} is exempt from routing rationale (no routing decision made, exec.routing-rationale: skip, content-slot, daily-brief, or single-owner sign-off/approval gate).`;
   }
+  if (isPreRule(target, ruleEffectiveDate)) {
+    return `Auto-resolved by routing-rationale-watchdog: ${targetId} was created before the routing-rationale rule took effect (${ruleEffectiveDate.toISOString()}) — rationale is unrecoverable and not owed (AUR-4006).`;
+  }
   if (hasRecord) {
     const scopeTag = recordScope === 'project' ? ' — project-scoped (hidden from org reads)' : '';
     return `Auto-resolved by routing-rationale-watchdog: routing/${targetId} record now exists.${scopeTag}`;
   }
   return null;
+}
+
+/**
+ * The routing-rationale requirement itself did not exist before this date —
+ * scripts/check-routing-rationale.mjs first landed in commit b78456e6
+ * (AUR-2301), which is also when the AGENTS.md § "Routing rationale capture
+ * (enforcement)" section arrived. A routing decision made before this date
+ * was made under a regime with no performance/scorecard-adjusted registry to
+ * compare candidates against, so a faithful routing/{id} record for it is
+ * unrecoverable — demanding one only teaches agents to fabricate one (the
+ * AUR-3993 pattern: 44 fabricated TEST-* scorecards). AUR-4006: measured
+ * 2026-07-25, 5 of 6 outstanding gaps in the AUR-4000 sweep were 4-7 weeks
+ * pre-rule. Override via --rule-effective-date; do not hardcode a second
+ * copy of this date elsewhere.
+ */
+export const RULE_EFFECTIVE_DATE = new Date('2026-06-15T00:00:00Z');
+
+/**
+ * Parses a --rule-effective-date override into a Date, throwing on an
+ * unparseable value so a typo'd override fails loudly at startup instead of
+ * silently degrading: an invalid Date's getTime() is NaN, and every `<`
+ * comparison against NaN is false, which would make isPreRule() silently
+ * exempt nothing rather than erroring.
+ */
+export function parseRuleEffectiveDate(value) {
+  if (value == null) return RULE_EFFECTIVE_DATE;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error(`--rule-effective-date: could not parse "${value}" as a date`);
+  }
+  return parsed;
+}
+
+/**
+ * Returns true when the issue was created before the routing-rationale rule
+ * took effect, so no routing/{id} record is owed regardless of whether a
+ * routing decision was made (AUR-4006). The boundary is INCLUSIVE of the
+ * rule date: an issue created exactly at ruleEffectiveDate was created the
+ * instant the rule was already in force, so rationale is owed for it — this
+ * uses strict `<`, not `<=`.
+ */
+export function isPreRule(issue, ruleEffectiveDate = RULE_EFFECTIVE_DATE) {
+  if (!issue?.createdAt) return false;
+  const created = new Date(issue.createdAt);
+  if (Number.isNaN(created.getTime())) return false;
+  return created.getTime() < ruleEffectiveDate.getTime();
 }
 
 /**
@@ -418,9 +477,12 @@ export function todayDateKey(now = new Date()) {
  * anything beyond that is summarized as a held-back count, never silently
  * dropped. `closedGapCount` (from the full-population measurement) is
  * surfaced for visibility only — those gaps are unrecoverable and never
- * listed individually here.
+ * listed individually here. `preruleCount` (AUR-4006) is the count of
+ * issues excluded from the eligible pool entirely because they predate
+ * RULE_EFFECTIVE_DATE — also report-only, so the compliance number never
+ * silently shrinks without an explanation of why.
  */
-export function buildRollingIssueBody(missingOpen, { maxListed, closedGapCount }) {
+export function buildRollingIssueBody(missingOpen, { maxListed, closedGapCount, preruleCount = 0, ruleEffectiveDate = RULE_EFFECTIVE_DATE }) {
   const listed = missingOpen.slice(0, maxListed);
   const held = missingOpen.length - listed.length;
   const lines = [
@@ -447,6 +509,12 @@ export function buildRollingIssueBody(missingOpen, { maxListed, closedGapCount }
     lines.push(
       '',
       `${closedGapCount} additional gap(s) exist on already-closed (done/cancelled) issues. Their rationale is unrecoverable, so they are intentionally NOT listed or filed here — see the watchdog run's console summary for the list.`
+    );
+  }
+  if (preruleCount > 0) {
+    lines.push(
+      '',
+      `${preruleCount} additional issue(s) were excluded from the eligible pool entirely: created before the routing-rationale rule took effect (${ruleEffectiveDate.toISOString()}, commit b78456e6/AUR-2301), so no routing/{id} record is owed or ever demanded for them (AUR-4006).`
     );
   }
   lines.push(
@@ -477,11 +545,11 @@ export async function findRollingIssue({ companyId, apiGet, title }) {
  * target of itself.
  */
 async function syncRollingGapIssue({
-  companyId, apiGet, apiPatch, apiPost, apply, missingOpen, closedGapCount, maxListed, dateKey, failedMutations,
+  companyId, apiGet, apiPatch, apiPost, apply, missingOpen, closedGapCount, preruleCount, ruleEffectiveDate, maxListed, dateKey, failedMutations,
 }) {
   const title = rollingIssueTitle(dateKey);
   const existing = await findRollingIssue({ companyId, apiGet, title });
-  const body = buildRollingIssueBody(missingOpen, { maxListed, closedGapCount });
+  const body = buildRollingIssueBody(missingOpen, { maxListed, closedGapCount, preruleCount, ruleEffectiveDate });
 
   if (missingOpen.length === 0) {
     if (existing && !['done', 'cancelled'].includes(existing.status)) {
@@ -540,13 +608,15 @@ async function syncRollingGapIssue({
   return { action: 'file', issue: null };
 }
 
-export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, maxNewFlags = 20, now = new Date() }) {
+export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, maxNewFlags = 20, now = new Date(), ruleEffectiveDate = RULE_EFFECTIVE_DATE }) {
   // windowMinutes is accepted for CLI back-compat with the existing routine
   // invocation but is no longer used to filter anything — the full-
   // population measurement pass below scans every status every run instead
   // (AUR-3994/AUR-3987a: window-based filtering was the root cause of the
   // ~2% detection rate).
   void windowMinutes;
+
+  console.log(`Rule effective date: ${ruleEffectiveDate.toISOString()} (routing decisions created before this are exempt — commit b78456e6/AUR-2301, AUR-4006). Override with --rule-effective-date.\n`);
 
   const headers = {
     Authorization: `Bearer ${apiKey}`,
@@ -622,7 +692,10 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
     // Check routing record only when target is open and non-exempt
     let hasRecord = false;
     let recordScope = null;
-    if (target && !['done', 'cancelled'].includes(target.status) && !isExempt(target)) {
+    if (
+      target && !['done', 'cancelled'].includes(target.status) &&
+      !isExempt(target) && !isPreRule(target, ruleEffectiveDate)
+    ) {
       const lookup = await lookupRoutingRecord({
         companyId, targetId, projectId: target.projectId, apiGet,
       });
@@ -634,7 +707,7 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
       projectScopedHits.push({ targetId, source: 'phase-a' });
     }
 
-    const cancelReason = resolveCancelReason({ target, targetId, hasRecord, recordScope });
+    const cancelReason = resolveCancelReason({ target, targetId, hasRecord, recordScope, ruleEffectiveDate });
 
     if (cancelReason) {
       toCancel.push({ flag, targetId, reason: cancelReason });
@@ -686,8 +759,25 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
   // paying that cost for the entire company's issue history.
   const hydratedPool = await Promise.all(priorityPool.map(withFullDescription));
 
-  const eligible = hydratedPool.filter(issue => !isExempt(issue));
-  const exemptCount = hydratedPool.length - eligible.length;
+  // AUR-4006: split the old single "exempt" bucket into WHY an issue is
+  // exempt. exempt_nondecision covers the AUR-3994 reasons (no routing
+  // decision made, skip-token, content-slot, daily-brief, sign-off gate).
+  // exempt_prerule is new: a genuine routing decision that predates
+  // RULE_EFFECTIVE_DATE, for which a faithful record is unrecoverable. Order
+  // matters — a pre-rule issue that also happens to match a classic
+  // exemption is counted once, under exempt_nondecision, not double-counted.
+  const exemptNondecision = [];
+  const exemptPrerule = [];
+  const eligible = [];
+  for (const issue of hydratedPool) {
+    if (isExempt(issue)) {
+      exemptNondecision.push(issue);
+    } else if (isPreRule(issue, ruleEffectiveDate)) {
+      exemptPrerule.push(issue);
+    } else {
+      eligible.push(issue);
+    }
+  }
 
   const missing = [];
   let hasRecordCount = 0;
@@ -713,12 +803,21 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
   const missingOpenDedupSkipped = missingOpenAll.filter(issue => openFlagTargets.has(issue.identifier ?? issue.id));
   const missingOpen = missingOpenAll.filter(issue => !openFlagTargets.has(issue.identifier ?? issue.id));
 
+  // Real post-cutoff compliance rate: `eligible` already excludes both
+  // exempt_nondecision and exempt_prerule, so this is the only number that
+  // means anything post-AUR-4006 — the board should never be shown the
+  // pre-cutoff eligible/have-record ratio again.
+  const complianceRate = eligible.length > 0 ? hasRecordCount / eligible.length : 1;
+
   console.log(`  Total issues scanned:  ${allIssuesEver.length}`);
   console.log(`  Priority pool (high/critical, assigned): ${hydratedPool.length}`);
-  console.log(`  Exempt:                ${exemptCount}`);
-  console.log(`  Eligible:               ${eligible.length}`);
+  console.log(`  Exempt (no routing decision / skip-token / content-slot / daily-brief / sign-off): ${exemptNondecision.length}`);
+  console.log(`  Exempt (created before rule effective date ${ruleEffectiveDate.toISOString()}, unrecoverable — AUR-4006): ${exemptPrerule.length}`);
+  console.log(`  Eligible (post-rule, routing decision made): ${eligible.length}`);
   console.log(`  Have routing/{id} record: ${hasRecordCount}`);
   console.log(`  Missing:                ${missing.length} (open: ${missingOpenAll.length}, closed/unrecoverable: ${missingClosed.length})`);
+  console.log(`  True post-cutoff compliance rate: ${(complianceRate * 100).toFixed(1)}% (${hasRecordCount}/${eligible.length} post-rule eligible issues have a routing/{id} record)`);
+  console.log(`  pool=${hydratedPool.length} eligible=${eligible.length} exempt_nondecision=${exemptNondecision.length} exempt_prerule=${exemptPrerule.length} have_record=${hasRecordCount} missing_open=${missingOpenAll.length} missing_closed=${missingClosed.length}`);
   if (missingOpenDedupSkipped.length > 0) {
     console.log(`  SKIPPED-DEDUP — open legacy flag already covers this target (${missingOpenDedupSkipped.length}):`);
     for (const issue of missingOpenDedupSkipped) {
@@ -740,6 +839,7 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
   const rollingResult = await syncRollingGapIssue({
     companyId, apiGet, apiPatch, apiPost, apply,
     missingOpen, closedGapCount: missingClosed.length,
+    preruleCount: exemptPrerule.length, ruleEffectiveDate,
     maxListed: maxNewFlags, dateKey, failedMutations,
   });
   console.log();
@@ -747,7 +847,8 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
   // ── Summary ────────────────────────────────────────────────────────────────
   console.log('── Summary ──');
   console.log(`  Legacy flags resolved: ${toCancel.length}`);
-  console.log(`  Eligible / have record / missing (full population): ${eligible.length} / ${hasRecordCount} / ${missing.length}`);
+  console.log(`  pool=${hydratedPool.length} eligible=${eligible.length} exempt_nondecision=${exemptNondecision.length} exempt_prerule=${exemptPrerule.length} have_record=${hasRecordCount} missing_open=${missingOpenAll.length} missing_closed=${missingClosed.length}`);
+  console.log(`  True post-cutoff compliance rate: ${(complianceRate * 100).toFixed(1)}%`);
   console.log(`  Missing open (listed in rolling issue): ${missingOpen.length}`);
   console.log(`  Missing closed (unrecoverable, report-only): ${missingClosed.length}`);
   console.log(`  Rolling issue action: ${rollingResult.action}`);
@@ -790,19 +891,25 @@ if (isMain) {
     options: {
       'window-minutes': { type: 'string', default: '1440' },
       'max-new-flags': { type: 'string', default: '20' },
+      'rule-effective-date': { type: 'string' },
       apply: { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
   });
 
   if (args.help) {
-    console.log('Usage: node scripts/check-routing-rationale.mjs [--window-minutes N] [--max-new-flags N] [--apply]');
-    console.log('  --window-minutes N  Accepted for CLI back-compat; NO LONGER USED (AUR-3994 — the');
-    console.log('                      measurement pass now scans the full population every run,');
-    console.log('                      not just issues updated within a window).');
-    console.log('  --max-new-flags N   Cap how many outstanding gaps are individually listed in the');
-    console.log('                      rolling gap-aggregate issue body (default: 20, anti-flood guard).');
-    console.log('  --apply             Execute changes (default: dry-run, exit 1 if actions pending)');
+    console.log('Usage: node scripts/check-routing-rationale.mjs [--window-minutes N] [--max-new-flags N] [--rule-effective-date ISO_DATE] [--apply]');
+    console.log('  --window-minutes N       Accepted for CLI back-compat; NO LONGER USED (AUR-3994 — the');
+    console.log('                           measurement pass now scans the full population every run,');
+    console.log('                           not just issues updated within a window).');
+    console.log('  --max-new-flags N        Cap how many outstanding gaps are individually listed in the');
+    console.log('                           rolling gap-aggregate issue body (default: 20, anti-flood guard).');
+    console.log('  --rule-effective-date D  ISO 8601 date/time. Routing decisions created before this are');
+    console.log('                           exempt — no rationale is owed for them (default: 2026-06-15T00:00:00Z,');
+    console.log('                           commit b78456e6/AUR-2301, AUR-4006). The boundary is inclusive of');
+    console.log('                           the date itself: an issue created exactly at this instant IS owed a');
+    console.log('                           rationale.');
+    console.log('  --apply                  Execute changes (default: dry-run, exit 1 if actions pending)');
     process.exit(0);
   }
 
@@ -814,6 +921,14 @@ if (isMain) {
     process.exit(2);
   }
 
+  let ruleEffectiveDate;
+  try {
+    ruleEffectiveDate = parseRuleEffectiveDate(args['rule-effective-date']);
+  } catch (err) {
+    console.error(`ERROR: ${err.message}`);
+    process.exit(2);
+  }
+
   resolveApiBase().then(API_URL => main({
     windowMinutes: parseInt(args['window-minutes'], 10),
     maxNewFlags: parseInt(args['max-new-flags'], 10),
@@ -821,6 +936,7 @@ if (isMain) {
     apiUrl: API_URL,
     apiKey: API_KEY,
     companyId: COMPANY_ID,
+    ruleEffectiveDate,
   })).then(code => process.exit(code)).catch(err => {
     console.error('FATAL:', err.message);
     process.exit(2);

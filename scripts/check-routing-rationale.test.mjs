@@ -7,6 +7,10 @@ import {
   extractStatusCode,
   isRoutingDecision,
   isExempt,
+  isPreRule,
+  parseRuleEffectiveDate,
+  resolveCancelReason,
+  RULE_EFFECTIVE_DATE,
   fetchAllIssues,
   buildRollingIssueBody,
   findRollingIssue,
@@ -317,6 +321,91 @@ test("isExempt: a genuinely routed high-priority issue is NOT exempt", () => {
     description: "",
   };
   assert.equal(isExempt(issue), false);
+});
+
+// ── AUR-4006: RULE_EFFECTIVE_DATE cutoff ────────────────────────────────────
+
+test("isPreRule: an issue created before the cutoff is pre-rule-exempt", () => {
+  const issue = { createdAt: "2026-05-01T00:00:00Z" };
+  assert.equal(isPreRule(issue, RULE_EFFECTIVE_DATE), true);
+});
+
+test("isPreRule: an issue created after the cutoff is NOT pre-rule-exempt", () => {
+  const issue = { createdAt: "2026-07-01T00:00:00Z" };
+  assert.equal(isPreRule(issue, RULE_EFFECTIVE_DATE), false);
+});
+
+test("isPreRule: boundary is inclusive-of-rule-date = owed (exactly-on-cutoff is NOT exempt)", () => {
+  const issue = { createdAt: RULE_EFFECTIVE_DATE.toISOString() };
+  assert.equal(isPreRule(issue, RULE_EFFECTIVE_DATE), false);
+});
+
+test("isPreRule: one millisecond before the cutoff IS exempt", () => {
+  const oneMsBefore = new Date(RULE_EFFECTIVE_DATE.getTime() - 1).toISOString();
+  const issue = { createdAt: oneMsBefore };
+  assert.equal(isPreRule(issue, RULE_EFFECTIVE_DATE), true);
+});
+
+test("isPreRule: missing createdAt is never exempt (fail closed, not open)", () => {
+  assert.equal(isPreRule({}), false);
+});
+
+test("parseRuleEffectiveDate: --rule-effective-date override is honored", () => {
+  const overridden = parseRuleEffectiveDate("2026-01-01T00:00:00Z");
+  assert.equal(overridden.toISOString(), "2026-01-01T00:00:00.000Z");
+  // An issue that is pre-rule under the DEFAULT cutoff is post-rule under an
+  // earlier override — proves main()'s ruleEffectiveDate param actually
+  // changes the comparison, not just accepted-and-ignored.
+  const issue = { createdAt: "2026-05-01T00:00:00Z" };
+  assert.equal(isPreRule(issue, RULE_EFFECTIVE_DATE), true);
+  assert.equal(isPreRule(issue, overridden), false);
+});
+
+test("parseRuleEffectiveDate: no override falls back to RULE_EFFECTIVE_DATE", () => {
+  assert.equal(parseRuleEffectiveDate(undefined).getTime(), RULE_EFFECTIVE_DATE.getTime());
+});
+
+test("parseRuleEffectiveDate: unparseable override throws loudly instead of silently exempting nothing", () => {
+  assert.throws(() => parseRuleEffectiveDate("not-a-date"), /could not parse/);
+});
+
+test("resolveCancelReason: a pre-rule target auto-resolves the legacy flag as exempt", () => {
+  const target = {
+    status: "todo",
+    priority: "high",
+    createdAt: "2026-05-01T00:00:00Z",
+    createdByAgentId: "agent-1",
+    assigneeAgentId: "agent-2",
+    originKind: "manual",
+    title: "Genuinely routed pre-rule issue",
+  };
+  const reason = resolveCancelReason({
+    target, targetId: "AUR-1", hasRecord: false, ruleEffectiveDate: RULE_EFFECTIVE_DATE,
+  });
+  assert.ok(reason && /before the routing-rationale rule took effect/.test(reason));
+});
+
+test("resolveCancelReason: a post-rule target with no record is NOT auto-resolved", () => {
+  const target = {
+    status: "todo",
+    priority: "high",
+    createdAt: "2026-07-01T00:00:00Z",
+    createdByAgentId: "agent-1",
+    assigneeAgentId: "agent-2",
+    originKind: "manual",
+    title: "Genuinely routed post-rule issue",
+  };
+  const reason = resolveCancelReason({
+    target, targetId: "AUR-2", hasRecord: false, ruleEffectiveDate: RULE_EFFECTIVE_DATE,
+  });
+  assert.equal(reason, null);
+});
+
+test("buildRollingIssueBody: surfaces preruleCount as report-only, with the cutoff date cited", () => {
+  const body = buildRollingIssueBody([], { maxListed: 20, closedGapCount: 0, preruleCount: 689, ruleEffectiveDate: RULE_EFFECTIVE_DATE });
+  assert.ok(body.includes("689 additional issue(s)"));
+  assert.ok(body.includes(RULE_EFFECTIVE_DATE.toISOString()));
+  assert.ok(body.includes("AUR-4006"));
 });
 
 // ── fetchAllIssues: pagination ──────────────────────────────────────────────

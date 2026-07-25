@@ -2666,6 +2666,48 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     ).rejects.toMatchObject({ status: 422 });
   });
 
+  it("refuses to check out an issue owned by a human assignee", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const humanUserId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const humanGatedId = randomUUID();
+    await db.insert(issues).values({
+      id: humanGatedId,
+      companyId,
+      title: "Human-gated issue",
+      status: "blocked",
+      priority: "medium",
+      assigneeUserId: humanUserId,
+    });
+
+    await expect(
+      svc.checkout(humanGatedId, assigneeAgentId, ["todo", "blocked"], null),
+    ).rejects.toMatchObject({ status: 409 });
+
+    const [row] = await db.select().from(issues).where(eq(issues.id, humanGatedId));
+    expect(row.status).toBe("blocked");
+    expect(row.assigneeUserId).toBe(humanUserId);
+    expect(row.assigneeAgentId).toBeNull();
+  });
+
   it("wakes parents only when all direct children are terminal", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();

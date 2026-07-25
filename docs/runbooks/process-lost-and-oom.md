@@ -259,3 +259,7 @@ memory-constrained host without redoing the arithmetic above.
 - [AUR-3931](/AUR/issues/AUR-3931) — extracted Postgres into its own unit (§3)
 - [AUR-3921](/AUR/issues/AUR-3921) — the false-positive productivity review this runbook
   exists to prevent a repeat of
+- [`agent-privilege-model.md`](agent-privilege-model.md) — what an agent can actually do to
+  this host and what is logged; reads the same §1 topology correction from the privilege side
+- [`docs/runbooks/README.md`](README.md) — index of the full runbook set, including the
+  AUR-3938 content that has no repo file

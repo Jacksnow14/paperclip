@@ -6535,6 +6535,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       payload: staleness.details,
     });
 
+    // AUR-4323: cancelling the stale run is only half the job. Wakes that arrived for
+    // the issue while this run held the execution slot are parked as
+    // `deferred_issue_execution` and are re-driven by nothing else — without this the
+    // new assignee's wake stays a dead letter even after the blocking run is gone.
+    await releaseIssueExecutionAndPromote(cancelled, { allowImmediateRecovery: false });
+
     return cancelled;
   }
 
@@ -8546,7 +8552,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
   }
 
-  async function releaseIssueExecutionAndPromote(run: typeof heartbeatRuns.$inferSelect) {
+  async function releaseIssueExecutionAndPromote(
+    run: typeof heartbeatRuns.$inferSelect,
+    // AUR-4323: callers that cancelled `run` *because the work should not happen*
+    // (the stale-queued-run gate) still need parked deferred wakes handed on, but must
+    // not re-arm automatic recovery — that would immediately re-queue the very run the
+    // staleness gate just rejected, and the pair would spin forever.
+    opts: { allowImmediateRecovery?: boolean } = {},
+  ) {
+    const allowImmediateRecovery = opts.allowImmediateRecovery ?? true;
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = readNonEmptyString(runContext.issueId);
     const taskKey = deriveTaskKeyWithHeartbeatFallback(runContext, null);
@@ -8803,6 +8817,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const issueNeedsImmediateRecovery =
+        allowImmediateRecovery &&
         (issue.status === "todo" || issue.status === "in_progress") &&
         !issue.assigneeUserId &&
         issue.assigneeAgentId === run.agentId &&
@@ -9186,35 +9201,70 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return { kind: "skipped" as const };
         }
 
-        const cancelStaleScheduledRetry = async (scheduledRun: typeof heartbeatRuns.$inferSelect) => {
+        // AUR-4323: a run that has not started yet and is owned by an agent who is no
+        // longer the assignee can never run, but it still satisfies the issue-level
+        // "already has an active execution run" scan below. Left in place it pins the
+        // execution lock to the old owner forever, so every wake for the *new* assignee
+        // is filed as `deferred_issue_execution` and no run is ever created. Clearing it
+        // eagerly here is what makes a re-route away from a wedged agent schedulable —
+        // the lazy claim-time gate (evaluateQueuedRunStaleness) cannot help, because it
+        // only ever runs on the wedged lane that never claims.
+        const cancelStaleUnstartedRun = async (staleRun: typeof heartbeatRuns.$inferSelect) => {
           const issueCancelled = issue.status === "cancelled";
+          const isScheduledRetry = staleRun.status === "scheduled_retry";
+          const isQueued = staleRun.status === "queued";
           if (
-            scheduledRun.status !== "scheduled_retry" ||
-            (scheduledRun.agentId === issue.assigneeAgentId && !issueCancelled)
+            (!isScheduledRetry && !isQueued) ||
+            (staleRun.agentId === issue.assigneeAgentId && !issueCancelled)
           ) {
             return false;
           }
 
+          // Mirror the claim-time exception: an explicit, verified mention-scoped reply
+          // wake stays addressed to the agent it named, so it survives a reassignment.
+          if (isQueued && !issueCancelled) {
+            const staleContext = parseObject(staleRun.contextSnapshot);
+            const isVerifiedMentionReplyWake =
+              readNonEmptyString(staleContext.wakeReason) === "issue_comment_mentioned" &&
+              (await isVerifiedIssueTreeControlInteractionWake(tx, {
+                companyId: staleRun.companyId,
+                issueId: issue.id,
+                agentId: staleRun.agentId,
+                runId: staleRun.id,
+                wakeupRequestId: staleRun.wakeupRequestId,
+                contextSnapshot: staleContext,
+              }));
+            if (isVerifiedMentionReplyWake) return false;
+          }
+
           const now = new Date();
           const reason = issueCancelled
-            ? "Cancelled because the issue was cancelled before the scheduled retry became due"
-            : "Cancelled because the issue was reassigned before the scheduled retry became due";
+            ? isScheduledRetry
+              ? "Cancelled because the issue was cancelled before the scheduled retry became due"
+              : "Cancelled because the issue was cancelled before the queued run could start"
+            : isScheduledRetry
+              ? "Cancelled because the issue was reassigned before the scheduled retry became due"
+              : "Cancelled because issue assignee changed before the queued run could start; the new owner will be woken instead";
           const cancelled = await tx
             .update(heartbeatRuns)
             .set({
               status: "cancelled",
               finishedAt: now,
               error: reason,
-              errorCode: issueCancelled ? "issue_cancelled" : "issue_reassigned",
+              errorCode: issueCancelled
+                ? "issue_cancelled"
+                : isScheduledRetry
+                  ? "issue_reassigned"
+                  : "issue_assignee_changed",
               updatedAt: now,
             })
-            .where(and(eq(heartbeatRuns.id, scheduledRun.id), eq(heartbeatRuns.status, "scheduled_retry")))
+            .where(and(eq(heartbeatRuns.id, staleRun.id), eq(heartbeatRuns.status, staleRun.status)))
             .returning()
             .then((rows) => rows[0] ?? null);
 
           if (!cancelled) return false;
 
-          if (scheduledRun.wakeupRequestId) {
+          if (staleRun.wakeupRequestId) {
             await tx
               .update(agentWakeupRequests)
               .set({
@@ -9223,10 +9273,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 error: reason,
                 updatedAt: now,
               })
-              .where(eq(agentWakeupRequests.id, scheduledRun.wakeupRequestId));
+              .where(eq(agentWakeupRequests.id, staleRun.wakeupRequestId));
           }
 
-          if (issue.executionRunId === scheduledRun.id) {
+          if (issue.executionRunId === staleRun.id) {
             await tx
               .update(issues)
               .set({
@@ -9235,7 +9285,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 executionLockedAt: null,
                 updatedAt: now,
               })
-              .where(and(eq(issues.id, issue.id), eq(issues.executionRunId, scheduledRun.id)));
+              .where(and(eq(issues.id, issue.id), eq(issues.executionRunId, staleRun.id)));
           }
 
           const [eventSeq] = await tx
@@ -9252,11 +9302,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             stream: "system",
             level: "warn",
             message: issueCancelled
-              ? "Scheduled retry cancelled because issue was cancelled before it became due"
-              : "Scheduled retry cancelled because issue ownership changed before it became due",
+              ? isScheduledRetry
+                ? "Scheduled retry cancelled because issue was cancelled before it became due"
+                : "Queued run cancelled because issue was cancelled before it could start"
+              : isScheduledRetry
+                ? "Scheduled retry cancelled because issue ownership changed before it became due"
+                : "Queued run cancelled because issue ownership changed before it could start",
             payload: {
               issueId: issue.id,
               issueStatus: issue.status,
+              staleRunStatus: staleRun.status,
               scheduledRetryAttempt: cancelled.scheduledRetryAttempt,
               scheduledRetryAt: cancelled.scheduledRetryAt ? new Date(cancelled.scheduledRetryAt).toISOString() : null,
               scheduledRetryReason: cancelled.scheduledRetryReason,
@@ -9285,7 +9340,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           activeExecutionRun = null;
         }
 
-        if (activeExecutionRun && await cancelStaleScheduledRetry(activeExecutionRun)) {
+        if (activeExecutionRun && await cancelStaleUnstartedRun(activeExecutionRun)) {
           activeExecutionRun = null;
         }
 
@@ -9320,7 +9375,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .then((rows) => rows[0] ?? null);
 
           if (legacyRun) {
-            if (await cancelStaleScheduledRetry(legacyRun)) {
+            if (await cancelStaleUnstartedRun(legacyRun)) {
               activeExecutionRun = null;
             } else {
               activeExecutionRun = legacyRun;
@@ -9932,6 +9987,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           requestedByActorType: agentWakeupRequests.requestedByActorType,
           requestedByActorId: agentWakeupRequests.requestedByActorId,
           runId: agentWakeupRequests.runId,
+          // AUR-4323: the issue a wake is for is the field you actually need to answer
+          // "is this handoff live?". Without it, filtering the response on `payload`
+          // returns a clean zero that is a false zero. Projected rather than returning
+          // the whole payload, which carries the full deferred-wake context snapshot.
+          issueId: sql<string | null>`${agentWakeupRequests.payload} ->> 'issueId'`,
           requestedAt: agentWakeupRequests.requestedAt,
           claimedAt: agentWakeupRequests.claimedAt,
           finishedAt: agentWakeupRequests.finishedAt,

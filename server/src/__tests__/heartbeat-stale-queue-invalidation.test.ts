@@ -925,6 +925,150 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(countExecuteCallsForRun(runId)).toBe(0);
   });
 
+  // AUR-4323: the two halves of "re-routing an issue away from a wedged agent never
+  // schedules work for the new assignee". Neither of these may lean on the old agent's
+  // lane ever admitting again — that is precisely what is broken in the field.
+  async function seedReroutedIssueWithOrphanRun(opts: { issueStatus?: string } = {}) {
+    const { companyId, agentId: wedgedAgentId } = await seedCompanyAndAgent({ agentName: "WedgedCoder" });
+    const newAssigneeId = randomUUID();
+    await db.insert(agents).values({
+      id: newAssigneeId,
+      companyId,
+      name: "HealthyCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Re-routed away from a wedged agent",
+      status: opts.issueStatus ?? "todo",
+      priority: "critical",
+      assigneeAgentId: newAssigneeId,
+    });
+
+    // The orphan: queued on the OLD agent, never started, and it never will be.
+    const { runId: orphanRunId } = await seedQueuedRun({
+      companyId,
+      agentId: wedgedAgentId,
+      issueId,
+      wakeReason: "issue_commented",
+      invocationSource: "automation",
+    });
+
+    return { companyId, wedgedAgentId, newAssigneeId, issueId, orphanRunId };
+  }
+
+  it("schedules a run for the new assignee even when an unstartable queued run is stranded on the old one", async () => {
+    const { companyId, newAssigneeId, issueId, orphanRunId } = await seedReroutedIssueWithOrphanRun();
+
+    // The assignment wake. Pre-fix this returns a `deferred_issue_execution` wake and
+    // no run, because the company-wide execution-run scan adopts the orphan and the
+    // execution lock lands back on the agent that can never run it.
+    await heartbeat.wakeup(newAssigneeId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId, mutation: "assignee_changed" },
+      contextSnapshot: { issueId, source: "issue_update" },
+      requestedByActorType: "system",
+    });
+
+    await waitForCondition(async () => {
+      const rows = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, newAssigneeId));
+      return rows.length > 0;
+    });
+
+    const newAssigneeRuns = await db
+      .select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, newAssigneeId));
+    const runsForIssue = newAssigneeRuns.filter(
+      (row) => (row.contextSnapshot as { issueId?: string } | null)?.issueId === issueId,
+    );
+    expect(runsForIssue.length).toBeGreaterThan(0);
+
+    // And the orphan is retired rather than left to pin the lock forever.
+    const orphan = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, orphanRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(orphan?.status).toBe("cancelled");
+    expect(orphan?.errorCode).toBe("issue_assignee_changed");
+
+    // Nothing should have been parked as a dead-letter deferred wake.
+    const deferred = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        sql`${agentWakeupRequests.companyId} = ${companyId}
+          and ${agentWakeupRequests.status} = 'deferred_issue_execution'
+          and ${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+      );
+    expect(deferred).toHaveLength(0);
+  });
+
+  it("promotes a deferred wake once the stale queued run blocking the issue is cancelled", async () => {
+    const { companyId, newAssigneeId, issueId, orphanRunId } = await seedReroutedIssueWithOrphanRun({
+      issueStatus: "in_progress",
+    });
+
+    // Exactly the field state of AUR-4144: the new assignee's wake parked as a
+    // deferred dead letter behind an orphan run that can never drain.
+    const deferredWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeId,
+      companyId,
+      agentId: newAssigneeId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_execution_deferred",
+      payload: {
+        issueId,
+        _paperclipWakeContext: { issueId, wakeReason: "issue_assigned", source: "issue_update" },
+      },
+      status: "deferred_issue_execution",
+      requestedByActorType: "system",
+    });
+
+    // Cancelling the orphan must hand the issue on, not just free it.
+    await heartbeat.resumeQueuedRuns();
+
+    await waitForCondition(async () => {
+      const wake = await db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, deferredWakeId))
+        .then((rows) => rows[0] ?? null);
+      return wake?.status !== "deferred_issue_execution";
+    }, 8_000);
+
+    const orphan = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, orphanRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(orphan?.status).toBe("cancelled");
+
+    const deferredWake = await db
+      .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredWakeId))
+      .then((rows) => rows[0] ?? null);
+    expect(deferredWake?.status).not.toBe("deferred_issue_execution");
+    expect(deferredWake?.runId).toBeTruthy();
+  });
+
   it("baseline: runs queued runs when the issue is in_progress with the same assignee", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();

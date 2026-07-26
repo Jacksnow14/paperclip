@@ -28,6 +28,26 @@ const CONTENT_BOTS = new Set([
 const CTO = '371a1b08-0286-4a12-a516-f587f42df5eb';
 
 /**
+ * metadata.category for captured gap records (AUR-4151, 2026-07-26).
+ *
+ * Auto-accept in /memory/capture is keyed on metadata.category, and a NON-auto-accepted
+ * category lands the record in `reviewState: pending` — where it is write-only. The capture
+ * still returns 201, but the record is then unreadable by every path: the default records
+ * list omits it, `?reviewState=pending` (which the capture's own warning tells you to use)
+ * returns 0 items, and GET by id 404s.
+ *
+ * The natural category here, `retrospective_compliance_gap`, is NOT auto-accepted, so every
+ * gap record this script had ever "captured" was invisible — Step 4's durable enforcement
+ * record was silently a no-op. We therefore write an auto-accepted category (`lesson`) and
+ * keep the semantic one in `compliance_category`. Readers must filter on `compliance_category`
+ * (or the `retrospective-compliance/` title prefix), NOT on `category`.
+ *
+ * Auto-accepted set as of 2026-07-26: lesson, tool_gap, performance_scorecard,
+ * scorecard_adjusted, synthesis, experiment, experiment_conclusion.
+ */
+const GAP_CATEGORY = 'lesson';
+
+/**
  * Retrospective heading detector — matches the literal `## Retrospective` heading.
  *
  * MISFILED-RETRO HARDENING (AUR-3203): a bare `## Retrospective` string is not enough.
@@ -246,7 +266,8 @@ export async function main({ hours, apply, apiUrl, apiKey, companyId, runIssueId
         title: `retrospective-compliance/missing/${m.identifier}`,
         content: `Closed issue ${m.identifier} ("${m.title}") has no '## Retrospective' comment. Assignee ${m.assigneeName ?? 'unassigned'}; manager notified: ${m.managerName}.`,
         metadata: {
-          category: 'retrospective_compliance_gap',
+          category: GAP_CATEGORY,
+          compliance_category: 'retrospective_compliance_gap',
           gap_type: 'missing_retro',
           issue_identifier: m.identifier, issue_id: m.id, title: m.title,
           assignee_agent_id: m.assigneeAgentId, manager_agent_id: m.managerId,
@@ -266,7 +287,8 @@ export async function main({ hours, apply, apiUrl, apiKey, companyId, runIssueId
         title: `retrospective-compliance/scorecard-missing/${m.identifier}`,
         content: `Closed issue ${m.identifier} ("${m.title}") is missing scorecard captures: [${missing}]. Assignee ${m.assigneeName ?? 'unassigned'}; manager notified: ${m.managerName}.`,
         metadata: {
-          category: 'retrospective_compliance_gap',
+          category: GAP_CATEGORY,
+          compliance_category: 'retrospective_compliance_gap',
           gap_type: 'missing_scorecard',
           missing_records: [m.missingPerf && 'performance_scorecard', m.missingAdj && 'scorecard_adjusted'].filter(Boolean),
           issue_identifier: m.identifier, issue_id: m.id, title: m.title,

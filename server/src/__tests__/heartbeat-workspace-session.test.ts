@@ -297,6 +297,84 @@ describe("buildRealizedExecutionWorkspaceFromPersisted", () => {
     expect(result.branchName).toBe("PAP-880-thumbs-capture-for-evals-feature");
     expect(result.source).toBe("task_session");
   });
+
+  it("preserves project_workspace source on the shared_workspace reuse path (AUR-4104)", () => {
+    const result = buildRealizedExecutionWorkspaceFromPersisted({
+      base: buildResolvedWorkspace({
+        cwd: "/tmp/project-primary",
+        source: "project_workspace",
+        repoRef: "main",
+      }),
+      workspace: {
+        id: "execution-workspace-2",
+        companyId: "company-1",
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        sourceIssueId: "issue-2",
+        mode: "shared_workspace",
+        strategyType: "project_primary",
+        name: "PAP-4104-pinned-workspace-reuse",
+        status: "active",
+        cwd: "/tmp/pinned-project-workspace",
+        repoUrl: "https://example.com/paperclip.git",
+        baseRef: "main",
+        branchName: null,
+        providerType: "project_primary",
+        providerRef: "/tmp/pinned-project-workspace",
+        derivedFromExecutionWorkspaceId: null,
+        lastUsedAt: new Date(),
+        openedAt: new Date(),
+        closedAt: null,
+        cleanupEligibleAt: null,
+        cleanupReason: null,
+        config: null,
+        metadata: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    });
+
+    expect(result?.source).toBe("project_workspace");
+  });
+
+  it("still labels an unpinned shared_workspace reuse as project_primary (AUR-4104 regression guard)", () => {
+    const result = buildRealizedExecutionWorkspaceFromPersisted({
+      base: buildResolvedWorkspace({
+        cwd: "/tmp/project-primary",
+        source: "project_primary",
+        repoRef: "main",
+      }),
+      workspace: {
+        id: "execution-workspace-3",
+        companyId: "company-1",
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        sourceIssueId: "issue-3",
+        mode: "shared_workspace",
+        strategyType: "project_primary",
+        name: "PAP-4104-unpinned-workspace-reuse",
+        status: "active",
+        cwd: "/tmp/project-primary",
+        repoUrl: "https://example.com/paperclip.git",
+        baseRef: "main",
+        branchName: null,
+        providerType: "project_primary",
+        providerRef: "/tmp/project-primary",
+        derivedFromExecutionWorkspaceId: null,
+        lastUsedAt: new Date(),
+        openedAt: new Date(),
+        closedAt: null,
+        cleanupEligibleAt: null,
+        cleanupReason: null,
+        config: null,
+        metadata: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    });
+
+    expect(result?.source).toBe("project_primary");
+  });
 });
 
 describe("stripWorkspaceRuntimeFromExecutionRunConfig", () => {

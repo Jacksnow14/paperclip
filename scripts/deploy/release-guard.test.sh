@@ -148,6 +148,54 @@ assert_deletable "$APP" "$APP/releases/IDLE" >/dev/null 2>&1
 check "assert_deletable permits an idle release" "$?" "0"
 
 echo
+echo "== --force against current/previous: the activate->restart window =="
+# The gap @CEO found reviewing PR #127: assert_deletable protected only what
+# was RUNNING, so `--force` on the just-activated release (current, but not yet
+# running — this script never restarts the service) still rm -rf'd it, dangling
+# `current` for a full rebuild. prune_releases already protected these two; the
+# guard did not. NOTHING is running in these fixtures on purpose: that is
+# precisely the state in which the old guard said yes.
+APP="$TMP/force-active"
+make_app "$APP" OLD ACTIVE NEW
+activate "$APP" ACTIVE
+set_previous "$APP" OLD
+assert_deletable "$APP" "$APP/releases/ACTIVE" > "$TMP/force-active.log" 2>&1
+check "assert_deletable refuses the current release (nothing running)" "$?" "1"
+check "refusal names current" \
+  "$(grep -qi "it is the 'current' release" "$TMP/force-active.log" && echo yes || echo no)" "yes"
+check "current release still on disk after refusal" \
+  "$( [[ -d "$APP/releases/ACTIVE" ]] && echo present || echo GONE )" "present"
+
+assert_deletable "$APP" "$APP/releases/OLD" > "$TMP/force-prev.log" 2>&1
+check "assert_deletable refuses the previous release (rollback target)" "$?" "1"
+check "refusal names previous" \
+  "$(grep -qi "it is the 'previous' release" "$TMP/force-prev.log" && echo yes || echo no)" "yes"
+
+# Negative control: the guard must not have become "refuse everything". NEW is
+# neither running, nor current, nor previous — in the same APP_ROOT that just
+# produced two refusals.
+assert_deletable "$APP" "$APP/releases/NEW" >/dev/null 2>&1
+check "assert_deletable still permits a release that is neither" "$?" "0"
+
+# Guard and retention must now agree. Same fixture, keep=0: only NEW may go.
+prune_releases "$APP" 0 > "$TMP/force-agree.log" 2>&1
+check "prune agrees: current kept" \
+  "$( [[ -d "$APP/releases/ACTIVE" ]] && echo present || echo GONE )" "present"
+check "prune agrees: previous kept" \
+  "$( [[ -d "$APP/releases/OLD" ]] && echo present || echo GONE )" "present"
+check "prune agrees: unprotected release reaped" \
+  "$( [[ -d "$APP/releases/NEW" ]] && echo present || echo GONE )" "GONE"
+
+# A dangling `current` (target already gone via some other path) must not crash
+# the guard, and must not start protecting an unrelated release.
+APP="$TMP/force-dangling"
+make_app "$APP" GONEREL LIVE
+activate "$APP" GONEREL
+rm -rf "$APP/releases/GONEREL"
+assert_deletable "$APP" "$APP/releases/LIVE" >/dev/null 2>&1
+check "dangling current does not block an unrelated release" "$?" "0"
+
+echo
 echo "== structural refusals =="
 APP="$TMP/struct"
 make_app "$APP" R

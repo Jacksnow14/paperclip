@@ -29,10 +29,28 @@
 #      two ordinary builds with NO `--activate` anywhere also satisfy (b).
 #      This is the routine "iterating on a build failure after a deploy" case.
 #
-# So the guard keys on WHAT IS ACTUALLY RUNNING, read from /proc, never on
-# `current` — `current` is precisely what stops pointing at production. That
-# invariant holds no matter which path got you there, which matters because
-# both of us enumerated the kill paths wrong at least once while analysing this.
+# So the guard's PRIMARY key is WHAT IS ACTUALLY RUNNING, read from /proc, and
+# never `current` alone — `current` is precisely what stops pointing at
+# production. That invariant holds no matter which path got you there, which
+# matters because both of us enumerated the kill paths wrong at least once
+# while analysing this.
+#
+# But "running" is necessary, not sufficient. Reviewing this change (@CEO,
+# AUR-4127), the guard and the retention loop were found to disagree:
+# prune_releases protected running + `current` + `previous`, while
+# assert_deletable — the function that actually gates every `rm -rf` — refused
+# only what was running. So `build-release.sh --force` against the
+# just-activated release still deleted it, because between `--activate` and the
+# next restart that release is `current` and NOT yet running. That dangles
+# `current` for the length of a full clone + pnpm install + two builds, with
+# paperclip-oom-guard.timer live and able to restart the unit into a symlink
+# pointing at nothing. `previous` matters for the same class of reason: it is
+# the rollback target, and losing it turns a bad deploy into an outage.
+#
+# The protected set is therefore the UNION — running ∪ current ∪ previous —
+# and it is enforced in ONE place (assert_deletable) so the two `rm -rf` call
+# sites cannot drift apart again. AUR-4127 scope 3 asked for exactly this: make
+# it impossible to delete what `current` resolves to, in the inner script.
 #
 # Sourceable with no side effects: `source release-guard.sh` defines functions
 # and does nothing else, so the tests exercise the real /proc logic rather than
@@ -108,11 +126,12 @@ release_name_of_link() {
   printf '%s\n' "${target##*/}"
 }
 
-# Refuse to delete a release that is running, or a path outside releases/.
-# Every `rm -rf` site in the deploy path MUST call this first.
+# Refuse to delete a release that is running, is `current`, is `previous`, or
+# sits outside releases/. Every `rm -rf` site in the deploy path MUST call this
+# first — this function, not the caller, is where the protected set is defined.
 assert_deletable() {
   local app_root=$1 path=$2
-  local name running
+  local name running link
 
   # Structural: never rm -rf anything that is not a direct child of releases/.
   case "$path" in
@@ -136,6 +155,19 @@ assert_deletable() {
       return 1
     fi
   done < <(detect_running_releases "$app_root")
+
+  # Not running, but still undeletable: `current` is what the next start will
+  # serve (deleting it dangles the symlink through a whole rebuild) and
+  # `previous` is the rollback target. Checked here rather than only in
+  # prune_releases so that --force, which calls no retention code at all, is
+  # covered by the same rule. To rebuild the active sha, activate another
+  # release (or roll back) first — that is the operation you actually want.
+  for link in current previous; do
+    if [[ "$(release_name_of_link "$app_root/$link")" == "$name" ]]; then
+      echo "refusing to delete '$path': it is the '$link' release ($link -> releases/$name); activate a different release first (AUR-4127)" >&2
+      return 1
+    fi
+  done
   return 0
 }
 

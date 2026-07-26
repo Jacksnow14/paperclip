@@ -23,6 +23,7 @@ import {
   issueDocuments,
   issueReadStates,
   issueThreadInteractions,
+  issueTombstones,
   issues,
   labels,
   projectWorkspaces,
@@ -3834,6 +3835,28 @@ export function issueService(db: Db) {
       return getIssueByIdentifier(identifier);
     },
 
+    /**
+     * Looks up a tombstone (issue-was-deleted record) by `AUR-NNNN`
+     * identifier or UUID, scoped to `companyId`. Used to distinguish "this
+     * identifier referred to a real, since-deleted issue" from "this
+     * identifier never existed" (AUR-4091).
+     */
+    getTombstoneByIdentifierOrUuid: async (companyId: string, raw: string) => {
+      const id = raw.trim();
+      const identifier = normalizeIssueReferenceIdentifier(id);
+      const condition = identifier
+        ? and(eq(issueTombstones.companyId, companyId), eq(issueTombstones.identifier, identifier))
+        : isUuidLike(id)
+          ? and(eq(issueTombstones.companyId, companyId), eq(issueTombstones.issueId, id))
+          : null;
+      if (!condition) return null;
+      return db
+        .select()
+        .from(issueTombstones)
+        .where(condition)
+        .then((rows) => rows[0] ?? null);
+    },
+
     getCurrentScheduledRetry: async (issueId: string) => {
       const issue = await db
         .select({ id: issues.id, companyId: issues.companyId })
@@ -4639,6 +4662,18 @@ export function issueService(db: Db) {
           .where(eq(issues.id, id))
           .returning()
           .then((rows) => rows[0] ?? null);
+
+        if (removedIssue) {
+          await tx
+            .insert(issueTombstones)
+            .values({
+              companyId: removedIssue.companyId,
+              issueId: removedIssue.id,
+              identifier: removedIssue.identifier,
+              title: removedIssue.title,
+            })
+            .onConflictDoNothing();
+        }
 
         if (removedIssue && attachmentAssetIds.length > 0) {
           await tx

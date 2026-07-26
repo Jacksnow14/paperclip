@@ -692,6 +692,7 @@ export function memoryRoutes(
         // Restrict to allowlisted categories to prevent arbitrary record mutation.
         const category = recordCategory(record as { metadata?: Record<string, unknown> | null });
         const isSharedContributorCategory = category !== null && SHARED_CONTRIBUTOR_CATEGORIES.has(category);
+        const isNonOwnerAgent = record.owner?.type !== "agent" || record.owner.id !== req.actor.agentId;
         if (!category || !AGENT_MUTABLE_CATEGORIES.has(category)) {
           throw forbidden(
             `Category '${category ?? "(none)"}' is immutable — agents cannot PATCH records in this category. ` +
@@ -705,10 +706,7 @@ export function memoryRoutes(
             },
           );
         }
-        if (
-          (record.owner?.type !== "agent" || record.owner.id !== req.actor.agentId) &&
-          !isSharedContributorCategory
-        ) {
+        if (isNonOwnerAgent && !isSharedContributorCategory) {
           throw forbidden(
             "Agents cannot PATCH non-shared memory records they do not own. " +
               "Supported alternatives: ask the owner to update the record, or capture a new record via POST /memory/capture. " +
@@ -723,6 +721,55 @@ export function memoryRoutes(
               rule: "agent_non_owner_patch_disallowed",
             },
           );
+        }
+        if (isNonOwnerAgent && isSharedContributorCategory) {
+          const body = req.body as { title?: string | null; metadata?: Record<string, unknown> };
+          if (Object.prototype.hasOwnProperty.call(body, "title")) {
+            const requestedTitle = body.title ?? null;
+            const currentTitle = record.title ?? null;
+            if (requestedTitle !== currentTitle) {
+              throw forbidden(
+                "Non-owner contributors cannot change the title of a shared memory record. " +
+                  "Supported alternatives: keep the existing title and amend the record content, or ask the owner to retitle it.",
+                {
+                  category,
+                  ownerType: record.owner?.type ?? null,
+                  ownerId: record.owner?.id ?? null,
+                  ownerAgentId: record.owner?.type === "agent" ? record.owner.id : null,
+                  currentTitle,
+                  requestedTitle,
+                  supportedAlternatives: ["keep_existing_title", "ask_owner_to_retitle"],
+                  rule: "shared_contributor_title_change_disallowed",
+                },
+              );
+            }
+          }
+          if (
+            body.metadata &&
+            typeof body.metadata === "object" &&
+            Object.prototype.hasOwnProperty.call(body.metadata, "category")
+          ) {
+            const requestedCategory =
+              typeof body.metadata.category === "string" && body.metadata.category.trim().length > 0
+                ? body.metadata.category
+                : null;
+            if (requestedCategory !== category) {
+              throw forbidden(
+                "Non-owner contributors cannot change metadata.category on a shared memory record. " +
+                  "Supported alternatives: keep the existing category and amend the record, or ask the owner to reclassify it.",
+                {
+                  category,
+                  ownerType: record.owner?.type ?? null,
+                  ownerId: record.owner?.id ?? null,
+                  ownerAgentId: record.owner?.type === "agent" ? record.owner.id : null,
+                  currentCategory: category,
+                  requestedCategory,
+                  supportedAlternatives: ["keep_existing_category", "ask_owner_to_reclassify"],
+                  rule: "shared_contributor_category_change_disallowed",
+                },
+              );
+            }
+          }
         }
       } else {
         // Board users have unrestricted update access (they can already use /correct).

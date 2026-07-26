@@ -658,6 +658,54 @@ describe("memory routes", () => {
       );
     });
 
+    it("blocks a non-owner agent from retitling another agent's shared lesson record", async () => {
+      const otherAgent = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      mockMemoryService.getRecord.mockResolvedValue(makeRecord({ title: "Lesson", metadata: { category: "lesson" } }));
+      const app = createApp({ type: "agent", agentId: otherAgent, companyId: companyA });
+
+      const res = await request(app)
+        .patch(`/api/companies/${companyA}/memory/records/${recordId}`)
+        .send({ title: "retitled lesson" });
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toMatch(/cannot change the title/i);
+      expect(res.body.error).toMatch(/ask the owner to retitle/i);
+      expect(res.body.details).toMatchObject({
+        category: "lesson",
+        ownerType: "agent",
+        ownerId: agentId,
+        ownerAgentId: agentId,
+        currentTitle: "Lesson",
+        requestedTitle: "retitled lesson",
+        rule: "shared_contributor_title_change_disallowed",
+      });
+      expect(mockMemoryService.agentUpdate).not.toHaveBeenCalled();
+    });
+
+    it("blocks a non-owner agent from changing metadata.category on another agent's shared lesson record", async () => {
+      const otherAgent = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      mockMemoryService.getRecord.mockResolvedValue(makeRecord({ metadata: { category: "lesson" } }));
+      const app = createApp({ type: "agent", agentId: otherAgent, companyId: companyA });
+
+      const res = await request(app)
+        .patch(`/api/companies/${companyA}/memory/records/${recordId}`)
+        .send({ metadata: { category: "experiment", status: "approved" } });
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toMatch(/cannot change metadata\.category/i);
+      expect(res.body.error).toMatch(/ask the owner to reclassify/i);
+      expect(res.body.details).toMatchObject({
+        category: "lesson",
+        ownerType: "agent",
+        ownerId: agentId,
+        ownerAgentId: agentId,
+        currentCategory: "lesson",
+        requestedCategory: "experiment",
+        rule: "shared_contributor_category_change_disallowed",
+      });
+      expect(mockMemoryService.agentUpdate).not.toHaveBeenCalled();
+    });
+
     it("blocks an agent from updating a record with no category", async () => {
       mockMemoryService.getRecord.mockResolvedValue(makeRecord({ metadata: {} }));
       const app = createApp({ type: "agent", agentId, companyId: companyA });

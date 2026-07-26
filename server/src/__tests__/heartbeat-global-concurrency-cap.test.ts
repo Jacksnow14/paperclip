@@ -56,6 +56,7 @@ import {
   PROCESS_LOST_RETRY_DELAYS_MS,
   PROCESS_LOST_RETRY_MAX_ATTEMPTS,
 } from "../services/heartbeat.ts";
+import { findActiveAdapterQuotaPause, MAX_ADAPTER_QUOTA_PAUSE_MS } from "../services/quota-pause.ts";
 
 const GiB = 1024 * 1024 * 1024;
 
@@ -518,6 +519,39 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
     hangAdapterUntilReleased();
     expect(await heartbeat.startNextQueuedRunForAgent(unrelatedAgentId)).toHaveLength(1);
     expect((await heartbeat.getRun(unrelatedQueuedRun))?.status).toBe("running");
+  });
+
+  it("clamps an adapter-wide quota pause to the maximum horizon (AUR-4139)", async () => {
+    const companyId = await seedCompany();
+    const pausedAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const now = new Date("2026-07-26T00:00:00.000Z");
+    await seedActiveQuotaPause(companyId, pausedAgentId, new Date(now.getTime() + 24 * 60 * 60 * 1000));
+
+    const activePause = await findActiveAdapterQuotaPause(db, companyId, "claude_local", now);
+
+    expect(activePause).not.toBeNull();
+    expect(activePause?.agentId).toBe(pausedAgentId);
+    expect(activePause?.scheduledRetryAt.toISOString()).toBe(
+      new Date(now.getTime() + MAX_ADAPTER_QUOTA_PAUSE_MS).toISOString(),
+    );
+  });
+
+  it("ignores terminated agents when resolving an adapter-wide quota pause (AUR-4139)", async () => {
+    const companyId = await seedCompany();
+    const terminatedAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const liveAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const now = new Date("2026-07-26T00:00:00.000Z");
+    await seedActiveQuotaPause(companyId, terminatedAgentId, new Date(now.getTime() + 5 * 60 * 60 * 1000));
+    await seedActiveQuotaPause(companyId, liveAgentId, new Date(now.getTime() + 60 * 60 * 1000));
+    await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, terminatedAgentId));
+
+    const activePause = await findActiveAdapterQuotaPause(db, companyId, "claude_local", now);
+
+    expect(activePause).not.toBeNull();
+    expect(activePause?.agentId).toBe(liveAgentId);
+    expect(activePause?.scheduledRetryAt.toISOString()).toBe(
+      new Date(now.getTime() + 60 * 60 * 1000).toISOString(),
+    );
   });
 
   it("schedules process-lost retries with backoff and jitter instead of re-queueing them", async () => {

@@ -87,6 +87,32 @@ export interface StartedServer {
   databaseUrl: string;
 }
 
+type IssueGraphLivenessReconciliationSummary = {
+  escalationsCreated?: number;
+  obsoleteRecoveriesRetired?: number;
+  obsoleteRecoveryBlockerRelationsRemoved?: number;
+  classAAutoRecovered?: number;
+  classBNudged?: number;
+  classBEscalated?: number;
+  issueGraphRecoveryActionsResolved?: number;
+  actionErrors?: number;
+};
+
+export function shouldLogIssueGraphLivenessReconciliation(
+  reconciled: IssueGraphLivenessReconciliationSummary,
+): boolean {
+  return (
+    (reconciled.escalationsCreated ?? 0) > 0 ||
+    (reconciled.obsoleteRecoveriesRetired ?? 0) > 0 ||
+    (reconciled.obsoleteRecoveryBlockerRelationsRemoved ?? 0) > 0 ||
+    (reconciled.classAAutoRecovered ?? 0) > 0 ||
+    (reconciled.classBNudged ?? 0) > 0 ||
+    (reconciled.classBEscalated ?? 0) > 0 ||
+    (reconciled.issueGraphRecoveryActionsResolved ?? 0) > 0 ||
+    (reconciled.actionErrors ?? 0) > 0
+  );
+}
+
 export async function startServer(): Promise<StartedServer> {
   let config = loadConfig();
   initTelemetry({ enabled: config.telemetryEnabled });
@@ -910,8 +936,11 @@ export async function startServer(): Promise<StartedServer> {
       })
       .then(async () => {
         const reconciled = await heartbeat.reconcileIssueGraphLiveness();
-        if (reconciled.escalationsCreated > 0) {
-          logger.warn({ ...reconciled }, "startup issue-graph liveness reconciliation created escalations");
+        if (shouldLogIssueGraphLivenessReconciliation(reconciled)) {
+          logger.warn(
+            { ...reconciled },
+            "startup issue-graph liveness reconciliation changed issue state or recorded action errors",
+          );
         }
       })
       .then(async () => {
@@ -976,8 +1005,11 @@ export async function startServer(): Promise<StartedServer> {
         })
         .then(async () => {
           const reconciled = await heartbeat.reconcileIssueGraphLiveness();
-          if (reconciled.escalationsCreated > 0) {
-            logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation created escalations");
+          if (shouldLogIssueGraphLivenessReconciliation(reconciled)) {
+            logger.warn(
+              { ...reconciled },
+              "periodic issue-graph liveness reconciliation changed issue state or recorded action errors",
+            );
           }
         })
         .then(async () => {

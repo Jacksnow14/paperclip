@@ -671,7 +671,10 @@ export function buildRealizedExecutionWorkspaceFromPersisted(input: {
   const strategy = input.workspace.strategyType === "git_worktree" ? "git_worktree" : "project_primary";
   return {
     baseCwd: input.base.baseCwd,
-    source: input.workspace.mode === "shared_workspace" ? "project_primary" : "task_session",
+    source:
+      input.workspace.mode === "shared_workspace"
+        ? (input.base.source === "project_workspace" ? "project_workspace" : "project_primary")
+        : "task_session",
     projectId: input.workspace.projectId ?? input.base.projectId,
     workspaceId: input.workspace.projectWorkspaceId ?? input.base.workspaceId,
     repoUrl: input.workspace.repoUrl ?? input.base.repoUrl,

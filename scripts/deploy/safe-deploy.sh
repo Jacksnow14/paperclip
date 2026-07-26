@@ -195,7 +195,9 @@ cleanup() {
 trap cleanup EXIT
 
 BUILD_RC=0
-systemd-run --user --scope --unit "$SCOPE" --nice=10 --quiet \
+# Future-proof the wrapper-owned activate path: build-release refuses direct
+# `--activate` unless the call is explicitly marked gated or break-glass.
+PAPERCLIP_DEPLOY_GATED=1 systemd-run --user --scope --unit "$SCOPE" --nice=10 --quiet \
   -p MemoryHigh="$BUILD_MEM_HIGH" \
   -p MemoryMax="$BUILD_MEM_MAX" \
   -p MemorySwapMax="$BUILD_SWAP_MAX" \

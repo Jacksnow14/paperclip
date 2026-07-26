@@ -11,6 +11,7 @@ import {
   agents,
   agentWakeupRequests,
   approvals,
+  activityLog,
   companies,
   issueComments,
   heartbeatRunEvents,
@@ -112,7 +113,16 @@ type WatchdogDecisionActor =
 
 type DurableBlockedIssueRow = Pick<
   typeof issues.$inferSelect,
-  "id" | "companyId" | "identifier" | "title" | "status" | "projectId" | "assigneeAgentId" | "assigneeUserId" | "updatedAt"
+  | "id"
+  | "companyId"
+  | "identifier"
+  | "title"
+  | "status"
+  | "projectId"
+  | "assigneeAgentId"
+  | "assigneeUserId"
+  | "createdAt"
+  | "updatedAt"
 >;
 
 type DurableBlockedIssueDirectBlockerRow = {
@@ -135,6 +145,7 @@ type DurableBlockedIssueClassification = {
   issue: DurableBlockedIssueRow;
   kind: DurableBlockedIssueClassificationKind;
   directBlockers: DurableBlockedIssueDirectBlocker[];
+  blockedEnteredAt: Date;
   staleAgeMs: number;
 };
 
@@ -2762,6 +2773,42 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return "none";
   }
 
+  async function loadDurableBlockedEnteredAtByIssue(blockedIssues: DurableBlockedIssueRow[]) {
+    if (blockedIssues.length === 0) return new Map<string, Date>();
+
+    const blockedIssueIds = blockedIssues.map((issue) => issue.id);
+    const rows = await db
+      .select({
+        issueId: activityLog.entityId,
+        blockedEnteredAt: sql<Date>`MAX(${activityLog.createdAt})`,
+      })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityType, "issue"),
+          inArray(activityLog.entityId, blockedIssueIds),
+          inArray(activityLog.action, ["issue.created", "issue.updated"]),
+          sql`${activityLog.details} ->> 'status' = 'blocked'`,
+        ),
+      )
+      .groupBy(activityLog.entityId);
+
+    const blockedEnteredAtByIssueId = new Map(
+      blockedIssues.map((issue) => [issue.id, issue.createdAt]),
+    );
+    for (const row of rows) {
+      if (!row.blockedEnteredAt) continue;
+      const blockedEnteredAt =
+        row.blockedEnteredAt instanceof Date
+          ? row.blockedEnteredAt
+          : new Date(row.blockedEnteredAt);
+      if (!Number.isNaN(blockedEnteredAt.getTime())) {
+        blockedEnteredAtByIssueId.set(row.issueId, blockedEnteredAt);
+      }
+    }
+    return blockedEnteredAtByIssueId;
+  }
+
   async function collectDurableBlockedIssueClassifications(
     now: Date,
   ): Promise<DurableBlockedIssueClassification[]> {
@@ -2775,6 +2822,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         projectId: issues.projectId,
         assigneeAgentId: issues.assigneeAgentId,
         assigneeUserId: issues.assigneeUserId,
+        createdAt: issues.createdAt,
         updatedAt: issues.updatedAt,
       })
       .from(issues)
@@ -2788,6 +2836,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     if (blockedIssues.length === 0) return [];
 
     const blockedIssueIds = blockedIssues.map((issue) => issue.id);
+    const blockedEnteredAtByIssueId = await loadDurableBlockedEnteredAtByIssue(blockedIssues);
     const explicitBlockers = await db
       .select({
         blockedIssueId: issueRelations.relatedIssueId,
@@ -2824,6 +2873,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       );
 
     const directBlockersByIssueId = new Map<string, Map<string, DurableBlockedIssueDirectBlocker>>();
+    const explicitBlockerIdsByIssueId = new Map<string, Set<string>>();
+    for (const row of explicitBlockers) {
+      const blockerIds = explicitBlockerIdsByIssueId.get(row.blockedIssueId) ?? new Set<string>();
+      blockerIds.add(row.blockerIssueId);
+      explicitBlockerIdsByIssueId.set(row.blockedIssueId, blockerIds);
+    }
     for (const row of [...explicitBlockers, ...childBlockers]) {
       if (!row.blockedIssueId) continue;
       const byBlockerId = directBlockersByIssueId.get(row.blockedIssueId) ?? new Map();
@@ -2837,17 +2892,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       const directBlockers = sortDurableBlockedIssueDirectBlockers(
         [...(directBlockersByIssueId.get(issue.id)?.values() ?? [])],
       );
+      const hasFirstClassBlockerEdge = (explicitBlockerIdsByIssueId.get(issue.id)?.size ?? 0) > 0;
+      const blockedEnteredAt = blockedEnteredAtByIssueId.get(issue.id) ?? issue.createdAt;
       const kind: DurableBlockedIssueClassificationKind =
         directBlockers.length === 0
           ? "missing_edge"
-          : directBlockers.every((blocker) => DIRECT_BLOCKER_TERMINAL_STATUSES.has(blocker.status))
+          : !hasFirstClassBlockerEdge
+            ? "missing_edge"
+            : directBlockers.every((blocker) => DIRECT_BLOCKER_TERMINAL_STATUSES.has(blocker.status))
             ? "terminal_only"
             : "open_non_terminal";
       return {
         issue,
         kind,
         directBlockers,
-        staleAgeMs: Math.max(0, now.getTime() - issue.updatedAt.getTime()),
+        blockedEnteredAt,
+        staleAgeMs: Math.max(0, now.getTime() - blockedEnteredAt.getTime()),
       };
     });
   }
@@ -3151,7 +3211,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               sourceIssue: classification.issue,
               status: "cancelled",
               outcome: "cancelled",
-              resolutionNote: "Cancelled automatically because the source issue was updated recently and is below the stale-age threshold.",
+              resolutionNote: "Cancelled automatically because the source issue entered blocked recently and is below the stale-age threshold.",
               runId: input.runId ?? null,
             });
             if (resolved) result.issueGraphRecoveryActionsResolved += 1;
@@ -3198,6 +3258,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             sourceIssueId: classification.issue.id,
             sourceIdentifier: classification.issue.identifier,
             sourceIssueStatus: classification.issue.status,
+            blockedEnteredAt: classification.blockedEnteredAt.toISOString(),
             staleAgeMs: classification.staleAgeMs,
             directBlockerCount: classification.directBlockers.length,
             stage,

@@ -354,6 +354,110 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     ]);
   });
 
+  it("treats child-only terminal gates as missing-edge work instead of auto-recovering", async () => {
+    await enableAutoRecovery();
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const coderId = randomUUID();
+    const blockedIssueId = randomUUID();
+    const childIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const staleTimestamp = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: managerId,
+        companyId,
+        name: "CTO",
+        role: "cto",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: false } },
+        permissions: {},
+      },
+      {
+        id: coderId,
+        companyId,
+        name: "Coder",
+        role: "engineer",
+        status: "idle",
+        reportsTo: managerId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: false } },
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Founder gate",
+        status: "blocked",
+        priority: "medium",
+        assigneeAgentId: coderId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+        createdAt: staleTimestamp,
+        updatedAt: staleTimestamp,
+      },
+      {
+        id: childIssueId,
+        companyId,
+        parentId: blockedIssueId,
+        title: "Upload one identity document",
+        status: "done",
+        priority: "medium",
+        assigneeAgentId: coderId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+        createdAt: staleTimestamp,
+        updatedAt: staleTimestamp,
+        completedAt: staleTimestamp,
+      },
+    ]);
+
+    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+    expect(result).toMatchObject({
+      blockedIssuesScanned: 1,
+      terminalOnlyIssues: 0,
+      missingEdgeIssues: 1,
+      classAAutoRecovered: 0,
+      classBNudged: 1,
+      classBEscalated: 0,
+    });
+
+    const [sourceIssue] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, blockedIssueId));
+    expect(sourceIssue?.status).toBe("blocked");
+
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, blockedIssueId),
+        ),
+      );
+    expect(recoveryActions).toHaveLength(1);
+    expect(recoveryActions[0]).toMatchObject({
+      kind: "issue_graph_liveness",
+      ownerAgentId: coderId,
+      status: "active",
+    });
+  });
+
   it("leaves open direct blockers alone across runtime-state flips", async () => {
     await enableAutoRecovery();
     const { companyId, coderId, blockedIssueId, blockerIssueId } = await seedBlockedChain({
@@ -534,6 +638,130 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       reason: "heartbeat.wakeOnDemand.disabled",
       status: "skipped",
       idempotencyKey: expect.stringContaining("issue_graph_liveness:"),
+    });
+  });
+
+  it("measures missing-edge staleness from the last blocked transition, not comment-recency updatedAt", async () => {
+    await enableAutoRecovery();
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const coderId = randomUUID();
+    const blockedIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const createdAt = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+    const blockedAt = new Date(Date.now() - 9 * 24 * 60 * 60 * 1000);
+    const recentCommentAt = new Date(Date.now() - 60 * 60 * 1000);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: managerId,
+        companyId,
+        name: "CTO",
+        role: "cto",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: false } },
+        permissions: {},
+      },
+      {
+        id: coderId,
+        companyId,
+        name: "Coder",
+        role: "engineer",
+        status: "idle",
+        reportsTo: managerId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: false } },
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: blockedIssueId,
+      companyId,
+      title: "Chattery but stale blocked issue",
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      createdAt,
+      updatedAt: recentCommentAt,
+    });
+    await db.insert(issueComments).values({
+      issueId: blockedIssueId,
+      companyId,
+      body: "Heartbeat note that should not reset the blocked-age clock.",
+      authorType: "agent",
+      authorAgentId: coderId,
+      createdAt: recentCommentAt,
+      updatedAt: recentCommentAt,
+    });
+    await db.insert(activityLog).values([
+      {
+        companyId,
+        actorType: "agent",
+        actorId: coderId,
+        agentId: coderId,
+        action: "issue.created",
+        entityType: "issue",
+        entityId: blockedIssueId,
+        details: {
+          identifier: `${issuePrefix}-1`,
+          status: "todo",
+        },
+        createdAt,
+      },
+      {
+        companyId,
+        actorType: "agent",
+        actorId: coderId,
+        agentId: coderId,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: blockedIssueId,
+        details: {
+          identifier: `${issuePrefix}-1`,
+          status: "blocked",
+          _previous: {
+            status: "todo",
+          },
+        },
+        createdAt: blockedAt,
+      },
+    ]);
+
+    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+    expect(result).toMatchObject({
+      blockedIssuesScanned: 1,
+      missingEdgeIssues: 1,
+      classAAutoRecovered: 0,
+      classBNudged: 1,
+      classBEscalated: 0,
+    });
+
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, blockedIssueId),
+        ),
+      );
+    expect(recoveryActions).toHaveLength(1);
+    expect(recoveryActions[0]?.evidence).toMatchObject({
+      blockedEnteredAt: blockedAt.toISOString(),
+      staleAgeMs: expect.any(Number),
+      stage: "wake_assignee",
     });
   });
 

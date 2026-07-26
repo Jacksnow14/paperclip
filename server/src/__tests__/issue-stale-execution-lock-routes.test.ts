@@ -42,6 +42,20 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
   }, 20_000);
 
   afterEach(async () => {
+    let idlePolls = 0;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const wakeups = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests);
+      if (wakeups.length === 0) {
+        idlePolls += 1;
+        if (idlePolls >= 3) break;
+      } else {
+        idlePolls = 0;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
     await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(activityLog);

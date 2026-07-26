@@ -9,6 +9,8 @@ import {
   fetchMergedMemRecords,
   GAP_CATEGORY,
   COMPLIANCE_CATEGORY,
+  isProbeIssue,
+  classifyStaleSweepClosure,
 } from './retro-compliance-audit.mjs';
 
 // ── hasRetro ─────────────────────────────────────────────────────────────────
@@ -337,4 +339,172 @@ test('the semantic compliance category is NOT auto-accepted (why it moved off me
   // Documents the defect: the old wire value would land `pending`.
   assert.equal(COMPLIANCE_CATEGORY, 'retrospective_compliance_gap');
   assert.notEqual(COMPLIANCE_CATEGORY, GAP_CATEGORY);
+});
+
+// ── AUR-4235: synthetic probe exemption ──────────────────────────────────────
+
+test('isProbeIssue matches the production probe shape (AUR-3923)', () => {
+  // Real production row: title `probe-title-2`, description `probe-desc`.
+  assert.ok(isProbeIssue({ title: 'probe-title-2', description: 'probe-desc' }));
+});
+
+test('isProbeIssue matches a bare __probe__ marker regardless of title shape', () => {
+  assert.ok(isProbeIssue({ title: 'wake check', description: 'synthetic __probe__ issue, no work' }));
+});
+
+test('isProbeIssue does NOT match a real issue whose title starts with "Probe"', () => {
+  assert.ok(!isProbeIssue({
+    title: 'Probe the DNS failure on the control plane',
+    description: 'Primary nameserver 4.2.2.1 is dead; resolve and document.',
+  }));
+});
+
+test('isProbeIssue does NOT match a probe-shaped title carrying a real description', () => {
+  assert.ok(!isProbeIssue({
+    title: 'probe-2',
+    description: 'Long-form description of genuine engineering work that exceeds the stub threshold.',
+  }));
+});
+
+test('isExempt routes probe issues to the named probe bucket', () => {
+  const { exempt, reason } = isExempt({ title: 'probe-title-2', description: 'probe-desc' });
+  assert.ok(exempt);
+  assert.equal(reason, 'synthetic probe issue');
+});
+
+// ── AUR-4235: stale-sweep closure exemption ──────────────────────────────────
+// Fixtures are the real production timestamps from the 2026-07-26 audit run.
+
+// AUR-402: created + worked 2026-04-27, swept closed 2026-07-25 with CEO closing
+// comments written AT completedAt. The closing act must not mask the 89-day idle gap.
+const AUR_402 = {
+  identifier: 'AUR-402',
+  createdAt: '2026-04-27T00:37:54.887Z',
+  completedAt: '2026-07-25T15:55:51.416Z',
+};
+const AUR_402_COMMENTS = [
+  { createdAt: '2026-07-26T07:14:52.768Z', body: '## Retrospective — AUR-402: ...' },
+  { createdAt: '2026-07-25T15:55:51.446Z', body: 'CEO review verdict: ACCEPTED...' },
+  { createdAt: '2026-07-25T15:55:44.989Z', body: '## CEO review verdict — AUR-402: ACCEPTED, closing `done` (3 months later)' },
+  { createdAt: '2026-04-27T00:57:15.832Z', body: 'AUR-402 transitioned to `in_review`...' },
+  { createdAt: '2026-04-27T00:57:10.256Z', body: '## Shipped — circuit breaker live...' },
+  { createdAt: '2026-04-27T00:43:25.234Z', body: '## Acknowledged — taking ownership...' },
+];
+const AUR_402_ACTIVITY = [
+  { createdAt: '2026-07-25T15:55:51.468Z', action: 'issue.updated' },
+  { createdAt: '2026-07-25T15:55:45.010Z', action: 'issue.comment_added' },
+  { createdAt: '2026-04-27T04:49:02.810Z', action: 'issue.read_marked' },
+  { createdAt: '2026-04-27T00:57:10.258Z', action: 'issue.comment_added' },
+  { createdAt: '2026-04-27T00:38:04.271Z', action: 'issue.created' },
+];
+
+test('classifyStaleSweepClosure flags AUR-402 despite closing comments at completedAt', () => {
+  const r = classifyStaleSweepClosure(AUR_402, AUR_402_COMMENTS, AUR_402_ACTIVITY);
+  assert.ok(r.stale, 'AUR-402 must be exempt as a stale sweep closure');
+  assert.ok(r.idleDays > 80, `expected ~89d idle, got ${r.idleDays}`);
+  assert.ok(r.lastActivityAt.startsWith('2026-04-27'), `last work was April, got ${r.lastActivityAt}`);
+});
+
+test('classifyStaleSweepClosure ignores a read_marked page view (cannot re-arm the false positive)', () => {
+  // Same issue, but a human opened it the day before the sweep. A page view is not work.
+  const r = classifyStaleSweepClosure(AUR_402, AUR_402_COMMENTS, [
+    ...AUR_402_ACTIVITY,
+    { createdAt: '2026-07-24T09:00:00.000Z', action: 'issue.read_marked' },
+  ]);
+  assert.ok(r.stale, 'a read_marked view must not suppress the exemption');
+});
+
+test('classifyStaleSweepClosure does NOT fire on a genuinely fresh same-day closure', () => {
+  // The dominant real-gap class: 34/35 flagged issues closed within 10h of creation.
+  const fresh = {
+    identifier: 'AUR-9001',
+    createdAt: '2026-07-26T01:00:00.000Z',
+    completedAt: '2026-07-26T09:00:00.000Z',
+  };
+  const r = classifyStaleSweepClosure(fresh, [
+    { createdAt: '2026-07-26T02:00:00.000Z', body: 'ack' },
+    { createdAt: '2026-07-26T08:59:00.000Z', body: 'shipped' },
+  ], [{ createdAt: '2026-07-26T08:59:30.000Z', action: 'issue.updated' }]);
+  assert.equal(r.stale, false, 'a same-day closure is a real gap, not a sweep');
+});
+
+test('classifyStaleSweepClosure does NOT fire on a long-lived issue worked right up to closure', () => {
+  const longLived = {
+    identifier: 'AUR-9002',
+    createdAt: '2026-06-16T02:35:34.293Z',
+    completedAt: '2026-07-26T01:55:47.522Z',
+  };
+  const r = classifyStaleSweepClosure(longLived, [
+    { createdAt: '2026-06-16T03:00:00.000Z', body: 'filed' },
+    { createdAt: '2026-07-25T22:00:00.000Z', body: 'worked through the evening' },
+    { createdAt: '2026-07-26T01:40:00.000Z', body: 'implementation landed' },
+  ], []);
+  assert.equal(r.stale, false, 'age since creation is not the signal — the idle gap is');
+});
+
+// The wall-clock counter-example that killed the first design. AUR-2471's ENTIRE genuine
+// work session spans 4 minutes — narrower than AUR-402's close-out is from its own
+// completedAt. No fixed closing window can separate them, so the caller's ordering guard
+// (compliant-wins) is what protects this row, and this test pins that contract.
+const AUR_2471 = {
+  identifier: 'AUR-2471',
+  createdAt: '2026-06-16T02:35:34.293Z',
+  completedAt: '2026-07-26T01:55:47.522Z',
+};
+const AUR_2471_COMMENTS = [
+  { createdAt: '2026-07-26T01:55:29.390Z', body: 'brief amended' },
+  { createdAt: '2026-07-26T01:55:21.273Z', body: 'closing' },
+  { createdAt: '2026-07-26T01:51:46.969Z', body: '## Retrospective — AUR-2471: ...' },
+  { createdAt: '2026-06-22T19:41:30.903Z', body: 'earlier discussion' },
+];
+
+test('a 4-minute genuine work session is indistinguishable by timestamp (documents the residual)', () => {
+  const r = classifyStaleSweepClosure(AUR_2471, AUR_2471_COMMENTS, []);
+  assert.equal(r.stale, true,
+    'timestamps alone DO read AUR-2471 as a sweep — only the compliant-wins ordering saves it');
+});
+
+test('classifyStaleSweepClosure does NOT fire when work stopped just under the threshold', () => {
+  const r = classifyStaleSweepClosure(
+    { createdAt: '2026-07-01T00:00:00.000Z', completedAt: '2026-07-26T00:00:00.000Z' },
+    [{ createdAt: '2026-07-19T06:00:00.000Z', body: 'last real work (6.75d before close)' }],
+    [],
+  );
+  assert.equal(r.stale, false, '6.75 days idle is under the 7-day threshold');
+});
+
+test('classifyStaleSweepClosure fires just over the threshold', () => {
+  const r = classifyStaleSweepClosure(
+    { createdAt: '2026-07-01T00:00:00.000Z', completedAt: '2026-07-26T00:00:00.000Z' },
+    [{ createdAt: '2026-07-18T18:00:00.000Z', body: 'last real work (7.25d before close)' }],
+    [],
+  );
+  assert.equal(r.stale, true, '7.25 days idle is over the 7-day threshold');
+});
+
+test('classifyStaleSweepClosure falls back to createdAt when there is no pre-close activity', () => {
+  // Probe shape: created and closed minutes apart, all comments inside the closing window.
+  const r = classifyStaleSweepClosure(
+    { createdAt: '2026-07-25T09:37:21.465Z', completedAt: '2026-07-25T09:41:00.011Z' },
+    [{ createdAt: '2026-07-25T09:40:59.961Z', body: '## Probe acknowledged' }],
+    [],
+  );
+  assert.equal(r.stale, false, 'a minutes-old issue is never a stale sweep');
+});
+
+test('classifyStaleSweepClosure returns not-stale when completedAt is missing', () => {
+  const r = classifyStaleSweepClosure({ createdAt: '2026-01-01T00:00:00.000Z' }, [], []);
+  assert.equal(r.stale, false);
+  assert.equal(r.lastActivityAt, null);
+});
+
+test('activity can only reduce exemption, never widen it (comments-only short-circuit is safe)', () => {
+  const issue = { createdAt: '2026-05-01T00:00:00.000Z', completedAt: '2026-07-26T00:00:00.000Z' };
+  const comments = [{ createdAt: '2026-07-25T00:00:00.000Z', body: 'real work yesterday' }];
+  assert.equal(classifyStaleSweepClosure(issue, comments, []).stale, false);
+  // Adding old activity must not flip a not-stale verdict to stale.
+  const withOld = classifyStaleSweepClosure(issue, comments, [
+    { createdAt: '2026-05-02T00:00:00.000Z', action: 'issue.updated' },
+  ]);
+  assert.equal(withOld.stale, false);
 });

@@ -50,12 +50,15 @@ vi.mock("../adapters/index.ts", async () => {
 
 import {
   computeProcessLostRetrySchedule,
+  getGlobalConcurrencyState,
   heartbeatService,
   resolveGlobalMaxConcurrentRuns,
   GLOBAL_MAX_CONCURRENT_RUNS_ENV_VAR,
   PROCESS_LOST_RETRY_DELAYS_MS,
   PROCESS_LOST_RETRY_MAX_ATTEMPTS,
+  __resetGlobalCapSaturationTrackerForTests,
 } from "../services/heartbeat.ts";
+import { logger } from "../middleware/logger.ts";
 
 const GiB = 1024 * 1024 * 1024;
 
@@ -151,9 +154,11 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
   afterEach(async () => {
     for (const release of adapterReleases) release();
     adapterReleases = [];
+    vi.restoreAllMocks();
     vi.clearAllMocks();
     mockAdapterExecute.mockImplementation(async () => adapterSuccessResult);
     runningProcesses.clear();
+    __resetGlobalCapSaturationTrackerForTests();
 
     // Cancel anything still live so table cleanup does not race executions.
     const deadline = Date.now() + 5_000;
@@ -410,6 +415,68 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
     expect(await heartbeat.startNextQueuedRunForAgent(agentC)).toHaveLength(1);
     expect((await heartbeat.getRun(runC))?.status).toBe("running");
   }, 20_000);
+
+  it("reports cap/queue state with a queued-by-agent-status breakdown for the health route (AUR-4059)", async () => {
+    const companyId = await seedCompany();
+    const agentA = await seedAgent(companyId);
+    const agentB = await seedAgent(companyId);
+    await seedDeadRunningRun(companyId, agentA);
+    await seedQueuedRun(companyId, agentA);
+    await seedQueuedRun(companyId, agentB);
+    await db.update(agents).set({ status: "error" }).where(eq(agents.id, agentB));
+
+    const state = await getGlobalConcurrencyState(db, { globalMaxConcurrentRuns: 1 });
+
+    expect(state.globalCap).toBe(1);
+    expect(state.running).toBe(1);
+    expect(state.queued).toBe(2);
+    expect(state.saturated).toBe(true);
+    // Distinguishes "queued behind the saturated cap" (agentA, still idle)
+    // from "queued behind a dead agent" (agentB, in error) — the two need
+    // opposite responses and are indistinguishable from a bare queued count.
+    expect(state.queuedByAgentStatus).toMatchObject({ idle: 1, error: 1 });
+  });
+
+  it("escalates to a warn only once cap refusal has been continuous past the sustained threshold (AUR-4059)", async () => {
+    let simulatedNowMs = Date.now();
+    const heartbeat = heartbeatService(db, {
+      globalMaxConcurrentRuns: 1,
+      now: () => simulatedNowMs,
+    });
+    const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+
+    const companyId = await seedCompany();
+    const agentA = await seedAgent(companyId);
+    const agentB = await seedAgent(companyId);
+    await seedDeadRunningRun(companyId, agentA); // occupies the single global slot
+    const runB = await seedQueuedRun(companyId, agentB);
+
+    // First refusal: a single blocked admission is normal fleet behavior.
+    expect(await heartbeat.startNextQueuedRunForAgent(agentB)).toHaveLength(0);
+    expect(warnSpy).not.toHaveBeenCalled();
+
+    // Still short of the 5-minute sustained-saturation threshold.
+    simulatedNowMs += 4 * 60 * 1000;
+    expect(await heartbeat.startNextQueuedRunForAgent(agentB)).toHaveLength(0);
+    expect(warnSpy).not.toHaveBeenCalled();
+
+    // Refusal has now been continuous for 6 minutes — escalate.
+    simulatedNowMs += 2 * 60 * 1000;
+    expect(await heartbeat.startNextQueuedRunForAgent(agentB)).toHaveLength(0);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0][1]).toMatch(/sustained saturation/);
+
+    // Re-warning is throttled until the repeat interval (15 min) passes.
+    simulatedNowMs += 5 * 60 * 1000;
+    expect(await heartbeat.startNextQueuedRunForAgent(agentB)).toHaveLength(0);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+
+    simulatedNowMs += 11 * 60 * 1000;
+    expect(await heartbeat.startNextQueuedRunForAgent(agentB)).toHaveLength(0);
+    expect(warnSpy).toHaveBeenCalledTimes(2);
+
+    expect((await heartbeat.getRun(runB))?.status).toBe("queued");
+  });
 
   it("suppresses new run admission for an agent quota-paused until a parsed reset time (AUR-4055)", async () => {
     const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4 });

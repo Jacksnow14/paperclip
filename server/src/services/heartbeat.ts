@@ -257,6 +257,103 @@ const GLOBAL_RUN_MEMORY_BUDGET_MB = 1024;
 // Arbitrary-but-fixed advisory lock id serializing run admission across every
 // control-plane instance connected to the same database.
 const GLOBAL_RUN_ADMISSION_LOCK_ID = 739_241_101;
+
+// AUR-4059: a single admission refusal is normal fleet behavior and stays at
+// info level (see claimQueuedRun below). Only a *sustained* refusal — the
+// signature of a saturated-but-healthy fleet being indistinguishable from a
+// stalled one — is escalated to warn, and then at most once per repeat
+// interval so a long outage doesn't spam the log.
+const GLOBAL_CAP_SUSTAINED_WARN_THRESHOLD_MS = 5 * 60 * 1000;
+const GLOBAL_CAP_WARN_REPEAT_INTERVAL_MS = 15 * 60 * 1000;
+
+// Module-level (not per-heartbeatService-instance) because only the singleton
+// admission loop in index.ts drives claimQueuedRun/startNextQueuedRunForAgent
+// in production; every route handler that calls heartbeatService(db) creates
+// a disposable instance for unrelated helpers and never touches admission.
+// Tracking state on that closure would make it invisible to the one place —
+// the health route — that needs to read it back.
+let globalCapSaturatedSinceMs: number | null = null;
+let globalCapLastWarnedAtMs: number | null = null;
+
+function observeGlobalCapAdmission(
+  reached: boolean,
+  context: { runningCount: number; globalCap: number },
+  nowMs: number = Date.now(),
+) {
+  if (!reached) {
+    globalCapSaturatedSinceMs = null;
+    globalCapLastWarnedAtMs = null;
+    return;
+  }
+  if (globalCapSaturatedSinceMs === null) {
+    globalCapSaturatedSinceMs = nowMs;
+  }
+  const saturatedForMs = nowMs - globalCapSaturatedSinceMs;
+  if (
+    saturatedForMs >= GLOBAL_CAP_SUSTAINED_WARN_THRESHOLD_MS &&
+    (globalCapLastWarnedAtMs === null || nowMs - globalCapLastWarnedAtMs >= GLOBAL_CAP_WARN_REPEAT_INTERVAL_MS)
+  ) {
+    globalCapLastWarnedAtMs = nowMs;
+    logger.warn(
+      { globalCap: context.globalCap, runningCount: context.runningCount, saturatedForMs },
+      "claimQueuedRun: global concurrency ceiling sustained saturation; fleet admission has been continuously blocked",
+    );
+  }
+}
+
+/** Test-only: clear sustained-saturation tracking between cases sharing this module. */
+export function __resetGlobalCapSaturationTrackerForTests() {
+  globalCapSaturatedSinceMs = null;
+  globalCapLastWarnedAtMs = null;
+}
+
+/**
+ * AUR-4059: answers "is the cap binding right now, and why aren't queued runs
+ * starting" without a DB query or log grep. Surfaced on the health route.
+ */
+export async function getGlobalConcurrencyState(
+  db: Db,
+  options: { globalMaxConcurrentRuns?: number } = {},
+) {
+  const globalCap = options.globalMaxConcurrentRuns ?? resolveGlobalMaxConcurrentRuns();
+
+  const statusRows = await db
+    .select({ status: heartbeatRuns.status, count: sql<number>`count(*)` })
+    .from(heartbeatRuns)
+    .where(inArray(heartbeatRuns.status, ["running", "queued", "scheduled_retry"]))
+    .groupBy(heartbeatRuns.status);
+  const counts = { running: 0, queued: 0, scheduledRetry: 0 };
+  for (const row of statusRows) {
+    if (row.status === "running") counts.running = Number(row.count ?? 0);
+    else if (row.status === "queued") counts.queued = Number(row.count ?? 0);
+    else if (row.status === "scheduled_retry") counts.scheduledRetry = Number(row.count ?? 0);
+  }
+
+  // Distinguishes "queued behind a saturated cap" from "queued behind a dead
+  // agent" — the two need opposite responses and look identical as a bare count.
+  const queuedByAgentStatusRows = await db
+    .select({ agentStatus: agents.status, count: sql<number>`count(*)` })
+    .from(heartbeatRuns)
+    .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
+    .where(eq(heartbeatRuns.status, "queued"))
+    .groupBy(agents.status);
+  const queuedByAgentStatus: Record<string, number> = {};
+  for (const row of queuedByAgentStatusRows) {
+    queuedByAgentStatus[row.agentStatus] = Number(row.count ?? 0);
+  }
+
+  const saturated = counts.running >= globalCap;
+  return {
+    globalCap,
+    running: counts.running,
+    queued: counts.queued,
+    scheduledRetry: counts.scheduledRetry,
+    saturated,
+    saturatedForMs: globalCapSaturatedSinceMs !== null ? Date.now() - globalCapSaturatedSinceMs : 0,
+    queuedByAgentStatus,
+  };
+}
+
 export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
 export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
@@ -2472,6 +2569,8 @@ export interface HeartbeatServiceOptions {
   isDiskPressureActive?: () => boolean;
   /** Host-wide cap on concurrently running runs. Defaults to resolveGlobalMaxConcurrentRuns(). */
   globalMaxConcurrentRuns?: number;
+  /** Test hook for the global-cap sustained-saturation clock. Defaults to Date.now(). */
+  now?: () => number;
 }
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
@@ -6200,8 +6299,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
         .returning()
         .then((rows) => rows[0] ?? null);
-      return { kind: "claimed" as const, row };
+      return { kind: "claimed" as const, row, runningCount };
     });
+    observeGlobalCapAdmission(
+      claimOutcome.kind === "global_cap_reached",
+      { runningCount: claimOutcome.runningCount, globalCap },
+      options.now ? options.now() : undefined,
+    );
     if (claimOutcome.kind === "global_cap_reached") {
       // Leave the run queued — resumeQueuedRuns re-drives it once a slot frees.
       logger.info(
@@ -7095,6 +7199,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // advisory lock; this pre-check only avoids pointless claim attempts.
       const globalCap = resolveGlobalRunCap();
       const globalRunningCount = await countRunningRunsGlobal();
+      observeGlobalCapAdmission(
+        globalRunningCount >= globalCap,
+        { runningCount: globalRunningCount, globalCap },
+        options.now ? options.now() : undefined,
+      );
       const availableSlots = Math.max(
         0,
         Math.min(policy.maxConcurrentRuns - runningCount, globalCap - globalRunningCount),

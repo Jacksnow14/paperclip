@@ -7,6 +7,7 @@ import type { DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
 import { readBuildInfo } from "../build-info.js";
 import { readPersistedDevServerStatus, toDevServerHealthStatus } from "../dev-server-status.js";
 import { logger } from "../middleware/logger.js";
+import { getGlobalConcurrencyState } from "../services/heartbeat.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { serverVersion } from "../version.js";
 
@@ -136,6 +137,11 @@ export function healthRoutes(
       return;
     }
 
+    // AUR-4059: whether the global run ceiling is currently binding, and why
+    // queued runs aren't starting (cap-saturated vs. agents in error/paused),
+    // readable here instead of grepping heartbeat.ts logs.
+    const concurrency = await getGlobalConcurrencyState(db);
+
     res.json({
       status: "ok",
       version: serverVersion,
@@ -154,6 +160,7 @@ export function healthRoutes(
           !!process.env.GOOGLE_WORKSPACE_SA_KEY &&
           process.env.GMAIL_INTAKE_POLLER_ENABLED !== "false",
       },
+      concurrency,
       ...(devServer ? { devServer } : {}),
     });
   });

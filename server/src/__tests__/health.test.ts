@@ -9,6 +9,33 @@ import { serverVersion } from "../version.js";
 // Outside a pinned release there is no build-info.json (AUR-3937).
 const untrackedBuild = { source: "untracked", sha: null, ref: null, builtAt: null };
 
+// AUR-4059: getGlobalConcurrencyState() runs a status-breakdown select and a
+// queued-runs-by-agent-status select, both ending in groupBy(). Real drizzle
+// query builders stay chainable until awaited; this mimics that shape so the
+// health route's extra queries don't throw in tests that stub `db.select`.
+function createConcurrencyAwareDb(options: {
+  statusRows?: Array<{ status: string; count: number }>;
+  queuedByAgentStatusRows?: Array<{ agentStatus: string; count: number }>;
+} = {}) {
+  const statusRows = options.statusRows ?? [];
+  const queuedByAgentStatusRows = options.queuedByAgentStatusRows ?? [];
+  return {
+    execute: vi.fn().mockResolvedValue([{ "?column?": 1 }]),
+    select: vi.fn(() => ({
+      from: vi.fn(() => ({
+        where: vi.fn(() => ({
+          groupBy: vi.fn().mockResolvedValue(statusRows),
+        })),
+        innerJoin: vi.fn(() => ({
+          where: vi.fn(() => ({
+            groupBy: vi.fn().mockResolvedValue(queuedByAgentStatusRows),
+          })),
+        })),
+      })),
+    })),
+  } as unknown as Db;
+}
+
 const mockReadPersistedDevServerStatus = vi.hoisted(() => vi.fn());
 
 vi.mock("../dev-server-status.js", () => ({
@@ -39,9 +66,7 @@ describe("GET /health", () => {
   }, 15_000);
 
   it("returns 200 when the database probe succeeds", async () => {
-    const db = {
-      execute: vi.fn().mockResolvedValue([{ "?column?": 1 }]),
-    } as unknown as Db;
+    const db = createConcurrencyAwareDb();
     const app = createApp(db);
 
     const res = await request(app).get("/health");
@@ -49,6 +74,32 @@ describe("GET /health", () => {
     expect(res.status).toBe(200);
     expect(db.execute).toHaveBeenCalledTimes(1);
     expect(res.body).toMatchObject({ status: "ok", version: serverVersion });
+  });
+
+  it("surfaces global concurrency cap state on the health payload (AUR-4059)", async () => {
+    const db = createConcurrencyAwareDb({
+      statusRows: [
+        { status: "running", count: 4 },
+        { status: "queued", count: 23 },
+        { status: "scheduled_retry", count: 15 },
+      ],
+      queuedByAgentStatusRows: [
+        { agentStatus: "idle", count: 20 },
+        { agentStatus: "error", count: 3 },
+      ],
+    });
+    const app = createApp(db);
+
+    const res = await request(app).get("/health");
+
+    expect(res.status).toBe(200);
+    expect(res.body.concurrency).toMatchObject({
+      running: 4,
+      queued: 23,
+      scheduledRetry: 15,
+      saturated: expect.any(Boolean),
+      queuedByAgentStatus: { idle: 20, error: 3 },
+    });
   });
 
   it("returns 503 when the database probe fails", async () => {
@@ -147,11 +198,22 @@ describe("GET /health", () => {
     const { healthRoutes } = await import("../routes/health.js");
     const db = {
       execute: vi.fn().mockResolvedValue([{ "?column?": 1 }]),
-      select: vi.fn(() => ({
-        from: vi.fn(() => ({
-          where: vi.fn().mockResolvedValue([{ count: 1 }]),
+      // Query order for this request: (1) bootstrapStatus roleCount, then
+      // getGlobalConcurrencyState's (2) status breakdown and (3) queued-by-
+      // agent-status breakdown — each shaped like its real call site.
+      select: vi
+        .fn()
+        .mockImplementationOnce(() => ({
+          from: () => ({ where: () => Promise.resolve([{ count: 1 }]) }),
+        }))
+        .mockImplementationOnce(() => ({
+          from: () => ({ where: () => ({ groupBy: () => Promise.resolve([]) }) }),
+        }))
+        .mockImplementationOnce(() => ({
+          from: () => ({
+            innerJoin: () => ({ where: () => ({ groupBy: () => Promise.resolve([]) }) }),
+          }),
         })),
-      })),
     } as unknown as Db;
     const app = express();
     app.use((req, _res, next) => {

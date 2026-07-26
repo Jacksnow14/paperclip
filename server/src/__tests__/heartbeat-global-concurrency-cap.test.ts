@@ -241,7 +241,7 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
     return companyId;
   }
 
-  async function seedAgent(companyId: string, opts?: { maxConcurrentRuns?: number }) {
+  async function seedAgent(companyId: string, opts?: { maxConcurrentRuns?: number; adapterType?: string }) {
     const agentId = randomUUID();
     await db.insert(agents).values({
       id: agentId,
@@ -249,7 +249,7 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
       name: `Coder-${agentId.slice(0, 8)}`,
       role: "engineer",
       status: "idle",
-      adapterType: "codex_local",
+      adapterType: opts?.adapterType ?? "codex_local",
       adapterConfig: {},
       runtimeConfig: {
         heartbeat: { wakeOnDemand: true, maxConcurrentRuns: opts?.maxConcurrentRuns ?? 5 },
@@ -315,6 +315,42 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
       scheduledRetryAt,
       scheduledRetryReason: "transient_failure",
       contextSnapshot: { transientRetryNotBefore: scheduledRetryAt.toISOString() },
+      updatedAt: now,
+      createdAt: now,
+    });
+    return runId;
+  }
+
+  // AUR-4139: a scheduled_retry row with a future scheduledRetryAt but no
+  // transientRetryNotBefore marker is an ordinary bounded retry (e.g. a
+  // process-lost backoff), not a parsed provider quota reset -- it must not
+  // suppress admission the way seedActiveQuotaPause's row does.
+  async function seedScheduledRetryWithoutQuotaMarker(companyId: string, agentId: string, scheduledRetryAt: Date) {
+    const runId = randomUUID();
+    const wakeupRequestId = randomUUID();
+    const now = new Date();
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "process_lost_retry",
+      payload: {},
+      status: "queued",
+      updatedAt: now,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "scheduled_retry",
+      wakeupRequestId,
+      scheduledRetryAt,
+      scheduledRetryReason: "process_lost",
+      contextSnapshot: {},
       updatedAt: now,
       createdAt: now,
     });
@@ -434,6 +470,54 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
     hangAdapterUntilReleased();
     expect(await heartbeat.startNextQueuedRunForAgent(agentId)).toHaveLength(1);
     expect((await heartbeat.getRun(otherIssueRun))?.status).toBe("running");
+  });
+
+  it("does not suppress admission for a scheduled_retry row lacking a parsed quota reset marker (AUR-4139)", async () => {
+    const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4 });
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId);
+    const futureRetryAt = new Date(Date.now() + 60 * 60 * 1000);
+    await seedScheduledRetryWithoutQuotaMarker(companyId, agentId, futureRetryAt);
+    const queuedRun = await seedQueuedRun(companyId, agentId);
+
+    // A future scheduledRetryAt alone (no transientRetryNotBefore) must not be
+    // mistaken for an active quota pause -- otherwise every ordinary bounded
+    // retry (e.g. process-lost backoff) would also freeze admission.
+    hangAdapterUntilReleased();
+    expect(await heartbeat.startNextQueuedRunForAgent(agentId)).toHaveLength(1);
+    expect((await heartbeat.getRun(queuedRun))?.status).toBe("running");
+  });
+
+  it("suppresses admission for a sibling agent sharing the same adapter's quota pause (AUR-4139)", async () => {
+    const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4 });
+    const companyId = await seedCompany();
+    const pausedAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const siblingAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const resetAt = new Date(Date.now() + 60 * 60 * 1000);
+    await seedActiveQuotaPause(companyId, pausedAgentId, resetAt);
+    const siblingQueuedRun = await seedQueuedRun(companyId, siblingAgentId);
+
+    // Session limits are scoped to the credential/account behind the adapter, not
+    // to the individual agent whose run happened to hit the limit -- a sibling
+    // agent sharing the same adapterType shares the same wall.
+    expect(await heartbeat.startNextQueuedRunForAgent(siblingAgentId)).toHaveLength(0);
+    expect((await heartbeat.getRun(siblingQueuedRun))?.status).toBe("queued");
+  });
+
+  it("does not suppress admission for an agent on a different adapterType than the paused one (AUR-4139)", async () => {
+    const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4 });
+    const companyId = await seedCompany();
+    const pausedAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const unrelatedAgentId = await seedAgent(companyId, { adapterType: "codex_local" });
+    const resetAt = new Date(Date.now() + 60 * 60 * 1000);
+    await seedActiveQuotaPause(companyId, pausedAgentId, resetAt);
+    const unrelatedQueuedRun = await seedQueuedRun(companyId, unrelatedAgentId);
+
+    // A different adapterType means a different credential/account -- it must
+    // not inherit another adapter's quota pause.
+    hangAdapterUntilReleased();
+    expect(await heartbeat.startNextQueuedRunForAgent(unrelatedAgentId)).toHaveLength(1);
+    expect((await heartbeat.getRun(unrelatedQueuedRun))?.status).toBe("running");
   });
 
   it("schedules process-lost retries with backoff and jitter instead of re-queueing them", async () => {

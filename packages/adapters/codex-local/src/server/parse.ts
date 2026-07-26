@@ -8,8 +8,12 @@ import {
 const CODEX_TRANSIENT_UPSTREAM_RE =
   /(?:we(?:'|’)re\s+currently\s+experiencing\s+high\s+demand|temporary\s+errors|rate[-\s]?limit(?:ed)?|too\s+many\s+requests|\b429\b|server\s+overloaded|service\s+unavailable|try\s+again\s+later)/i;
 const CODEX_REMOTE_COMPACTION_RE = /remote\s+compact\s+task/i;
+// Matches both the model-scoped wording ("...usage limit for GPT-5.3-Codex-Spark.
+// Switch to another model now, or try again at ...") and the account-level wording
+// ("...usage limit. Upgrade to Pro (...), visit ... to purchase more credits or try
+// again at ...") observed in production codex_local runs (AUR-4139).
 const CODEX_USAGE_LIMIT_RE =
-  /you(?:'|’)ve hit your usage limit for .+\.\s+switch to another model now,\s+or try again at\s+([^.!\n]+)(?:[.!]|\n|$)/i;
+  /you(?:'|’)ve hit your usage limit\b[\s\S]{0,400}?\bor try again at\s+([^.!\n]+?)(?:[.!]|\n|$)/i;
 
 export function parseCodexJsonl(stdout: string) {
   let sessionId: string | null = null;
@@ -202,20 +206,48 @@ function nextClockTimeInTimeZone(input: {
   return retryAt;
 }
 
+const MONTH_ABBREVIATIONS = [
+  "jan", "feb", "mar", "apr", "may", "jun",
+  "jul", "aug", "sep", "oct", "nov", "dec",
+];
+
+// Handles both a bare clock time ("11:31 PM", "11:31 PM (America/Chicago)") and a
+// date-prefixed clock time ("Jun 18th, 2026 2:13 AM") — the account-level usage-limit
+// wording observed in production always includes the full reset date (AUR-4139).
 function parseLocalClockTime(clockText: string, now: Date): Date | null {
   const normalized = clockText.trim();
-  const match = normalized.match(/^(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?(?:\s*\(([^)]+)\)|\s+([A-Z]{2,5}))?$/i);
+  const match = normalized.match(
+    /^(?:([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?(?:\s*\(([^)]+)\)|\s+([A-Z]{2,5}))?$/i,
+  );
   if (!match) return null;
 
-  const hour12 = Number.parseInt(match[1] ?? "", 10);
-  const minute = Number.parseInt(match[2] ?? "0", 10);
+  const monthName = match[1];
+  const day = match[2] != null ? Number.parseInt(match[2], 10) : null;
+  const year = match[3] != null ? Number.parseInt(match[3], 10) : null;
+  const hour12 = Number.parseInt(match[4] ?? "", 10);
+  const minute = Number.parseInt(match[5] ?? "0", 10);
   if (!Number.isInteger(hour12) || hour12 < 1 || hour12 > 12) return null;
   if (!Number.isInteger(minute) || minute < 0 || minute > 59) return null;
 
   let hour24 = hour12 % 12;
-  if ((match[3] ?? "").toLowerCase() === "p") hour24 += 12;
+  if ((match[6] ?? "").toLowerCase() === "p") hour24 += 12;
 
-  const timeZoneHint = match[4] ?? match[5];
+  const timeZoneHint = match[7] ?? match[8];
+
+  if (monthName != null && day != null && year != null) {
+    if (day < 1 || day > 31) return null;
+    const monthIndex = MONTH_ABBREVIATIONS.indexOf(monthName.slice(0, 3).toLowerCase());
+    if (monthIndex === -1) return null;
+
+    const timeZone = normalizeResetTimeZone(timeZoneHint);
+    if (timeZone) {
+      return dateFromTimeZoneWallClock({ year, month: monthIndex + 1, day, hour: hour24, minute, timeZone });
+    }
+
+    const retryAt = new Date(year, monthIndex, day, hour24, minute, 0, 0);
+    return Number.isNaN(retryAt.getTime()) ? null : retryAt;
+  }
+
   if (timeZoneHint) {
     const explicitRetryAt = nextClockTimeInTimeZone({
       now,

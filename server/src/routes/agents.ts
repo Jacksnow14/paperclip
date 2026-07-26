@@ -12,6 +12,7 @@ import {
   createAgentHireSchema,
   createAgentSchema,
   deriveAgentUrlKey,
+  envBindingSchema,
   isUuidLike,
   normalizeIssueIdentifier,
   resetAgentSessionSchema,
@@ -919,9 +920,15 @@ export function agentRoutes(
     return entries;
   }
 
-  function assertNoAgentRuntimeConfigAdapterConfigMutation(req: Request, runtimeConfig: unknown) {
+  function assertNoAgentRuntimeConfigAdapterConfigMutation(
+    req: Request,
+    runtimeConfig: unknown,
+    existingRuntimeConfig: unknown = null,
+  ) {
+    const existingProfiles = asRecord(asRecord(existingRuntimeConfig)?.modelProfiles) ?? {};
     for (const entry of listRuntimeModelProfileAdapterConfigs(runtimeConfig)) {
-      assertNoAgentAdapterConfigMutation(req, entry.adapterConfig, entry.path);
+      const existingProfileAdapterConfig = asRecord(asRecord(existingProfiles[entry.profileKey])?.adapterConfig);
+      assertNoAgentAdapterConfigMutation(req, entry.adapterConfig, entry.path, existingProfileAdapterConfig);
     }
   }
 
@@ -1163,16 +1170,62 @@ export function agentRoutes(
     return KNOWN_INSTRUCTIONS_BUNDLE_KEYS.some((key) => adapterConfig[key] !== undefined);
   }
 
+  function parseSecretRefEnvBinding(rawBinding: unknown): { secretId: string; version: string } | null {
+    const parsed = envBindingSchema.safeParse(rawBinding);
+    if (!parsed.success) return null;
+    const binding = parsed.data;
+    if (typeof binding === "string" || binding.type !== "secret_ref") return null;
+    return { secretId: binding.secretId, version: String(binding.version ?? "latest") };
+  }
+
+  // AUR-4093: agent-authenticated callers may keep or remove existing
+  // secret_ref env entries, but adding one — or changing the secretId/version
+  // at an existing key — requires board authentication. This is the early,
+  // clear-message rejection; the secrets service enforces the same gate
+  // authoritatively at the binding write.
+  function assertNoAgentSecretRefEnvMutation(
+    req: Request,
+    adapterConfig: Record<string, unknown>,
+    path: string,
+    existingAdapterConfig: Record<string, unknown> | null | undefined,
+  ) {
+    if (req.actor.type !== "agent") return;
+    const requestedEnv = asRecord(adapterConfig.env);
+    if (!requestedEnv) return;
+    const existingEnv = asRecord(asRecord(existingAdapterConfig)?.env) ?? {};
+    const violations: string[] = [];
+    for (const [key, rawBinding] of Object.entries(requestedEnv)) {
+      const requestedRef = parseSecretRefEnvBinding(rawBinding);
+      if (!requestedRef) continue;
+      const existingRef = parseSecretRefEnvBinding(existingEnv[key]);
+      if (
+        existingRef
+        && existingRef.secretId === requestedRef.secretId
+        && existingRef.version === requestedRef.version
+      ) {
+        continue;
+      }
+      violations.push(`${path}.env.${key}`);
+    }
+    if (violations.length === 0) return;
+    throw forbidden(
+      `Agent-authenticated callers cannot add or change secret_ref env bindings (${violations.join(", ")}). `
+      + "Granting secrets requires board authentication; removing existing bindings is allowed.",
+    );
+  }
+
   function assertNoAgentAdapterConfigMutation(
     req: Request,
     adapterConfig: Record<string, unknown>,
     path = "adapterConfig",
+    existingAdapterConfig: Record<string, unknown> | null | undefined = null,
   ) {
     assertNoAgentInstructionsConfigMutation(req, adapterConfig, path);
     assertNoAgentHostWorkspaceCommandMutation(
       req,
       collectAgentAdapterWorkspaceCommandPaths(adapterConfig, path),
     );
+    assertNoAgentSecretRefEnvMutation(req, adapterConfig, path, existingAdapterConfig);
   }
 
   function summarizeAgentUpdateDetails(patch: Record<string, unknown>) {
@@ -1997,6 +2050,12 @@ export function agentRoutes(
       adapterConfig: normalizedAdapterConfig,
       runtimeConfig: normalizedRuntimeConfig,
     };
+    await secretsSvc.assertEnvBindingMutationAllowed?.(
+      req.actor,
+      companyId,
+      { targetType: "agent", targetId: null },
+      asRecord(normalizedAdapterConfig)?.env,
+    );
 
     const company = await db
       .select()
@@ -2017,6 +2076,15 @@ export function agentRoutes(
       lastHeartbeatAt: null,
     });
     const agent = await materializeDefaultInstructionsBundleForNewAgent(createdAgent, instructionsBundle);
+    const hiredAgentEnv = asRecord(agent.adapterConfig)?.env;
+    if (hiredAgentEnv) {
+      await secretsSvc.syncEnvBindingsForTarget?.(
+        companyId,
+        { targetType: "agent", targetId: agent.id },
+        hiredAgentEnv,
+        req.actor,
+      );
+    }
 
     let approval: Awaited<ReturnType<typeof approvalsSvc.getById>> | null = null;
     const actor = getActorInfo(req);
@@ -2183,6 +2251,12 @@ export function agentRoutes(
       allowedDrivers: allowedEnvironmentDriversForAgent(createInput.adapterType),
       allowedSandboxProviders: allowedSandboxProvidersForAgent(createInput.adapterType),
     });
+    await secretsSvc.assertEnvBindingMutationAllowed?.(
+      req.actor,
+      companyId,
+      { targetType: "agent", targetId: null },
+      asRecord(normalizedAdapterConfig)?.env,
+    );
 
     const createdAgent = await svc.create(companyId, {
       ...createInput,
@@ -2199,6 +2273,7 @@ export function agentRoutes(
         companyId,
         { targetType: "agent", targetId: agent.id },
         agentEnv,
+        req.actor,
       );
     }
 
@@ -2570,7 +2645,7 @@ export function agentRoutes(
         res.status(422).json({ error: "adapterConfig must be an object" });
         return;
       }
-      assertNoAgentAdapterConfigMutation(req, adapterConfig);
+      assertNoAgentAdapterConfigMutation(req, adapterConfig, "adapterConfig", asRecord(existing.adapterConfig));
       const changingInstructionsConfig = adapterConfigTouchesInstructionsConfig(adapterConfig);
       if (changingInstructionsConfig) {
         await assertCanManageInstructionsPath(req, existing);
@@ -2588,7 +2663,7 @@ export function agentRoutes(
         res.status(422).json({ error: "runtimeConfig must be an object" });
         return;
       }
-      assertNoAgentRuntimeConfigAdapterConfigMutation(req, runtimeConfig);
+      assertNoAgentRuntimeConfigAdapterConfigMutation(req, runtimeConfig, existing.runtimeConfig);
       requestedRuntimeConfig = runtimeConfig;
     }
     const touchesAdapterConfiguration =
@@ -2665,6 +2740,15 @@ export function agentRoutes(
       );
     }
 
+    if (touchesAdapterConfiguration) {
+      await secretsSvc.assertEnvBindingMutationAllowed?.(
+        req.actor,
+        existing.companyId,
+        { targetType: "agent", targetId: existing.id },
+        asRecord(patchData.adapterConfig)?.env,
+      );
+    }
+
     const actor = getActorInfo(req);
     const agent = await svc.update(id, patchData, {
       recordRevision: {
@@ -2683,6 +2767,7 @@ export function agentRoutes(
         agent.companyId,
         { targetType: "agent", targetId: agent.id },
         agentEnv,
+        req.actor,
       );
     }
 

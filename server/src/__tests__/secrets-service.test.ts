@@ -114,7 +114,7 @@ describeEmbeddedPostgres("secretService", () => {
       targetType: "agent",
       targetId: "agent-1",
       configPath: "env.API_KEY",
-    });
+    }, { type: "board" });
 
     await expect(
       svc.createBinding({
@@ -123,7 +123,7 @@ describeEmbeddedPostgres("secretService", () => {
         targetType: "agent",
         targetId: "agent-1",
         configPath: "env.API_KEY",
-      }),
+      }, { type: "board" }),
     ).rejects.toThrow(/already exists/i);
   });
 
@@ -152,6 +152,7 @@ describeEmbeddedPostgres("secretService", () => {
       {
         OPENAI_API_KEY: { type: "secret_ref", secretId: secret.id, version: "latest" },
       },
+      { type: "board" },
     );
 
     const listed = await svc.list(companyId);
@@ -180,7 +181,7 @@ describeEmbeddedPostgres("secretService", () => {
       API_KEY: { type: "secret_ref" as const, secretId: secret.id, version: "latest" as const },
     };
 
-    await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: "agent-1" }, env);
+    await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: "agent-1" }, env, { type: "board" });
 
     await expect(
       svc.resolveEnvBindings(companyId, env, {
@@ -225,18 +226,20 @@ describeEmbeddedPostgres("secretService", () => {
       targetType: "agent",
       targetId: "agent-1",
       configPath: "runtime.token",
-    });
+    }, { type: "board" });
     await svc.syncEnvBindingsForTarget(
       companyId,
       { targetType: "agent", targetId: "agent-1" },
       {
         API_KEY: { type: "secret_ref", secretId: envSecret.id, version: "latest" },
       },
+      { type: "board" },
     );
     await svc.syncEnvBindingsForTarget(
       companyId,
       { targetType: "agent", targetId: "agent-1" },
       {},
+      { type: "board" },
     );
 
     const bindings = await db
@@ -257,7 +260,7 @@ describeEmbeddedPostgres("secretService", () => {
     const env = {
       API_KEY: { type: "secret_ref" as const, secretId: secret.id, version: "latest" as const },
     };
-    await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: "agent-1" }, env);
+    await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: "agent-1" }, env, { type: "board" });
 
     vi.spyOn(db, "update").mockImplementationOnce(
       () => ({
@@ -330,7 +333,7 @@ describeEmbeddedPostgres("secretService", () => {
       targetType: "system",
       targetId: "system",
       configPath: "env.API_KEY",
-    });
+    }, { type: "board" });
     vi.spyOn(localEncryptedProvider, "resolveVersion").mockRejectedValueOnce(
       new Error("provider resolution failed"),
     );
@@ -433,7 +436,7 @@ describeEmbeddedPostgres("secretService", () => {
         targetType: "agent",
         targetId: "agent-1",
         configPath: "env.API_KEY",
-      }),
+      }, { type: "board" }),
     ).rejects.toThrow(/not found/i);
     await expect(
       svc.normalizeEnvBindingsForPersistence(companyId, {

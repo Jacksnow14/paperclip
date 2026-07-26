@@ -7055,6 +7055,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
         return [];
       }
+      // AUR-4055: while a scheduled_retry row for this agent carries a parsed
+      // provider quota reset time (transientRetryNotBefore) that hasn't passed
+      // yet, every other run against the same adapter is guaranteed to hit the
+      // same wall. Leave queued runs queued instead of admitting them into a
+      // known-dead attempt; they're picked up again as soon as this query stops
+      // matching (either the reset time passes, or promoteDueScheduledRetries
+      // promotes the retry itself).
+      const activeQuotaPause = await db
+        .select({ scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, agentId),
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'transientRetryNotBefore' is not null`,
+            gt(heartbeatRuns.scheduledRetryAt, new Date()),
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.scheduledRetryAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (activeQuotaPause) return [];
       const policy = parseHeartbeatPolicy(agent);
       const runningCount = await countRunningRunsForAgent(agentId);
       // Global ceiling (AUR-3929): per-agent slots must never admit a run once

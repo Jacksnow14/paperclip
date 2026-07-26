@@ -1,0 +1,11 @@
+[Unit]
+Description=Sample Paperclip host memory/OOM signals every 5min (AUR-3924)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=paperclip-mem-watch.service
+
+[Install]
+WantedBy=timers.target

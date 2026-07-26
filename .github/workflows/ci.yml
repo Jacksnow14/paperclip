@@ -38,6 +38,28 @@ jobs:
       # Loop/audit scripts under scripts/ are dependency-free node:test suites.
       - run: node --test scripts/
 
+  deploy-scripts-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # scripts/deploy/*.test.sh are hermetic bash regression suites (fixture
+      # logs/stubs, no network, no systemd, no /var) for the host monitors
+      # that run outside the app release pipeline (AUR-4086).
+      - run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tests=(scripts/deploy/*.test.sh)
+          if [[ ${#tests[@]} -eq 0 ]]; then
+            echo "no scripts/deploy/*.test.sh found" >&2
+            exit 1
+          fi
+          for t in "${tests[@]}"; do
+            echo "::group::$t"
+            bash "$t"
+            echo "::endgroup::"
+          done
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 45

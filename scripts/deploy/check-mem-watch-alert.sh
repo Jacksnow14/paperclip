@@ -21,14 +21,13 @@
 # /usr/local/sbin rather than from an app release. A host monitor that depends on
 # the thing it might need to alert about (a broken deploy) is not a monitor.
 #
-# Log format note: as of 2026-07-25 the sampler intermittently splits a data row
-# across two physical lines (columns 10+ land on a following line that starts
-# with a bare "0", not a timestamp -- see the AUR-4025 follow-up issue on the
-# sampler itself). The three trigger fields (oom_5min, swap_free_mb,
-# mem_avail_mb) always live within the first 9 comma fields of the line that
-# starts with the ISO-8601 timestamp, so this reader only trusts that prefix and
-# is unaffected by the split. Do not "fix" this by joining lines here -- see the
-# follow-up issue before changing sampler output shape.
+# Log format note: AUR-4056 fixed the sampler (deployed 2026-07-25 21:00 UTC) so
+# it can no longer split a record across two physical lines; the sampler now
+# refuses to emit a row that isn't exactly as wide as its own header. That makes
+# a row whose field count doesn't match the header a real corruption signal
+# (pre-AUR-4056 log history, truncated write, manual edit, etc.), not an
+# expected shape to route around -- see the exact-width check below, which
+# replaced the old column-position lockout (AUR-4086).
 set -uo pipefail
 
 LOG=${PAPERCLIP_MEM_WATCH_LOG:-/var/log/paperclip-mem-watch.log}
@@ -38,9 +37,6 @@ ALERT_COOLDOWN_SEC=${PAPERCLIP_MEM_WATCH_ALERT_COOLDOWN_SEC:-1800}
 ISSUE_URL=${PAPERCLIP_MEM_WATCH_ISSUE_URL:-https://paperclip/AUR/issues/AUR-3924}
 SWAP_FREE_MIN_MB=${PAPERCLIP_MEM_WATCH_SWAP_FREE_MIN_MB:-2000}
 MEM_AVAIL_MIN_MB=${PAPERCLIP_MEM_WATCH_MEM_AVAIL_MIN_MB:-1500}
-# Columns beyond this index can land on the corrupted second half of a split
-# row, so any trigger field must resolve at or below it (see note above).
-SPLIT_SAFE_MAX_COL=9
 
 if [[ ! -r "$LOG" ]]; then
   echo "paperclip-mem-watch-alert: log not readable: $LOG" >&2
@@ -51,13 +47,10 @@ header=$(head -n1 "$LOG")
 IFS=',' read -r -a cols <<< "$header"
 declare -A idx
 for i in "${!cols[@]}"; do idx["${cols[$i]}"]=$((i + 1)); done
+want_cols=${#cols[@]}
 for want in ts mem_avail_mb swap_free_mb oom_5min; do
   if [[ -z "${idx[$want]:-}" ]]; then
     echo "paperclip-mem-watch-alert: log header missing column '$want': $header" >&2
-    exit 1
-  fi
-  if (( idx[$want] > SPLIT_SAFE_MAX_COL )); then
-    echo "paperclip-mem-watch-alert: column '$want' moved past the split-safe prefix (col ${idx[$want]} > ${SPLIT_SAFE_MAX_COL}) -- reader needs updating before this is safe to trust" >&2
     exit 1
   fi
 done
@@ -69,6 +62,10 @@ if [[ -z "$last_row" ]]; then
 fi
 
 IFS=',' read -r -a fields <<< "$last_row"
+if [[ "${#fields[@]}" -ne "$want_cols" ]]; then
+  echo "paperclip-mem-watch-alert: row has ${#fields[@]} columns, header has ${want_cols} -- refusing to read a malformed row (AUR-4056 sampler never emits one, so this is corruption, not an expected shape): $last_row" >&2
+  exit 1
+fi
 ts="${fields[$((idx[ts]-1))]:-}"
 mem_avail="${fields[$((idx[mem_avail_mb]-1))]:-}"
 swap_free="${fields[$((idx[swap_free_mb]-1))]:-}"

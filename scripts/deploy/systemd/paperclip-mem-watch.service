@@ -1,0 +1,8 @@
+[Unit]
+Description=Paperclip host memory/OOM sampler (AUR-3924)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/paperclip-mem-watch.sh
+MemoryMax=64M
+OOMScoreAdjust=-500

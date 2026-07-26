@@ -4,8 +4,9 @@
 # What this locks down: AUR-3924's sampler logged the 2026-07-25 16:02 UTC
 # breach correctly the whole time -- the bug was that nothing read the log, so
 # it woke no one. These cases assert the read-and-escalate path actually fires,
-# stays quiet when healthy, survives the sampler's known row-splitting defect,
-# rate-limits instead of paging every 5 minutes, and never swallows a delivery
+# stays quiet when healthy, loudly refuses a malformed (non-header-width) row
+# instead of reading through it (AUR-4086, post AUR-4056 sampler fix), rate-
+# limits instead of paging every 5 minutes, and never swallows a delivery
 # failure.
 #
 # Hermetic: fixture log, stub notifier, no network, no systemd, no /var.
@@ -93,20 +94,33 @@ else
   fail "oom_5min breach (2 > 0) pages the founder" "alerts=$(alerts) sink=$(cat "$SINK" 2>/dev/null) out=$out"
 fi
 
-# 5. THE SPLIT-ROW DEFECT (real, observed in the live log since ~17:06 UTC):
-#    columns 10+ land on a following line starting with a bare "0", not a
-#    timestamp. The breach must still be detected from the intact prefix.
+# 5. A malformed row that is short of the header width (e.g. the pre-AUR-4056
+#    split-row defect, where columns 10+ land on a following line starting
+#    with a bare "0") is now refused loudly and pages no one -- the sampler
+#    guarantees an 18-column row or none at all, so a short row means real
+#    corruption, not an expected shape to route around (AUR-4086).
 reset
 {
   printf '%s\n' "$HEADER"
   printf '2026-07-25T21:10:00Z,1200,6800,2100,6000,8095,0.50,0,0\n'
   printf '0,0,0,0,3859857,2026-07-25T16:30:26,-800,d5c37635bb00,yes\n'
 } > "$LOG"
+out=$(run_check); rc=$?
+if [[ "$rc" == "1" && "$(alerts)" == "0" ]] && grep -q "columns, header has" <<<"$out"; then
+  ok "malformed (short) row is refused loudly, not read through"
+else
+  fail "malformed (short) row is refused loudly, not read through" "rc=$rc alerts=$(alerts) out=$out"
+fi
+
+# 5b. A well-formed row is still read correctly regardless of where its trigger
+#     columns land -- this asserts there is no positional lockout left.
+reset
+printf '%s\n2026-07-25T21:12:00Z,1200,6800,2100,6000,8095,0.50,0,4,2,2,3637,0,3859857,2026-07-25T16:30:26,-800,d5c37635bb00,yes\n' "$HEADER" > "$LOG"
 out=$(run_check)
 if [[ "$(alerts)" == "1" ]] && grep -q "mem_avail_mb=1200" "$SINK"; then
-  ok "breach on a split (row-corrupted) log line is still detected"
+  ok "breach on a full 18-column row is detected (build_rss_mb no longer blocks the reader)"
 else
-  fail "breach on a split (row-corrupted) log line is still detected" "alerts=$(alerts) sink=$(cat "$SINK" 2>/dev/null) out=$out"
+  fail "breach on a full 18-column row is detected (build_rss_mb no longer blocks the reader)" "alerts=$(alerts) sink=$(cat "$SINK" 2>/dev/null) out=$out"
 fi
 
 # 6. Rate limiting: a still-breaching next sample within the cooldown window

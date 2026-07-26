@@ -566,7 +566,6 @@ describe("issue graph liveness classifier", () => {
           identifier: "PAP-2156",
           title: "Blocked epic",
           status: "blocked",
-          assigneeAgentId: null,
         }),
         issue({
           id: childId,
@@ -617,6 +616,106 @@ describe("issue graph liveness classifier", () => {
     expect(findings[0]).toMatchObject({
       issueId: parentId,
       identifier: "AUR-2156",
+      state: "blocked_by_unassigned_issue",
+      recoveryIssueId: childId,
+    });
+  });
+
+  it("flags each blocked child independently when a blocked parent has two blocked children with their own unassigned blockers", () => {
+    const parentId = "epic-1";
+    const childAId = "child-a";
+    const childBId = "child-b";
+    const blockerAId = "blocker-a";
+    const blockerBId = "blocker-b";
+
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue({
+          id: parentId,
+          identifier: "PAP-2156",
+          title: "Blocked epic",
+          status: "blocked",
+        }),
+        issue({
+          id: childAId,
+          identifier: "PAP-3918",
+          title: "Blocked child A",
+          status: "blocked",
+          parentId,
+          assigneeAgentId: null,
+        }),
+        issue({
+          id: childBId,
+          identifier: "PAP-3919",
+          title: "Blocked child B",
+          status: "blocked",
+          parentId,
+          assigneeAgentId: null,
+        }),
+        issue({
+          id: blockerAId,
+          identifier: "PAP-3920",
+          title: "Missing unblock work A",
+          status: "todo",
+          assigneeAgentId: null,
+        }),
+        issue({
+          id: blockerBId,
+          identifier: "PAP-3921",
+          title: "Missing unblock work B",
+          status: "todo",
+          assigneeAgentId: null,
+        }),
+      ],
+      relations: [
+        { companyId, blockerIssueId: blockerAId, blockedIssueId: childAId },
+        { companyId, blockerIssueId: blockerBId, blockedIssueId: childBId },
+      ],
+      agents: [agent(), manager],
+    });
+
+    expect(findings).toHaveLength(2);
+    expect(findings).toContainEqual(
+      expect.objectContaining({ issueId: childAId, recoveryIssueId: blockerAId, state: "blocked_by_unassigned_issue" }),
+    );
+    expect(findings).toContainEqual(
+      expect.objectContaining({ issueId: childBId, recoveryIssueId: blockerBId, state: "blocked_by_unassigned_issue" }),
+    );
+    // Both siblings' blockers must be independently attributed to their own child, not
+    // collapsed onto (or dropped in favor of) the parent's longer chain through one sibling.
+    expect(findings.map((f) => f.issueId).sort()).toEqual([childAId, childBId].sort());
+  });
+
+  it("flags a blocked, unassigned, blocker-less child even when its parent is not itself blocked", () => {
+    const parentId = "epic-1";
+    const childId = "child-1";
+
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue({
+          id: parentId,
+          identifier: "PAP-2156",
+          title: "Done epic",
+          status: "done",
+        }),
+        issue({
+          id: childId,
+          identifier: "PAP-3918",
+          title: "Blocked child work",
+          status: "blocked",
+          parentId,
+          assigneeAgentId: null,
+          assigneeUserId: null,
+        }),
+      ],
+      relations: [],
+      agents: [agent(), manager],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      issueId: childId,
+      identifier: "PAP-3918",
       state: "blocked_by_unassigned_issue",
       recoveryIssueId: childId,
     });

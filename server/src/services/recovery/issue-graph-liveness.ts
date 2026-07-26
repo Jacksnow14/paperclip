@@ -305,6 +305,28 @@ function ownerCandidatesForRecoveryIssue(
   return candidates;
 }
 
+// True when the shorter dependency path is an exact tail match of the longer one, i.e. both
+// findings describe a walk that ends by crossing the exact same final edge into the same
+// recoveryIssue (same lineage), as opposed to two different sources independently landing on
+// the same recoveryIssue by coincidence.
+function dependencyPathTailsMatch(a: IssueLivenessFinding, b: IssueLivenessFinding): boolean {
+  const [shortPath, longPath] = a.dependencyPath.length <= b.dependencyPath.length
+    ? [a.dependencyPath, b.dependencyPath]
+    : [b.dependencyPath, a.dependencyPath];
+  const offset = longPath.length - shortPath.length;
+  return shortPath.every((entry, index) => entry.issueId === longPath[offset + index]?.issueId);
+}
+
+// A "self" finding (issueId === recoveryIssueId) only exists because a leaf-level walk had
+// nothing else to blame; a finding naming a distinct blocker/blocked-by issue is always more
+// specific. Among non-self findings, the shortest dependency path is the most proximate report.
+function isMoreSpecificFinding(candidate: IssueLivenessFinding, existing: IssueLivenessFinding): boolean {
+  const candidateIsSelf = candidate.issueId === candidate.recoveryIssueId;
+  const existingIsSelf = existing.issueId === existing.recoveryIssueId;
+  if (candidateIsSelf !== existingIsSelf) return !candidateIsSelf;
+  return candidate.dependencyPath.length < existing.dependencyPath.length;
+}
+
 function incidentKey(input: {
   companyId: string;
   issueId: string;
@@ -395,10 +417,6 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     const list = childrenByParentId.get(issue.parentId) ?? [];
     list.push(issue);
     childrenByParentId.set(issue.parentId, list);
-
-    if (issue.status !== "done" && issue.status !== "cancelled" && parent.status === "blocked") {
-      unresolvedBlockers.add(issue.id);
-    }
   }
 
   function hasExplicitWaitingPath(issue: IssueLivenessIssueInput) {
@@ -619,7 +637,16 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     if (issue.status === "blocked") {
       if (unresolvedBlockers.has(issue.id)) continue;
       const chainFinding = firstBlockedChainFinding(issue, issue, [issue], new Set());
-      if (chainFinding) findings.push(chainFinding);
+      if (chainFinding) {
+        findings.push(chainFinding);
+      } else if (!hasExplicitWaitingPath(issue) && blockerCandidatesFor(issue, issue).length === 0) {
+        // Leaf-level check: a blocked issue with no relation/child blockers of its own is
+        // structurally inert on its own terms (AUR-3918's shape) regardless of its parent's
+        // status. It only surfaces above via blockerCandidatesFor when some ancestor is also
+        // being walked as a root, so check it directly here too.
+        const selfFinding = blockedFindingForLeaf(issue, issue, [issue]);
+        if (selfFinding) findings.push(selfFinding);
+      }
     }
 
     if (issue.status === "in_review" && !unresolvedBlockers.has(issue.id)) {
@@ -628,5 +655,24 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     }
   }
 
-  return findings;
+  // Not root-skipping a child from its own independent walk (above) means the exact same
+  // blocked-issue-to-recoveryIssue edge can now surface twice: once from the child's own walk,
+  // once from an ancestor's walk landing on the same child via the parent/child edge. That is a
+  // duplicate report of the same edge (same recoveryIssueId AND one's dependency path is the
+  // tail of the other's) and should collapse to the most specific one. It is NOT a duplicate
+  // when two unrelated issues are independently blocked by the same shared blocker — that is
+  // two distinct, equally actionable findings and both must survive.
+  const deduped: IssueLivenessFinding[] = [];
+  for (const candidate of findings) {
+    const duplicateIndex = deduped.findIndex(
+      (existing) => existing.recoveryIssueId === candidate.recoveryIssueId && dependencyPathTailsMatch(candidate, existing),
+    );
+    if (duplicateIndex === -1) {
+      deduped.push(candidate);
+    } else if (isMoreSpecificFinding(candidate, deduped[duplicateIndex]!)) {
+      deduped[duplicateIndex] = candidate;
+    }
+  }
+
+  return deduped;
 }

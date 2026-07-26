@@ -20,9 +20,9 @@
  *   3. Emergent cost outliers       — projects/work burning tokens out of proportion to value
  *   4. Delta vs. previous day       — how today's picture moved against the last synthesis
  *
- * The record is idempotent per day: re-running overwrites nothing (capture is
- * insert-only) but the title carries the date so a given day has one canonical
- * synthesis; re-runs append a fresh record the board can treat as the latest.
+ * The record is idempotent per day: capture is insert-only, so a re-run writes a
+ * fresh `synthesis/{date}` record and then revokes our own earlier copies of the
+ * same title, leaving exactly one live canonical synthesis per UTC day.
  *
  * Usage:
  *   node scripts/sgi-loop-e-nightly-synthesis.mjs            # synthesize "today" (UTC)
@@ -44,10 +44,14 @@ const DRY_RUN = argv.includes('--dry-run');
 const dateArg = (argv.find(a => a.startsWith('--date=')) || '').split('=')[1];
 const TARGET_DATE = dateArg || new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
 
-// How many recent records to scan. Daily signal volume is small; the deployed
-// records route returns most-recent first with no cursor, so one wide page is
-// enough to cover today plus the prior synthesis for the delta.
-const SCAN_LIMIT = 200;
+// Records are scanned most-recent-first via ?limit&offset pagination. Daily
+// signal volume outgrew a single page long ago (~750 records/day as of
+// 2026-07-25, so one 200-record page covered only the last ~6h of a UTC day and
+// never reached the prior day's synthesis for the delta). We now page until we
+// have walked past the target day and found the previous synthesis, bounded by
+// SCAN_MAX_PAGES so a runaway stream can't hang the nightly run.
+const SCAN_PAGE_SIZE = 200;
+const SCAN_MAX_PAGES = 30;
 
 // A failure theme is "recurring" if it shows up at least this many times today,
 // independent of any single record self-declaring frequency=recurring.
@@ -72,12 +76,42 @@ async function apiFetch(path, opts = {}) {
   return res.json();
 }
 
-async function fetchRecords() {
+async function fetchRecordPage(offset) {
   const data = await apiFetch(
-    `/api/companies/${COMPANY_ID}/memory/records?limit=${SCAN_LIMIT}`
+    `/api/companies/${COMPANY_ID}/memory/records?limit=${SCAN_PAGE_SIZE}&offset=${offset}`
   );
   if (data._notFound) return [];
   return Array.isArray(data) ? data : (data.records || []);
+}
+
+/**
+ * Page most-recent-first until the whole target UTC day is covered and the
+ * previous synthesis (delta basis) is in hand. Offsets shift while the table
+ * grows under us, so dedupe by record id.
+ */
+async function fetchRecords() {
+  const byId = new Map();
+  let pages = 0;
+  let truncated = false;
+  for (let offset = 0; ; offset += SCAN_PAGE_SIZE) {
+    const page = await fetchRecordPage(offset);
+    pages++;
+    for (const r of page) byId.set(r.id || `${r.title}:${r.createdAt}`, r);
+    const records = [...byId.values()];
+    const walkedPastDay = records.some(r => dayOf(r) < TARGET_DATE);
+    const hasPrevSynthesis = records.some(r => cat(r) === 'synthesis' && dayOf(r) < TARGET_DATE);
+    if (page.length < SCAN_PAGE_SIZE) break;            // reached the oldest record
+    if (walkedPastDay && hasPrevSynthesis) break;        // day fully covered + delta basis found
+    if (pages >= SCAN_MAX_PAGES) { truncated = true; break; }
+  }
+  const records = [...byId.values()];
+  if (truncated) {
+    console.error(
+      `[loop-e] WARNING: scan hit the ${SCAN_MAX_PAGES}-page cap (${records.length} records); ` +
+      `signals for ${TARGET_DATE} may be incomplete and the delta may fall back to baseline.`
+    );
+  }
+  return { records, pages, truncated };
 }
 
 async function captureSynthesis(title, body, metadata) {
@@ -106,6 +140,13 @@ async function postComment(issueId, body) {
 
 const cat = (r) => (r.metadata && r.metadata.category) || '';
 const dayOf = (r) => (r.createdAt || '').slice(0, 10);
+
+// /memory/capture silently drops category `retrospective`, so agents capture
+// retro lessons as category `lesson` under a `retrospective/<AUR-xxxx>/...`
+// title. Matching on category alone counted 0 retros every night.
+const isRetro = (r) =>
+  cat(r) === 'retrospective' ||
+  (cat(r) === 'lesson' && String(r.title || '').startsWith('retrospective/'));
 const idLabel = (r) => (r.metadata && (r.metadata.issue_id || r.metadata.project_id || r.metadata.agent_id)) || '';
 
 /** Normalize a free-text capability/theme into a short grouping key. */
@@ -151,7 +192,7 @@ function recurringFailureModes(today) {
         const reason = m.rework_required ? 'rework required' : m.outcome === 'failure' ? 'task failed' : 'low quality signal';
         bump(`${m.task_type || 'task'}: ${reason}`, { example: m.issue_id, kind: 'scorecard' });
       }
-    } else if (cat(r) === 'retrospective' && m.aspect === 'tool_gaps') {
+    } else if (isRetro(r) && m.aspect === 'tool_gaps') {
       bump(`retro tool-gap: ${m.issue_id || r.title}`, { example: m.issue_id, kind: 'retro' });
     }
   }
@@ -171,7 +212,7 @@ function recurringFailureModes(today) {
 
 /** 2. Consistently strong patterns — what_worked + clean successes. */
 function strongPatterns(today) {
-  const worked = today.filter(r => cat(r) === 'retrospective' && (r.metadata.aspect === 'what_worked' || r.metadata.aspect === 'patterns'));
+  const worked = today.filter(r => isRetro(r) && (r.metadata.aspect === 'what_worked' || r.metadata.aspect === 'patterns'));
   const cleanWins = today.filter(r => {
     const m = r.metadata || {};
     return cat(r) === 'performance_scorecard'
@@ -195,7 +236,7 @@ function strongPatterns(today) {
     repeatedStrengths: [...byCombo.values()]
       .filter(c => c.wins >= RECURRING_THRESHOLD)
       .sort((a, b) => b.wins - a.wins)
-      .map(c => ({ task: c.task, wins: c.wins, agents: [...c.agents].length, issues: [...c.issues] })),
+      .map(c => ({ task: c.task, wins: c.wins, agents: [...c.agents].length, issues: [...c.issues].slice(0, 10), issuesTotal: c.issues.size })),
   };
 }
 
@@ -251,6 +292,16 @@ function delta(metrics, prev) {
     `Cost outlier projects: ${metrics.costOutliers} (prev ${p.costOutliers ?? '–'}) ${arrow(metrics.costOutliers, p.costOutliers ?? 0)}`,
     `Tool-gaps logged: ${metrics.toolGaps} (prev ${p.toolGaps ?? '–'}) ${arrow(metrics.toolGaps, p.toolGaps ?? 0)}`,
   ];
+  // A synthesis written before the paginated scan landed only saw one
+  // 200-record window of its day, so its counts under-sample. Flag it instead
+  // of letting the board read a coverage change as a real regression.
+  const prevInputs = prev.metadata.inputs || {};
+  if (!prevInputs.pagesScanned) {
+    lines.push(
+      '_Caveat: the prior synthesis predates the full-day paginated scan (it saw a single 200-record window), ' +
+      'so these deltas mostly reflect scan coverage, not a real change in fleet behaviour._'
+    );
+  }
   return { hasPrev: true, prevDate: dayOf(prev), lines };
 }
 
@@ -258,13 +309,20 @@ function delta(metrics, prev) {
 
 function renderBody(s) {
   const { date, failures, patterns, cost, deltaInfo, counts } = s;
+  // Section 1 is capped so a high-signal day can't push the record past the
+  // 20k-char capture limit and silently amputate sections 3 and 4. The omitted
+  // tail is reported, never dropped in silence.
+  const FAIL_RENDER_CAP = 15;
+  const shownFailures = failures.slice(0, FAIL_RENDER_CAP);
+  const omittedFailures = failures.length - shownFailures.length;
   const fail = failures.length
-    ? failures.map(f => `- **${f.label}** — seen ${f.count}×${f.recurring ? ' _(flagged recurring)_' : ''}${f.examples.length ? ` · e.g. ${f.examples.join(', ')}` : ''}${f.costs.length ? ` · workaround cost: ${f.costs.join('; ')}` : ''}`).join('\n')
+    ? shownFailures.map(f => `- **${f.label}** — seen ${f.count}×${f.recurring ? ' _(flagged recurring)_' : ''}${f.examples.length ? ` · e.g. ${f.examples.join(', ')}` : ''}${f.costs.length ? ` · workaround cost: ${f.costs.join('; ')}` : ''}`).join('\n')
+      + (omittedFailures > 0 ? `\n- _…and ${omittedFailures} more theme(s) below the top ${FAIL_RENDER_CAP} by occurrence (see metadata.failure_modes for the full list)._` : '')
     : '- _None crossed the recurrence threshold today._';
 
   const strong = [
     patterns.workedAspects.length ? patterns.workedAspects.map(w => `- ${w.aspect} → ${w.ref}`).join('\n') : null,
-    patterns.repeatedStrengths.length ? patterns.repeatedStrengths.map(r => `- **${r.task}**: ${r.wins} clean wins across ${r.agents} agent(s) (${r.issues.join(', ')})`).join('\n') : null,
+    patterns.repeatedStrengths.length ? patterns.repeatedStrengths.map(r => `- **${r.task}**: ${r.wins} clean wins across ${r.agents} agent(s) (${r.issues.join(', ')}${r.issuesTotal > r.issues.length ? `, +${r.issuesTotal - r.issues.length} more` : ''})`).join('\n') : null,
     !patterns.workedAspects.length && !patterns.repeatedStrengths.length ? '- _No repeated strong pattern surfaced today._' : null,
   ].filter(Boolean).join('\n');
 
@@ -277,7 +335,7 @@ function renderBody(s) {
 
   return `# Cross-Project Synthesis — ${date}
 
-_SGI Loop E · distilled from ${counts.inputs} signal record(s) dated ${date} (${counts.retros} retro, ${counts.toolGaps} tool-gap, ${counts.scorecards} scorecard, ${counts.adjusted} cost-adjusted, ${counts.efficiency} efficiency).${counts.inputs === 0 ? ' No fresh signals today — sections reflect standing state only.' : ''}_
+_SGI Loop E · distilled from ${counts.inputs} signal record(s) dated ${date} (${counts.retros} retro, ${counts.toolGaps} tool-gap, ${counts.scorecards} scorecard, ${counts.adjusted} cost-adjusted, ${counts.efficiency} efficiency); scanned ${counts.pagesScanned ?? '?'} page(s) of memory${counts.scanTruncated ? ' — **scan hit the page cap, coverage incomplete**' : ''}.${counts.inputs === 0 ? ' No fresh signals today — sections reflect standing state only.' : ''}_
 
 ## 1. Recurring failure modes
 ${fail}
@@ -299,7 +357,8 @@ ${deltaInfo.lines.map(l => `- ${l}`).join('\n')}
 
 async function main() {
   API_URL = await resolveApiBase();
-  const all = await fetchRecords();
+  const scan = await fetchRecords();
+  const all = scan.records;
   const today = all.filter(r => dayOf(r) === TARGET_DATE && cat(r) !== 'synthesis');
 
   const failures = recurringFailureModes(today);
@@ -308,7 +367,7 @@ async function main() {
   const prev = findPreviousSynthesis(all);
 
   const counts = {
-    retros: today.filter(r => cat(r) === 'retrospective').length,
+    retros: today.filter(r => isRetro(r)).length,
     toolGaps: today.filter(r => cat(r) === 'tool_gap').length,
     scorecards: today.filter(r => cat(r) === 'performance_scorecard').length,
     adjusted: today.filter(r => cat(r) === 'scorecard_adjusted').length,
@@ -316,6 +375,8 @@ async function main() {
   };
   counts.inputs = counts.retros + counts.toolGaps + counts.scorecards + counts.adjusted + counts.efficiency;
   counts.scanned = today.length;
+  counts.pagesScanned = scan.pages;
+  counts.scanTruncated = scan.truncated;
 
   const metrics = {
     failureModes: failures.length,
@@ -336,7 +397,7 @@ async function main() {
     generated_at: new Date().toISOString(),
     metrics,
     inputs: counts,
-    failure_modes: failures.map(f => ({ label: f.label, count: f.count, recurring: f.recurring })),
+    failure_modes: failures.slice(0, 60).map(f => ({ label: f.label, count: f.count, recurring: f.recurring })),
     cost_outliers: cost.projectOutliers,
     prev_synthesis_date: deltaInfo.prevDate || null,
   };
@@ -351,12 +412,30 @@ async function main() {
   const captured = await captureSynthesis(title, body, metadata);
   const recordId = captured && captured.record && captured.record.id;
 
+  // Capture is insert-only, so a re-run (backfill, retry after a failed
+  // heartbeat) would leave two live records for the same day and the board
+  // would not know which one is canonical. `synthesis` is agent-mutable
+  // (AUR-3072), so retire our own earlier copies of this exact title.
+  const superseded = [];
+  for (const r of all) {
+    if (r.title !== title || !r.id || r.id === recordId || cat(r) !== 'synthesis') continue;
+    try {
+      await apiFetch(`/api/companies/${COMPANY_ID}/memory/records/${r.id}/revoke-own`, {
+        method: 'POST',
+        body: JSON.stringify({ reason: `superseded by a later ${title} synthesis run` }),
+      });
+      superseded.push(r.id);
+    } catch (err) {
+      console.error(`[loop-e] could not revoke superseded ${r.id}: ${err.message}`);
+    }
+  }
+
   if (TASK_ID) {
     const link = recordId ? ` (memory record \`${recordId}\`)` : '';
     await postComment(TASK_ID, `## SGI Loop E — Nightly Cross-Project Synthesis\n\nWrote \`${title}\`${link}, category \`synthesis\` (auto-accepted).\n\n- Recurring failure modes: **${metrics.failureModes}**\n- Strong patterns: **${metrics.strongPatterns}**\n- Cost outlier projects: **${metrics.costOutliers}**\n- Inputs synthesized: ${counts.inputs} (${counts.retros} retro · ${counts.toolGaps} tool-gap · ${counts.scorecards} scorecard · ${counts.adjusted} cost-adjusted)\n- Delta basis: ${deltaInfo.prevDate ? `prior synthesis ${deltaInfo.prevDate}` : 'baseline (no prior synthesis)'}\n\n<details><summary>Synthesis record</summary>\n\n${body}\n</details>`);
   }
 
-  return { title, recordId, metrics, counts };
+  return { title, recordId, supersededRecordIds: superseded, metrics, counts };
 }
 
 main().then(result => {

@@ -3,7 +3,15 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, pruneOldBackups, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import {
+  BackupProducerConflictError,
+  createBufferedTextFileWriter,
+  emergencyPruneBackups,
+  getNewestBackupAgeMs,
+  pruneOldBackups,
+  runDatabaseBackup,
+  runDatabaseRestore,
+} from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -74,6 +82,91 @@ describe("createBufferedTextFileWriter", () => {
 });
 
 describeEmbeddedPostgres("runDatabaseBackup", () => {
+  it(
+    "round-trips the production COPY-format dump without psql (AUR-4035 DoD 4)",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const restoreConnectionString = await createSiblingDatabase(
+        sourceConnectionString,
+        "paperclip_copy_restore_target",
+      );
+      const backupDir = createTempDir("paperclip-db-copy-backup-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+      const restoreSql = postgres(restoreConnectionString, { max: 1, onnotice: () => {} });
+
+      // Force the exact production configuration regardless of host tooling:
+      // pg_dump unavailable → JS engine emits COPY blocks; psql unavailable →
+      // restore must go through the driver's copy-in path.
+      const savedPgDumpPath = process.env.PAPERCLIP_PG_DUMP_PATH;
+      const savedPsqlPath = process.env.PAPERCLIP_PSQL_PATH;
+      process.env.PAPERCLIP_PG_DUMP_PATH = "/nonexistent/pg_dump";
+      process.env.PAPERCLIP_PSQL_PATH = "/nonexistent/psql";
+      cleanups.push(() => {
+        if (savedPgDumpPath === undefined) delete process.env.PAPERCLIP_PG_DUMP_PATH;
+        else process.env.PAPERCLIP_PG_DUMP_PATH = savedPgDumpPath;
+        if (savedPsqlPath === undefined) delete process.env.PAPERCLIP_PSQL_PATH;
+        else process.env.PAPERCLIP_PSQL_PATH = savedPsqlPath;
+      });
+
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."copy_roundtrip_test" (
+            "id" serial PRIMARY KEY,
+            "label" text NOT NULL,
+            "tricky" text
+          );
+        `);
+        // Values that exercise COPY text-format escaping
+        await sourceSql`
+          INSERT INTO "public"."copy_roundtrip_test" ("label", "tricky") VALUES
+            ('plain', 'hello'),
+            ('tab', ${"a\tb"}),
+            ('newline', ${"line1\nline2"}),
+            ('backslash', ${"back\\slash and \\."}),
+            ('null-value', ${null})
+        `;
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-copy-test",
+          // engine "auto" — the pg_dump attempt fails, falling back to the JS
+          // engine, which uses COPY blocks when no transforms are configured
+        });
+
+        // Control: this dump really is COPY-format. Without it the test would
+        // silently regress to the INSERT path and stop guarding anything.
+        const zlib = await import("node:zlib");
+        const dumpText = zlib.gunzipSync(fs.readFileSync(result.backupFile)).toString("utf8");
+        expect(dumpText).toContain("FROM stdin;");
+        expect(dumpText).not.toContain("INSERT INTO \"public\".\"copy_roundtrip_test\"");
+
+        await runDatabaseRestore({
+          connectionString: restoreConnectionString,
+          backupFile: result.backupFile,
+        });
+
+        const rows = await restoreSql.unsafe<{ label: string; tricky: string | null }[]>(`
+          SELECT "label", "tricky"
+          FROM "public"."copy_roundtrip_test"
+          ORDER BY "id"
+        `);
+        expect(rows).toEqual([
+          { label: "plain", tricky: "hello" },
+          { label: "tab", tricky: "a\tb" },
+          { label: "newline", tricky: "line1\nline2" },
+          { label: "backslash", tricky: "back\\slash and \\." },
+          { label: "null-value", tricky: null },
+        ]);
+      } finally {
+        await sourceSql.end();
+        await restoreSql.end();
+      }
+    },
+    20_000,
+  );
+
   it(
     "backs up and restores large table payloads without materializing one giant string",
     async () => {
@@ -501,6 +594,57 @@ describe("pruneOldBackups — retention logic", () => {
     expect(remaining.some((f) => f.includes(keyPart(timestamps[0]!.iso)))).toBe(true);
   });
 
+  it("byte cap eviction is tier-aware: hourly bulk dies first, daily/weekly/monthly anchors survive (AUR-4035)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-prune-tiercap-"));
+    cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+    const MB = 1024 * 1024;
+    const now = Date.now();
+    const HOUR = 60 * 60 * 1000;
+    const DAY = 24 * HOUR;
+    const at = (agoMs: number) => ({ iso: new Date(now - agoMs).toISOString(), sizeBytes: 10 * MB });
+    const fileNameFor = (agoMs: number) => {
+      const safe = new Date(now - agoMs).toISOString().replace(/[:-]/g, "").replace("T", "-").slice(0, 15);
+      return `pc-${safe}.sql.gz`;
+    };
+
+    // 8 hourly near-duplicates + the DR ladder: 3 daily, 2 weekly, 1 monthly anchors
+    const hourlyAgos = Array.from({ length: 8 }, (_, i) => i * HOUR);
+    const anchorAgos = [2 * DAY, 3 * DAY, 4 * DAY, 10 * DAY, 17 * DAY, 35 * DAY];
+    createBackupFiles(dir, "pc", [...hourlyAgos, ...anchorAgos].map(at));
+
+    const measure = () =>
+      listBackupFiles(dir, "pc").reduce((sum, f) => sum + fs.statSync(path.join(dir, f)).size, 0);
+    // Control: the saturation the cap must resolve actually exists (14 × 10 MiB > 80 MiB cap)
+    expect(measure()).toBe(140 * MB);
+
+    const result = pruneOldBackups(dir, {
+      dailyDays: 7,
+      weeklyWeeks: 4,
+      monthlyMonths: 3,
+      hourlyCount: 8,
+      maxBytes: 80 * MB,
+    }, "pc");
+
+    // Bytes actually left the disk, and the result reports them accurately
+    const afterBytes = measure();
+    expect(afterBytes).toBe(80 * MB);
+    expect(result.prunedBytes).toBe(60 * MB);
+    expect(result.prunedCount).toBe(6);
+    expect(result.keptBytes).toBe(afterBytes);
+    // Every DR anchor survived: the cap drained the hourly tier instead.
+    // (The pre-AUR-4035 oldest-first eviction deleted exactly these six.)
+    for (const ago of anchorAgos) {
+      expect(fs.existsSync(path.join(dir, fileNameFor(ago)))).toBe(true);
+    }
+    // The evicted mass is the oldest hourlies; the newest two hourlies remain
+    expect(fs.existsSync(path.join(dir, fileNameFor(0)))).toBe(true);
+    expect(fs.existsSync(path.join(dir, fileNameFor(1 * HOUR)))).toBe(true);
+    for (const ago of hourlyAgos.slice(2)) {
+      expect(fs.existsSync(path.join(dir, fileNameFor(ago)))).toBe(false);
+    }
+  });
+
   it("tier fall-through: daily → weekly → monthly; nothing survives beyond monthlyMonths", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-prune-tiers-"));
     cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -530,5 +674,163 @@ describe("pruneOldBackups — retention logic", () => {
       return ts !== undefined && new Date(ts.iso).getTime() < cutoffMs;
     });
     expect(tooOld.length).toBe(0);
+  });
+});
+
+describe("emergencyPruneBackups — disk-pressure remediation (AUR-4035 defect 3)", () => {
+  it("frees measured disk bytes from a dir the normal prune cannot shrink", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-emergency-"));
+    cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+    const MB = 1024 * 1024;
+    const HOUR = 60 * 60 * 1000;
+    const now = Date.now();
+    // The incident shape: 23 hourly dumps, retention whose hourly tier wants
+    // them all and whose byte cap they fit under.
+    const timestamps = Array.from({ length: 23 }, (_, i) => ({
+      iso: new Date(now - i * HOUR).toISOString(),
+      sizeBytes: 10 * MB,
+    }));
+    createBackupFiles(dir, "pc", timestamps);
+    const incidentRetention = {
+      dailyDays: 7,
+      weeklyWeeks: 4,
+      monthlyMonths: 1,
+      hourlyCount: 48,
+      maxBytes: 240 * MB,
+    };
+    const measure = () =>
+      listBackupFiles(dir, "pc").reduce((sum, f) => sum + fs.statSync(path.join(dir, f)).size, 0);
+    expect(measure()).toBe(230 * MB);
+
+    // Control — reproduce the defect: the "next backup cycle" prune the old
+    // alert relied on frees nothing under this retention.
+    const noopResult = pruneOldBackups(dir, incidentRetention, "pc");
+    expect(noopResult.prunedCount).toBe(0);
+    expect(noopResult.prunedBytes).toBe(0);
+    expect(measure()).toBe(230 * MB);
+
+    // Fix: the emergency overlay collapses the hourly bulk and actually frees bytes.
+    const result = emergencyPruneBackups(dir, incidentRetention, "pc");
+    const afterBytes = measure();
+    expect(afterBytes).toBeLessThanOrEqual(40 * MB);
+    expect(result.prunedBytes).toBe(230 * MB - afterBytes);
+    expect(result.prunedBytes).toBeGreaterThanOrEqual(190 * MB);
+    expect(result.prunedCount).toBeGreaterThanOrEqual(19);
+    // The newest dump always survives an emergency prune
+    const newest = timestamps[0]!;
+    expect(listBackupFiles(dir, "pc").some((f) => f.includes(keyPart(newest.iso)))).toBe(true);
+  });
+});
+
+describe("duplicate-producer guards (AUR-4035 defect 2)", () => {
+  const MB = 1024 * 1024;
+  // Nothing listens on port 1; guard checks must fire before any connection.
+  const unreachableConnectionString = "postgres://paperclip:paperclip@127.0.0.1:1/paperclip";
+  const retention = { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 };
+
+  it("getNewestBackupAgeMs reports the newest matching dump and null when none exists", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-newest-age-"));
+    cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+    expect(getNewestBackupAgeMs(dir, "pc")).toBeNull();
+    expect(getNewestBackupAgeMs(path.join(dir, "missing"), "pc")).toBeNull();
+
+    const now = Date.now();
+    createBackupFiles(dir, "pc", [
+      { iso: new Date(now - 2 * 60 * 60 * 1000).toISOString() },
+      { iso: new Date(now - 30 * 60 * 1000).toISOString() },
+    ]);
+    // A non-matching prefix must not count
+    fs.writeFileSync(path.join(dir, "other-20260101-000000.sql.gz"), Buffer.alloc(16));
+
+    const ageMs = getNewestBackupAgeMs(dir, "pc", now);
+    expect(ageMs).not.toBeNull();
+    expect(ageMs!).toBeGreaterThanOrEqual(29 * 60 * 1000);
+    expect(ageMs!).toBeLessThanOrEqual(31 * 60 * 1000);
+    expect(getNewestBackupAgeMs(dir, "other", now)).toBeLessThanOrEqual(1000);
+  });
+
+  it("refuses a dump when the newest backup is inside the min spacing window", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-minspacing-"));
+    cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+    createBackupFiles(dir, "pc", [
+      { iso: new Date(Date.now() - 2 * 60 * 1000).toISOString(), sizeBytes: 1 * MB },
+    ]);
+    const before = listBackupFiles(dir, "pc");
+
+    const err = await runDatabaseBackup({
+      connectionString: unreachableConnectionString,
+      backupDir: dir,
+      retention,
+      filenamePrefix: "pc",
+      minIntervalMs: 55 * 60 * 1000,
+      connectTimeoutSeconds: 1,
+    }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    expect(err).toBeInstanceOf(BackupProducerConflictError);
+    expect((err as BackupProducerConflictError).reason).toBe("recent_backup");
+    // Guard fired before any file was created or deleted
+    expect(listBackupFiles(dir, "pc")).toEqual(before);
+    expect(fs.existsSync(path.join(dir, ".pc-backup.lock"))).toBe(false);
+  });
+
+  it("refuses a dump while a live producer holds the cross-process lock", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-lockheld-"));
+    cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+    const lockPath = path.join(dir, ".pc-backup.lock");
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+
+    const err = await runDatabaseBackup({
+      connectionString: unreachableConnectionString,
+      backupDir: dir,
+      retention,
+      filenamePrefix: "pc",
+      connectTimeoutSeconds: 1,
+    }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    expect(err).toBeInstanceOf(BackupProducerConflictError);
+    expect((err as BackupProducerConflictError).reason).toBe("lock_held");
+    // The loser must not delete the holder's lock
+    expect(fs.existsSync(lockPath)).toBe(true);
+  });
+
+  it("breaks a stale lock (dead pid) and releases its own lock even on failure", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-lockstale-"));
+    cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+    const { spawnSync } = await import("node:child_process");
+    const deadPid = spawnSync("true").pid;
+    expect(deadPid).toBeGreaterThan(0);
+
+    const lockPath = path.join(dir, ".pc-backup.lock");
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: deadPid, startedAt: new Date().toISOString() }));
+
+    const err = await runDatabaseBackup({
+      connectionString: unreachableConnectionString,
+      backupDir: dir,
+      retention,
+      filenamePrefix: "pc",
+      connectTimeoutSeconds: 1,
+    }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    // The stale lock was broken: the run got past the guard and failed on the
+    // (unreachable) database instead of on the producer conflict.
+    expect(err).not.toBeNull();
+    expect(err).not.toBeInstanceOf(BackupProducerConflictError);
+    // And the lock taken for the failed run was released
+    expect(fs.existsSync(lockPath)).toBe(false);
+    expect(listBackupFiles(dir, "pc")).toEqual([]);
   });
 });

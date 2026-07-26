@@ -18,6 +18,8 @@ import {
   reconcilePendingMigrationHistory,
   formatDatabaseBackupResult,
   runDatabaseBackup,
+  emergencyPruneBackups,
+  BackupProducerConflictError,
   authUsers,
   companies,
   companyMemberships,
@@ -557,11 +559,22 @@ export async function startServer(): Promise<StartedServer> {
       const generalSettings = await backupSettingsSvc.getGeneral();
       const retention = generalSettings.backupRetention;
 
+      // AUR-4035 duplicate-producer guard: scheduled dumps keep minimum
+      // spacing to the newest existing dump regardless of which process wrote
+      // it, so a second scheduler (stray server process, restart-shifted
+      // interval) cannot double backup volume. Manual backups skip the
+      // spacing check but still contend on the cross-process producer lock.
+      const scheduledMinIntervalMs = Math.max(
+        0,
+        config.databaseBackupIntervalMinutes * 60 * 1000 - 5 * 60 * 1000,
+      );
+
       const result = await runDatabaseBackup({
         connectionString: activeDatabaseConnectionString,
         backupDir: config.databaseBackupDir,
         retention,
         filenamePrefix: "paperclip",
+        minIntervalMs: trigger === "scheduled" ? scheduledMinIntervalMs : undefined,
       });
       const finishedAt = new Date();
       const response: InstanceDatabaseBackupRunResult = {
@@ -587,6 +600,16 @@ export async function startServer(): Promise<StartedServer> {
       );
       return response;
     } catch (err) {
+      if (err instanceof BackupProducerConflictError) {
+        if (trigger === "scheduled") {
+          logger.warn(
+            { reason: err.reason, backupDir: config.databaseBackupDir },
+            `Skipping scheduled database backup: ${err.message}`,
+          );
+          return null;
+        }
+        throw conflict(`Database backup refused: ${err.message}`);
+      }
       logger.error({ err, backupDir: config.databaseBackupDir, trigger }, `${label} database backup failed`);
       throw err;
     } finally {
@@ -685,7 +708,7 @@ export async function startServer(): Promise<StartedServer> {
   }
 
   if (config.heartbeatSchedulerEnabled) {
-    const { isDiskPressureActive, updateDiskPressure, shouldFireCeoAlert, checkDisk, formatDiskReport, getArtifactDirFootprints } = await import("./services/disk-monitor.js");
+    const { isDiskPressureActive, updateDiskPressure, shouldFireCeoAlert, checkDisk, formatDiskReport, getArtifactDirFootprints, getBackupDirStats } = await import("./services/disk-monitor.js");
     const {
       runArtifactRetention,
       formatArtifactRetentionReport,
@@ -730,39 +753,67 @@ export async function startServer(): Promise<StartedServer> {
 
     setInterval(() => {
       const result = updateDiskPressure(config.databaseBackupDir, config.databaseBackupDir);
-      // On disk pressure, run artifact-retention alongside backup pruning.
-      // Active deletion stays gated on `activeDirs` being explicitly populated
-      // by the operator (AUR-1722 hard safety gate).
+      // On disk pressure: emergency-prune backups, run artifact-retention, then
+      // alert with the MEASURED outcome. Before AUR-4035 the alert claimed
+      // "Emergency backup pruning triggered on next backup cycle" while no code
+      // path pruned anything — remediation reported, none performed.
       if (result.act) {
+        const fireCeoAlert = shouldFireCeoAlert();
         void (async () => {
-          const artifactRetentionConfig = await loadArtifactRetentionConfig();
-          if (!artifactRetentionConfig.enabled) return;
+          let emergencyPruneLine: string;
           try {
-            const artifactReport = runArtifactRetention(artifactRetentionConfig, {
-              dryRun: artifactRetentionConfig.activeDirs.length === 0,
-              diskPressureActive: true,
-            });
-            logger.warn(
-              {
-                reclaimableBytes: artifactReport.totalReclaimableBytes,
-                reclaimedBytes: artifactReport.totalReclaimedBytes,
-                dirs: artifactReport.dirs.length,
-              },
-              `artifact-retention pressure pass:\n${formatArtifactRetentionReport(artifactReport)}`,
-            );
+            const generalSettings = await backupSettingsSvc.getGeneral();
+            const prune = emergencyPruneBackups(config.databaseBackupDir, generalSettings.backupRetention, "paperclip");
+            const after = getBackupDirStats(config.databaseBackupDir);
+            const freedMb = (prune.prunedBytes / (1024 ** 2)).toFixed(1);
+            const dirMb = (after.totalSizeBytes / (1024 ** 2)).toFixed(1);
+            emergencyPruneLine = prune.prunedCount > 0
+              ? `- Emergency backup prune freed ${freedMb} MiB (${prune.prunedCount} dump(s) deleted; backup dir now ${dirMb} MiB, ${after.fileCount} file(s))`
+              : `- Emergency backup prune freed 0 B — backup dir already minimal (${dirMb} MiB, ${after.fileCount} file(s)); disk growth is elsewhere`;
+            if (prune.prunedCount > 0) {
+              logger.warn(
+                { prunedCount: prune.prunedCount, prunedBytes: prune.prunedBytes, backupDirBytes: after.totalSizeBytes },
+                "disk-monitor: emergency backup prune freed space",
+              );
+            }
           } catch (err) {
-            logger.warn({ err }, "artifact-retention: pressure pass failed");
+            emergencyPruneLine = "- Emergency backup prune FAILED — see server log; manual pruning required";
+            logger.error({ err }, "disk-monitor: emergency backup prune failed");
           }
-        })();
-      }
-      if (result.act && shouldFireCeoAlert()) {
-        void (async () => {
+
+          // Artifact retention pressure pass. Active deletion stays gated on
+          // `activeDirs` being explicitly populated by the operator (AUR-1722
+          // hard safety gate).
+          const artifactRetentionConfig = await loadArtifactRetentionConfig();
+          if (artifactRetentionConfig.enabled) {
+            try {
+              const artifactReport = runArtifactRetention(artifactRetentionConfig, {
+                dryRun: artifactRetentionConfig.activeDirs.length === 0,
+                diskPressureActive: true,
+              });
+              logger.warn(
+                {
+                  reclaimableBytes: artifactReport.totalReclaimableBytes,
+                  reclaimedBytes: artifactReport.totalReclaimedBytes,
+                  dirs: artifactReport.dirs.length,
+                },
+                `artifact-retention pressure pass:\n${formatArtifactRetentionReport(artifactReport)}`,
+              );
+            } catch (err) {
+              logger.warn({ err }, "artifact-retention: pressure pass failed");
+            }
+          }
+
+          if (!fireCeoAlert) return;
           try {
             const companyId = await getFirstCompanyId();
             if (companyId) {
+              // Re-measure after remediation so the alert reports the state a
+              // responder will actually find.
+              const postRemediation = checkDisk(config.databaseBackupDir, config.databaseBackupDir);
               await issuesSvc.create(companyId, {
                 title: `[DISK ALERT] Disk usage critical: ${result.diskStats.usedPercent.toFixed(1)}%`,
-                description: `## Disk High-Water-Mark Alert\n\nDisk usage has reached **${result.diskStats.usedPercent.toFixed(1)}%** (≥${result.thresholds.actPercent}% act threshold).\n\n${formatDiskReport(result)}\n\nImmediate actions taken:\n- Non-critical run admission throttled until disk recovers\n- Emergency backup pruning triggered on next backup cycle\n\nManual action may be needed to free disk space.`,
+                description: `## Disk High-Water-Mark Alert\n\nDisk usage has reached **${result.diskStats.usedPercent.toFixed(1)}%** (≥${result.thresholds.actPercent}% act threshold).\n\nAt detection: ${formatDiskReport(result)}\nAfter remediation: ${formatDiskReport(postRemediation)}\n\nImmediate actions taken:\n- Non-critical run admission throttled until disk recovers\n${emergencyPruneLine}\n\nManual action may be needed to free disk space.`,
                 status: "todo",
                 priority: "critical",
                 assigneeAgentId: CEO_AGENT_ID,

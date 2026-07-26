@@ -56,7 +56,10 @@ if [[ -e "$RELEASE" ]]; then
     echo "release $RELEASE already exists (use --force to rebuild)" >&2
     exit 1
   fi
-  # AUR-4134: --force must hard-fail against a release something is running.
+  # AUR-4134: --force must hard-fail against a release that is running, is
+  # `current`, or is `previous`. The guard owns that set — do not restate it
+  # here, because a comment claiming a narrower policy than the code enforces
+  # is exactly what let the original gap through review (AUR-4127).
   assert_deletable "$APP_ROOT" "$RELEASE" || exit 1
   $PAPERCLIP_DEPLOY_RM "$RELEASE"
 fi

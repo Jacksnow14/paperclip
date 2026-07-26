@@ -1,8 +1,16 @@
+import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { agents, createDb, companies, memoryBindings, memoryLocalRecords, memoryOperations, projects } from "@paperclipai/db";
+import { eq } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { errorHandler } from "../middleware/index.js";
 import { memoryRoutes } from "../routes/memory.js";
+import { memoryService as actualMemoryService } from "../services/memory.js";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
 
 const companyA = "11111111-1111-4111-8111-111111111111";
 const companyB = "22222222-2222-4222-8222-222222222222";
@@ -70,6 +78,15 @@ function createApp(actor: Record<string, unknown>) {
   app.use("/api", memoryRoutes({} as any));
   app.use(errorHandler);
   return app;
+}
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+if (!embeddedPostgresSupport.supported) {
+  console.warn(
+    `Skipping embedded Postgres memory route visibility tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
+  );
 }
 
 describe("memory routes", () => {
@@ -540,7 +557,7 @@ describe("memory routes", () => {
       expect(mockLogActivity).toHaveBeenCalledOnce();
     });
 
-    it("blocks a non-owner agent from updating the record", async () => {
+    it("blocks a non-owner agent from updating a non-shared record with owner details and alternatives", async () => {
       const otherAgent = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
       const app = createApp({ type: "agent", agentId: otherAgent, companyId: companyA });
 
@@ -549,7 +566,18 @@ describe("memory routes", () => {
         .send({ metadata: { status: "approved" } });
 
       expect(res.status).toBe(403);
-      expect(res.body).toEqual({ error: "Agent can only update memory records it owns" });
+      expect(res.body.error).toMatch(/non-shared memory records they do not own/i);
+      expect(res.body.error).toMatch(/ask the owner/i);
+      expect(res.body.details).toMatchObject({
+        category: "experiment",
+        ownerType: "agent",
+        ownerId: agentId,
+        ownerAgentId: agentId,
+        rule: "agent_non_owner_patch_disallowed",
+      });
+      expect(res.body.details.sharedContributorCategories).toEqual(
+        expect.arrayContaining(["lesson", "synthesis", "tool_gap"]),
+      );
       expect(mockMemoryService.agentUpdate).not.toHaveBeenCalled();
     });
 
@@ -597,18 +625,37 @@ describe("memory routes", () => {
       );
     });
 
-    it("blocks a non-owner agent from updating another agent's lesson record", async () => {
+    it("allows a non-owner agent to update another agent's lesson record via the shared contributor path", async () => {
       const otherAgent = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
       mockMemoryService.getRecord.mockResolvedValue(makeRecord({ metadata: { category: "lesson" } }));
+      mockMemoryService.agentUpdate.mockResolvedValue({
+        operation: { id: "op-update-lesson-2" },
+        record: makeRecord({ metadata: { category: "lesson" }, content: "attempted correction" }),
+      });
       const app = createApp({ type: "agent", agentId: otherAgent, companyId: companyA });
 
       const res = await request(app)
         .patch(`/api/companies/${companyA}/memory/records/${recordId}`)
         .send({ content: "attempted correction" });
 
-      expect(res.status).toBe(403);
-      expect(res.body).toEqual({ error: "Agent can only update memory records it owns" });
-      expect(mockMemoryService.agentUpdate).not.toHaveBeenCalled();
+      expect(res.status).toBe(200);
+      expect(mockMemoryService.agentUpdate).toHaveBeenCalledWith(
+        companyA,
+        recordId,
+        { content: "attempted correction" },
+        expect.objectContaining({ actorType: "agent", agentId: otherAgent }),
+      );
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "memory.updated",
+          details: expect.objectContaining({
+            contributorAmendment: true,
+            recordOwnerType: "agent",
+            recordOwnerId: agentId,
+          }),
+        }),
+      );
     });
 
     it("blocks an agent from updating a record with no category", async () => {
@@ -1055,6 +1102,195 @@ describe("memory routes", () => {
       expect(res.body.warnings).toEqual([]);
     });
 
+    it("returns a shared-category collision warning via an exact-title system probe", async () => {
+      const title = "lesson/false-zero-from-unvalidated-field-name";
+      mockMemoryService.capture.mockResolvedValue({
+        operation: { id: "op-2b", bindingId: bindingId, source: { kind: "issue" } },
+        records: [{
+          id: "ee100000-0000-4000-8000-000000000000",
+          title,
+          owner: { type: "agent", id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+          metadata: { category: "lesson" },
+          reviewState: "accepted",
+          scopeType: "org",
+          scope: {},
+        }],
+      });
+      mockMemoryService.listRecords.mockResolvedValue([
+        {
+          id: "ee100000-0000-4000-8000-000000000000",
+          title,
+          owner: { type: "agent", id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+          metadata: { category: "lesson" },
+          reviewState: "accepted",
+          scopeType: "org",
+          scope: {},
+        },
+        {
+          id: "cc680000-0000-4000-8000-000000000000",
+          title,
+          owner: { type: "agent", id: "371a1b08-0286-4a12-a516-f587f42df5eb" },
+          metadata: { category: "lesson" },
+          reviewState: "pending",
+          scopeType: "project",
+          scope: {},
+          sensitivityLabel: "internal",
+        },
+      ]);
+      const app = createApp({
+        type: "agent",
+        agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        companyId: companyA,
+      });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .send({ ...captureBody, title, metadata: { category: "lesson" } });
+
+      expect(res.status).toBe(201);
+      expect(mockMemoryService.listRecords).toHaveBeenCalledWith(
+        companyA,
+        { key: title, limit: 200 },
+        expect.objectContaining({ actorType: "system", actorId: "memory-capture-collision-probe" }),
+      );
+      expect(res.body.warnings.some((w: string) => w.includes("cc680000-0000-4000-8000-000000000000"))).toBe(true);
+      expect(res.body.warnings.some((w: string) => w.includes("371a1b08-0286-4a12-a516-f587f42df5eb"))).toBe(
+        true,
+      );
+      expect(res.body.warnings.some((w: string) => w.includes("PATCH the existing record"))).toBe(true);
+    });
+
+    it("returns an owner-keyed collision warning without suggesting PATCH", async () => {
+      const title = "routing/AUR-4147";
+      mockMemoryService.capture.mockResolvedValue({
+        operation: { id: "op-2c", bindingId: bindingId, source: { kind: "issue" } },
+        records: [{
+          id: "ee200000-0000-4000-8000-000000000000",
+          title,
+          owner: { type: "agent", id: "441a5729-1a2c-4f2e-83d4-1bdd65982872" },
+          metadata: { category: "routing_rationale" },
+          reviewState: "accepted",
+          scopeType: "org",
+          scope: {},
+        }],
+      });
+      mockMemoryService.listRecords.mockResolvedValue([
+        {
+          id: "ee200000-0000-4000-8000-000000000000",
+          title,
+          owner: { type: "agent", id: "441a5729-1a2c-4f2e-83d4-1bdd65982872" },
+          metadata: { category: "routing_rationale" },
+          reviewState: "accepted",
+          scopeType: "org",
+          scope: {},
+        },
+        {
+          id: "ceo-row-0000-4000-8000-000000000000",
+          title,
+          owner: { type: "agent", id: "3823a155-b4d4-4b06-b7d3-b3a55c6cbc1b" },
+          metadata: { category: "routing_rationale" },
+          reviewState: "accepted",
+          scopeType: "org",
+          scope: {},
+          sensitivityLabel: "internal",
+        },
+      ]);
+      const app = createApp({
+        type: "agent",
+        agentId: "441a5729-1a2c-4f2e-83d4-1bdd65982872",
+        companyId: companyA,
+      });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .send({ ...captureBody, title, metadata: { category: "routing_rationale" } });
+
+      expect(res.status).toBe(201);
+      expect(res.body.warnings.some((w: string) => w.includes("PATCH the existing record"))).toBe(false);
+      expect(res.body.warnings.some((w: string) => w.includes("Readers resolve routing/* by recency"))).toBe(true);
+    });
+
+    it("withholds collision details when the existing row is restricted", async () => {
+      const title = "lesson/restricted-collision";
+      mockMemoryService.capture.mockResolvedValue({
+        operation: { id: "op-2d", bindingId: bindingId, source: { kind: "issue" } },
+        records: [{
+          id: "ee300000-0000-4000-8000-000000000000",
+          title,
+          owner: { type: "agent", id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+          metadata: { category: "lesson" },
+          reviewState: "accepted",
+          scopeType: "org",
+          scope: {},
+        }],
+      });
+      mockMemoryService.listRecords.mockResolvedValue([
+        {
+          id: "ee300000-0000-4000-8000-000000000000",
+          title,
+          owner: { type: "agent", id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+          metadata: { category: "lesson" },
+          reviewState: "accepted",
+          scopeType: "org",
+          scope: {},
+        },
+        {
+          id: "restricted-row-0000-4000-8000-000000000000",
+          title,
+          owner: { type: "agent", id: "restricted-owner" },
+          metadata: { category: "lesson" },
+          reviewState: "accepted",
+          scopeType: "org",
+          scope: {},
+          sensitivityLabel: "restricted",
+        },
+      ]);
+      const app = createApp({
+        type: "agent",
+        agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        companyId: companyA,
+      });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .send({ ...captureBody, title, metadata: { category: "lesson" } });
+
+      expect(res.status).toBe(201);
+      expect(res.body.warnings.some((w: string) => /details withheld/i.test(w))).toBe(true);
+      expect(res.body.warnings.some((w: string) => w.includes("restricted-row-0000-4000-8000-000000000000"))).toBe(
+        false,
+      );
+    });
+
+    it("does not fail capture when the post-write collision lookup errors", async () => {
+      const title = "lesson/collision-check-failure";
+      mockMemoryService.capture.mockResolvedValue({
+        operation: { id: "op-2e", bindingId: bindingId, source: { kind: "issue" } },
+        records: [{
+          id: "ee400000-0000-4000-8000-000000000000",
+          title,
+          owner: { type: "agent", id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+          metadata: { category: "lesson" },
+          reviewState: "accepted",
+          scopeType: "org",
+          scope: {},
+        }],
+      });
+      mockMemoryService.listRecords.mockRejectedValue(new Error("transient db restart"));
+      const app = createApp({
+        type: "agent",
+        agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        companyId: companyA,
+      });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .send({ ...captureBody, title, metadata: { category: "lesson" } });
+
+      expect(res.status).toBe(201);
+      expect(res.body.warnings.some((w: string) => /collision check/i.test(w))).toBe(true);
+    });
+
     it("returns a warning when captured record is project-scoped", async () => {
       const projectId = "77777777-7777-4777-8777-777777777777";
       mockMemoryService.capture.mockResolvedValue({
@@ -1153,6 +1389,177 @@ describe("memory routes", () => {
 
       expect(res.status).toBe(201);
       expect(res.body.warnings).toEqual([]);
+    });
+  });
+
+  describeEmbeddedPostgres("POST /companies/:companyId/memory/capture — collision detection uses real service visibility rules", () => {
+    let db!: ReturnType<typeof createDb>;
+    let realMemory!: ReturnType<typeof actualMemoryService>;
+    let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+    const bindingKey = "primary";
+    const ownerA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const ownerB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const projectId = "77777777-7777-4777-8777-777777777777";
+
+    beforeAll(async () => {
+      tempDb = await startEmbeddedPostgresTestDatabase("paperclip-memory-routes-");
+      db = createDb(tempDb.connectionString);
+      realMemory = actualMemoryService(db);
+    }, 20_000);
+
+    afterEach(async () => {
+      await db.delete(memoryLocalRecords);
+      await db.delete(memoryOperations);
+      await db.delete(memoryBindings);
+      await db.delete(projects);
+      await db.delete(agents);
+      await db.delete(companies);
+    });
+
+    afterAll(async () => {
+      await tempDb?.cleanup();
+    });
+
+    beforeEach(() => {
+      mockMemoryService.capture.mockImplementation((companyId, payload, actor) =>
+        realMemory.capture(companyId, payload, actor)
+      );
+      mockMemoryService.listRecords.mockImplementation((companyId, filters, actor) =>
+        realMemory.listRecords(companyId, filters, actor)
+      );
+    });
+
+    async function setUpCompanyWithBinding(options?: { projectId?: string }) {
+      const companyId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values([
+        {
+          id: ownerA,
+          companyId,
+          name: "Owner A",
+          role: "tester",
+          adapterType: "process",
+        },
+        {
+          id: ownerB,
+          companyId,
+          name: "Owner B",
+          role: "tester",
+          adapterType: "process",
+        },
+      ]);
+      if (options?.projectId) {
+        await db.insert(projects).values({
+          id: options.projectId,
+          companyId,
+          name: "Memory collision project",
+          status: "active",
+        });
+      }
+      await db.insert(memoryBindings).values({
+        id: randomUUID(),
+        companyId,
+        key: bindingKey,
+        name: "Primary",
+        providerKey: "local_basic",
+        config: {},
+        enabled: true,
+      });
+      return { companyId };
+    }
+
+    function agentActor(agentId: string) {
+      return {
+        actorType: "agent" as const,
+        actorId: agentId,
+        agentId,
+        userId: null,
+        runId: null,
+      };
+    }
+
+    it("warns on a pending cross-owner collision that the capturing agent cannot see directly", async () => {
+      const title = "lesson/false-zero-from-unvalidated-field-name";
+      const { companyId } = await setUpCompanyWithBinding();
+      const existing = await realMemory.capture(
+        companyId,
+        {
+          bindingKey,
+          source: { kind: "manual_note" as const },
+          title,
+          content: "Owner A lesson",
+          metadata: { category: "lesson" },
+        },
+        agentActor(ownerA),
+      );
+      await db.update(memoryLocalRecords).set({ reviewState: "pending" }).where(eq(memoryLocalRecords.id, existing.records[0].id));
+
+      const invisibleToCapturingAgent = await realMemory.listRecords(
+        companyId,
+        { key: title, limit: 200 },
+        agentActor(ownerB),
+      );
+      expect(invisibleToCapturingAgent).toHaveLength(0);
+
+      const app = createApp({ type: "agent", agentId: ownerB, companyId });
+      const res = await request(app)
+        .post(`/api/companies/${companyId}/memory/capture`)
+        .send({
+          bindingKey,
+          source: { kind: "manual_note" },
+          title,
+          content: "Owner B lesson",
+          metadata: { category: "lesson" },
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.warnings.some((w: string) => w.includes("reviewState=pending"))).toBe(true);
+      expect(res.body.warnings.some((w: string) => w.includes("PATCH the existing record"))).toBe(true);
+    });
+
+    it("warns on a project-scoped cross-owner collision that the capturing agent cannot see directly", async () => {
+      const title = "lesson/project-scoped-shadow";
+      const { companyId } = await setUpCompanyWithBinding({ projectId });
+      await realMemory.capture(
+        companyId,
+        {
+          bindingKey,
+          source: { kind: "manual_note" as const },
+          title,
+          content: "Owner A project lesson",
+          scope: { projectId },
+          metadata: { category: "lesson" },
+        },
+        agentActor(ownerA),
+      );
+
+      const invisibleToCapturingAgent = await realMemory.listRecords(
+        companyId,
+        { key: title, limit: 200 },
+        agentActor(ownerB),
+      );
+      expect(invisibleToCapturingAgent).toHaveLength(0);
+
+      const app = createApp({ type: "agent", agentId: ownerB, companyId });
+      const res = await request(app)
+        .post(`/api/companies/${companyId}/memory/capture`)
+        .send({
+          bindingKey,
+          source: { kind: "manual_note" },
+          title,
+          content: "Owner B org lesson",
+          metadata: { category: "lesson" },
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.warnings.some((w: string) => w.includes("scopeType=project"))).toBe(true);
+      expect(res.body.warnings.some((w: string) => w.includes("PATCH the existing record"))).toBe(true);
     });
   });
 

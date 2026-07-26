@@ -63,6 +63,14 @@ describe("isClaudeTransientUpstreamError", () => {
     ).toBe(true);
   });
 
+  it("classifies the live 'session limit' wording as transient (AUR-4055)", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        errorMessage: "You've hit your session limit · resets 7:40pm (UTC)",
+      }),
+    ).toBe(true);
+  });
+
   it("does not classify login/auth failures as transient", () => {
     expect(
       isClaudeTransientUpstreamError({
@@ -119,5 +127,23 @@ describe("extractClaudeRetryNotBefore", () => {
     expect(
       extractClaudeRetryNotBefore({ errorMessage: "Overloaded. Try again later." }, new Date()),
     ).toBeNull();
+  });
+
+  it("parses the verbatim 'session limit' reset hint from AUR-4055 in UTC", () => {
+    const now = new Date("2026-07-25T19:00:00.000Z");
+    const extracted = extractClaudeRetryNotBefore(
+      { errorMessage: "You've hit your session limit · resets 7:40pm (UTC)" },
+      now,
+    );
+    expect(extracted?.toISOString()).toBe("2026-07-25T19:40:00.000Z");
+  });
+
+  it("rolls the verbatim 'session limit' reset hint to the next day once it has passed", () => {
+    const now = new Date("2026-07-25T23:33:19.399Z");
+    const extracted = extractClaudeRetryNotBefore(
+      { errorMessage: "You've hit your session limit · resets 12:40am (UTC)" },
+      now,
+    );
+    expect(extracted?.toISOString()).toBe("2026-07-26T00:40:00.000Z");
   });
 });

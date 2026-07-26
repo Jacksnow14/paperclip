@@ -148,11 +148,18 @@ export type IssueBlockerAttentionReason =
   | "active_dependency"
   | "stalled_review"
   | "attention_required"
+  | "cancelled_blocker"
   | null;
 
 export interface IssueBlockerAttention {
   state: IssueBlockerAttentionState;
   reason: IssueBlockerAttentionReason;
+  // Deliberately NOT renamed to `unresolvedDependencyCount` (CTO review on PR #112,
+  // AUR-3959): the count unions explicit `blocks` relations and direct child issues,
+  // while `blockedBy` on the issue itself reports only explicit relations. That
+  // asymmetry is real and worth naming precisely, but a cross-package rename
+  // (packages/shared, server, ui) is separate, larger-blast-radius work from the
+  // cancelled-blocker fix this field sits in — tracked, not silently deferred.
   unresolvedBlockerCount: number;
   coveredBlockerCount: number;
   stalledBlockerCount: number;
@@ -233,7 +240,8 @@ export interface IssueBlockedInboxAttention {
 export type IssueProductivityReviewTrigger =
   | "no_comment_streak"
   | "long_active_duration"
-  | "high_churn";
+  | "high_churn"
+  | "stalled_active_episode";
 
 export interface IssueProductivityReview {
   reviewIssueId: string;

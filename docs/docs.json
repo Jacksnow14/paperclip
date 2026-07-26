@@ -91,7 +91,8 @@
             "group": "Runbooks",
             "pages": [
               "runbooks/process-lost-and-oom",
-              "runbooks/production-deploy"
+              "runbooks/production-deploy",
+              "runbooks/agent-privilege-model"
             ]
           }
         ]

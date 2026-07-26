@@ -336,6 +336,9 @@ export interface MemoryQueryResult {
 export interface MemoryCaptureResult {
   operation: MemoryOperation;
   records: MemoryRecord[];
+  // True when this capture matched an existing record (idempotencyKey replay, upsert-by-title,
+  // or the tool_gap dedup window) and no new record was created.
+  dedup?: boolean;
 }
 
 export interface MemoryForgetResult {

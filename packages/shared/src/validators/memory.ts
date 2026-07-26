@@ -227,6 +227,12 @@ export const memoryCaptureSchema = z
     metadata: z.record(z.unknown()).optional(),
     reviewState: z.enum(MEMORY_REVIEW_STATES).optional(),
     upsert: z.boolean().optional().default(false),
+    // Opt-in exactly-once guard (AUR-4022): when set, a second capture with the same
+    // idempotencyKey + company returns the first record instead of creating a duplicate.
+    // Unlike `upsert` (which intentionally collapses same-title records into one bucket),
+    // this is scoped to a single caller-chosen key, so unrelated captures that happen to
+    // share a title are never affected.
+    idempotencyKey: z.string().trim().min(1).max(255).optional().nullable(),
   })
   .strict();
 

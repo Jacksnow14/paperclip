@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, inArray, or } from "drizzle-orm";
+import { and, eq, inArray, or } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -289,6 +289,38 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
     return runId;
   }
 
+  async function seedActiveQuotaPause(companyId: string, agentId: string, scheduledRetryAt: Date) {
+    const runId = randomUUID();
+    const wakeupRequestId = randomUUID();
+    const now = new Date();
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "transient_failure_retry",
+      payload: {},
+      status: "queued",
+      updatedAt: now,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "scheduled_retry",
+      wakeupRequestId,
+      scheduledRetryAt,
+      scheduledRetryReason: "transient_failure",
+      contextSnapshot: { transientRetryNotBefore: scheduledRetryAt.toISOString() },
+      updatedAt: now,
+      createdAt: now,
+    });
+    return runId;
+  }
+
   async function seedDeadRunningRun(companyId: string, agentId: string) {
     const runId = randomUUID();
     const wakeupRequestId = randomUUID();
@@ -378,6 +410,31 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
     expect(await heartbeat.startNextQueuedRunForAgent(agentC)).toHaveLength(1);
     expect((await heartbeat.getRun(runC))?.status).toBe("running");
   }, 20_000);
+
+  it("suppresses new run admission for an agent quota-paused until a parsed reset time (AUR-4055)", async () => {
+    const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4 });
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId);
+    const resetAt = new Date(Date.now() + 60 * 60 * 1000);
+    await seedActiveQuotaPause(companyId, agentId, resetAt);
+    const otherIssueRun = await seedQueuedRun(companyId, agentId);
+
+    // A different, independently-queued run for the same agent must not be
+    // admitted while a parsed quota reset time is still in the future — it
+    // would just burn another zero-token attempt into the same wall.
+    expect(await heartbeat.startNextQueuedRunForAgent(agentId)).toHaveLength(0);
+    expect((await heartbeat.getRun(otherIssueRun))?.status).toBe("queued");
+
+    // Once the reset time has passed, admission resumes without any manual
+    // clearing — the gate simply stops matching.
+    await db
+      .update(heartbeatRuns)
+      .set({ scheduledRetryAt: new Date(Date.now() - 1_000) })
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "scheduled_retry")));
+    hangAdapterUntilReleased();
+    expect(await heartbeat.startNextQueuedRunForAgent(agentId)).toHaveLength(1);
+    expect((await heartbeat.getRun(otherIssueRun))?.status).toBe("running");
+  });
 
   it("schedules process-lost retries with backoff and jitter instead of re-queueing them", async () => {
     const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4 });

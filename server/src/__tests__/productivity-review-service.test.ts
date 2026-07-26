@@ -362,11 +362,20 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(4);
   });
 
-  it("creates a long-active review without enabling a continuation hold", async () => {
+  it("creates a long-active review with non-zero recent activity, without enabling a continuation hold", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({
       status: "in_progress",
       startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    // One run in the last hour keeps the activity-rate axis non-zero, so this stays a
+    // long_active_duration review rather than being reclassified as a stall (AUR-4014).
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now,
     });
     const service = productivityReviewService(db);
 
@@ -381,8 +390,178 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.created).toBe(1);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    expect(review?.description).toContain("Activity rate in the last hour: non-zero");
     expect(review?.priority).toBe("medium");
     expect(hold.held).toBe(false);
+  });
+
+  // AUR-4014: long_active_duration fired on wall-clock episode age alone, so a genuinely dark
+  // issue (zero runs, zero assignee comments, zero active runs in the last hour) got the same
+  // churn-shaped "snooze / decompose / the work is inefficient" remedy menu as an issue that was
+  // still actively (if slowly) working. Regression tests for all four cells of the
+  // rate x episode-age table from the issue.
+  describe("AUR-4014 stall vs churn discrimination", () => {
+    it("fires stalled_active_episode (not long_active_duration) when episode age is long and recent activity is zero", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue({
+        status: "in_progress",
+        startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      });
+      const service = productivityReviewService(db);
+
+      const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+      const hold = await service.isProductivityReviewContinuationHoldActive({
+        companyId: seeded.companyId,
+        issueId: seeded.issueId,
+        agentId: seeded.coderId,
+        now,
+      });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `stalled_active_episode`");
+      expect(review?.description).toContain("stalled active episode");
+      expect(review?.description).toContain("Activity rate in the last hour: zero");
+      expect(review?.description).toContain("Wake the assignee agent to resume work");
+      expect(review?.description).not.toContain("Continue with a snooze window");
+      expect(review?.priority).toBe("high");
+      // Not a soft-stop: nothing is running to hold, and the remedy is to wake the assignee.
+      expect(hold.held).toBe(false);
+    });
+
+    it("fires nothing when episode age is short and recent activity is zero (between heartbeats)", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue({
+        status: "in_progress",
+        startedAt: new Date(now.getTime() - 30 * 60 * 1000),
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(0);
+      expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+    });
+
+    it("fires high_churn (not stalled_active_episode) when episode age is long and recent activity is high", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue({
+        status: "in_progress",
+        startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 10,
+        now,
+        withRunComments: true,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `high_churn`");
+    });
+
+    it("fires nothing when episode age is short and recent activity is high but below the churn threshold", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue({
+        status: "in_progress",
+        startedAt: new Date(now.getTime() - 30 * 60 * 1000),
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 3,
+        now,
+        withRunComments: true,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(0);
+      expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+    });
+
+    it("fires stalled_active_episode, not high_churn, when the 6h window is stale but the last hour is dark", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue({
+        status: "in_progress",
+        startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      });
+      // 30 runs land 65-94 minutes ago: inside the 6h churn window (so runCountLastSixHours alone
+      // would clear the high-churn threshold) but outside the 1h window entirely, so the last hour
+      // is completely dark. Before the AUR-4014 precedence fix, choosePrimaryTrigger checked
+      // highChurn before stalled, so this stale 6h burst would mislabel a currently-dark issue as
+      // churn -- the exact failure this trigger exists to prevent, just via the 6h path.
+      // withRunComments avoids also tripping no_comment_streak (which outranks stalled and would
+      // otherwise mask the precedence bug this test targets).
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 30,
+        now,
+        startIndex: 65,
+        withRunComments: true,
+      });
+      const service = productivityReviewService(db);
+
+      const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `stalled_active_episode`");
+      expect(review?.description).toContain("Activity rate in the last hour: zero");
+      expect(review?.description).toContain("Wake the assignee agent to resume work");
+      expect(review?.description).not.toContain("Continue with a snooze window");
+      // The stale 6h churn stats must not appear as a "reason" alongside a stall-shaped review --
+      // that would contradict the "this is a dark issue, not churn" text above it.
+      expect(review?.description).not.toContain("assignee-run comments in 1h; 30 runs");
+    });
+
+    it("does not label the evidence block as the stall axis when a non-stall trigger wins precedence", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      // The whole no-comment streak lands 65-74 minutes ago, so the last hour is completely dark
+      // (zeroRecentActivity === true) while `no_comment_streak` still wins precedence and carries
+      // the generic (churn-shaped) manager menu.
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+        startIndex: 65,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+      // The zero-rate measurement itself is still reported -- it is evidence either way ...
+      expect(review?.description).toContain("Activity rate in the last hour: zero");
+      // ... but the editorial "this is the stall axis" claim is gated on the resolved trigger,
+      // exactly like triggerReasons: asserting a stall axis directly above a churn-shaped remedy
+      // menu hands the manager the same mixed axis signal AUR-4014 exists to remove.
+      expect(review?.description).not.toContain("this is a stall axis");
+      expect(review?.description).toContain("Continue with a snooze window");
+    });
   });
 
   it("creates a high-churn review even when every sampled run has a progress comment", async () => {

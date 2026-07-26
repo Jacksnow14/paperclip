@@ -101,6 +101,28 @@ describe("StatusIcon", () => {
     expect(html).toContain("bg-cyan-600");
   });
 
+  it("surfaces cancelled-blocker remedy copy on the needs-attention visual (AUR-3956 Defect 2)", () => {
+    const html = renderToStaticMarkup(
+      <StatusIcon
+        status="blocked"
+        blockerAttention={{
+          state: "needs_attention",
+          reason: "cancelled_blocker",
+          unresolvedBlockerCount: 1,
+          coveredBlockerCount: 0,
+          stalledBlockerCount: 0,
+          attentionBlockerCount: 1,
+          sampleBlockerIdentifier: "PAP-9",
+          sampleStalledBlockerIdentifier: null,
+        }}
+      />,
+    );
+
+    expect(html).toContain('data-blocker-attention-state="needs_attention"');
+    expect(html).toContain('aria-label="Blocked · PAP-9 was cancelled — remove the relation or replace it"');
+    expect(html).toContain("border-red-600");
+  });
+
   it("renders stalled review chains with amber visual and stalled-leaf copy", () => {
     const html = renderToStaticMarkup(
       <StatusIcon

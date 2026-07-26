@@ -58,6 +58,13 @@ function blockedAttentionLabel(blockerAttention: IssueBlockerAttention | null | 
     return `Blocked · ${attentionCopy}`;
   }
 
+  if (blockerAttention.reason === "cancelled_blocker") {
+    const identifier = blockerAttention.sampleBlockerIdentifier;
+    return identifier
+      ? `Blocked · ${identifier} was cancelled — remove the relation or replace it`
+      : "Blocked · a blocker was cancelled — remove the relation or replace it";
+  }
+
   return "Blocked";
 }
 

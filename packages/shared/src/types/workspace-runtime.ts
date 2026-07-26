@@ -248,8 +248,11 @@ export interface WorkspaceRealizationRequest {
   issueId: string | null;
   heartbeatRunId: string;
   requestedMode: string | null;
+  // Persisted in workspace metadata; "project_workspace" is additive (rows written
+  // before it carry only the original three values, and still parse). No consumer
+  // treats this union as exhaustive, so widening it is safe.
   source: {
-    kind: "project_primary" | "task_session" | "agent_home";
+    kind: "project_primary" | "project_workspace" | "task_session" | "agent_home";
     localPath: string;
     projectId: string | null;
     projectWorkspaceId: string | null;

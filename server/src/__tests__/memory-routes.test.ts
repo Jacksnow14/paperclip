@@ -46,6 +46,7 @@ const mockProjectService = vi.hoisted(() => ({
 
 const mockIssueService = vi.hoisted(() => ({
   getByIdentifier: vi.fn(),
+  getById: vi.fn(),
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
@@ -100,6 +101,10 @@ describe("memory routes", () => {
       companyId: companyA,
       name: "Project A",
     });
+    // Default: resolve any id (identifier or UUID) back to itself in companyA.
+    // Tests exercising a specific resolution outcome (miss, cross-company, etc.)
+    // override with mockResolvedValueOnce.
+    mockIssueService.getById.mockImplementation(async (id: string) => ({ id, companyId: companyA }));
     mockLogActivity.mockResolvedValue(undefined);
   });
 
@@ -546,7 +551,7 @@ describe("memory routes", () => {
       expect(mockMemoryService.agentUpdate).not.toHaveBeenCalled();
     });
 
-    it("blocks an agent from updating a record with a non-allowlisted category", async () => {
+    it("blocks an agent from updating a record with a non-allowlisted category with an actionable 403 (AUR-4022)", async () => {
       mockMemoryService.getRecord.mockResolvedValue(makeRecord({ metadata: { category: "misc" } }));
       const app = createApp({ type: "agent", agentId, companyId: companyA });
 
@@ -555,7 +560,17 @@ describe("memory routes", () => {
         .send({ metadata: { status: "approved" } });
 
       expect(res.status).toBe(403);
+      // Names the category and states it's immutable, not a bare 403 (AUR-3938 regression:
+      // a silent-403 PATCH was mistaken for success and left a stale runbook live for ~6h).
       expect(res.body.error).toMatch(/misc/);
+      expect(res.body.error).toMatch(/immutable/i);
+      expect(res.body.error).toMatch(/capture a new record/i);
+      expect(res.body.details).toMatchObject({
+        category: "misc",
+        immutable: true,
+        supportedAlternative: "capture_new_record",
+      });
+      expect(res.body.details.agentMutableCategories).toEqual(expect.arrayContaining(["lesson", "experiment"]));
       expect(mockMemoryService.agentUpdate).not.toHaveBeenCalled();
     });
 
@@ -657,7 +672,7 @@ describe("memory routes", () => {
     };
 
     it("resolves AUR-NNNN to UUID before persisting", async () => {
-      mockIssueService.getByIdentifier.mockResolvedValue({ id: issueUuid, companyId: companyA });
+      mockIssueService.getById.mockResolvedValueOnce({ id: issueUuid, companyId: companyA });
       mockMemoryService.capture.mockResolvedValue(captureResult);
       const app = createApp(boardActor);
 
@@ -667,7 +682,7 @@ describe("memory routes", () => {
         .send(captureBody);
 
       expect(res.status).toBe(201);
-      expect(mockIssueService.getByIdentifier).toHaveBeenCalledWith("AUR-1234");
+      expect(mockIssueService.getById).toHaveBeenCalledWith("AUR-1234");
       expect(mockMemoryService.capture).toHaveBeenCalledWith(
         companyA,
         expect.objectContaining({ source: { kind: "issue", issueId: issueUuid } }),
@@ -675,7 +690,7 @@ describe("memory routes", () => {
       );
     });
 
-    it("passes through a valid UUID without extra lookup", async () => {
+    it("resolves a UUID-shaped issueId against the DB before persisting (AUR-3996: never trust shape alone)", async () => {
       mockMemoryService.capture.mockResolvedValue(captureResult);
       const app = createApp(boardActor);
 
@@ -685,7 +700,7 @@ describe("memory routes", () => {
         .send({ ...captureBody, source: { kind: "issue", issueId: issueUuid } });
 
       expect(res.status).toBe(201);
-      expect(mockIssueService.getByIdentifier).not.toHaveBeenCalled();
+      expect(mockIssueService.getById).toHaveBeenCalledWith(issueUuid);
       expect(mockMemoryService.capture).toHaveBeenCalledWith(
         companyA,
         expect.objectContaining({ source: { kind: "issue", issueId: issueUuid } }),
@@ -693,8 +708,24 @@ describe("memory routes", () => {
       );
     });
 
+    it("returns 422 for a fabricated UUID-shaped issueId that does not resolve to a real issue", async () => {
+      const fabricatedUuid = "10000000-f2f2-4f2f-8f2f-f2f2f2f2f2f2";
+      mockIssueService.getById.mockResolvedValueOnce(null);
+      const app = createApp(boardActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...captureBody, source: { kind: "issue", issueId: fabricatedUuid } });
+
+      expect(res.status).toBe(422);
+      expect(res.body.error).toMatch(new RegExp(fabricatedUuid));
+      expect(mockIssueService.getById).toHaveBeenCalledWith(fabricatedUuid);
+      expect(mockMemoryService.capture).not.toHaveBeenCalled();
+    });
+
     it("returns 422 for an unknown AUR-NNNN identifier", async () => {
-      mockIssueService.getByIdentifier.mockResolvedValue(null);
+      mockIssueService.getById.mockResolvedValueOnce(null);
       const app = createApp(boardActor);
 
       const res = await request(app)
@@ -708,7 +739,7 @@ describe("memory routes", () => {
     });
 
     it("returns 422 when the resolved issue belongs to a different company", async () => {
-      mockIssueService.getByIdentifier.mockResolvedValue({ id: issueUuid, companyId: companyB });
+      mockIssueService.getById.mockResolvedValueOnce({ id: issueUuid, companyId: companyB });
       const app = createApp(boardActor);
 
       const res = await request(app)
@@ -829,7 +860,7 @@ describe("memory routes", () => {
       expect(mockMemoryService.revoke).not.toHaveBeenCalled();
     });
 
-    it("returns 403 when agent tries to revoke its own record with off-allowlist category", async () => {
+    it("returns an actionable 403 when agent tries to revoke its own record with off-allowlist category (AUR-4022)", async () => {
       mockMemoryService.getRecord.mockResolvedValue(makeRoutingRecord({ metadata: { category: "misc" } }));
       const app = createApp({ type: "agent", agentId, companyId: companyA });
 
@@ -839,6 +870,13 @@ describe("memory routes", () => {
 
       expect(res.status).toBe(403);
       expect(res.body.error).toMatch(/misc/);
+      expect(res.body.error).toMatch(/immutable/i);
+      expect(res.body.error).toMatch(/capture a new record/i);
+      expect(res.body.details).toMatchObject({
+        category: "misc",
+        immutable: true,
+        supportedAlternative: "capture_new_record",
+      });
       expect(mockMemoryService.revoke).not.toHaveBeenCalled();
     });
 
@@ -1110,7 +1148,18 @@ describe("memory routes", () => {
       const res = await request(app)
         .post(`/api/companies/${companyA}/memory/capture`)
         .set("Origin", "http://localhost:3100")
-        .send({ ...baseBody, metadata: { category: "performance_scorecard", project_id: projectId } });
+        .send({
+          ...baseBody,
+          metadata: {
+            category: "performance_scorecard",
+            project_id: projectId,
+            issue_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            quality_signal: 4,
+            token_cost: 12000,
+            agent_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            task_type: "bug",
+          },
+        });
 
       expect(res.status).toBe(201);
       expect(mockMemoryService.capture).toHaveBeenCalledTimes(1);
@@ -1139,6 +1188,152 @@ describe("memory routes", () => {
 
       expect(res.status).toBe(201);
       expect(mockMemoryService.capture).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ── Part E: Scorecard integrity guard (AUR-3993/AUR-3996) ──────────────────
+
+  describe("POST /companies/:companyId/memory/capture — scorecard integrity guard", () => {
+    const scorecardBaseBody = {
+      source: { kind: "issue", issueId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" },
+      content: "Test capture content",
+    };
+    const scorecardCaptureResult = {
+      operation: { id: "op-scorecard-1", bindingId: bindingId, source: { kind: "issue" } },
+      records: [{ id: "ee000000-0000-4000-8000-000000000000", reviewState: "accepted", scopeType: "org", scope: {} }],
+    };
+    const validIssueUuid = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const agentActor = {
+      type: "agent",
+      agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: companyA,
+    };
+    const completeMetadata = {
+      category: "performance_scorecard",
+      issue_id: validIssueUuid,
+      quality_signal: 4,
+      token_cost: 12000,
+      agent_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      task_type: "bug",
+    };
+
+    it.each(["performance_scorecard", "scorecard_adjusted"])(
+      "returns 422 for category '%s' with an unresolvable issue_id (TEST-0)",
+      async (category) => {
+        mockIssueService.getById.mockResolvedValueOnce(null);
+        const app = createApp(agentActor);
+
+        const res = await request(app)
+          .post(`/api/companies/${companyA}/memory/capture`)
+          .set("Origin", "http://localhost:3100")
+          .send({ ...scorecardBaseBody, metadata: { ...completeMetadata, category, issue_id: "TEST-0" } });
+
+        expect(res.status).toBe(422);
+        expect(res.body.details.errors.some((e: string) => e.includes("TEST-0"))).toBe(true);
+        expect(mockMemoryService.capture).not.toHaveBeenCalled();
+      },
+    );
+
+    it("returns 422 for a UUID-shaped issue_id that does not resolve to a real issue (AUR-3996 CTO finding)", async () => {
+      const fabricatedUuid = "10000000-f2f2-4f2f-8f2f-f2f2f2f2f2f2";
+      mockIssueService.getById.mockResolvedValueOnce(null);
+      const app = createApp(agentActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...scorecardBaseBody, metadata: { ...completeMetadata, issue_id: fabricatedUuid } });
+
+      expect(res.status).toBe(422);
+      expect(res.body.details.errors.some((e: string) => e.includes(fabricatedUuid))).toBe(true);
+      expect(mockIssueService.getById).toHaveBeenCalledWith(fabricatedUuid);
+      expect(mockMemoryService.capture).not.toHaveBeenCalled();
+    });
+
+    it("returns 422 when metadata.issue_id is absent", async () => {
+      const app = createApp(agentActor);
+      const { issue_id: _omit, ...metadataWithoutIssueId } = completeMetadata;
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...scorecardBaseBody, metadata: metadataWithoutIssueId });
+
+      expect(res.status).toBe(422);
+      expect(res.body.details.errors.some((e: string) => e.includes("metadata.issue_id"))).toBe(true);
+      expect(mockMemoryService.capture).not.toHaveBeenCalled();
+    });
+
+    it.each(["quality_signal", "token_cost", "agent_id", "task_type"])(
+      "returns 422 when metadata.%s is absent",
+      async (field) => {
+        const app = createApp(agentActor);
+        const metadata: Record<string, unknown> = { ...completeMetadata };
+        delete metadata[field];
+
+        const res = await request(app)
+          .post(`/api/companies/${companyA}/memory/capture`)
+          .set("Origin", "http://localhost:3100")
+          .send({ ...scorecardBaseBody, metadata });
+
+        expect(res.status).toBe(422);
+        expect(res.body.details.errors.some((e: string) => e.includes(`metadata.${field}`))).toBe(true);
+        expect(mockMemoryService.capture).not.toHaveBeenCalled();
+      },
+    );
+
+    it("returns 422 when metadata.test_data is true, even with all required fields present", async () => {
+      const app = createApp(agentActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...scorecardBaseBody, metadata: { ...completeMetadata, test_data: true } });
+
+      expect(res.status).toBe(422);
+      expect(res.body.details.errors.some((e: string) => e.includes("test_data"))).toBe(true);
+      expect(mockMemoryService.capture).not.toHaveBeenCalled();
+    });
+
+    it("returns 201 for a scorecard with a real resolvable issue_id and all required fields", async () => {
+      mockIssueService.getById.mockResolvedValueOnce({ id: validIssueUuid, companyId: companyA });
+      mockMemoryService.capture.mockResolvedValue(scorecardCaptureResult);
+      const app = createApp(agentActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...scorecardBaseBody, metadata: completeMetadata });
+
+      expect(res.status).toBe(201);
+      expect(mockIssueService.getById).toHaveBeenCalledWith(validIssueUuid);
+      expect(mockMemoryService.capture).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not leak the guard to a non-scorecard category with no issue_id", async () => {
+      mockMemoryService.capture.mockResolvedValue(scorecardCaptureResult);
+      const app = createApp(agentActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...scorecardBaseBody, metadata: { category: "lesson" } });
+
+      expect(res.status).toBe(201);
+      expect(mockMemoryService.capture).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns all violations together in details.errors[]", async () => {
+      const app = createApp(agentActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...scorecardBaseBody, metadata: { category: "scorecard_adjusted" } });
+
+      expect(res.status).toBe(422);
+      expect(res.body.details.errors.length).toBeGreaterThanOrEqual(5);
+      expect(mockMemoryService.capture).not.toHaveBeenCalled();
     });
   });
 

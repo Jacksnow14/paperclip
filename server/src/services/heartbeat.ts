@@ -1105,7 +1105,7 @@ export interface ModelProfileApplication {
 
 export type ResolvedWorkspaceForRun = {
   cwd: string;
-  source: "project_primary" | "task_session" | "agent_home";
+  source: "project_primary" | "project_workspace" | "task_session" | "agent_home";
   projectId: string | null;
   workspaceId: string | null;
   repoUrl: string | null;
@@ -1563,7 +1563,7 @@ export function resolveRuntimeSessionParamsForWorkspace(input: {
       warning: null as string | null,
     };
   }
-  if (resolvedWorkspace.source !== "project_primary") {
+  if (resolvedWorkspace.source !== "project_primary" && resolvedWorkspace.source !== "project_workspace") {
     return {
       sessionParams: previousSessionParams,
       warning: null as string | null,
@@ -1806,6 +1806,14 @@ function shouldQueueFollowupForRunningIssueWake(input: {
   wakeCommentId: string | null;
 }) {
   if (input.wakeCommentId) return true;
+  // Interaction resolution wakes (accept/reject/answer/cancel on a wake_assignee
+  // interaction) carry interactionId in the context snapshot (see
+  // normalizeInteractionContinuationWakeContext). The assignee's own run is
+  // typically still marked "running" in the DB when the answer lands — the
+  // agent asked the question and is winding down its turn concurrently with
+  // the reply. Coalescing into that dying run silently drops the wake instead
+  // of guaranteeing a followup once it actually finishes (AUR-3784).
+  if (readNonEmptyString(input.contextSnapshot?.interactionId)) return true;
   const wakeReason = readNonEmptyString(input.contextSnapshot?.wakeReason);
   return Boolean(wakeReason && RUNNING_ISSUE_WAKE_REASONS_REQUIRING_FOLLOWUP.has(wakeReason));
 }
@@ -3603,7 +3611,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(projectWorkspaces.projectId, workspaceProjectId),
             ),
           )
-          .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
+          .orderBy(
+            desc(projectWorkspaces.isPrimary),
+            asc(projectWorkspaces.createdAt),
+            asc(projectWorkspaces.id),
+          )
       : [];
     const projectWorkspaceRows = prioritizeProjectWorkspaceCandidatesForRun(
       unorderedProjectWorkspaceRows,
@@ -3655,7 +3667,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (projectCwdExists) {
           return {
             cwd: projectCwd,
-            source: "project_primary" as const,
+            source: workspace.isPrimary ? ("project_primary" as const) : ("project_workspace" as const),
             projectId: resolvedProjectId,
             workspaceId: workspace.id,
             repoUrl: workspace.repoUrl,
@@ -3694,7 +3706,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       return {
         cwd: fallbackCwd,
-        source: "project_primary" as const,
+        source: projectWorkspaceRows[0]?.isPrimary
+          ? ("project_primary" as const)
+          : ("project_workspace" as const),
         projectId: resolvedProjectId,
         workspaceId: projectWorkspaceRows[0]?.id ?? null,
         repoUrl: projectWorkspaceRows[0]?.repoUrl ?? null,
@@ -7049,6 +7063,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
         return [];
       }
+      // AUR-4055: while a scheduled_retry row for this agent carries a parsed
+      // provider quota reset time (transientRetryNotBefore) that hasn't passed
+      // yet, every other run against the same adapter is guaranteed to hit the
+      // same wall. Leave queued runs queued instead of admitting them into a
+      // known-dead attempt; they're picked up again as soon as this query stops
+      // matching (either the reset time passes, or promoteDueScheduledRetries
+      // promotes the retry itself).
+      const activeQuotaPause = await db
+        .select({ scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, agentId),
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'transientRetryNotBefore' is not null`,
+            gt(heartbeatRuns.scheduledRetryAt, new Date()),
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.scheduledRetryAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (activeQuotaPause) return [];
       const policy = parseHeartbeatPolicy(agent);
       const runningCount = await countRunningRunsForAgent(agentId);
       // Global ceiling (AUR-3929): per-agent slots must never admit a run once

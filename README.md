@@ -358,9 +358,15 @@ See [doc/DEVELOPING.md](doc/DEVELOPING.md) for the full development guide.
 
 ## Operations
 
+Full index: [`docs/runbooks/README.md`](docs/runbooks/README.md)
+
 - [Process lost / OOM on the control plane](docs/runbooks/process-lost-and-oom.md) — diagnose
   whether a `Process lost -- server may have restarted` report is an infra event or agent
   behavior, in under a minute.
+- [Production deploys and deploy-drift alerts](docs/runbooks/production-deploy.md) — what
+  production is actually running and how a deploy lands.
+- [Agent privilege model and `hostguard`](docs/runbooks/agent-privilege-model.md) — what an
+  agent can do to this host, and what is logged.
 
 <br/>
 

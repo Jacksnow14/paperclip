@@ -156,6 +156,39 @@ export function checkScorecardMetadataViolations(metadata: Record<string, unknow
   return errors;
 }
 
+export const ROUTING_RATIONALE_CATEGORY = "routing_rationale";
+
+/**
+ * `metadata.chosen_agent` is the ONLY field that records which agent a routing
+ * decision actually picked. Without it a `routing/*` row proves a rationale was
+ * written but not who it routed to, so a re-route cannot be distinguished from
+ * the original decision — the reader is forced to guess by matching the issue's
+ * current assignee, which reports a false gap on every re-route (AUR-4280).
+ * The forward key shape `routing/{issueId}/{ownerId}` derives its owner suffix
+ * from this field, so a blank one also makes the key unbuildable.
+ *
+ * Returns an empty array when `metadata.category` isn't `routing_rationale`, or
+ * when every check passes.
+ */
+export function checkRoutingRationaleMetadataViolations(
+  metadata: Record<string, unknown> | undefined,
+): string[] {
+  if (metadata?.category !== ROUTING_RATIONALE_CATEGORY) return [];
+
+  const errors: string[] = [];
+  const chosenAgent = metadata?.chosen_agent;
+  if (isBlankMetadataValue(chosenAgent)) {
+    errors.push(
+      `metadata.chosen_agent is required for category '${ROUTING_RATIONALE_CATEGORY}' — ` +
+      "it names the agent the routing decision selected, and keys the " +
+      "routing/{issueId}/{ownerId} record so a re-route does not clobber the prior owner's rationale.",
+    );
+  } else if (typeof chosenAgent !== "string") {
+    errors.push("metadata.chosen_agent must be a string agent id");
+  }
+  return errors;
+}
+
 function actorInfoFromReq(req: any) {
   if (req.actor.type === "agent") {
     return {
@@ -384,7 +417,14 @@ export function memoryRoutes(
     if (routerReadScopeViolation) {
       throw unprocessable(routerReadScopeViolation);
     }
-    const scorecardErrors = checkScorecardMetadataViolations(payload.metadata);
+    // Category-integrity guards share one error bucket so a capture gets ALL of
+    // its violations back in a single 422 rather than one-per-round-trip. The
+    // guards are mutually exclusive by category, so the message below names the
+    // one category that actually produced errors.
+    const categoryErrors = [
+      ...checkScorecardMetadataViolations(payload.metadata),
+      ...checkRoutingRationaleMetadataViolations(payload.metadata),
+    ];
     const scorecardIssueId = payload.metadata?.issue_id;
     if (
       typeof payload.metadata?.category === "string" &&
@@ -394,16 +434,16 @@ export function memoryRoutes(
     ) {
       const resolved = await resolveSourceIssueId(companyId, scorecardIssueId);
       if (!resolved) {
-        scorecardErrors.push(
+        categoryErrors.push(
           `metadata.issue_id '${scorecardIssueId}' does not resolve to a real issue in this company; ` +
           "use a scoped test company, not production.",
         );
       }
     }
-    if (scorecardErrors.length > 0) {
+    if (categoryErrors.length > 0) {
       throw unprocessable(
-        `Invalid '${payload.metadata?.category}' capture: ${scorecardErrors.length} validation error(s)`,
-        { errors: scorecardErrors },
+        `Invalid '${payload.metadata?.category}' capture: ${categoryErrors.length} validation error(s)`,
+        { errors: categoryErrors },
       );
     }
     if (payload.source?.issueId) {

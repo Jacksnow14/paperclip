@@ -1455,6 +1455,95 @@ describe("memory routes", () => {
     });
   });
 
+  describe("POST /companies/:companyId/memory/capture — routing_rationale chosen_agent guard (AUR-4280/AUR-4303)", () => {
+    const routingAgentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const routingBaseBody = {
+      title: "routing/AUR-4147/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      source: { kind: "issue", issueId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" },
+      content: "Routed AUR-4147 to the release-tooling owner on scorecard evidence.",
+    };
+    const routingCaptureResult = {
+      operation: { id: "op-routing-1", bindingId: bindingId, source: { kind: "issue" } },
+      records: [{ id: "ef000000-0000-4000-8000-000000000000", reviewState: "accepted", scopeType: "org", scope: {} }],
+    };
+    const agentActor = { type: "agent", agentId: routingAgentId, companyId: companyA };
+
+    it("returns 422 naming metadata.chosen_agent when it is absent", async () => {
+      const app = createApp(agentActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...routingBaseBody, metadata: { category: "routing_rationale", issue_id: "AUR-4147" } });
+
+      expect(res.status).toBe(422);
+      expect(res.body.details.errors.some((e: string) => e.includes("metadata.chosen_agent"))).toBe(true);
+      expect(mockMemoryService.capture).not.toHaveBeenCalled();
+    });
+
+    it.each([["empty string", ""], ["whitespace only", "   "], ["null", null]])(
+      "returns 422 when metadata.chosen_agent is %s",
+      async (_label, value) => {
+        const app = createApp(agentActor);
+
+        const res = await request(app)
+          .post(`/api/companies/${companyA}/memory/capture`)
+          .set("Origin", "http://localhost:3100")
+          .send({ ...routingBaseBody, metadata: { category: "routing_rationale", chosen_agent: value } });
+
+        expect(res.status).toBe(422);
+        expect(res.body.details.errors.some((e: string) => e.includes("metadata.chosen_agent"))).toBe(true);
+        expect(mockMemoryService.capture).not.toHaveBeenCalled();
+      },
+    );
+
+    it("returns 422 when metadata.chosen_agent is present but not a string", async () => {
+      const app = createApp(agentActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...routingBaseBody, metadata: { category: "routing_rationale", chosen_agent: 42 } });
+
+      expect(res.status).toBe(422);
+      expect(res.body.details.errors.some((e: string) => e.includes("chosen_agent must be a string"))).toBe(true);
+      expect(mockMemoryService.capture).not.toHaveBeenCalled();
+    });
+
+    it("returns 201 for a routing_rationale capture WITH chosen_agent (positive control)", async () => {
+      mockMemoryService.capture.mockResolvedValue(routingCaptureResult);
+      const app = createApp(agentActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({
+          ...routingBaseBody,
+          metadata: {
+            category: "routing_rationale",
+            issue_id: "AUR-4147",
+            chosen_agent: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          },
+        });
+
+      expect(res.status).toBe(201);
+      expect(mockMemoryService.capture).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not leak the guard to other categories that legitimately omit chosen_agent", async () => {
+      mockMemoryService.capture.mockResolvedValue(routingCaptureResult);
+      const app = createApp(agentActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...routingBaseBody, title: "lesson/AUR-4147", metadata: { category: "lesson" } });
+
+      expect(res.status).toBe(201);
+      expect(mockMemoryService.capture).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it("starts memory refresh jobs through the memory service and logs activity", async () => {
     mockMemoryService.startRefreshJob.mockResolvedValue({
       job: {

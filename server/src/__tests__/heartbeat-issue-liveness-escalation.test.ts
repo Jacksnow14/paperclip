@@ -354,6 +354,322 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     ]);
   });
 
+  it("caps repeat class A auto-recovery for a re-blocked issue and downgrades it to class B", async () => {
+    await enableAutoRecovery();
+    const { companyId, coderId, blockedIssueId } = await seedBlockedChain({
+      blockerStatus: "cancelled",
+      blockerAssigneeAgentId: "coder",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.reconcileIssueGraphLiveness();
+    expect(first).toMatchObject({
+      terminalOnlyIssues: 1,
+      classAAutoRecovered: 1,
+      classAOscillationCapped: 0,
+    });
+
+    // Control: the first pass must really have actuated, otherwise the second
+    // pass proves nothing.
+    const [afterFirst] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, blockedIssueId));
+    expect(afterFirst?.status).toBe("todo");
+    const commentsAfterFirst = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, blockedIssueId));
+    expect(commentsAfterFirst).toHaveLength(1);
+
+    // Re-block with no new first-class blocker edge — the plain
+    // `PATCH status=blocked` an agent does for a founder gate or a narrative
+    // blocker. The original terminal `blocks` edge is untouched.
+    await db
+      .update(issues)
+      .set({ status: "blocked", updatedAt: new Date() })
+      .where(eq(issues.id, blockedIssueId));
+
+    const second = await heartbeat.reconcileIssueGraphLiveness();
+    expect(second).toMatchObject({
+      terminalOnlyIssues: 1,
+      classAAutoRecovered: 0,
+      classAOscillationCapped: 1,
+    });
+
+    const [afterSecond] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, blockedIssueId));
+    expect(afterSecond?.status).toBe("blocked");
+
+    // The Class A recovery comment must not be posted a second time. Other
+    // subsystems may still comment on this issue, so count the Class A
+    // comment specifically rather than the raw comment total.
+    const commentsAfterSecond = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, blockedIssueId));
+    const classAComments = commentsAfterSecond.filter((comment) =>
+      comment.body.includes("All direct blocker edges on this issue are now terminal"),
+    );
+    expect(classAComments).toHaveLength(1);
+
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, blockedIssueId),
+        ),
+      );
+    expect(recoveryActions).toHaveLength(1);
+    expect(recoveryActions[0]).toMatchObject({
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: coderId,
+      status: "active",
+    });
+    expect(recoveryActions[0]?.evidence).toMatchObject({
+      stage: "class_a_oscillation_capped",
+    });
+    expect(recoveryActions[0]?.nextAction).toContain("keeps being re-blocked");
+
+    const wakeups = await db
+      .select({
+        source: agentWakeupRequests.source,
+        status: agentWakeupRequests.status,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, coderId),
+        ),
+      );
+    const ownerNudge = wakeups.find((wakeup) => {
+      const payload = wakeup.payload as Record<string, unknown> | null;
+      return payload?.sourceIssueId === blockedIssueId &&
+        payload?.recoveryCause === "issue_graph_liveness";
+    });
+    expect(ownerNudge).toMatchObject({ source: "assignment" });
+
+    // A further tick must not flip the issue back or re-post the Class A
+    // comment. (By now the legacy escalation path has attached its escalation
+    // issue as a real blocker edge, so the issue is no longer terminal_only —
+    // Class A cannot fire for that reason either. Both roads lead to "no
+    // ping-pong", which is what this asserts.)
+    const third = await heartbeat.reconcileIssueGraphLiveness();
+    expect(third).toMatchObject({ classAAutoRecovered: 0 });
+
+    const [afterThird] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, blockedIssueId));
+    expect(afterThird?.status).toBe("blocked");
+
+    const classACommentsAfterThird = (await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, blockedIssueId)))
+      .filter((comment) =>
+        comment.body.includes("All direct blocker edges on this issue are now terminal"),
+      );
+    expect(classACommentsAfterThird).toHaveLength(1);
+
+    const recoveryActionsAfterThird = await db
+      .select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, blockedIssueId));
+    expect(recoveryActionsAfterThird).toHaveLength(1);
+  });
+
+  it("routes a user-assigned class B nudge to a real owner instead of silently no-oping", async () => {
+    await enableAutoRecovery();
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const projectId = randomUUID();
+    const blockedIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const createdAt = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+    const blockedAt = new Date(Date.now() - 9 * 24 * 60 * 60 * 1000);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: managerId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: false } },
+      permissions: {},
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Control plane",
+      status: "active",
+      leadAgentId: managerId,
+    });
+    // Assigned to a human, so assigneeAgentId is null at the wake_assignee
+    // stage. Before the fix this fell through to ownerType "board" and woke
+    // nobody, indistinguishable from a nudge that reached someone.
+    await db.insert(issues).values({
+      id: blockedIssueId,
+      companyId,
+      projectId,
+      title: "User-assigned blocked issue with no blocker edge",
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: null,
+      assigneeUserId: "founder-user-id",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      createdAt,
+      updatedAt: blockedAt,
+    });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "user",
+      actorId: "founder-user-id",
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: blockedIssueId,
+      details: { identifier: `${issuePrefix}-1`, status: "blocked" },
+      createdAt: blockedAt,
+    });
+
+    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+    expect(result).toMatchObject({
+      missingEdgeIssues: 1,
+      classBNudged: 1,
+      classBBoardOnly: 0,
+    });
+
+    const recoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, blockedIssueId));
+    expect(recoveryActions).toHaveLength(1);
+    expect(recoveryActions[0]).toMatchObject({
+      ownerType: "agent",
+      ownerAgentId: managerId,
+    });
+
+    const wakeups = await db
+      .select({ payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, managerId),
+        ),
+      );
+    const ownerNudge = wakeups.find((wakeup) => {
+      const payload = wakeup.payload as Record<string, unknown> | null;
+      return payload?.sourceIssueId === blockedIssueId &&
+        payload?.recoveryCause === "issue_graph_liveness";
+    });
+    expect(ownerNudge).toBeDefined();
+  });
+
+  it("does not escalate a freshly re-blocked issue that has no blocked-transition activity row", async () => {
+    await enableAutoRecovery();
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const coderId = randomUUID();
+    const blockedIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const createdAt = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000);
+    const blockedAt = new Date(Date.now() - 60 * 60 * 1000);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: managerId,
+        companyId,
+        name: "CTO",
+        role: "cto",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: false } },
+        permissions: {},
+      },
+      {
+        id: coderId,
+        companyId,
+        name: "Coder",
+        role: "engineer",
+        status: "idle",
+        reportsTo: managerId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: false } },
+        permissions: {},
+      },
+    ]);
+    // Old issue, blocked an hour ago by a write path that does not put
+    // `status` in the activity details, so there is no blocked-transition row
+    // to read. The createdAt fallback would score this 60 days stale and
+    // escalate immediately on a guess.
+    await db.insert(issues).values({
+      id: blockedIssueId,
+      companyId,
+      title: "Old issue blocked a moment ago",
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      createdAt,
+      updatedAt: blockedAt,
+    });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "agent",
+      actorId: coderId,
+      agentId: coderId,
+      action: "issue.created",
+      entityType: "issue",
+      entityId: blockedIssueId,
+      details: { identifier: `${issuePrefix}-1`, status: "todo" },
+      createdAt,
+    });
+
+    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+    expect(result).toMatchObject({
+      blockedIssuesScanned: 1,
+      missingEdgeIssues: 1,
+      classBNudged: 0,
+      classBEscalated: 0,
+      classBNoop: 1,
+      blockedEnteredAtFallbacks: 1,
+    });
+
+    const recoveryActions = await db
+      .select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, blockedIssueId));
+    expect(recoveryActions).toHaveLength(0);
+  });
+
   it("treats child-only terminal gates as missing-edge work instead of auto-recovering", async () => {
     await enableAutoRecovery();
     const companyId = randomUUID();

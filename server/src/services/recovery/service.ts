@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -73,6 +73,13 @@ const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const DIRECT_BLOCKER_TERMINAL_STATUSES = new Set(["done", "cancelled"]);
 const MISSING_BLOCKER_EDGE_REMINDER_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const MISSING_BLOCKER_EDGE_ESCALATION_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+// Class A (terminal_only) auto-recovery flips an issue blocked -> todo. The
+// status change is its own guard only while the issue stays out of `blocked`.
+// If an agent re-blocks it without attaching a new first-class blocker, the
+// original terminal edges still classify as terminal_only and the actuator
+// would flip it back every tick. Cap auto-recovery at one per
+// (issueId, blocker-set) per rolling window and downgrade to Class B after.
+const CLASS_A_OSCILLATION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
@@ -141,11 +148,14 @@ type DurableBlockedIssueClassificationKind =
   | "terminal_only"
   | "open_non_terminal";
 
+type DurableBlockedEnteredAtSource = "activity_log" | "fallback_updated_at";
+
 type DurableBlockedIssueClassification = {
   issue: DurableBlockedIssueRow;
   kind: DurableBlockedIssueClassificationKind;
   directBlockers: DurableBlockedIssueDirectBlocker[];
   blockedEnteredAt: Date;
+  blockedEnteredAtSource: DurableBlockedEnteredAtSource;
   staleAgeMs: number;
 };
 
@@ -2774,7 +2784,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function loadDurableBlockedEnteredAtByIssue(blockedIssues: DurableBlockedIssueRow[]) {
-    if (blockedIssues.length === 0) return new Map<string, Date>();
+    type BlockedEnteredAtEntry = { at: Date; source: DurableBlockedEnteredAtSource };
+    if (blockedIssues.length === 0) return new Map<string, BlockedEnteredAtEntry>();
 
     const blockedIssueIds = blockedIssues.map((issue) => issue.id);
     const rows = await db
@@ -2793,8 +2804,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       )
       .groupBy(activityLog.entityId);
 
-    const blockedEnteredAtByIssueId = new Map(
-      blockedIssues.map((issue) => [issue.id, issue.createdAt]),
+    // No activity_log row carries the blocked transition for this issue (some
+    // svc.update() paths omit `status` from the details). Falling back to
+    // issues.createdAt would make a freshly re-blocked but old issue look
+    // 60+ days stale and escalate on a guess, so fall back to the newest
+    // timestamp we can actually observe while the issue is blocked. The
+    // fallback is tracked so it shows up in the reconciler counters instead of
+    // silently shaping an escalation decision.
+    const blockedEnteredAtByIssueId = new Map<string, BlockedEnteredAtEntry>(
+      blockedIssues.map((issue) => {
+        const createdAt = issue.createdAt;
+        const updatedAt = issue.updatedAt;
+        const newest =
+          updatedAt instanceof Date && !Number.isNaN(updatedAt.getTime()) &&
+          updatedAt.getTime() > createdAt.getTime()
+            ? updatedAt
+            : createdAt;
+        return [issue.id, { at: newest, source: "fallback_updated_at" as const }];
+      }),
     );
     for (const row of rows) {
       if (!row.blockedEnteredAt) continue;
@@ -2803,7 +2830,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           ? row.blockedEnteredAt
           : new Date(row.blockedEnteredAt);
       if (!Number.isNaN(blockedEnteredAt.getTime())) {
-        blockedEnteredAtByIssueId.set(row.issueId, blockedEnteredAt);
+        blockedEnteredAtByIssueId.set(row.issueId, {
+          at: blockedEnteredAt,
+          source: "activity_log",
+        });
       }
     }
     return blockedEnteredAtByIssueId;
@@ -2893,7 +2923,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         [...(directBlockersByIssueId.get(issue.id)?.values() ?? [])],
       );
       const hasFirstClassBlockerEdge = (explicitBlockerIdsByIssueId.get(issue.id)?.size ?? 0) > 0;
-      const blockedEnteredAt = blockedEnteredAtByIssueId.get(issue.id) ?? issue.createdAt;
+      const blockedEnteredAtEntry = blockedEnteredAtByIssueId.get(issue.id)
+        ?? { at: issue.createdAt, source: "fallback_updated_at" as const };
+      const blockedEnteredAt = blockedEnteredAtEntry.at;
       const kind: DurableBlockedIssueClassificationKind =
         directBlockers.length === 0
           ? "missing_edge"
@@ -2907,6 +2939,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         kind,
         directBlockers,
         blockedEnteredAt,
+        blockedEnteredAtSource: blockedEnteredAtEntry.source,
         staleAgeMs: Math.max(0, now.getTime() - blockedEnteredAt.getTime()),
       };
     });
@@ -3026,6 +3059,72 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return `issue_graph_liveness:${input.issueId}:missing_blocker_edge:${input.stage}:${input.ownerAgentId ?? "board"}`;
   }
 
+  /**
+   * Identity of the blocker set that justified a Class A auto-recovery. A new
+   * or removed blocker edge is new information and earns a fresh recovery; the
+   * same edges re-observed after a re-block do not.
+   */
+  function buildClassABlockerSetFingerprint(blockerIssueIds: string[]) {
+    return [...new Set(blockerIssueIds)].sort().join(",");
+  }
+
+  function buildClassAOscillationActionFingerprint(input: {
+    issueId: string;
+    blockerSetFingerprint: string;
+    ownerAgentId: string | null;
+  }) {
+    return `issue_graph_liveness:${input.issueId}:class_a_oscillation:${input.blockerSetFingerprint}:${input.ownerAgentId ?? "board"}`;
+  }
+
+  /**
+   * Prior Class A auto-recoveries inside the rolling window, keyed by issue.
+   * Derived from `activity_log` rows the Class A path already writes, so this
+   * needs no new table. Rows written before the fingerprint was recorded fall
+   * back to deriving it from the logged blocker summaries.
+   */
+  async function loadRecentClassAAutoRecoveryFingerprints(
+    issueIds: string[],
+    since: Date,
+  ): Promise<Map<string, Set<string>>> {
+    const byIssueId = new Map<string, Set<string>>();
+    if (issueIds.length === 0) return byIssueId;
+
+    const rows = await db
+      .select({
+        issueId: activityLog.entityId,
+        details: activityLog.details,
+      })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityType, "issue"),
+          inArray(activityLog.entityId, [...new Set(issueIds)]),
+          eq(activityLog.action, "issue.updated"),
+          gte(activityLog.createdAt, since),
+          sql`${activityLog.details} ->> 'source' = 'recovery.reconcile_issue_graph_liveness'`,
+          sql`${activityLog.details} ->> 'previousStatus' = 'blocked'`,
+          sql`${activityLog.details} ->> 'status' = 'todo'`,
+        ),
+      );
+
+    for (const row of rows) {
+      if (!row.issueId) continue;
+      const details = (row.details ?? {}) as Record<string, unknown>;
+      const recorded = readNonEmptyString(details.classABlockerSetFingerprint);
+      const fingerprint = recorded ?? buildClassABlockerSetFingerprint(
+        Array.isArray(details.blockerSummaries)
+          ? (details.blockerSummaries as Array<Record<string, unknown>>)
+              .map((summary) => readNonEmptyString(summary?.issueId))
+              .filter((issueId): issueId is string => Boolean(issueId))
+          : [],
+      );
+      const set = byIssueId.get(row.issueId) ?? new Set<string>();
+      set.add(fingerprint);
+      byIssueId.set(row.issueId, set);
+    }
+    return byIssueId;
+  }
+
   async function resolveDurableIssueGraphLivenessAction(input: {
     action: typeof issueRecoveryActions.$inferSelect;
     sourceIssue: DurableBlockedIssueRow;
@@ -3076,13 +3175,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       loadActiveIssueGraphLivenessRecoveryActions(sourceIssueIds),
       loadAnyActiveRecoveryActions(sourceIssueIds),
     ]);
+    // Owner resolution is needed for every issue that can end up needing an
+    // owner: 30-day escalations, capped Class A downgrades, and the
+    // wake_assignee stage when the issue is assigned to a user (no agent).
     const ownerMaps = await loadDurableMissingBlockerEscalationOwners(
+      classifications.map((classification) => classification.issue),
+    );
+    const recentClassAFingerprintsByIssueId = await loadRecentClassAAutoRecoveryFingerprints(
       classifications
-        .filter((classification) =>
-          classification.kind === "missing_edge" &&
-          missingBlockerEdgeStageForAge(classification.staleAgeMs) === "escalate_owner"
-        )
-        .map((classification) => classification.issue),
+        .filter((classification) => classification.kind === "terminal_only")
+        .map((classification) => classification.issue.id),
+      new Date(input.now.getTime() - CLASS_A_OSCILLATION_WINDOW_MS),
     );
 
     const result = {
@@ -3091,25 +3194,181 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       missingEdgeIssues: 0,
       openNonTerminalIssues: 0,
       classAAutoRecovered: 0,
+      classAOscillationCapped: 0,
       classBNudged: 0,
       classBEscalated: 0,
       classBNoop: 0,
+      classBBoardOnly: 0,
       classBSkippedOtherRecoveryAction: 0,
+      blockedEnteredAtFallbacks: 0,
       issueGraphRecoveryActionsResolved: 0,
       actionErrors: 0,
       errorIssueIds: [] as string[],
     };
+
+    const resolveFallbackOwnerAgentId = (issue: DurableBlockedIssueRow) => (
+      issue.projectId
+        ? ownerMaps.projectLeadByProjectId.get(issue.projectId) ?? null
+        : null
+    ) ?? ownerMaps.fallbackOwnerByCompanyId.get(issue.companyId) ?? null;
+
+    /** Upsert the issue_graph_liveness attention action and wake its owner. */
+    async function upsertDurableAttentionAction(args: {
+      classification: DurableBlockedIssueClassification;
+      ownerAgentId: string | null;
+      fingerprint: string;
+      stage: string;
+      nextAction: string;
+      extraEvidence?: Record<string, unknown>;
+    }) {
+      const { classification, ownerAgentId, stage } = args;
+      const action = await recoveryActionsSvc.upsertSourceScoped({
+        companyId: classification.issue.companyId,
+        sourceIssueId: classification.issue.id,
+        kind: "issue_graph_liveness",
+        ownerType: ownerAgentId ? "agent" : "board",
+        ownerAgentId,
+        previousOwnerAgentId: classification.issue.assigneeAgentId,
+        returnOwnerAgentId: classification.issue.assigneeAgentId,
+        cause: "issue_graph_liveness",
+        fingerprint: args.fingerprint,
+        evidence: {
+          durableBlockerClassification: classification.kind,
+          sourceIssueId: classification.issue.id,
+          sourceIdentifier: classification.issue.identifier,
+          sourceIssueStatus: classification.issue.status,
+          blockedEnteredAt: classification.blockedEnteredAt.toISOString(),
+          blockedEnteredAtSource: classification.blockedEnteredAtSource,
+          staleAgeMs: classification.staleAgeMs,
+          directBlockerCount: classification.directBlockers.length,
+          stage,
+          ...args.extraEvidence,
+        },
+        nextAction: args.nextAction,
+        wakePolicy: ownerAgentId
+          ? { type: "wake_owner", reason: "issue_graph_liveness", ownerAgentId, stage }
+          : { type: "board_escalation", reason: "issue_graph_liveness", stage },
+        monitorPolicy: null,
+        maxAttempts: null,
+        lastAttemptAt: input.now,
+      });
+
+      await logActivity(db, {
+        companyId: classification.issue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: ownerAgentId,
+        runId: input.runId ?? null,
+        action: "issue.recovery_action_upserted",
+        entityType: "issue",
+        entityId: classification.issue.id,
+        details: {
+          identifier: classification.issue.identifier,
+          recoveryActionId: action.id,
+          recoveryActionKind: action.kind,
+          recoveryActionOwnerAgentId: action.ownerAgentId,
+          recoveryActionAttemptCount: action.attemptCount,
+          source: "recovery.reconcile_issue_graph_liveness",
+          durableBlockerClassification: classification.kind,
+          stage,
+        },
+      });
+
+      if (ownerAgentId) {
+        await deps.enqueueWakeup(ownerAgentId, {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "source_scoped_recovery_action",
+          idempotencyKey: `issue_graph_liveness:${action.id}:${action.attemptCount}`,
+          payload: withRecoveryModelProfileHint({
+            issueId: classification.issue.id,
+            sourceIssueId: classification.issue.id,
+            recoveryActionId: action.id,
+            recoveryCause: "issue_graph_liveness",
+            issueGraphLivenessStage: stage,
+          }),
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          contextSnapshot: withRecoveryModelProfileHint({
+            issueId: classification.issue.id,
+            taskId: classification.issue.id,
+            wakeReason: "source_scoped_recovery_action",
+            skipIssueComment: true,
+            source: "issue_recovery_action",
+            recoveryActionId: action.id,
+            sourceIssueId: classification.issue.id,
+            recoveryCause: "issue_graph_liveness",
+            issueGraphLivenessStage: stage,
+          }),
+        });
+      }
+
+      return action;
+    }
 
     for (const classification of classifications) {
       if (classification.kind === "terminal_only") result.terminalOnlyIssues += 1;
       else if (classification.kind === "missing_edge") result.missingEdgeIssues += 1;
       else result.openNonTerminalIssues += 1;
 
+      if (classification.blockedEnteredAtSource === "fallback_updated_at") {
+        result.blockedEnteredAtFallbacks += 1;
+      }
+
       const graphLivenessAction = graphLivenessActions.get(classification.issue.id) ?? null;
       const anyActiveAction = anyActiveActions.get(classification.issue.id) ?? null;
 
       try {
         if (classification.kind === "terminal_only") {
+          const blockerSetFingerprint = buildClassABlockerSetFingerprint(
+            classification.directBlockers.map((blocker) => blocker.blockerIssueId),
+          );
+          const alreadyAutoRecovered = recentClassAFingerprintsByIssueId
+            .get(classification.issue.id)
+            ?.has(blockerSetFingerprint) ?? false;
+
+          if (alreadyAutoRecovered) {
+            // The issue was already auto-recovered off this exact blocker set
+            // inside the window and is blocked again, so the terminal edges are
+            // no longer the real gate. Downgrade to Class B rather than
+            // flipping it back and re-posting the same comment: a capped and
+            // silent path would reintroduce the inert-detector failure this
+            // line of work exists to kill.
+            result.classAOscillationCapped += 1;
+
+            if (anyActiveAction && anyActiveAction.kind !== "issue_graph_liveness") {
+              result.classBSkippedOtherRecoveryAction += 1;
+              continue;
+            }
+
+            const ownerAgentId = classification.issue.assigneeAgentId
+              ?? resolveFallbackOwnerAgentId(classification.issue);
+            const fingerprint = buildClassAOscillationActionFingerprint({
+              issueId: classification.issue.id,
+              blockerSetFingerprint,
+              ownerAgentId,
+            });
+            if (graphLivenessAction?.fingerprint === fingerprint) {
+              result.classBNoop += 1;
+              continue;
+            }
+            if (!ownerAgentId) result.classBBoardOnly += 1;
+
+            await upsertDurableAttentionAction({
+              classification,
+              ownerAgentId,
+              fingerprint,
+              stage: "class_a_oscillation_capped",
+              nextAction:
+                "This issue keeps being re-blocked with only terminal blocker edges. Attach a real first-class blocker or state the gate in the issue instead of leaving it blocked.",
+              extraEvidence: {
+                classABlockerSetFingerprint: blockerSetFingerprint,
+                classAOscillationWindowMs: CLASS_A_OSCILLATION_WINDOW_MS,
+              },
+            });
+            continue;
+          }
+
           const updatedIssue = await issuesSvc.update(classification.issue.id, { status: "todo" });
           if (!updatedIssue) continue;
 
@@ -3146,6 +3405,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               durableBlockerClassification: classification.kind,
               previousStatus: "blocked",
               blockerSummaries,
+              classABlockerSetFingerprint: blockerSetFingerprint,
             },
           });
 
@@ -3225,13 +3485,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
+        // At the wake_assignee stage an issue assigned to a *user* has no
+        // assigneeAgentId. Falling straight through to ownerType "board" woke
+        // nobody, and the resulting action was indistinguishable from a nudge
+        // that actually reached someone. Route to the project lead / company
+        // root like the 30-day stage does, and only then fall back to board —
+        // counted distinctly so it is never a silent no-op.
         const ownerAgentId = stage === "wake_assignee"
-          ? classification.issue.assigneeAgentId ?? null
-          : (
-              classification.issue.projectId
-                ? ownerMaps.projectLeadByProjectId.get(classification.issue.projectId) ?? null
-                : null
-            ) ?? ownerMaps.fallbackOwnerByCompanyId.get(classification.issue.companyId) ?? null;
+          ? classification.issue.assigneeAgentId ?? resolveFallbackOwnerAgentId(classification.issue)
+          : resolveFallbackOwnerAgentId(classification.issue);
         const fingerprint = buildDurableMissingBlockerActionFingerprint({
           issueId: classification.issue.id,
           stage,
@@ -3242,96 +3504,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           result.classBNoop += 1;
           continue;
         }
+        if (!ownerAgentId) result.classBBoardOnly += 1;
 
-        const action = await recoveryActionsSvc.upsertSourceScoped({
-          companyId: classification.issue.companyId,
-          sourceIssueId: classification.issue.id,
-          kind: "issue_graph_liveness",
-          ownerType: ownerAgentId ? "agent" : "board",
+        await upsertDurableAttentionAction({
+          classification,
           ownerAgentId,
-          previousOwnerAgentId: classification.issue.assigneeAgentId,
-          returnOwnerAgentId: classification.issue.assigneeAgentId,
-          cause: "issue_graph_liveness",
           fingerprint,
-          evidence: {
-            durableBlockerClassification: classification.kind,
-            sourceIssueId: classification.issue.id,
-            sourceIdentifier: classification.issue.identifier,
-            sourceIssueStatus: classification.issue.status,
-            blockedEnteredAt: classification.blockedEnteredAt.toISOString(),
-            staleAgeMs: classification.staleAgeMs,
-            directBlockerCount: classification.directBlockers.length,
-            stage,
-          },
+          stage,
           nextAction: stage === "wake_assignee"
             ? "Attach a real first-class blocker to this issue or move it out of blocked."
             : "Review this stale blocked issue, attach a real first-class blocker, or move it out of blocked.",
-          wakePolicy: ownerAgentId
-            ? {
-                type: "wake_owner",
-                reason: "issue_graph_liveness",
-                ownerAgentId,
-                stage,
-              }
-            : {
-                type: "board_escalation",
-                reason: "issue_graph_liveness",
-                stage,
-              },
-          monitorPolicy: null,
-          maxAttempts: null,
-          lastAttemptAt: input.now,
         });
-
-        await logActivity(db, {
-          companyId: classification.issue.companyId,
-          actorType: "system",
-          actorId: "system",
-          agentId: ownerAgentId,
-          runId: input.runId ?? null,
-          action: "issue.recovery_action_upserted",
-          entityType: "issue",
-          entityId: classification.issue.id,
-          details: {
-            identifier: classification.issue.identifier,
-            recoveryActionId: action.id,
-            recoveryActionKind: action.kind,
-            recoveryActionOwnerAgentId: action.ownerAgentId,
-            recoveryActionAttemptCount: action.attemptCount,
-            source: "recovery.reconcile_issue_graph_liveness",
-            durableBlockerClassification: classification.kind,
-            stage,
-          },
-        });
-
-        if (ownerAgentId) {
-          await deps.enqueueWakeup(ownerAgentId, {
-            source: "assignment",
-            triggerDetail: "system",
-            reason: "source_scoped_recovery_action",
-            idempotencyKey: `issue_graph_liveness:${action.id}:${action.attemptCount}`,
-            payload: withRecoveryModelProfileHint({
-              issueId: classification.issue.id,
-              sourceIssueId: classification.issue.id,
-              recoveryActionId: action.id,
-              recoveryCause: "issue_graph_liveness",
-              issueGraphLivenessStage: stage,
-            }),
-            requestedByActorType: "system",
-            requestedByActorId: null,
-            contextSnapshot: withRecoveryModelProfileHint({
-              issueId: classification.issue.id,
-              taskId: classification.issue.id,
-              wakeReason: "source_scoped_recovery_action",
-              skipIssueComment: true,
-              source: "issue_recovery_action",
-              recoveryActionId: action.id,
-              sourceIssueId: classification.issue.id,
-              recoveryCause: "issue_graph_liveness",
-              issueGraphLivenessStage: stage,
-            }),
-          });
-        }
 
         if (stage === "wake_assignee") result.classBNudged += 1;
         else result.classBEscalated += 1;
@@ -3653,10 +3836,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       missingEdgeIssues: 0,
       openNonTerminalIssues: 0,
       classAAutoRecovered: 0,
+      classAOscillationCapped: 0,
       classBNudged: 0,
       classBEscalated: 0,
       classBNoop: 0,
+      classBBoardOnly: 0,
       classBSkippedOtherRecoveryAction: 0,
+      blockedEnteredAtFallbacks: 0,
       issueGraphRecoveryActionsResolved: 0,
       actionErrors: 0,
       actionErrorIssueIds: [] as string[],
@@ -3678,10 +3864,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     result.missingEdgeIssues = durableBlockedIssueActuation.missingEdgeIssues;
     result.openNonTerminalIssues = durableBlockedIssueActuation.openNonTerminalIssues;
     result.classAAutoRecovered = durableBlockedIssueActuation.classAAutoRecovered;
+    result.classAOscillationCapped = durableBlockedIssueActuation.classAOscillationCapped;
     result.classBNudged = durableBlockedIssueActuation.classBNudged;
     result.classBEscalated = durableBlockedIssueActuation.classBEscalated;
     result.classBNoop = durableBlockedIssueActuation.classBNoop;
+    result.classBBoardOnly = durableBlockedIssueActuation.classBBoardOnly;
     result.classBSkippedOtherRecoveryAction = durableBlockedIssueActuation.classBSkippedOtherRecoveryAction;
+    result.blockedEnteredAtFallbacks = durableBlockedIssueActuation.blockedEnteredAtFallbacks;
     result.issueGraphRecoveryActionsResolved = durableBlockedIssueActuation.issueGraphRecoveryActionsResolved;
     result.actionErrors = durableBlockedIssueActuation.actionErrors;
     result.actionErrorIssueIds = durableBlockedIssueActuation.errorIssueIds;

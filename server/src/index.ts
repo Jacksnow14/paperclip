@@ -919,6 +919,12 @@ export async function startServer(): Promise<StartedServer> {
       .then(() => heartbeat.promoteDueScheduledRetries())
       .then(async (promotion) => {
         await heartbeat.resumeQueuedRuns();
+        // Must precede the stranded sweep: a parked deferred wake counts as an active
+        // execution path, so an un-reaped dead letter hides the issue from that sweep.
+        const reapedWakes = await heartbeat.reapStrandedDeferredWakes();
+        if (reapedWakes.promoted > 0 || reapedWakes.retired > 0) {
+          logger.warn({ ...reapedWakes }, "startup deferred-wake reaper drained stranded wakes");
+        }
         const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
         if (
           promotion.promoted > 0 ||
@@ -988,6 +994,12 @@ export async function startServer(): Promise<StartedServer> {
         .then(() => heartbeat.promoteDueScheduledRetries())
         .then(async (promotion) => {
           await heartbeat.resumeQueuedRuns();
+          // Must precede the stranded sweep: a parked deferred wake counts as an active
+          // execution path, so an un-reaped dead letter hides the issue from that sweep.
+          const reapedWakes = await heartbeat.reapStrandedDeferredWakes();
+          if (reapedWakes.promoted > 0 || reapedWakes.retired > 0) {
+            logger.warn({ ...reapedWakes }, "periodic deferred-wake reaper drained stranded wakes");
+          }
           const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
           if (
             promotion.promoted > 0 ||

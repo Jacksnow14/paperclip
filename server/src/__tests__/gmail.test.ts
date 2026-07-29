@@ -586,7 +586,9 @@ describe("createGmailService", () => {
       expect(decoded).toContain("To: Jane Customer <jane@example.com>");
       expect(decoded).toContain("Subject: Re: Question about pricing");
       expect(decoded).toContain("In-Reply-To: <orig-msg-id@mail.gmail.com>");
-      expect(result).toEqual({ id: "reply1", threadId: "thread42" });
+      expect(result).toMatchObject({ id: "reply1", threadId: "thread42" });
+      // AUR-4479: the resolved recipient is now surfaced so callers can assert on it.
+      expect(result.resolvedRecipient).toBe("Jane Customer <jane@example.com>");
     });
 
     it("resolves the latest message of a thread when threadId is given", async () => {
@@ -643,6 +645,154 @@ describe("createGmailService", () => {
       const callArgs = mockMessagesSend.mock.calls[0][0];
       const decoded = Buffer.from(callArgs.requestBody.raw, "base64url").toString("utf-8");
       expect(decoded).toContain("To: support@example.com");
+    });
+
+    // AUR-4479: the reply recipient used to come from the From: of the thread's
+    // LAST message. That is our own alias on every follow-up, so the reply was
+    // addressed to ourselves, sent successfully, and reached nobody.
+    describe("never self-addresses (AUR-4479)", () => {
+      const EXTERNAL_MSG = {
+        id: "msg1",
+        threadId: "thread42",
+        payload: {
+          headers: [
+            { name: "Message-ID", value: "<jane-1@mail.example.com>" },
+            { name: "Subject", value: "Can you send the one-pager?" },
+            { name: "From", value: "Jane Prospect <jane@example.com>" },
+          ],
+        },
+      };
+      const OUR_REPLY_MSG = {
+        id: "msg2",
+        threadId: "thread42",
+        payload: {
+          headers: [
+            { name: "Message-ID", value: "<ours-1@mail.gmail.com>" },
+            { name: "Subject", value: "Re: Can you send the one-pager?" },
+            { name: "From", value: "Alex at Auranode <alex@tryauranode.com>" },
+          ],
+        },
+      };
+
+      // CONTROL — the healthy case. Proves the guard does not simply block
+      // everything: a guard proven only by its failing case is half-proven.
+      it("replies to the external party when the last message is inbound", async () => {
+        mockThreadsGet.mockResolvedValue({
+          data: { id: "thread42", messages: [OUR_REPLY_MSG, EXTERNAL_MSG] },
+        });
+        mockMessagesGet.mockResolvedValue({ data: EXTERNAL_MSG });
+        mockMessagesSend.mockResolvedValue({ data: { id: "reply1", threadId: "thread42" } });
+        const service = createGmailService();
+
+        const result = await service.replyInThread("alex", {
+          threadId: "thread42",
+          body: "Here it is.",
+        });
+
+        const decoded = Buffer.from(
+          mockMessagesSend.mock.calls[0][0].requestBody.raw,
+          "base64url",
+        ).toString("utf-8");
+        expect(decoded).toContain("To: Jane Prospect <jane@example.com>");
+        expect(result.resolvedRecipient).toBe("Jane Prospect <jane@example.com>");
+      });
+
+      // THE BUG — reproduces gmail msg 19f98227a5d306dc: our own message is
+      // last, so the pre-fix code addressed the reply to alex@tryauranode.com.
+      it("replies to the external party when the last message is OURS, not to ourselves", async () => {
+        mockThreadsGet.mockResolvedValue({
+          data: { id: "thread42", messages: [EXTERNAL_MSG, OUR_REPLY_MSG] },
+        });
+        mockMessagesGet.mockImplementation(async ({ id }: { id: string }) => ({
+          data: id === "msg1" ? EXTERNAL_MSG : OUR_REPLY_MSG,
+        }));
+        mockMessagesSend.mockResolvedValue({ data: { id: "reply2", threadId: "thread42" } });
+        const service = createGmailService();
+
+        const result = await service.replyInThread("alex", {
+          threadId: "thread42",
+          body: "Following up with the one-pager.",
+        });
+
+        const decoded = Buffer.from(
+          mockMessagesSend.mock.calls[0][0].requestBody.raw,
+          "base64url",
+        ).toString("utf-8");
+        expect(decoded).toContain("To: Jane Prospect <jane@example.com>");
+        expect(decoded).not.toContain("To: Alex at Auranode <alex@tryauranode.com>");
+        expect(result.resolvedRecipient).toBe("Jane Prospect <jane@example.com>");
+        expect(result.recipientSourceMessageId).toBe("msg1");
+        // Threading anchor still points at the newest message in the thread.
+        expect(decoded).toContain("In-Reply-To: <ours-1@mail.gmail.com>");
+      });
+
+      it("throws instead of sending when the thread has no external participant", async () => {
+        mockThreadsGet.mockResolvedValue({
+          data: { id: "thread99", messages: [OUR_REPLY_MSG] },
+        });
+        mockMessagesGet.mockResolvedValue({ data: OUR_REPLY_MSG });
+        const service = createGmailService();
+
+        await expect(
+          service.replyInThread("alex", { threadId: "thread99", body: "Anyone?" }),
+        ).rejects.toThrow(/no external participant/i);
+        expect(mockMessagesSend).not.toHaveBeenCalled();
+      });
+
+      it("still allows a deliberate self-addressed send via allowSelfAddressed", async () => {
+        mockThreadsGet.mockResolvedValue({
+          data: { id: "thread99", messages: [OUR_REPLY_MSG] },
+        });
+        mockMessagesGet.mockResolvedValue({ data: OUR_REPLY_MSG });
+        mockMessagesSend.mockResolvedValue({ data: { id: "probe1" } });
+        const service = createGmailService();
+
+        const result = await service.replyInThread("alex", {
+          threadId: "thread99",
+          body: "capability probe",
+          allowSelfAddressed: true,
+        });
+
+        const decoded = Buffer.from(
+          mockMessagesSend.mock.calls[0][0].requestBody.raw,
+          "base64url",
+        ).toString("utf-8");
+        expect(decoded).toContain("To: Alex at Auranode <alex@tryauranode.com>");
+        expect(result.resolvedRecipient).toBe("Alex at Auranode <alex@tryauranode.com>");
+      });
+
+      // Belt-and-braces: even if recipient resolution is bypassed, a threaded
+      // send addressed only to our own domain is refused at the chokepoint.
+      it("blocks a threaded sendMessage addressed only to our own domain", async () => {
+        mockMessagesGet.mockResolvedValue({ data: OUR_REPLY_MSG });
+        const service = createGmailService();
+
+        await expect(
+          service.sendMessage("alex", {
+            to: "alex@tryauranode.com",
+            subject: "Re: Can you send the one-pager?",
+            body: "Following up.",
+            replyToMessageId: "msg2",
+          }),
+        ).rejects.toThrow(/every recipient of this threaded reply is on our own domain/i);
+        expect(mockMessagesSend).not.toHaveBeenCalled();
+      });
+
+      it("does not block a threaded send that also reaches an external recipient", async () => {
+        mockMessagesGet.mockResolvedValue({ data: EXTERNAL_MSG });
+        mockMessagesSend.mockResolvedValue({ data: { id: "mixed1" } });
+        const service = createGmailService();
+
+        await service.sendMessage("alex", {
+          to: "jane@example.com",
+          cc: "alex@tryauranode.com",
+          subject: "Re: Can you send the one-pager?",
+          body: "Following up.",
+          replyToMessageId: "msg1",
+        });
+
+        expect(mockMessagesSend).toHaveBeenCalledOnce();
+      });
     });
 
     it("throws when neither replyToMessageId nor threadId is given", async () => {
@@ -725,7 +875,7 @@ describe("createGmailService", () => {
           },
           { approvalVerified: true, approvalScope: { mailbox: "board", to: "report@bunq.com" } },
         ),
-      ).resolves.toEqual({ id: "reply1" });
+      ).resolves.toMatchObject({ id: "reply1" });
       expect(mockMessagesSend).toHaveBeenCalledOnce();
     });
 

@@ -81,7 +81,8 @@ POST /api/companies/:companyId/gmail/mailboxes/:mailbox/reply
   "cc": "optional — string or string[]",
   "replyTo": "optional",
   "attachments": [ { "filename": "...", "mimeType": "...", "contentBase64": "..." } ],
-  "ceoApprovalId": "optional — required only if the reply is gated, see Outbound gate below"
+  "ceoApprovalId": "optional — required only if the reply is gated, see Outbound gate below",
+  "allowSelfAddressed": "optional — opt in to a reply addressed only to our own domain"
 }
 ```
 
@@ -106,6 +107,35 @@ curl -s -X POST -H "Authorization: Bearer $AGENT_KEY" -H "Content-Type: applicat
     "attachments": [{ "filename": "summary.txt", "mimeType": "text/plain", "contentBase64": "'"$(base64 -w0 summary.txt)"'" }]
   }'
 ```
+
+### A returned message id proves DISPATCH, not delivery to the intended party (AUR-4479)
+
+`POST .../reply` returns `201` with a Gmail message id whenever Gmail accepted the
+message. That is **not** evidence the mail reached the person you meant to answer.
+Gmail will happily accept — and return an id for — a message addressed to our own
+alias, which reaches nobody. **Read the resolved recipient back and assert on it:**
+
+```bash
+curl -s -X POST ... "$API/.../reply" -d '{ "threadId": "...", "body": "..." }' \
+  | jq -e '.resolvedRecipient | test("@tryauranode\\.com$") | not'   # fails if we self-addressed
+```
+
+The `201` body now carries `resolvedRecipient` (the address the reply was actually
+sent to) and `recipientSourceMessageId` (the thread message that address came from).
+
+**Recipient resolution never self-addresses.** The recipient used to be taken from
+the `From:` of the thread's last message. That is correct only when the last message
+is inbound — on any follow-up *we* spoke last, so `From:` was our own alias and the
+reply was addressed to ourselves, sent successfully, and reached nobody (gmail msg
+`19f98227a5d306dc`). Resolution now walks the thread **backwards** to the last
+message whose sender is not one of our aliases and replies to them. If the thread
+has no external participant at all, the call **throws instead of sending**.
+
+A genuinely self-addressed send (capability probes, invoice/booking smoketests) is
+still possible, but must be declared with `"allowSelfAddressed": true` so a self-send
+is always a deliberate act, never an accident. The same rule is enforced one level
+down in `sendMessage()`: a *threaded* send whose entire recipient set is on our own
+domain is rejected outright.
 
 ## Outbound gate (CEO-approval chokepoint)
 

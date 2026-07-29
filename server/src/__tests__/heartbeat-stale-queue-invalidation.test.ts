@@ -108,15 +108,14 @@ async function cleanupHeartbeatInvalidationFixture(db: ReturnType<typeof createD
       await db.delete(companies);
       return;
     } catch (error) {
-      const isLateCommentRace =
-        error instanceof Error &&
-        error.message.includes("issue_comments_issue_id_issues_id_fk");
-      if (!isLateCommentRace || attempt === 4) {
+      const isFkViolation =
+        error instanceof Error && error.message.includes("23503");
+      if (!isFkViolation || attempt === 4) {
         throw error;
       }
 
-      // Heartbeat completion can write issue-thread comments shortly after the
-      // run leaves queued/running. Retry the dependent deletes once those land.
+      // Heartbeat completion can lazily re-insert child rows (issue comments,
+      // company skills) after the first delete sweep. Re-clear and retry.
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
   }

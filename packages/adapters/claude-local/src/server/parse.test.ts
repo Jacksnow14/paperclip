@@ -168,13 +168,26 @@ describe("extractClaudeRetryNotBefore", () => {
     expect(extracted?.toISOString()).toBe("2026-07-29T11:00:00.000Z");
   });
 
-  it("pins the verbatim dated 'weekly limit' reset hint to the named day", () => {
+  it("parses the verbatim dated 'weekly limit' reset hint", () => {
     const now = new Date("2026-07-28T23:10:00.000Z");
     const extracted = extractClaudeRetryNotBefore(
       { errorMessage: "You've hit your weekly limit · resets Jul 29, 11am (UTC)" },
       now,
     );
     expect(extracted?.toISOString()).toBe("2026-07-29T11:00:00.000Z");
+  });
+
+  // A weekly cap can reset days out, so the named day has to be honoured rather
+  // than collapsed to the next occurrence of the clock time — otherwise the
+  // scheduler resumes early and burns the whole retry ladder against a wall
+  // that is still up. Reading the next 11am here would give Jul 29, not Aug 2.
+  it("pins a dated reset hint to the named day, not the next matching clock time", () => {
+    const now = new Date("2026-07-28T23:10:00.000Z");
+    const extracted = extractClaudeRetryNotBefore(
+      { errorMessage: "You've hit your weekly limit · resets Aug 2, 11am (UTC)" },
+      now,
+    );
+    expect(extracted?.toISOString()).toBe("2026-08-02T11:00:00.000Z");
   });
 
   it("does not roll a dated reset hint forward a day once it has passed", () => {
@@ -191,10 +204,10 @@ describe("extractClaudeRetryNotBefore", () => {
   it("resolves a dated reset hint across a year boundary", () => {
     const now = new Date("2026-12-31T22:00:00.000Z");
     const extracted = extractClaudeRetryNotBefore(
-      { errorMessage: "You've hit your weekly limit · resets Jan 1, 11am (UTC)" },
+      { errorMessage: "You've hit your weekly limit · resets Jan 3, 11am (UTC)" },
       now,
     );
-    expect(extracted?.toISOString()).toBe("2027-01-01T11:00:00.000Z");
+    expect(extracted?.toISOString()).toBe("2027-01-03T11:00:00.000Z");
   });
 
   it("ignores a non-date word ahead of the clock rather than mis-parsing it", () => {

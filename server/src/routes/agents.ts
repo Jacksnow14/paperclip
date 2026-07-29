@@ -1466,9 +1466,15 @@ export function agentRoutes(
         inputAdapterConfig,
         { strictMode: strictSecretsMode },
       );
+      // No agent exists yet for a pre-save connectivity test (AUR-4279): only a
+      // board actor — the same trusted root that bypasses the write-side
+      // binding gate (AUR-4093) — may resolve secret_refs here without a bound
+      // consumer target.
       const { config: runtimeAdapterConfig } = await secretsSvc.resolveAdapterConfigForRuntime(
         companyId,
         normalizedAdapterConfig,
+        undefined,
+        { type: req.actor.type },
       );
 
       const { executionTarget, environmentName, fallbackChecks, release } =
@@ -1541,9 +1547,17 @@ export function agentRoutes(
       return;
     }
 
+    const listSkillsActorInfo = getActorInfo(req);
     const { config: runtimeConfig } = await secretsSvc.resolveAdapterConfigForRuntime(
       agent.companyId,
       agent.adapterConfig,
+      {
+        consumerType: "agent",
+        consumerId: agent.id,
+        actorType: listSkillsActorInfo.actorType,
+        actorId: listSkillsActorInfo.actorId,
+      },
+      { type: req.actor.type },
     );
     const runtimeSkillConfig = await buildRuntimeSkillConfig(
       agent.companyId,
@@ -1610,6 +1624,13 @@ export function agentRoutes(
       const { config: runtimeConfig } = await secretsSvc.resolveAdapterConfigForRuntime(
         updated.companyId,
         updated.adapterConfig,
+        {
+          consumerType: "agent",
+          consumerId: updated.id,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+        },
+        { type: req.actor.type },
       );
       const runtimeSkillConfig = {
         ...runtimeConfig,
@@ -3191,7 +3212,12 @@ export function agentRoutes(
     }
 
     const config = asRecord(agent.adapterConfig) ?? {};
-    const { config: runtimeConfig } = await secretsSvc.resolveAdapterConfigForRuntime(agent.companyId, config);
+    const { config: runtimeConfig } = await secretsSvc.resolveAdapterConfigForRuntime(
+      agent.companyId,
+      config,
+      undefined,
+      { type: req.actor.type },
+    );
     const result = await runClaudeLogin({
       runId: `claude-login-${randomUUID()}`,
       agent: {

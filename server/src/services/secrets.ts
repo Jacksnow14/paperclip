@@ -321,12 +321,23 @@ export function secretService(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
+  /**
+   * Board gate for secret_ref resolution (AUR-4279, resolution-side twin of
+   * assertBindingAdditionsAllowed / AUR-4093). A missing context used to skip
+   * the binding check entirely; now only a `board` actor — the same trusted
+   * root that bypasses the write-side gate — may resolve without one. Every
+   * other caller must supply a context that resolves to a real binding row.
+   */
   async function assertBindingContext(
     companyId: string,
     secretId: string,
     context: SecretConsumerContext | undefined,
+    actor: SecretBindingWriteActor,
   ) {
-    if (!context) return;
+    if (actor?.type === "board") return;
+    if (!context) {
+      throw unprocessable("Secret resolution requires a consumer binding context");
+    }
     if (!context.configPath) {
       throw unprocessable("Secret resolution requires a binding config path");
     }
@@ -569,6 +580,7 @@ export function secretService(db: Db) {
     secretId: string,
     version: number | "latest",
     context?: SecretConsumerContext,
+    actor?: SecretBindingWriteActor,
   ): Promise<RuntimeSecretResolution> {
     const secret = await assertSecretInCompany(companyId, secretId);
     const resolvedVersion = version === "latest" ? secret.latestVersion : version;
@@ -578,7 +590,7 @@ export function secretService(db: Db) {
       if (secret.status !== "active") {
         throw unprocessable("Secret is not active");
       }
-      await assertBindingContext(companyId, secret.id, context);
+      await assertBindingContext(companyId, secret.id, context, actor);
       const versionRow = await getSecretVersion(secret.id, resolvedVersion);
       if (!versionRow) throw notFound("Secret version not found");
       if (versionRow.status === "disabled" || versionRow.status === "destroyed" || versionRow.revokedAt) {
@@ -649,8 +661,9 @@ export function secretService(db: Db) {
     secretId: string,
     version: number | "latest",
     context?: SecretConsumerContext,
+    actor?: SecretBindingWriteActor,
   ): Promise<string> {
-    return (await resolveSecretValueInternal(companyId, secretId, version, context)).value;
+    return (await resolveSecretValueInternal(companyId, secretId, version, context, actor)).value;
   }
 
   async function normalizeEnvConfig(
@@ -2246,6 +2259,7 @@ export function secretService(db: Db) {
       companyId: string,
       envValue: unknown,
       context?: Omit<SecretConsumerContext, "configPath">,
+      actor?: SecretBindingWriteActor,
     ): Promise<{ env: Record<string, string>; secretKeys: Set<string>; manifest: RuntimeSecretManifestEntry[] }> => {
       const record = asRecord(envValue);
       if (!record) return { env: {} as Record<string, string>, secretKeys: new Set<string>(), manifest: [] };
@@ -2270,6 +2284,7 @@ export function secretService(db: Db) {
             binding.secretId,
             binding.version,
             context ? { ...context, configPath: `env.${key}` } : undefined,
+            actor,
           );
           resolved[key] = secretResolution.value;
           manifest.push(secretResolution.manifestEntry);
@@ -2283,6 +2298,7 @@ export function secretService(db: Db) {
       companyId: string,
       adapterConfig: Record<string, unknown>,
       context?: Omit<SecretConsumerContext, "configPath">,
+      actor?: SecretBindingWriteActor,
     ): Promise<{ config: Record<string, unknown>; secretKeys: Set<string>; manifest: RuntimeSecretManifestEntry[] }> => {
       const resolved = { ...adapterConfig };
       const secretKeys = new Set<string>();
@@ -2313,6 +2329,7 @@ export function secretService(db: Db) {
             binding.secretId,
             binding.version,
             context ? { ...context, configPath: `env.${key}` } : undefined,
+            actor,
           );
           env[key] = secretResolution.value;
           manifest.push(secretResolution.manifestEntry);

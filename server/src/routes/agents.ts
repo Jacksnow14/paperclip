@@ -58,6 +58,11 @@ import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
 import { resolveEnvironmentExecutionTarget } from "../services/environment-execution-target.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
+import {
+  FLEET_CAPACITY_RUN_WINDOW,
+  computeFleetCapacity,
+  type FleetCapacityRunInput,
+} from "../services/fleet-capacity.js";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import type {
   AdapterEnvironmentCheck,
@@ -3130,6 +3135,40 @@ export function agentRoutes(
     const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10) || 200)) : undefined;
     const runs = await heartbeat.list(companyId, agentId, limit);
     res.json(runs);
+  });
+
+  // AUR-4385: one call answering "which agents can execute right now, and why
+  // not" for every agent. Derived from run history (see services/fleet-capacity.ts).
+  router.get("/companies/:companyId/fleet-capacity", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+
+    const agentRows = await svc.list(companyId);
+    const capacityAgents = agentRows.map((agent) => ({
+      id: agent.id as string,
+      name: agent.name as string,
+      adapterType: (agent.adapterType as string) ?? "unknown",
+      pausedAt: (agent as { pausedAt?: Date | string | null }).pausedAt ?? null,
+    }));
+
+    const runsByAgent = new Map<string, FleetCapacityRunInput[]>(
+      await Promise.all(
+        capacityAgents.map(async (agent) => {
+          const runs = await heartbeat.list(companyId, agent.id, FLEET_CAPACITY_RUN_WINDOW);
+          return [
+            agent.id,
+            runs.map((run) => ({
+              status: run.status,
+              createdAt: run.createdAt,
+              finishedAt: run.finishedAt,
+              error: (run as { error?: string | null }).error ?? null,
+            })),
+          ] as const;
+        }),
+      ),
+    );
+
+    res.json({ companyId, ...computeFleetCapacity(capacityAgents, runsByAgent, new Date()) });
   });
 
   router.get("/companies/:companyId/live-runs", async (req, res) => {

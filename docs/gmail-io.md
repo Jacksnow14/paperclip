@@ -46,6 +46,36 @@ curl -s -H "Authorization: Bearer $AGENT_KEY" \
   | jq -r '.dataBase64' | base64 -d > downloaded-file
 ```
 
+## Where board@ keeps DMARC aggregate reports
+
+DMARC aggregate reports sent to `board@tryauranode.com` live under the **`DMARC`**
+label (`Label_2`), **archived** — they are deliberately not in `INBOX`. Anything
+reading them must ask for the label explicitly:
+
+```
+GET /api/companies/:companyId/gmail/mailboxes/board/messages?q=label:DMARC
+```
+
+An unfiltered listing is **not** equivalent: it returns whatever is newest and
+buries the reports behind unrelated mail.
+
+**Gmail filters on board@ must never add `TRASH`.** Two filters previously did
+(`addLabelIds: ["Label_2", "TRASH"]`), which routed every incoming aggregate
+straight to Trash. Gmail purges Trash after ~30 days, so the reports were being
+destroyed on a rolling basis and the deliverability sensor read an empty mailbox —
+a silent, self-erasing data loss. The filters now use
+`addLabelIds: ["Label_2"]`, `removeLabelIds: ["INBOX", "UNREAD"]`. If you recreate
+or edit them, keep it that way. (Gmail filters cannot be edited in place — only
+deleted and recreated — so re-adding `TRASH` by accident is easy.)
+
+Two consumer-facing details, both of which have caused silent breakage:
+
+- The **list** endpoint returns `{ id, threadId }` only — no `subject`/`from`.
+  Do not filter a listing on those fields; they are always `undefined`.
+- Reports arrive compressed, and the format varies by reporter: Google sends
+  `.zip`, Microsoft/Yahoo/AOL send `.gz`. Handle both, or you drop roughly half
+  the corpus without any error.
+
 ## Send
 
 ```

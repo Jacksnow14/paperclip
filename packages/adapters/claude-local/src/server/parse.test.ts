@@ -71,6 +71,14 @@ describe("isClaudeTransientUpstreamError", () => {
     ).toBe(true);
   });
 
+  it("classifies the live 'weekly limit' wording as transient (AUR-4192)", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        errorMessage: "You've hit your weekly limit · resets Jul 29, 11am (UTC)",
+      }),
+    ).toBe(true);
+  });
+
   it("does not classify login/auth failures as transient", () => {
     expect(
       isClaudeTransientUpstreamError({
@@ -145,5 +153,56 @@ describe("extractClaudeRetryNotBefore", () => {
       now,
     );
     expect(extracted?.toISOString()).toBe("2026-07-26T00:40:00.000Z");
+  });
+
+  // AUR-4192: both wordings below are verbatim from heartbeat_runs rows. Between
+  // 2026-07-22 and 2026-07-29 they accounted for 18,703 failed runs across 11
+  // agents — 82% of every fleet run failure — and none carried a retryNotBefore,
+  // because the AUR-4055 wording list only covered "<window> limit reached".
+  it("parses the verbatim clock-only 'weekly limit' reset hint", () => {
+    const now = new Date("2026-07-29T10:41:38.815Z");
+    const extracted = extractClaudeRetryNotBefore(
+      { errorMessage: "Claude run failed: subtype=success: You've hit your weekly limit · resets 11am (UTC)" },
+      now,
+    );
+    expect(extracted?.toISOString()).toBe("2026-07-29T11:00:00.000Z");
+  });
+
+  it("pins the verbatim dated 'weekly limit' reset hint to the named day", () => {
+    const now = new Date("2026-07-28T23:10:00.000Z");
+    const extracted = extractClaudeRetryNotBefore(
+      { errorMessage: "You've hit your weekly limit · resets Jul 29, 11am (UTC)" },
+      now,
+    );
+    expect(extracted?.toISOString()).toBe("2026-07-29T11:00:00.000Z");
+  });
+
+  it("does not roll a dated reset hint forward a day once it has passed", () => {
+    const now = new Date("2026-07-29T12:00:00.000Z");
+    const extracted = extractClaudeRetryNotBefore(
+      { errorMessage: "You've hit your weekly limit · resets Jul 29, 11am (UTC)" },
+      now,
+    );
+    // Already elapsed: the caller only uses this to push a retry later, so the
+    // correct answer is the real (past) reset, not tomorrow.
+    expect(extracted?.toISOString()).toBe("2026-07-29T11:00:00.000Z");
+  });
+
+  it("resolves a dated reset hint across a year boundary", () => {
+    const now = new Date("2026-12-31T22:00:00.000Z");
+    const extracted = extractClaudeRetryNotBefore(
+      { errorMessage: "You've hit your weekly limit · resets Jan 1, 11am (UTC)" },
+      now,
+    );
+    expect(extracted?.toISOString()).toBe("2027-01-01T11:00:00.000Z");
+  });
+
+  it("ignores a non-date word ahead of the clock rather than mis-parsing it", () => {
+    expect(
+      extractClaudeRetryNotBefore(
+        { errorMessage: "You've hit your weekly limit · resets sometime 11am" },
+        new Date("2026-07-29T10:00:00.000Z"),
+      ),
+    ).toBeNull();
   });
 });

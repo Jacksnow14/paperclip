@@ -365,6 +365,8 @@ Full index: [`docs/runbooks/README.md`](docs/runbooks/README.md)
   behavior, in under a minute.
 - [Production deploys and deploy-drift alerts](docs/runbooks/production-deploy.md) — what
   production is actually running and how a deploy lands.
+- [Deploy safety gate](docs/runbooks/deploy-safety-gate.md) — why a release build was refused
+  or killed by the memory gate, and how to run one safely.
 - [Agent privilege model and `hostguard`](docs/runbooks/agent-privilege-model.md) — what an
   agent can do to this host, and what is logged.
 

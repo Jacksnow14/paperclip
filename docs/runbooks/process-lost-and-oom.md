@@ -172,7 +172,7 @@ sudo -n -l    # -> (ALL : ALL) ALL, no password
 | Mitigation | Unit / file | Purpose |
 | --- | --- | --- |
 | `paperclip-oom-guard.timer` | `/etc/systemd/system/paperclip-oom-guard.{service,timer}`, script `/usr/local/sbin/paperclip-oom-guard.sh` | Every 30s, sets `oom_score_adj`: `-900` Postgres, `-800` control-plane main pid, `+600` `claude` agent children — biases kernel kill selection toward a sacrificial agent child |
-| `paperclip-mem-watch.timer` | `/etc/systemd/system/paperclip-mem-watch.{service,timer}`, script `/usr/local/sbin/paperclip-mem-watch.sh` | Every 5min, appends a CSV row to `/var/log/paperclip-mem-watch.log` (§1) so a "sustained window under real load" is a log lookup, not journalctl forensics |
+| `paperclip-mem-watch.timer` | `/etc/systemd/system/paperclip-mem-watch.{service,timer}`, script `/usr/local/sbin/paperclip-mem-watch.sh` (canonical source: `scripts/paperclip-mem-watch.sh` in this repo — see §4a) | Every 5min, appends a CSV row to `/var/log/paperclip-mem-watch.log` (§1) so a "sustained window under real load" is a log lookup, not journalctl forensics |
 | `OOMPolicy=continue` | `~/.config/systemd/user/paperclip.service.d/oom-policy.conf` | A `claude` child getting OOM-killed no longer stops the whole `paperclip.service` unit and orphans every other run on it |
 | `OOMScoreAdjust=-900`, `OOMPolicy=continue` | built into `paperclip-db.service` | Postgres is the last thing the kernel should pick, independent of the guard timer |
 
@@ -190,6 +190,35 @@ How to reverse (read-only runbook note only — do not run this without a reason
 ```bash
 sudo systemctl disable --now paperclip-oom-guard.timer
 ```
+
+### 4a. Canonical source and sync path for `paperclip-mem-watch.sh` (AUR-4170)
+
+The live copy at `/usr/local/sbin/paperclip-mem-watch.sh` is a **deployment target, not the
+source of truth**. The canonical source is `scripts/paperclip-mem-watch.sh` in this repo,
+kept byte-identical to the host copy and guarded by a hermetic regression harness for the
+`oom_5min` kernel-only derivation (stubbed `journalctl`; needs no root and no live journal,
+so it runs anywhere):
+
+```bash
+bash scripts/paperclip-mem-watch.test.sh    # exit 0 = all assertions pass
+```
+
+The harness runs the real sampler end-to-end and asserts: a genuine `kernel: oom-kill:`
+line counts **exactly once** (not once per line of its 4-line kill block); app-log text
+containing `oom-kill` / `oom_reaper` / a quoted `journalctl -k ... grep -ci 'oom-kill'`
+command counts **zero** (the AUR-4119/AUR-4126 self-poisoning defect); and the retired
+unrestricted grep gets both of those wrong, so a revert fails the suite.
+
+To change the sampler: edit the repo copy, run the harness, ship via PR, then deploy with
+
+```bash
+sudo install -m 0755 scripts/paperclip-mem-watch.sh /usr/local/sbin/paperclip-mem-watch.sh
+```
+
+The harness includes a drift check that fails loudly when run **on the prod host** if the
+two copies differ (it skips off-host, e.g. in CI). A hotfix applied directly to
+`/usr/local/sbin` — as the AUR-4126 hotfix was — is therefore caught the next time the
+suite runs here: port the hotfix back into `scripts/paperclip-mem-watch.sh` to clear it.
 
 ---
 

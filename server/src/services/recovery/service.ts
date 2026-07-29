@@ -11,6 +11,7 @@ import {
   agents,
   agentWakeupRequests,
   approvals,
+  activityLog,
   companies,
   issueComments,
   heartbeatRunEvents,
@@ -21,6 +22,7 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  projects,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
@@ -68,6 +70,9 @@ const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+const DIRECT_BLOCKER_TERMINAL_STATUSES = new Set(["done", "cancelled"]);
+const MISSING_BLOCKER_EDGE_REMINDER_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const MISSING_BLOCKER_EDGE_ESCALATION_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
@@ -105,6 +110,49 @@ type WatchdogDecisionActor =
   | { type: "board"; userId?: string | null; runId?: string | null }
   | { type: "agent"; agentId?: string | null; runId?: string | null }
   | { type: "none" };
+
+type DurableBlockedIssueRow = Pick<
+  typeof issues.$inferSelect,
+  | "id"
+  | "companyId"
+  | "identifier"
+  | "title"
+  | "status"
+  | "projectId"
+  | "assigneeAgentId"
+  | "assigneeUserId"
+  | "createdAt"
+  | "updatedAt"
+>;
+
+type DurableBlockedIssueDirectBlockerRow = {
+  blockedIssueId: string;
+  blockerIssueId: string;
+  identifier: string | null;
+  title: string;
+  status: string;
+  updatedAt: Date;
+};
+
+type DurableBlockedIssueDirectBlocker = DurableBlockedIssueDirectBlockerRow;
+
+type DurableBlockedIssueClassificationKind =
+  | "missing_edge"
+  | "terminal_only"
+  | "open_non_terminal";
+
+type DurableBlockedIssueClassification = {
+  issue: DurableBlockedIssueRow;
+  kind: DurableBlockedIssueClassificationKind;
+  directBlockers: DurableBlockedIssueDirectBlocker[];
+  blockedEnteredAt: Date;
+  staleAgeMs: number;
+};
+
+type MissingBlockerEdgeStage =
+  | "none"
+  | "wake_assignee"
+  | "escalate_owner";
 
 export type RunOutputSilenceSummary = {
   lastOutputAt: Date | null;
@@ -2709,6 +2757,599 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     };
   }
 
+  function sortDurableBlockedIssueDirectBlockers(
+    blockers: DurableBlockedIssueDirectBlocker[],
+  ): DurableBlockedIssueDirectBlocker[] {
+    return [...blockers].sort((left, right) => {
+      const leftLabel = left.identifier ?? left.title ?? left.blockerIssueId;
+      const rightLabel = right.identifier ?? right.title ?? right.blockerIssueId;
+      return leftLabel.localeCompare(rightLabel);
+    });
+  }
+
+  function missingBlockerEdgeStageForAge(staleAgeMs: number): MissingBlockerEdgeStage {
+    if (staleAgeMs >= MISSING_BLOCKER_EDGE_ESCALATION_AGE_MS) return "escalate_owner";
+    if (staleAgeMs >= MISSING_BLOCKER_EDGE_REMINDER_AGE_MS) return "wake_assignee";
+    return "none";
+  }
+
+  async function loadDurableBlockedEnteredAtByIssue(blockedIssues: DurableBlockedIssueRow[]) {
+    if (blockedIssues.length === 0) return new Map<string, Date>();
+
+    const blockedIssueIds = blockedIssues.map((issue) => issue.id);
+    const rows = await db
+      .select({
+        issueId: activityLog.entityId,
+        blockedEnteredAt: sql<Date>`MAX(${activityLog.createdAt})`,
+      })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityType, "issue"),
+          inArray(activityLog.entityId, blockedIssueIds),
+          inArray(activityLog.action, ["issue.created", "issue.updated"]),
+          sql`${activityLog.details} ->> 'status' = 'blocked'`,
+        ),
+      )
+      .groupBy(activityLog.entityId);
+
+    const blockedEnteredAtByIssueId = new Map(
+      blockedIssues.map((issue) => [issue.id, issue.createdAt]),
+    );
+    for (const row of rows) {
+      if (!row.blockedEnteredAt) continue;
+      const blockedEnteredAt =
+        row.blockedEnteredAt instanceof Date
+          ? row.blockedEnteredAt
+          : new Date(row.blockedEnteredAt);
+      if (!Number.isNaN(blockedEnteredAt.getTime())) {
+        blockedEnteredAtByIssueId.set(row.issueId, blockedEnteredAt);
+      }
+    }
+    return blockedEnteredAtByIssueId;
+  }
+
+  async function collectDurableBlockedIssueClassifications(
+    now: Date,
+  ): Promise<DurableBlockedIssueClassification[]> {
+    const blockedIssues = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        identifier: issues.identifier,
+        title: issues.title,
+        status: issues.status,
+        projectId: issues.projectId,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        createdAt: issues.createdAt,
+        updatedAt: issues.updatedAt,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.status, "blocked"),
+          isNull(issues.hiddenAt),
+          notInArray(issues.originKind, [RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation]),
+        ),
+      );
+    if (blockedIssues.length === 0) return [];
+
+    const blockedIssueIds = blockedIssues.map((issue) => issue.id);
+    const blockedEnteredAtByIssueId = await loadDurableBlockedEnteredAtByIssue(blockedIssues);
+    const explicitBlockers = await db
+      .select({
+        blockedIssueId: issueRelations.relatedIssueId,
+        blockerIssueId: issues.id,
+        identifier: issues.identifier,
+        title: issues.title,
+        status: issues.status,
+        updatedAt: issues.updatedAt,
+      })
+      .from(issueRelations)
+      .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+      .where(
+        and(
+          eq(issueRelations.type, "blocks"),
+          inArray(issueRelations.relatedIssueId, blockedIssueIds),
+          isNull(issues.hiddenAt),
+        ),
+      );
+    const childBlockers = await db
+      .select({
+        blockedIssueId: issues.parentId,
+        blockerIssueId: issues.id,
+        identifier: issues.identifier,
+        title: issues.title,
+        status: issues.status,
+        updatedAt: issues.updatedAt,
+      })
+      .from(issues)
+      .where(
+        and(
+          isNull(issues.hiddenAt),
+          inArray(issues.parentId, blockedIssueIds),
+        ),
+      );
+
+    const directBlockersByIssueId = new Map<string, Map<string, DurableBlockedIssueDirectBlocker>>();
+    const explicitBlockerIdsByIssueId = new Map<string, Set<string>>();
+    for (const row of explicitBlockers) {
+      const blockerIds = explicitBlockerIdsByIssueId.get(row.blockedIssueId) ?? new Set<string>();
+      blockerIds.add(row.blockerIssueId);
+      explicitBlockerIdsByIssueId.set(row.blockedIssueId, blockerIds);
+    }
+    for (const row of [...explicitBlockers, ...childBlockers]) {
+      if (!row.blockedIssueId) continue;
+      const byBlockerId = directBlockersByIssueId.get(row.blockedIssueId) ?? new Map();
+      if (!byBlockerId.has(row.blockerIssueId)) {
+        byBlockerId.set(row.blockerIssueId, row);
+      }
+      directBlockersByIssueId.set(row.blockedIssueId, byBlockerId);
+    }
+
+    return blockedIssues.map((issue) => {
+      const directBlockers = sortDurableBlockedIssueDirectBlockers(
+        [...(directBlockersByIssueId.get(issue.id)?.values() ?? [])],
+      );
+      const hasFirstClassBlockerEdge = (explicitBlockerIdsByIssueId.get(issue.id)?.size ?? 0) > 0;
+      const blockedEnteredAt = blockedEnteredAtByIssueId.get(issue.id) ?? issue.createdAt;
+      const kind: DurableBlockedIssueClassificationKind =
+        directBlockers.length === 0
+          ? "missing_edge"
+          : !hasFirstClassBlockerEdge
+            ? "missing_edge"
+            : directBlockers.every((blocker) => DIRECT_BLOCKER_TERMINAL_STATUSES.has(blocker.status))
+            ? "terminal_only"
+            : "open_non_terminal";
+      return {
+        issue,
+        kind,
+        directBlockers,
+        blockedEnteredAt,
+        staleAgeMs: Math.max(0, now.getTime() - blockedEnteredAt.getTime()),
+      };
+    });
+  }
+
+  async function loadActiveIssueGraphLivenessRecoveryActions(sourceIssueIds: string[]) {
+    if (sourceIssueIds.length === 0) return new Map<string, typeof issueRecoveryActions.$inferSelect>();
+    const rows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          inArray(issueRecoveryActions.sourceIssueId, [...new Set(sourceIssueIds)]),
+          eq(issueRecoveryActions.kind, "issue_graph_liveness"),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        ),
+      )
+      .orderBy(desc(issueRecoveryActions.updatedAt));
+    const result = new Map<string, typeof issueRecoveryActions.$inferSelect>();
+    for (const row of rows) {
+      if (!result.has(row.sourceIssueId)) result.set(row.sourceIssueId, row);
+    }
+    return result;
+  }
+
+  async function loadAnyActiveRecoveryActions(sourceIssueIds: string[]) {
+    if (sourceIssueIds.length === 0) return new Map<string, typeof issueRecoveryActions.$inferSelect>();
+    const rows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          inArray(issueRecoveryActions.sourceIssueId, [...new Set(sourceIssueIds)]),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        ),
+      )
+      .orderBy(desc(issueRecoveryActions.updatedAt));
+    const result = new Map<string, typeof issueRecoveryActions.$inferSelect>();
+    for (const row of rows) {
+      if (!result.has(row.sourceIssueId)) result.set(row.sourceIssueId, row);
+    }
+    return result;
+  }
+
+  async function loadDurableMissingBlockerEscalationOwners(issuesNeedingOwners: DurableBlockedIssueRow[]) {
+    const companyIds = [...new Set(issuesNeedingOwners.map((issue) => issue.companyId))];
+    const projectIds = [
+      ...new Set(
+        issuesNeedingOwners
+          .map((issue) => issue.projectId)
+          .filter((projectId): projectId is string => Boolean(projectId)),
+      ),
+    ];
+    const [projectRows, agentRows] = await Promise.all([
+      projectIds.length === 0
+        ? Promise.resolve([] as Array<{ id: string; companyId: string; leadAgentId: string | null }>)
+        : db
+            .select({ id: projects.id, companyId: projects.companyId, leadAgentId: projects.leadAgentId })
+            .from(projects)
+            .where(inArray(projects.id, projectIds)),
+      companyIds.length === 0
+        ? Promise.resolve([] as Array<{ id: string; companyId: string; role: string; status: string; reportsTo: string | null }>)
+        : db
+            .select({
+              id: agents.id,
+              companyId: agents.companyId,
+              role: agents.role,
+              status: agents.status,
+              reportsTo: agents.reportsTo,
+            })
+            .from(agents)
+            .where(inArray(agents.companyId, companyIds)),
+    ]);
+
+    const invokableAgentById = new Map(
+      agentRows
+        .filter((agent) => ["active", "idle", "running", "error"].includes(agent.status))
+        .map((agent) => [agent.id, agent]),
+    );
+    const projectLeadByProjectId = new Map<string, string>();
+    for (const project of projectRows) {
+      if (!project.leadAgentId) continue;
+      const lead = invokableAgentById.get(project.leadAgentId);
+      if (!lead || lead.companyId !== project.companyId) continue;
+      projectLeadByProjectId.set(project.id, project.leadAgentId);
+    }
+
+    const fallbackOwnerByCompanyId = new Map<string, string>();
+    const rootsByCompanyId = new Map<string, Array<{ id: string; role: string }>>();
+    for (const agent of invokableAgentById.values()) {
+      if (agent.reportsTo) continue;
+      const list = rootsByCompanyId.get(agent.companyId) ?? [];
+      list.push({ id: agent.id, role: agent.role });
+      rootsByCompanyId.set(agent.companyId, list);
+    }
+    for (const [companyId, roots] of rootsByCompanyId) {
+      roots.sort((left, right) => {
+        const leftRank = left.role === "ceo" ? 0 : 1;
+        const rightRank = right.role === "ceo" ? 0 : 1;
+        if (leftRank !== rightRank) return leftRank - rightRank;
+        return left.id.localeCompare(right.id);
+      });
+      if (roots[0]) fallbackOwnerByCompanyId.set(companyId, roots[0].id);
+    }
+
+    return {
+      projectLeadByProjectId,
+      fallbackOwnerByCompanyId,
+    };
+  }
+
+  function buildDurableMissingBlockerActionFingerprint(input: {
+    issueId: string;
+    stage: Exclude<MissingBlockerEdgeStage, "none">;
+    ownerAgentId: string | null;
+  }) {
+    return `issue_graph_liveness:${input.issueId}:missing_blocker_edge:${input.stage}:${input.ownerAgentId ?? "board"}`;
+  }
+
+  async function resolveDurableIssueGraphLivenessAction(input: {
+    action: typeof issueRecoveryActions.$inferSelect;
+    sourceIssue: DurableBlockedIssueRow;
+    status: "resolved" | "cancelled";
+    outcome: "restored" | "blocked" | "cancelled";
+    resolutionNote: string;
+    runId?: string | null;
+  }) {
+    const resolved = await recoveryActionsSvc.resolveActiveForIssue({
+      companyId: input.action.companyId,
+      sourceIssueId: input.action.sourceIssueId,
+      actionId: input.action.id,
+      status: input.status,
+      outcome: input.outcome,
+      resolutionNote: input.resolutionNote,
+    });
+    if (!resolved) return null;
+
+    await logActivity(db, {
+      companyId: input.sourceIssue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: input.runId ?? null,
+      action: "issue.recovery_action_resolved",
+      entityType: "issue",
+      entityId: input.sourceIssue.id,
+      details: {
+        identifier: input.sourceIssue.identifier,
+        recoveryActionId: resolved.id,
+        recoveryActionStatus: resolved.status,
+        outcome: resolved.outcome,
+        resolutionNote: resolved.resolutionNote,
+        source: "recovery.reconcile_issue_graph_liveness",
+      },
+    });
+
+    return resolved;
+  }
+
+  async function reconcileDurableBlockedIssueAttention(input: {
+    now: Date;
+    runId?: string | null;
+  }) {
+    const classifications = await collectDurableBlockedIssueClassifications(input.now);
+    const sourceIssueIds = classifications.map((classification) => classification.issue.id);
+    const [graphLivenessActions, anyActiveActions] = await Promise.all([
+      loadActiveIssueGraphLivenessRecoveryActions(sourceIssueIds),
+      loadAnyActiveRecoveryActions(sourceIssueIds),
+    ]);
+    const ownerMaps = await loadDurableMissingBlockerEscalationOwners(
+      classifications
+        .filter((classification) =>
+          classification.kind === "missing_edge" &&
+          missingBlockerEdgeStageForAge(classification.staleAgeMs) === "escalate_owner"
+        )
+        .map((classification) => classification.issue),
+    );
+
+    const result = {
+      blockedIssuesScanned: classifications.length,
+      terminalOnlyIssues: 0,
+      missingEdgeIssues: 0,
+      openNonTerminalIssues: 0,
+      classAAutoRecovered: 0,
+      classBNudged: 0,
+      classBEscalated: 0,
+      classBNoop: 0,
+      classBSkippedOtherRecoveryAction: 0,
+      issueGraphRecoveryActionsResolved: 0,
+      actionErrors: 0,
+      errorIssueIds: [] as string[],
+    };
+
+    for (const classification of classifications) {
+      if (classification.kind === "terminal_only") result.terminalOnlyIssues += 1;
+      else if (classification.kind === "missing_edge") result.missingEdgeIssues += 1;
+      else result.openNonTerminalIssues += 1;
+
+      const graphLivenessAction = graphLivenessActions.get(classification.issue.id) ?? null;
+      const anyActiveAction = anyActiveActions.get(classification.issue.id) ?? null;
+
+      try {
+        if (classification.kind === "terminal_only") {
+          const updatedIssue = await issuesSvc.update(classification.issue.id, { status: "todo" });
+          if (!updatedIssue) continue;
+
+          result.classAAutoRecovered += 1;
+
+          const blockerSummaries = classification.directBlockers.map((blocker) => ({
+            issueId: blocker.blockerIssueId,
+            identifier: blocker.identifier,
+            status: blocker.status,
+          }));
+          const commentBody = [
+            "Recovered automatically from `blocked` to `todo`.",
+            "",
+            "All direct blocker edges on this issue are now terminal:",
+            ...classification.directBlockers.map((blocker) =>
+              `- \`${blocker.identifier ?? blocker.blockerIssueId}\` (\`${blocker.status}\`)`,
+            ),
+          ].join("\n");
+          await issuesSvc.addComment(classification.issue.id, commentBody, {}, { authorType: "system" });
+
+          await logActivity(db, {
+            companyId: classification.issue.companyId,
+            actorType: "system",
+            actorId: "system",
+            agentId: null,
+            runId: input.runId ?? null,
+            action: "issue.updated",
+            entityType: "issue",
+            entityId: classification.issue.id,
+            details: {
+              identifier: classification.issue.identifier,
+              status: "todo",
+              source: "recovery.reconcile_issue_graph_liveness",
+              durableBlockerClassification: classification.kind,
+              previousStatus: "blocked",
+              blockerSummaries,
+            },
+          });
+
+          if (classification.issue.assigneeAgentId) {
+            const resolvedBlockerIssueId = classification.directBlockers[0]?.blockerIssueId ?? null;
+            await deps.enqueueWakeup(classification.issue.assigneeAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_blockers_resolved",
+              payload: {
+                issueId: classification.issue.id,
+                resolvedBlockerIssueId,
+                blockerIssueIds: classification.directBlockers.map((blocker) => blocker.blockerIssueId),
+              },
+              requestedByActorType: "system",
+              requestedByActorId: null,
+              contextSnapshot: {
+                issueId: classification.issue.id,
+                taskId: classification.issue.id,
+                wakeReason: "issue_blockers_resolved",
+                source: "issue.blockers_resolved",
+                resolvedBlockerIssueId,
+                blockerIssueIds: classification.directBlockers.map((blocker) => blocker.blockerIssueId),
+              },
+            });
+          }
+
+          if (graphLivenessAction) {
+            const resolved = await resolveDurableIssueGraphLivenessAction({
+              action: graphLivenessAction,
+              sourceIssue: classification.issue,
+              status: "resolved",
+              outcome: "restored",
+              resolutionNote: "Resolved automatically because all direct blockers are terminal.",
+              runId: input.runId ?? null,
+            });
+            if (resolved) result.issueGraphRecoveryActionsResolved += 1;
+          }
+          continue;
+        }
+
+        if (classification.kind === "open_non_terminal") {
+          if (graphLivenessAction) {
+            const resolved = await resolveDurableIssueGraphLivenessAction({
+              action: graphLivenessAction,
+              sourceIssue: classification.issue,
+              status: "resolved",
+              outcome: "blocked",
+              resolutionNote: "Resolved automatically because the source issue now has a non-terminal direct blocker edge.",
+              runId: input.runId ?? null,
+            });
+            if (resolved) result.issueGraphRecoveryActionsResolved += 1;
+          }
+          result.classBNoop += 1;
+          continue;
+        }
+
+        const stage = missingBlockerEdgeStageForAge(classification.staleAgeMs);
+        if (stage === "none") {
+          if (graphLivenessAction) {
+            const resolved = await resolveDurableIssueGraphLivenessAction({
+              action: graphLivenessAction,
+              sourceIssue: classification.issue,
+              status: "cancelled",
+              outcome: "cancelled",
+              resolutionNote: "Cancelled automatically because the source issue entered blocked recently and is below the stale-age threshold.",
+              runId: input.runId ?? null,
+            });
+            if (resolved) result.issueGraphRecoveryActionsResolved += 1;
+          }
+          result.classBNoop += 1;
+          continue;
+        }
+
+        if (anyActiveAction && anyActiveAction.kind !== "issue_graph_liveness") {
+          result.classBSkippedOtherRecoveryAction += 1;
+          continue;
+        }
+
+        const ownerAgentId = stage === "wake_assignee"
+          ? classification.issue.assigneeAgentId ?? null
+          : (
+              classification.issue.projectId
+                ? ownerMaps.projectLeadByProjectId.get(classification.issue.projectId) ?? null
+                : null
+            ) ?? ownerMaps.fallbackOwnerByCompanyId.get(classification.issue.companyId) ?? null;
+        const fingerprint = buildDurableMissingBlockerActionFingerprint({
+          issueId: classification.issue.id,
+          stage,
+          ownerAgentId,
+        });
+
+        if (graphLivenessAction?.fingerprint === fingerprint) {
+          result.classBNoop += 1;
+          continue;
+        }
+
+        const action = await recoveryActionsSvc.upsertSourceScoped({
+          companyId: classification.issue.companyId,
+          sourceIssueId: classification.issue.id,
+          kind: "issue_graph_liveness",
+          ownerType: ownerAgentId ? "agent" : "board",
+          ownerAgentId,
+          previousOwnerAgentId: classification.issue.assigneeAgentId,
+          returnOwnerAgentId: classification.issue.assigneeAgentId,
+          cause: "issue_graph_liveness",
+          fingerprint,
+          evidence: {
+            durableBlockerClassification: classification.kind,
+            sourceIssueId: classification.issue.id,
+            sourceIdentifier: classification.issue.identifier,
+            sourceIssueStatus: classification.issue.status,
+            blockedEnteredAt: classification.blockedEnteredAt.toISOString(),
+            staleAgeMs: classification.staleAgeMs,
+            directBlockerCount: classification.directBlockers.length,
+            stage,
+          },
+          nextAction: stage === "wake_assignee"
+            ? "Attach a real first-class blocker to this issue or move it out of blocked."
+            : "Review this stale blocked issue, attach a real first-class blocker, or move it out of blocked.",
+          wakePolicy: ownerAgentId
+            ? {
+                type: "wake_owner",
+                reason: "issue_graph_liveness",
+                ownerAgentId,
+                stage,
+              }
+            : {
+                type: "board_escalation",
+                reason: "issue_graph_liveness",
+                stage,
+              },
+          monitorPolicy: null,
+          maxAttempts: null,
+          lastAttemptAt: input.now,
+        });
+
+        await logActivity(db, {
+          companyId: classification.issue.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: ownerAgentId,
+          runId: input.runId ?? null,
+          action: "issue.recovery_action_upserted",
+          entityType: "issue",
+          entityId: classification.issue.id,
+          details: {
+            identifier: classification.issue.identifier,
+            recoveryActionId: action.id,
+            recoveryActionKind: action.kind,
+            recoveryActionOwnerAgentId: action.ownerAgentId,
+            recoveryActionAttemptCount: action.attemptCount,
+            source: "recovery.reconcile_issue_graph_liveness",
+            durableBlockerClassification: classification.kind,
+            stage,
+          },
+        });
+
+        if (ownerAgentId) {
+          await deps.enqueueWakeup(ownerAgentId, {
+            source: "assignment",
+            triggerDetail: "system",
+            reason: "source_scoped_recovery_action",
+            idempotencyKey: `issue_graph_liveness:${action.id}:${action.attemptCount}`,
+            payload: withRecoveryModelProfileHint({
+              issueId: classification.issue.id,
+              sourceIssueId: classification.issue.id,
+              recoveryActionId: action.id,
+              recoveryCause: "issue_graph_liveness",
+              issueGraphLivenessStage: stage,
+            }),
+            requestedByActorType: "system",
+            requestedByActorId: null,
+            contextSnapshot: withRecoveryModelProfileHint({
+              issueId: classification.issue.id,
+              taskId: classification.issue.id,
+              wakeReason: "source_scoped_recovery_action",
+              skipIssueComment: true,
+              source: "issue_recovery_action",
+              recoveryActionId: action.id,
+              sourceIssueId: classification.issue.id,
+              recoveryCause: "issue_graph_liveness",
+              issueGraphLivenessStage: stage,
+            }),
+          });
+        }
+
+        if (stage === "wake_assignee") result.classBNudged += 1;
+        else result.classBEscalated += 1;
+      } catch (error) {
+        result.actionErrors += 1;
+        result.errorIssueIds.push(classification.issue.id);
+        logger.error({
+          err: error,
+          issueId: classification.issue.id,
+          issueIdentifier: classification.issue.identifier,
+          durableBlockerClassification: classification.kind,
+        }, "durable blocked-issue actuation failed");
+      }
+    }
+
+    return result;
+  }
+
   async function resolveEscalationOwnerAgentId(
     finding: IssueLivenessFinding,
     issue: typeof issues.$inferSelect,
@@ -2981,7 +3622,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     force?: boolean;
     lookbackHours?: number;
   }) {
-    const findings = await collectIssueGraphLivenessFindings();
     const experimentalSettings = await instanceSettings.getExperimental();
     const autoRecoveryEnabled = asBoolean(
       experimentalSettings.enableIssueGraphLivenessAutoRecovery,
@@ -2992,10 +3632,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     );
     const now = new Date();
     const cutoff = new Date(now.getTime() - lookbackHours * 60 * 60 * 1000);
-    const obsoleteRecoveryCleanup = await retireObsoleteLivenessRecoveryIssues(findings);
-    const updatedAtByIssueKey = await loadLivenessDependencyUpdatedAtByIssue(findings);
     const result = {
-      findings: findings.length,
+      findings: 0,
       autoRecoveryEnabled,
       lookbackHours,
       cutoff: cutoff.toISOString(),
@@ -3004,18 +3642,58 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       skipped: 0,
       skippedAutoRecoveryDisabled: 0,
       skippedOutsideLookback: 0,
-      obsoleteRecoveriesRetired: obsoleteRecoveryCleanup.retired,
-      obsoleteRecoveriesActiveSkipped: obsoleteRecoveryCleanup.activeSkipped,
-      obsoleteRecoveryBlockerRelationsRemoved: obsoleteRecoveryCleanup.blockerRelationsRemoved,
+      obsoleteRecoveriesRetired: 0,
+      obsoleteRecoveriesActiveSkipped: 0,
+      obsoleteRecoveryBlockerRelationsRemoved: 0,
       issueIds: [] as string[],
       escalationIssueIds: [] as string[],
-      retiredRecoveryIssueIds: obsoleteRecoveryCleanup.retiredIssueIds,
+      retiredRecoveryIssueIds: [] as string[],
+      blockedIssuesScanned: 0,
+      terminalOnlyIssues: 0,
+      missingEdgeIssues: 0,
+      openNonTerminalIssues: 0,
+      classAAutoRecovered: 0,
+      classBNudged: 0,
+      classBEscalated: 0,
+      classBNoop: 0,
+      classBSkippedOtherRecoveryAction: 0,
+      issueGraphRecoveryActionsResolved: 0,
+      actionErrors: 0,
+      actionErrorIssueIds: [] as string[],
     };
 
     if (!autoRecoveryEnabled) {
+      const findings = await collectIssueGraphLivenessFindings();
+      result.findings = findings.length;
       result.skippedAutoRecoveryDisabled = findings.length;
       return result;
     }
+
+    const durableBlockedIssueActuation = await reconcileDurableBlockedIssueAttention({
+      now,
+      runId: opts?.runId ?? null,
+    });
+    result.blockedIssuesScanned = durableBlockedIssueActuation.blockedIssuesScanned;
+    result.terminalOnlyIssues = durableBlockedIssueActuation.terminalOnlyIssues;
+    result.missingEdgeIssues = durableBlockedIssueActuation.missingEdgeIssues;
+    result.openNonTerminalIssues = durableBlockedIssueActuation.openNonTerminalIssues;
+    result.classAAutoRecovered = durableBlockedIssueActuation.classAAutoRecovered;
+    result.classBNudged = durableBlockedIssueActuation.classBNudged;
+    result.classBEscalated = durableBlockedIssueActuation.classBEscalated;
+    result.classBNoop = durableBlockedIssueActuation.classBNoop;
+    result.classBSkippedOtherRecoveryAction = durableBlockedIssueActuation.classBSkippedOtherRecoveryAction;
+    result.issueGraphRecoveryActionsResolved = durableBlockedIssueActuation.issueGraphRecoveryActionsResolved;
+    result.actionErrors = durableBlockedIssueActuation.actionErrors;
+    result.actionErrorIssueIds = durableBlockedIssueActuation.errorIssueIds;
+
+    const findings = await collectIssueGraphLivenessFindings();
+    result.findings = findings.length;
+    const obsoleteRecoveryCleanup = await retireObsoleteLivenessRecoveryIssues(findings);
+    result.obsoleteRecoveriesRetired = obsoleteRecoveryCleanup.retired;
+    result.obsoleteRecoveriesActiveSkipped = obsoleteRecoveryCleanup.activeSkipped;
+    result.obsoleteRecoveryBlockerRelationsRemoved = obsoleteRecoveryCleanup.blockerRelationsRemoved;
+    result.retiredRecoveryIssueIds = obsoleteRecoveryCleanup.retiredIssueIds;
+    const updatedAtByIssueKey = await loadLivenessDependencyUpdatedAtByIssue(findings);
 
     for (const finding of findings) {
       if (!isLivenessFindingInsideAutoRecoveryLookback(finding, cutoff, updatedAtByIssueKey)) {

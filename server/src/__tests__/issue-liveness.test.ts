@@ -239,6 +239,29 @@ describe("issue graph liveness classifier", () => {
     expect(findings).toEqual([]);
   });
 
+  it("does not flag an assigned todo blocker that still has a live agent owner", () => {
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue(),
+        issue({
+          id: blockerId,
+          identifier: "PAP-1704",
+          title: "Assigned unblock work",
+          status: "todo",
+          assigneeAgentId: "blocker-agent",
+        }),
+      ],
+      relations: blocks,
+      agents: [
+        agent(),
+        manager,
+        agent({ id: "blocker-agent", name: "Blocker Agent", reportsTo: managerId }),
+      ],
+    });
+
+    expect(findings).toEqual([]);
+  });
+
   it("detects cancelled blockers and uninvokable blocker assignees deterministically", () => {
     const cancelled = classifyIssueGraphLiveness({
       issues: [

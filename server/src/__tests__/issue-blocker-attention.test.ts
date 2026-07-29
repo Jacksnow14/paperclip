@@ -255,6 +255,41 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
+  it("can flip from needs_attention to covered without changing the blocker edges", async () => {
+    const { companyId, agentId } = await createCompany("PBF");
+    const parentId = await insertIssue({ companyId, identifier: "PBF-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PBF-2",
+      title: "Assigned blocker",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+
+    const before = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+    expect(before?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 1,
+      sampleBlockerIdentifier: "PBF-2",
+    });
+
+    await activeRun({ companyId, agentId, issueId: blockerId });
+
+    const after = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+    expect(after?.blockerAttention).toMatchObject({
+      state: "covered",
+      reason: "active_dependency",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      attentionBlockerCount: 0,
+      sampleBlockerIdentifier: "PBF-2",
+    });
+  });
+
   it("covers recursive blocker chains when the downstream leaf has active work", async () => {
     const { companyId, agentId } = await createCompany("PBR");
     const parentId = await insertIssue({ companyId, identifier: "PBR-1", title: "Parent", status: "blocked" });

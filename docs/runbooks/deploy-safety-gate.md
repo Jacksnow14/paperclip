@@ -53,6 +53,11 @@ runs before the cap is in effect.
    sampler never observes the new release, if `--expect-cap` is set and
    `cap_deployed` is not `yes`, or if `oom_5min` goes non-zero inside the
    15-minute post-activation watch.
+7. **`build-release.sh --activate` is no longer an accidental bypass.** Direct
+   activation now refuses with an error that names `safe-deploy.sh`. The only
+   bypass left is an explicit `PAPERCLIP_DEPLOY_BREAK_GLASS=1` emergency call,
+   which prints a loud warning because it skips the watchdog, sampler
+   confirmation, post-activation watch, and automatic rollback.
 
 ## The floors: 2500 MB to start, 700 MB to abort
 
@@ -127,6 +132,10 @@ cd /home/ievgen/paperclip
 
 `--activate` prompts before flipping; pass `--yes` for unattended runs.
 
+`./scripts/deploy/build-release.sh --activate` is intentionally blocked for
+normal use. If production is on fire and you must bypass the wrapper, set
+`PAPERCLIP_DEPLOY_BREAK_GLASS=1` explicitly so the exception is visible in logs.
+
 Tunables (env overrides): `PAPERCLIP_DEPLOY_FLOOR_MB`,
 `PAPERCLIP_DEPLOY_ABORT_FLOOR_MB`, `PAPERCLIP_DEPLOY_BUILD_MEM_MAX`,
 `PAPERCLIP_DEPLOY_QUIESCE_MAX_PROCS`, `PAPERCLIP_DEPLOY_PREFLIGHT_WAIT_SEC`.
@@ -151,12 +160,17 @@ systemd-run --user --unit paperclip-activate --collect \
 journalctl --user -u paperclip-activate -f
 ```
 
-## Footgun this gate closes
+## Footguns this gate closes
 
 `build-release.sh --force` runs `sudo rm -rf` on the target release directory. If
 that target is the *currently active* release, it deletes the code production is
 executing from. `safe-deploy.sh` refuses to build the active release for this
 reason.
+
+`build-release.sh --activate` also used to be directly invokable, which meant an
+operator could flip `current` with none of the memory floor, watchdog, sampler
+verification, post-activation watch, or automatic rollback. That path is now
+enforced closed unless `PAPERCLIP_DEPLOY_BREAK_GLASS=1` is set deliberately.
 
 ## Known gap
 

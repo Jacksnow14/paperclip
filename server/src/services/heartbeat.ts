@@ -7207,6 +7207,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             pausedByAgentId: activeQuotaPause.agentId,
             adapterType: agent.adapterType,
             quotaPausedUntil: activeQuotaPause.scheduledRetryAt.toISOString(),
+            // Surfaced separately so a horizon shortened by MAX_ADAPTER_QUOTA_PAUSE_MS is
+            // visible as such: a parsedResetAt far beyond quotaPausedUntil is the signature
+            // of a provider reset we refuse to honour in full (or a misparse worth fixing).
+            parsedResetAt: activeQuotaPause.parsedResetAt.toISOString(),
+            clampedToMaxHorizon:
+              activeQuotaPause.parsedResetAt.getTime() > activeQuotaPause.scheduledRetryAt.getTime(),
           },
           "startNextQueuedRunForAgent: adapter quota pause active; run admission suppressed",
         );

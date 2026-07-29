@@ -290,10 +290,18 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
     return runId;
   }
 
-  async function seedActiveQuotaPause(companyId: string, agentId: string, scheduledRetryAt: Date) {
+  // `pauseRecordedAt` is the row's updatedAt -- the fixed point MAX_ADAPTER_QUOTA_PAUSE_MS
+  // is anchored to. Tests must control it explicitly, otherwise "clamped" is
+  // indistinguishable from "recomputed relative to now" (AUR-4139).
+  async function seedActiveQuotaPause(
+    companyId: string,
+    agentId: string,
+    scheduledRetryAt: Date,
+    pauseRecordedAt?: Date,
+  ) {
     const runId = randomUUID();
     const wakeupRequestId = randomUUID();
-    const now = new Date();
+    const now = pauseRecordedAt ?? new Date();
     await db.insert(agentWakeupRequests).values({
       id: wakeupRequestId,
       companyId,
@@ -521,20 +529,69 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
     expect((await heartbeat.getRun(unrelatedQueuedRun))?.status).toBe("running");
   });
 
-  it("clamps an adapter-wide quota pause to the maximum horizon (AUR-4139)", async () => {
+  it("clamps an adapter-wide quota pause to the maximum horizon measured from when it was recorded (AUR-4139)", async () => {
     const companyId = await seedCompany();
     const pausedAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
-    const now = new Date("2026-07-26T00:00:00.000Z");
-    await seedActiveQuotaPause(companyId, pausedAgentId, new Date(now.getTime() + 24 * 60 * 60 * 1000));
+    // A ~24h reset recorded 1h ago: still inside the 6h max horizon, so still paused,
+    // but reported as expiring at anchor+6h rather than at the parsed 24h reset.
+    const recordedAt = new Date(Date.now() - 60 * 60 * 1000);
+    const parsedResetAt = new Date(recordedAt.getTime() + 24 * 60 * 60 * 1000);
+    await seedActiveQuotaPause(companyId, pausedAgentId, parsedResetAt, recordedAt);
 
-    const activePause = await findActiveAdapterQuotaPause(db, companyId, "claude_local", now);
+    const activePause = await findActiveAdapterQuotaPause(db, companyId, "claude_local", new Date());
 
     expect(activePause).not.toBeNull();
     expect(activePause?.agentId).toBe(pausedAgentId);
     expect(activePause?.scheduledRetryAt.toISOString()).toBe(
-      new Date(now.getTime() + MAX_ADAPTER_QUOTA_PAUSE_MS).toISOString(),
+      new Date(recordedAt.getTime() + MAX_ADAPTER_QUOTA_PAUSE_MS).toISOString(),
     );
+    // the unclamped provider value stays available for logging
+    expect(activePause?.parsedResetAt.toISOString()).toBe(parsedResetAt.toISOString());
   });
+
+  // The load-bearing test for the clamp. Asserting the horizon at a single instant cannot
+  // fail on a clamp anchored to `now` -- at t=0 "bounded to 6h" and "returns now+6h
+  // forever" are the same value. This asserts PAST the horizon, the one axis a sliding
+  // window cannot survive (AUR-4139).
+  it("stops suppressing admission once the maximum horizon has elapsed, even if the parsed reset is far out (AUR-4139)", async () => {
+    const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4 });
+    const companyId = await seedCompany();
+    const pausedAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const siblingAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    // A ~24h reset recorded 7h ago: the parsed reset is still 17h in the future, but the
+    // 6h max horizon lapsed an hour ago, so the fleet must be released to probe the wall.
+    const recordedAt = new Date(Date.now() - 7 * 60 * 60 * 1000);
+    const parsedResetAt = new Date(recordedAt.getTime() + 24 * 60 * 60 * 1000);
+    expect(parsedResetAt.getTime()).toBeGreaterThan(Date.now());
+    await seedActiveQuotaPause(companyId, pausedAgentId, parsedResetAt, recordedAt);
+
+    expect(await findActiveAdapterQuotaPause(db, companyId, "claude_local", new Date())).toBeNull();
+
+    const siblingQueuedRun = await seedQueuedRun(companyId, siblingAgentId);
+    hangAdapterUntilReleased();
+    expect(await heartbeat.startNextQueuedRunForAgent(siblingAgentId)).toHaveLength(1);
+    expect((await heartbeat.getRun(siblingQueuedRun))?.status).toBe("running");
+  });
+
+  it.each(["paused", "pending_approval"])(
+    "ignores %s agents when resolving an adapter-wide quota pause (AUR-4139)",
+    async (ineligibleStatus) => {
+      const companyId = await seedCompany();
+      const ineligibleAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+      const recordedAt = new Date(Date.now() - 60 * 1000);
+      await seedActiveQuotaPause(
+        companyId,
+        ineligibleAgentId,
+        new Date(recordedAt.getTime() + 60 * 60 * 1000),
+        recordedAt,
+      );
+      await db.update(agents).set({ status: ineligibleStatus }).where(eq(agents.id, ineligibleAgentId));
+
+      // An agent admission already refuses cannot clear the wall, so its retry row carries
+      // no live signal about the shared credential and must not gate live siblings.
+      expect(await findActiveAdapterQuotaPause(db, companyId, "claude_local", new Date())).toBeNull();
+    },
+  );
 
   it("ignores terminated agents when resolving an adapter-wide quota pause (AUR-4139)", async () => {
     const companyId = await seedCompany();

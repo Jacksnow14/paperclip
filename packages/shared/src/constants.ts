@@ -1158,6 +1158,7 @@ export const MEMORY_HOOK_KINDS = [
   "post_run_capture",
   "issue_comment_capture",
   "issue_document_capture",
+  "issue_close_scorecard_capture",
 ] as const;
 export type MemoryHookKind = (typeof MEMORY_HOOK_KINDS)[number];
 

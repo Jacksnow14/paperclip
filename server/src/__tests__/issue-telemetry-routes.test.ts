@@ -15,6 +15,9 @@ const mockAgentService = vi.hoisted(() => ({
 
 const mockTrackAgentTaskCompleted = vi.hoisted(() => vi.fn());
 const mockGetTelemetryClient = vi.hoisted(() => vi.fn());
+const mockMemoryService = vi.hoisted(() => ({
+  capture: vi.fn(async () => ({ operation: {}, records: [], dedup: false })),
+}));
 
 function registerModuleMocks() {
   vi.doMock("@paperclipai/shared/telemetry", () => ({
@@ -64,6 +67,7 @@ function registerModuleMocks() {
     }),
     issueService: () => mockIssueService,
     logActivity: vi.fn(async () => undefined),
+    memoryService: () => mockMemoryService,
     projectService: () => ({}),
     routineService: () => ({
       syncRunStatusForIssue: vi.fn(async () => undefined),

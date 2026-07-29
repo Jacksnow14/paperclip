@@ -12,6 +12,7 @@ import {
   issues as issueRows,
   projectWorkspaces,
 } from "@paperclipai/db";
+import { captureCloseTimeScorecard } from "../services/close-time-scorecard.js";
 import {
   addIssueCommentSchema,
   acceptIssueThreadInteractionSchema,
@@ -71,6 +72,7 @@ import {
   clampIssueListLimit,
   documentService,
   logActivity,
+  memoryService,
   projectService,
   routineService,
   workProductService,
@@ -861,6 +863,7 @@ export function issueRoutes(
   const searchRateLimiter = opts.searchRateLimiter ?? defaultCompanySearchRateLimiter;
   const instanceSettings = instanceSettingsService(db);
   const agentsSvc = agentService(db);
+  const memorySvc = memoryService(db);
   const projectsSvc = projectService(db);
   const goalsSvc = goalService(db);
   const issueApprovalsSvc = issueApprovalService(db);
@@ -3822,6 +3825,21 @@ export function issueRoutes(
             model,
           });
         }
+      }
+
+      // AUR-4224: don't rely on agents to hand-author a performance_scorecard +
+      // scorecard_adjusted capture at close time — that prose step is the fleet-wide
+      // compliance gap. Build and write both records here instead, from data the server
+      // already has. Never blocks or fails the close (see captureCloseTimeScorecard).
+      if (issue.assigneeAgentId) {
+        await captureCloseTimeScorecard(db, memorySvc, issue.companyId, {
+          id: issue.id,
+          identifier: issue.identifier,
+          title: issue.title,
+          description: issue.description,
+          assigneeAgentId: issue.assigneeAgentId,
+          projectId: issue.projectId,
+        });
       }
     }
 

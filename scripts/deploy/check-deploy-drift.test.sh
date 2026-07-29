@@ -141,6 +141,7 @@ run_check() {
   PAPERCLIP_DRIFT_GH="$GH" \
   PAPERCLIP_DRIFT_REPO="owner/repo" \
   PAPERCLIP_DRIFT_MERGE_DEBT_RECHECK_DELAY_SEC=0 \
+  PAPERCLIP_DRIFT_CHECKOUTS="${PAPERCLIP_DRIFT_CHECKOUTS-}" \
   FAKE_TIP_DATE="${FAKE_TIP_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
   FAKE_PR_DIR="${FAKE_PR_DIR:-$TMP/prs-none}" \
   NOTIFY_SINK="$SINK" \
@@ -425,6 +426,107 @@ if grep -q "status=DRIFT reason=merge-debt " <<<"$out" && [[ "$rc" == "1" && "$(
   ok "first-tick merge-debt fires the line but waits out the 2h sustain gate"
 else
   fail "first-tick merge-debt fires the line but waits out the 2h sustain gate" "rc=$rc alerts=$(alerts) out=$out"
+fi
+
+# --- checkout-drift axis (AUR-4227) -----------------------------------------
+# A routine can run fine and still execute stale, already-fixed code because the
+# checkout it `cd`s into never advanced past an old commit (AUR-4187). These
+# cases cover the axis that walks configured checkouts independently of the
+# primary running-server check. The axis is OPT-IN: with the default empty
+# PAPERCLIP_DRIFT_CHECKOUTS it does nothing (case 25).
+
+CO_REMOTE="$TMP/co-remote"
+git init -q --initial-branch=main "$CO_REMOTE"
+git -C "$CO_REMOTE" -c user.email=t@example.com -c user.name=t \
+  commit -q --allow-empty -m "checkout fixture: initial"
+CO_LOCAL="$TMP/co-local"
+git clone -q "$CO_REMOTE" "$CO_LOCAL"
+CO_LOCAL_SHA=$(git -C "$CO_LOCAL" rev-parse HEAD)
+
+CO_LOG="$LOG.checkout-fixture"
+CO_STATE="$STATE.checkout-fixture"
+
+run_check_co() {
+  PAPERCLIP_DRIFT_CHECKOUTS="fixture:$CO_LOCAL:main" run_check
+}
+
+# 20. A checkout that is current (HEAD == origin/main) reports ok and pages no one.
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"; clear_ad_state
+rm -f "$CO_LOG" "$CO_STATE"
+out=$(run_check_co); rc=$?
+if [[ "$rc" == "0" && "$(alerts)" == "0" ]] && grep -q "checkout=fixture .*status=ok" <<<"$out"; then
+  ok "current checkout reports ok and exits 0"
+else
+  fail "current checkout reports ok and exits 0" "rc=$rc alerts=$(alerts) out=$out"
+fi
+
+# 21. A checkout left behind origin/main for 3h is checkout-debt: below the 24h
+#     threshold, so it drifts (nonzero exit) but does not yet page.
+git -C "$CO_REMOTE" -c user.email=t@example.com -c user.name=t \
+  commit -q --allow-empty -m "checkout fixture: advances past local"
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+: > "$CO_LOG"; : > "$CO_STATE"
+now=$(date -u +%s)
+stamp=$(date -u -d "@$(( now - 3 * 3600 ))" +%Y-%m-%dT%H:%M:%SZ)
+printf '%s checkout=fixture local=%s remote=deadbeefdead status=DRIFT reason=checkout-behind:fixture\n' \
+  "$stamp" "${CO_LOCAL_SHA:0:12}" >> "$CO_LOG"
+out=$(run_check_co); rc=$?
+if [[ "$rc" == "1" && "$(alerts)" == "0" ]]; then
+  ok "checkout behind origin/main for 3h drifts but does not page (graded policy)"
+else
+  fail "checkout behind origin/main for 3h drifts but does not page (graded policy)" "rc=$rc alerts=$(alerts) out=$out"
+fi
+
+# 22. ...but left behind for 30h, it pages, naming the checkout label.
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+: > "$CO_LOG"; : > "$CO_STATE"
+stamp=$(date -u -d "@$(( now - 30 * 3600 ))" +%Y-%m-%dT%H:%M:%SZ)
+printf '%s checkout=fixture local=%s remote=deadbeefdead status=DRIFT reason=checkout-behind:fixture\n' \
+  "$stamp" "${CO_LOCAL_SHA:0:12}" >> "$CO_LOG"
+out=$(run_check_co); rc=$?
+if [[ "$(alerts)" == "1" ]] && grep -q "checkout-behind:fixture" "$SINK"; then
+  ok "checkout behind origin/main for 30h pages, naming the checkout"
+else
+  fail "checkout behind origin/main for 30h pages, naming the checkout" "rc=$rc alerts=$(alerts) sink=$(cat "$SINK" 2>/dev/null) out=$out"
+fi
+
+# 23. A checkout drift's sustained-duration clock is isolated from the primary
+#     axis's own log: a primary-axis DRIFT in the same run must not reset (or be
+#     reset by) the checkout's independently-tracked streak.
+reset; rm -f "$HEALTH"; set_activated "$MASTER_SHA"
+seed_log "untracked-or-unreachable:unreachable" 3
+: > "$CO_LOG"; : > "$CO_STATE"
+stamp=$(date -u -d "@$(( now - 30 * 3600 ))" +%Y-%m-%dT%H:%M:%SZ)
+printf '%s checkout=fixture local=%s remote=deadbeefdead status=DRIFT reason=checkout-behind:fixture\n' \
+  "$stamp" "${CO_LOCAL_SHA:0:12}" >> "$CO_LOG"
+out=$(run_check_co); rc=$?
+if [[ "$(alerts)" == "2" ]] && grep -q "SEV2" "$SINK" && grep -q "checkout-behind:fixture" "$SINK" \
+   && grep -q "untracked-or-unreachable" "$SINK"; then
+  ok "primary-axis drift and checkout drift page independently in the same run"
+else
+  fail "primary-axis drift and checkout drift page independently in the same run" "alerts=$(alerts) sink=$(cat "$SINK" 2>/dev/null) out=$out"
+fi
+
+# 24. A missing/unreachable checkout is skipped, not alarmed — this axis reports
+#     what it can prove, not what it cannot reach.
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+out=$(PAPERCLIP_DRIFT_CHECKOUTS="ghost:$TMP/does-not-exist:main" run_check); rc=$?
+if [[ "$rc" == "0" && "$(alerts)" == "0" ]] && grep -q "not present on this host, skipping" <<<"$out"; then
+  ok "missing checkout is skipped, not alarmed"
+else
+  fail "missing checkout is skipped, not alarmed" "rc=$rc alerts=$(alerts) out=$out"
+fi
+
+# 25. Feature off by default: no PAPERCLIP_DRIFT_CHECKOUTS, no checkout lines,
+#     exit still 0 on a converged deploy — the axis must be opt-in because a
+#     wrong default (e.g. a live checkout that deliberately sits on a
+#     non-master branch) would perpetually page.
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+out=$(run_check); rc=$?
+if [[ "$rc" == "0" && "$(alerts)" == "0" ]] && ! grep -q "checkout=" <<<"$out"; then
+  ok "empty checkout list disables the axis entirely"
+else
+  fail "empty checkout list disables the axis entirely" "rc=$rc alerts=$(alerts) out=$out"
 fi
 
 echo

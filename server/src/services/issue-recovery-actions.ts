@@ -65,6 +65,35 @@ export type ResolveIssueRecoveryActionInput = {
   resolutionNote?: string | null;
 };
 
+export type ResolveIssueRecoveryActionsForTerminalIssuesInput = {
+  companyId: string;
+  sourceIssueIds: string[];
+  issueStatus: string;
+  resolutionNote?: string | null;
+};
+
+type TerminalRecoveryResolution = {
+  status: Extract<IssueRecoveryActionStatus, "resolved" | "cancelled">;
+  outcome: IssueRecoveryActionOutcome;
+};
+
+/**
+ * How an active recovery action is disposed of when its source issue reaches a terminal status.
+ *
+ * A recovery action only ever tracks "this issue is stranded and needs to get moving again".
+ * Once the source issue is `done`/`cancelled` the tracking object has no remaining purpose, so
+ * it must be closed out rather than left active — otherwise `activeRecoveryAction` decays into a
+ * mostly-false signal and any consumer keyed off it is swamped by noise (AUR-4299).
+ *
+ * Returns `null` for every non-terminal status, which is what makes this safe to call
+ * unconditionally from the generic issue update path.
+ */
+export function terminalIssueRecoveryResolution(issueStatus: string): TerminalRecoveryResolution | null {
+  if (issueStatus === "done") return { status: "resolved", outcome: "restored" };
+  if (issueStatus === "cancelled") return { status: "cancelled", outcome: "cancelled" };
+  return null;
+}
+
 function toReadModel(row: IssueRecoveryActionRow): IssueRecoveryAction {
   return {
     id: row.id,
@@ -305,10 +334,50 @@ export function issueRecoveryActionService(db: Db) {
     return updated ? toReadModel(updated) : null;
   }
 
+  /**
+   * Close out every active recovery action whose source issue just reached a terminal status.
+   *
+   * Idempotent: the status predicate means a second call matches zero rows. Callers pass the
+   * *issue* status (not a recovery-action status) and get a no-op for non-terminal values, so
+   * this can be wired into generic update paths without the caller re-deriving the mapping.
+   */
+  async function resolveActiveForTerminalIssues(
+    input: ResolveIssueRecoveryActionsForTerminalIssuesInput,
+    dbOrTx: DbOrTransaction = db,
+  ): Promise<IssueRecoveryAction[]> {
+    const resolution = terminalIssueRecoveryResolution(input.issueStatus);
+    if (!resolution) return [];
+    const sourceIssueIds = [...new Set(input.sourceIssueIds)];
+    if (sourceIssueIds.length === 0) return [];
+
+    const now = new Date();
+    const updated = await dbOrTx
+      .update(issueRecoveryActions)
+      .set({
+        status: resolution.status,
+        outcome: resolution.outcome,
+        resolutionNote:
+          input.resolutionNote ?? `Source issue reached terminal status ${input.issueStatus}.`,
+        resolvedAt: now,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, input.companyId),
+          inArray(issueRecoveryActions.sourceIssueId, sourceIssueIds),
+          inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+        ),
+      )
+      .returning();
+
+    return updated.map(toReadModel);
+  }
+
   return {
     getActiveForIssue,
     listActiveForIssues,
     resolveActiveForIssue,
+    resolveActiveForTerminalIssues,
     upsertSourceScoped,
   };
 }

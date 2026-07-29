@@ -2084,6 +2084,23 @@ export function issueRoutes(
         }
       }
 
+      // Resolve the action BEFORE writing the issue status. `svc.update` also closes out active
+      // recovery actions when the issue lands on a terminal status (AUR-4299); doing that first
+      // would leave nothing for this endpoint to claim and lose the caller's explicit
+      // outcome/resolutionNote. Resolving first makes the update's sweep a no-op instead.
+      const recoveryAction = await recoveryActionsSvc.resolveActiveForIssue(
+        {
+          companyId: existing.companyId,
+          sourceIssueId: existing.id,
+          actionId: actionId ?? null,
+          status: actionStatus,
+          outcome,
+          resolutionNote: resolutionNote ?? null,
+        },
+        tx,
+      );
+      if (!recoveryAction) throw notFound("Active recovery action not found");
+
       if (sourceIssueStatus) {
         const updatedIssue = await svc.update(
           id,
@@ -2097,19 +2114,6 @@ export function issueRoutes(
         if (!updatedIssue) throw notFound("Issue not found");
         issue = updatedIssue;
       }
-
-      const recoveryAction = await recoveryActionsSvc.resolveActiveForIssue(
-        {
-          companyId: existing.companyId,
-          sourceIssueId: existing.id,
-          actionId: actionId ?? null,
-          status: actionStatus,
-          outcome,
-          resolutionNote: resolutionNote ?? null,
-        },
-        tx,
-      );
-      if (!recoveryAction) throw notFound("Active recovery action not found");
 
       return { issue, recoveryAction };
     });

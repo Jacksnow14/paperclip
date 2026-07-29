@@ -64,6 +64,7 @@ import {
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
@@ -2766,6 +2767,7 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
+  const recoveryActionsSvc = issueRecoveryActionService(db);
 
   async function getIssueByUuid(id: string) {
     const row = await db
@@ -4565,6 +4567,20 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+        if (issueData.status !== undefined) {
+          // An active recovery action tracks a stranded issue. Once the issue reaches a terminal
+          // status the tracker is obsolete, so close it out in the same transaction as the status
+          // write — otherwise `activeRecoveryAction` accumulates orphans and stops being a usable
+          // signal (AUR-4299). No-ops for non-terminal statuses.
+          await recoveryActionsSvc.resolveActiveForTerminalIssues(
+            {
+              companyId: existing.companyId,
+              sourceIssueIds: [updated.id],
+              issueStatus: updated.status,
+            },
+            tx,
+          );
+        }
         if (nextLabelIds !== undefined) {
           await syncIssueLabels(updated.id, existing.companyId, nextLabelIds, tx);
         }

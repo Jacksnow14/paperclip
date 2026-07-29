@@ -507,9 +507,13 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(duplicateWakeup?.status).toBe("cancelled");
   });
 
-  it.each(["blocked", "todo", "backlog"] as const)(
-    "does not schedule a max-turn continuation when the issue is already %s",
-    async (issueStatus) => {
+  it.each([
+    { issueStatus: "blocked", expectedErrorCode: "issue_blocked" },
+    { issueStatus: "todo", expectedErrorCode: "issue_not_in_progress" },
+    { issueStatus: "backlog", expectedErrorCode: "issue_not_in_progress" },
+  ] as const)(
+    "does not schedule a max-turn continuation when the issue is already $issueStatus",
+    async ({ issueStatus, expectedErrorCode }) => {
       const { issueId, runId, now } = await seedMaxTurnFixture({ issueStatus });
 
       const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
@@ -522,7 +526,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
       expect(scheduled).toMatchObject({
         outcome: "not_scheduled",
-        errorCode: "issue_not_in_progress",
+        errorCode: expectedErrorCode,
         issueId,
       });
 
@@ -535,9 +539,13 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     },
   );
 
-  it.each(["blocked", "todo", "backlog"] as const)(
-    "cancels a due max-turn continuation when the issue moves to %s before retry promotion",
-    async (issueStatus) => {
+  it.each([
+    { issueStatus: "blocked", expectedErrorCode: "issue_blocked" },
+    { issueStatus: "todo", expectedErrorCode: "issue_not_in_progress" },
+    { issueStatus: "backlog", expectedErrorCode: "issue_not_in_progress" },
+  ] as const)(
+    "cancels a due max-turn continuation when the issue moves to $issueStatus before retry promotion",
+    async ({ issueStatus, expectedErrorCode }) => {
       const { issueId, runId, now } = await seedMaxTurnFixture();
 
       const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
@@ -569,7 +577,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         .then((rows) => rows[0] ?? null);
       expect(retryRun).toMatchObject({
         status: "cancelled",
-        errorCode: "issue_not_in_progress",
+        errorCode: expectedErrorCode,
       });
 
       const wakeupRequest = await db
@@ -603,12 +611,20 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         .where(eq(heartbeatRunEvents.runId, scheduled.run.id))
         .orderBy(sql`${heartbeatRunEvents.seq} desc`)
         .then((rows) => rows[0] ?? null);
-      expect(event?.message).toContain("no longer in_progress");
-      expect(event?.payload).toMatchObject({
-        currentStatus: issueStatus,
-        requiredStatus: "in_progress",
-        scheduledRetryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
-      });
+      if (issueStatus === "blocked") {
+        expect(event?.message).toContain("issue is blocked");
+        expect(event?.payload).toMatchObject({
+          currentStatus: issueStatus,
+          scheduledRetryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
+        });
+      } else {
+        expect(event?.message).toContain("no longer in_progress");
+        expect(event?.payload).toMatchObject({
+          currentStatus: issueStatus,
+          requiredStatus: "in_progress",
+          scheduledRetryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
+        });
+      }
     },
   );
 
@@ -1684,5 +1700,208 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       const cancelled = await heartbeat.cancelSupersededRetryRunsForSourceRun(randomUUID());
       expect(cancelled).toHaveLength(0);
     });
+  });
+
+  it("suppresses transient retry scheduling when the target issue is blocked (LAR-618)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-07-02T12:00:00.000Z");
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CFO",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 },
+      },
+      permissions: {},
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Blocked issue that should not be retried",
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "failed",
+      error: "upstream overload",
+      errorCode: "claude_transient_upstream",
+      finishedAt: now,
+      resultJson: { errorFamily: "transient_upstream" },
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    const result = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+    expect(result).toMatchObject({
+      outcome: "not_scheduled",
+      errorCode: "issue_blocked",
+      issueId,
+    });
+
+    const retryRuns = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId))
+      .then((rows) => rows[0]?.count ?? 0);
+    expect(retryRuns).toBe(0);
+  });
+
+  it("allows transient retry scheduling when a previously-blocked issue transitions to in_progress", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-07-02T14:00:00.000Z");
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CFO",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 },
+      },
+      permissions: {},
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Issue that was blocked but is now actionable",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "failed",
+      error: "upstream overload",
+      errorCode: "claude_transient_upstream",
+      finishedAt: now,
+      resultJson: { errorFamily: "transient_upstream" },
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    const result = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+    expect(result.outcome).toBe("scheduled");
+  });
+
+  it("suppresses transient retry at promotion time when the issue becomes blocked between scheduling and due time", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-07-02T16:00:00.000Z");
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CFO",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 },
+      },
+      permissions: {},
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Issue that will become blocked after scheduling",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "failed",
+      error: "upstream overload",
+      errorCode: "claude_transient_upstream",
+      finishedAt: now,
+      resultJson: { errorFamily: "transient_upstream" },
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+    expect(scheduled.outcome).toBe("scheduled");
+
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+
+    const dueTime = new Date(now.getTime() + BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS[0] + 1000);
+    const promoted = await heartbeat.promoteDueScheduledRetries(dueTime);
+    expect(promoted.promoted).toBe(0);
+
+    if (scheduled.outcome === "scheduled") {
+      const retryRun = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, scheduled.run.id))
+        .then((rows) => rows[0] ?? null);
+      expect(retryRun?.status).toBe("cancelled");
+    }
   });
 });

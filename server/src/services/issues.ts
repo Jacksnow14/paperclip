@@ -4119,10 +4119,58 @@ export function issueService(db: Db) {
           issueData.executionWorkspaceId !== undefined ||
           issueData.executionWorkspacePreference !== undefined ||
           issueData.executionWorkspaceSettings !== undefined;
+        // Cache the project policy lookup for this insert. The workspace
+        // precedence block, the default-settings block and the
+        // assignee-environment-promotion block all need the same row; without
+        // caching they'd issue three round-trips.
+        let projectPolicyCached: ReturnType<typeof parseProjectExecutionWorkspacePolicy> | null = null;
+        let projectPolicyLoaded = false;
+        const loadProjectPolicyOnce = async () => {
+          if (projectPolicyLoaded) return projectPolicyCached;
+          projectPolicyLoaded = true;
+          if (!issueData.projectId) return null;
+          const projectRow = await tx
+            .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
+            .from(projects)
+            .where(and(eq(projects.id, issueData.projectId), eq(projects.companyId, companyId)))
+            .then((rows) => rows[0] ?? null);
+          projectPolicyCached = parseProjectExecutionWorkspacePolicy(projectRow?.executionWorkspacePolicy);
+          return projectPolicyCached;
+        };
+
+        // AUR-4277: the project's explicit defaultProjectWorkspaceId outranks
+        // parent inheritance. Inheritance may only fill a genuine hole, never
+        // override a project-level declaration — otherwise a parent pinned to
+        // a sibling workspace silently relocates every child issue (and a
+        // parent in another project makes the insert fail outright on
+        // assertValidProjectWorkspace below).
+        const policyDefaultProjectWorkspaceId = projectWorkspaceId == null && issueData.projectId
+          ? (await loadProjectPolicyOnce())?.defaultProjectWorkspaceId ?? null
+          : null;
+        if (policyDefaultProjectWorkspaceId) {
+          projectWorkspaceId = policyDefaultProjectWorkspaceId;
+        }
         if (workspaceInheritanceIssueId) {
           const workspaceSource = await getWorkspaceInheritanceIssue(tx, companyId, workspaceInheritanceIssueId);
           if (projectWorkspaceId == null && workspaceSource.projectWorkspaceId) {
             projectWorkspaceId = workspaceSource.projectWorkspaceId;
+          } else if (
+            policyDefaultProjectWorkspaceId &&
+            workspaceSource.projectWorkspaceId &&
+            workspaceSource.projectWorkspaceId !== policyDefaultProjectWorkspaceId
+          ) {
+            // Not an error, but the operator asked for two different things.
+            // Say so, rather than resolving it silently.
+            logger.warn(
+              {
+                companyId,
+                projectId: issueData.projectId,
+                workspaceInheritanceIssueId,
+                inheritedProjectWorkspaceId: workspaceSource.projectWorkspaceId,
+                projectWorkspaceId: policyDefaultProjectWorkspaceId,
+              },
+              "issue workspace inheritance skipped: project policy default takes precedence",
+            );
           }
           if (
             isolatedWorkspacesEnabled &&
@@ -4147,24 +4195,6 @@ export function issueService(db: Db) {
             }
           }
         }
-        // Cache the project policy lookup for this insert. Both the
-        // default-settings block and the assignee-environment-promotion block
-        // need the same row; without caching they'd issue two round-trips.
-        let projectPolicyCached: ReturnType<typeof parseProjectExecutionWorkspacePolicy> | null = null;
-        let projectPolicyLoaded = false;
-        const loadProjectPolicyOnce = async () => {
-          if (projectPolicyLoaded) return projectPolicyCached;
-          projectPolicyLoaded = true;
-          if (!issueData.projectId) return null;
-          const projectRow = await tx
-            .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
-            .from(projects)
-            .where(and(eq(projects.id, issueData.projectId), eq(projects.companyId, companyId)))
-            .then((rows) => rows[0] ?? null);
-          projectPolicyCached = parseProjectExecutionWorkspacePolicy(projectRow?.executionWorkspacePolicy);
-          return projectPolicyCached;
-        };
-
         if (
           executionWorkspaceSettings == null &&
           executionWorkspaceId == null &&
@@ -4210,23 +4240,15 @@ export function issueService(db: Db) {
           }
         }
         if (!projectWorkspaceId && issueData.projectId) {
-          const project = await tx
-            .select({
-              executionWorkspacePolicy: projects.executionWorkspacePolicy,
-            })
-            .from(projects)
-            .where(and(eq(projects.id, issueData.projectId), eq(projects.companyId, companyId)))
-            .then((rows) => rows[0] ?? null);
-          const projectPolicy = parseProjectExecutionWorkspacePolicy(project?.executionWorkspacePolicy);
-          projectWorkspaceId = projectPolicy?.defaultProjectWorkspaceId ?? null;
-          if (!projectWorkspaceId) {
-            projectWorkspaceId = await tx
-              .select({ id: projectWorkspaces.id })
-              .from(projectWorkspaces)
-              .where(and(eq(projectWorkspaces.projectId, issueData.projectId), eq(projectWorkspaces.companyId, companyId)))
-              .orderBy(desc(projectWorkspaces.isPrimary), asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
-              .then((rows) => rows[0]?.id ?? null);
-          }
+          // The policy default was already applied above (it outranks parent
+          // inheritance), so reaching here means the project declares none.
+          // Fall back to the project's primary workspace.
+          projectWorkspaceId = await tx
+            .select({ id: projectWorkspaces.id })
+            .from(projectWorkspaces)
+            .where(and(eq(projectWorkspaces.projectId, issueData.projectId), eq(projectWorkspaces.companyId, companyId)))
+            .orderBy(desc(projectWorkspaces.isPrimary), asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
+            .then((rows) => rows[0]?.id ?? null);
         }
         if (projectWorkspaceId) {
           await assertValidProjectWorkspace(companyId, issueData.projectId, projectWorkspaceId, tx);

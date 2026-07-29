@@ -631,10 +631,11 @@ function queueResolvedInteractionContinuationWakeup(input: {
     kind: string;
     status: string;
     continuationPolicy: string;
+    createdByAgentId?: string | null;
     sourceCommentId?: string | null;
     sourceRunId?: string | null;
   };
-  actor: { actorType: "user" | "agent"; actorId: string };
+  actor: { actorType: "user" | "agent"; actorId: string; agentId?: string | null };
   source: string;
   /** Skip the accept-only policy guard; used when the issue is being returned to the creator agent on reject. */
   forceWake?: boolean;
@@ -649,40 +650,62 @@ function queueResolvedInteractionContinuationWakeup(input: {
     && input.interaction.status !== "accepted"
   ) return;
   if (input.interaction.status === "expired") return;
-  if (!input.issue.assigneeAgentId || isClosedIssueStatus(input.issue.status)) return;
+  if (isClosedIssueStatus(input.issue.status)) return;
 
-  void input.heartbeat.wakeup(input.issue.assigneeAgentId, {
-    source: "automation",
-    triggerDetail: "system",
-    reason: "issue_commented",
-    payload: {
+  // AUR-4245: an agent that raised an interaction at ANOTHER actor must be resumed when that
+  // actor resolves it. The assignee wake alone cannot do this: on an agent-to-agent ask the
+  // resolver IS the assignee, so the creator (the asker) would never hear the answer and its
+  // delegated decision would stall silently. Wake the asker too — without reassigning the
+  // issue, since the asker does not necessarily own it.
+  const wakeTargets: string[] = [];
+  if (input.issue.assigneeAgentId) {
+    wakeTargets.push(input.issue.assigneeAgentId);
+  }
+  const creatorAgentId = input.interaction.createdByAgentId ?? null;
+  if (
+    creatorAgentId
+    && creatorAgentId !== input.actor.agentId
+    && !wakeTargets.includes(creatorAgentId)
+  ) {
+    wakeTargets.push(creatorAgentId);
+  }
+  if (wakeTargets.length === 0) return;
+
+  for (const targetAgentId of wakeTargets) {
+    void input.heartbeat.wakeup(targetAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: {
+        issueId: input.issue.id,
+        interactionId: input.interaction.id,
+        interactionKind: input.interaction.kind,
+        interactionStatus: input.interaction.status,
+        sourceCommentId: input.interaction.sourceCommentId ?? null,
+        sourceRunId: input.interaction.sourceRunId ?? null,
+        mutation: "interaction",
+      },
+      requestedByActorType: input.actor.actorType,
+      requestedByActorId: input.actor.actorId,
+      contextSnapshot: {
+        issueId: input.issue.id,
+        taskId: input.issue.id,
+        interactionId: input.interaction.id,
+        interactionKind: input.interaction.kind,
+        interactionStatus: input.interaction.status,
+        sourceCommentId: input.interaction.sourceCommentId ?? null,
+        sourceRunId: input.interaction.sourceRunId ?? null,
+        wakeReason: "issue_commented",
+        source: input.source,
+        isInteractionCreatorWake: targetAgentId !== input.issue.assigneeAgentId,
+      },
+    }).catch((err) => logger.warn({
+      err,
       issueId: input.issue.id,
       interactionId: input.interaction.id,
-      interactionKind: input.interaction.kind,
-      interactionStatus: input.interaction.status,
-      sourceCommentId: input.interaction.sourceCommentId ?? null,
-      sourceRunId: input.interaction.sourceRunId ?? null,
-      mutation: "interaction",
-    },
-    requestedByActorType: input.actor.actorType,
-    requestedByActorId: input.actor.actorId,
-    contextSnapshot: {
-      issueId: input.issue.id,
-      taskId: input.issue.id,
-      interactionId: input.interaction.id,
-      interactionKind: input.interaction.kind,
-      interactionStatus: input.interaction.status,
-      sourceCommentId: input.interaction.sourceCommentId ?? null,
-      sourceRunId: input.interaction.sourceRunId ?? null,
-      wakeReason: "issue_commented",
-      source: input.source,
-    },
-  }).catch((err) => logger.warn({
-    err,
-    issueId: input.issue.id,
-    interactionId: input.interaction.id,
-    agentId: input.issue.assigneeAgentId,
-  }, "failed to wake assignee on issue interaction resolution"));
+      agentId: targetAgentId,
+    }, "failed to wake agent on issue interaction resolution"));
+  }
 }
 
 function diffExecutionParticipants(
@@ -4322,14 +4345,23 @@ export function issueRoutes(
 
   function assertCanCancelInteraction(
     req: Request,
+    issue: { assigneeAgentId?: string | null },
     interaction: { createdByAgentId?: string | null; createdByUserId?: string | null },
   ) {
     // Board actors may cancel any interaction (existing behavior).
     if (req.actor.type === "board") return;
-    // An agent may cancel/supersede its OWN pending interaction (the creator).
     if (req.actor.type === "agent") {
-      if (!req.actor.agentId || interaction.createdByAgentId !== req.actor.agentId) {
-        throw forbidden("Only the interaction creator may cancel this interaction");
+      // An agent may cancel/supersede its OWN pending interaction (the creator).
+      const isCreator = req.actor.agentId != null && interaction.createdByAgentId === req.actor.agentId;
+      // AUR-4245: the addressed agent may also clear an interaction another AGENT raised at it,
+      // so an agent-to-agent interaction can never strand as permanently pending. Interactions
+      // raised by a board user stay board-only to cancel — an agent must not discard a human ask.
+      const isAddressedAgentOfAgentInteraction = req.actor.agentId != null
+        && interaction.createdByAgentId != null
+        && interaction.createdByAgentId !== req.actor.agentId
+        && issue.assigneeAgentId === req.actor.agentId;
+      if (!isCreator && !isAddressedAgentOfAgentInteraction) {
+        throw forbidden("Only the interaction creator or the addressed assignee agent may cancel this interaction");
       }
       if (!req.actor.runId?.trim()) {
         throw unauthorized("Agent run id required");
@@ -4600,7 +4632,12 @@ export function issueRoutes(
         return;
       }
       assertCompanyAccess(req, issue.companyId);
-      assertBoard(req);
+      const interactionForAuthz = await issueThreadInteractionService(db).getByIdForIssue(issue.id, issue.companyId, interactionId);
+      if (!interactionForAuthz) {
+        res.status(404).json({ error: "Interaction not found" });
+        return;
+      }
+      assertCanResolveInteraction(req, issue, interactionForAuthz);
 
       const actor = getActorInfo(req);
       const interaction = await issueThreadInteractionService(db).answerQuestions(issue, interactionId, req.body, {
@@ -4657,7 +4694,7 @@ export function issueRoutes(
         res.status(404).json({ error: "Interaction not found" });
         return;
       }
-      assertCanCancelInteraction(req, interactionForAuthz);
+      assertCanCancelInteraction(req, issue, interactionForAuthz);
 
       const actor = getActorInfo(req);
       const interaction = await issueThreadInteractionService(db).cancelInteraction(issue, interactionId, req.body, {

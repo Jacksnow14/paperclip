@@ -43,6 +43,10 @@ let API_URL = '';
 const API_KEY = process.env.PAPERCLIP_API_KEY;
 const COMPANY_ID = process.env.PAPERCLIP_COMPANY_ID;
 const RUN_ID = process.env.PAPERCLIP_RUN_ID;
+// Decider identity: the sweeper itself is the routing decider. PAPERCLIP_AGENT_ID
+// is injected by the runtime for every agent process; without it the title falls
+// back to the legacy flat key so existing watchdog reads are not broken.
+const SWEEPER_AGENT_ID = process.env.PAPERCLIP_AGENT_ID || null;
 const SWEEPER_ISSUE = 'AUR-2059';
 
 const argv = process.argv.slice(2);
@@ -227,8 +231,11 @@ async function captureRationale(issue, owner) {
   if (!APPLY) return;
   const isHot = ['high', 'critical', 'urgent'].includes((issue.priority || '').toLowerCase());
   if (!isHot) return;
+  const title = SWEEPER_AGENT_ID
+    ? `routing/${issue.identifier}/${SWEEPER_AGENT_ID}`
+    : `routing/${issue.identifier}`;
   const rec = {
-    title: `routing/${issue.identifier}`,
+    title,
     content: `Sweeper auto-routed orphan ${issue.identifier} to ${owner.agent.name}: ${owner.reason}.`,
     metadata: {
       category: 'routing_rationale',

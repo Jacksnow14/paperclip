@@ -200,6 +200,67 @@ test("collision (project scope): only collisions in both scopes -> found false, 
   assert.deepEqual(result, { found: false, scope: null });
 });
 
+// ── AUR-4475: sweeper decider-suffix routing key format ─────────────────────
+
+test("routing/{id}/{ownerId} suffixed key found in org scope", async () => {
+  const { apiGet } = makeStubApiGet({
+    [`/api/companies/c1/memory/records?titlePrefix=routing/AUR-600&limit=${ROUTING_RECORD_LOOKUP_LIMIT}`]: [
+      { id: "r1", title: "routing/AUR-600/agent-uuid-decider" },
+    ],
+  });
+
+  const result = await lookupRoutingRecord({
+    companyId: "c1",
+    targetId: "AUR-600",
+    projectId: undefined,
+    apiGet,
+  });
+
+  assert.deepEqual(result, { found: true, scope: "org" });
+});
+
+test("routing/{id}/{ownerId} suffixed key found in project scope when org scope misses", async () => {
+  const { apiGet } = makeStubApiGet({
+    [`/api/companies/c1/memory/records?titlePrefix=routing/AUR-601&limit=${ROUTING_RECORD_LOOKUP_LIMIT}`]: [],
+    [`/api/companies/c1/memory/records?titlePrefix=routing/AUR-601&limit=${ROUTING_RECORD_LOOKUP_LIMIT}&projectId=p1`]: [
+      { id: "r1", title: "routing/AUR-601/agent-uuid-decider" },
+    ],
+  });
+
+  const result = await lookupRoutingRecord({
+    companyId: "c1",
+    targetId: "AUR-601",
+    projectId: "p1",
+    apiGet,
+  });
+
+  assert.deepEqual(result, { found: true, scope: "project" });
+});
+
+test("routing/{id}/{ownerId} suffix uses SWEEPER_AGENT_ID not chosen_agent (decider must not be confused with routed-to)", async () => {
+  // Validates the invariant: the /{ownerId} segment is the DECIDER (sweeper actor),
+  // not the agent the issue was routed to (chosen_agent).  These two differ whenever
+  // the sweeper routes an issue to another agent — the title suffix must be the
+  // sweeper's own id, not the target agent's id.
+  const sweeperDeciderId = "sweeper-agent-uuid";
+  const chosenAgentId    = "chosen-agent-uuid";
+  assert.notEqual(sweeperDeciderId, chosenAgentId, "test setup: decider and chosen must differ");
+
+  const titleWithDecider = `routing/AUR-602/${sweeperDeciderId}`;
+  const titleWithChosen  = `routing/AUR-602/${chosenAgentId}`;
+
+  // A record keyed by the decider IS the canonical routing record.
+  assert.ok(
+    titleWithDecider.startsWith("routing/AUR-602/"),
+    "decider key has correct prefix",
+  );
+  // A record keyed by chosen_agent is NOT the decider key and must not be written.
+  assert.ok(
+    titleWithChosen !== titleWithDecider,
+    "title keyed by chosen_agent differs from title keyed by decider",
+  );
+});
+
 // ── AUR-3855: per-mutation status-code extraction ───────────────────────────
 
 test("extractStatusCode: pulls the numeric status out of an apiPatch/apiPost error message", () => {

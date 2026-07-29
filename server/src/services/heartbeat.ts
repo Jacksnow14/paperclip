@@ -1379,6 +1379,23 @@ function didAutomaticRecoveryFail(
   );
 }
 
+// AUR-4230: true when a run consumed its full bounded transient retry ladder
+// (or descends from one that did). A recovery continuation queued for such a
+// run must carry this fact forward so it is not granted a fresh ladder —
+// otherwise exhaustion → recovery → fresh ladder alternates without bound.
+function didRunExhaustTransientRetryBudget(
+  run: Pick<
+    typeof heartbeatRuns.$inferSelect,
+    "scheduledRetryReason" | "scheduledRetryAttempt" | "contextSnapshot"
+  >,
+) {
+  if (parseObject(run.contextSnapshot).transientRetryBudgetExhausted === true) return true;
+  return (
+    run.scheduledRetryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON &&
+    (run.scheduledRetryAttempt ?? 0) >= BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS
+  );
+}
+
 function normalizeLedgerBillingType(value: unknown): BillingType {
   const raw = readNonEmptyString(value);
   switch (raw) {
@@ -5388,6 +5405,77 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { outcome: "promoted", run: promoted };
   }
 
+  // AUR-4230: when the bounded transient retry budget for a wake exhausts, the
+  // failure must leave an issue-level artifact instead of only a warn line in a
+  // run event log nobody reads — otherwise the wake dies with no visible trace.
+  async function makeBoundedRetryExhaustionIssueVisible(
+    run: typeof heartbeatRuns.$inferSelect,
+    info: { attempts: number; maxAttempts: number },
+  ) {
+    const contextSnapshot = parseObject(run.contextSnapshot);
+    const contextIssueId = readNonEmptyString(contextSnapshot.issueId);
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, run.companyId),
+          contextIssueId ? eq(issues.id, contextIssueId) : eq(issues.executionRunId, run.id),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!issue) return { visibility: "no_issue" as const, issueId: contextIssueId ?? null };
+    if (issue.status === "done" || issue.status === "cancelled") {
+      return { visibility: "issue_terminal" as const, issueId: issue.id };
+    }
+
+    const existingComment = await findRunIssueComment(run.id, run.companyId, issue.id);
+    if (existingComment) {
+      return { visibility: "already_commented" as const, issueId: issue.id, commentId: existingComment.id };
+    }
+
+    const recoveryEligible =
+      (issue.status === "todo" || issue.status === "in_progress") &&
+      !issue.assigneeUserId &&
+      issue.assigneeAgentId === run.agentId;
+    const errorFamily = readTransientRecoveryContractFromRun(run)?.errorFamily ?? null;
+    const failureSummary = summarizeRunFailureForIssueComment(run) ?? "";
+    const body = [
+      `⚠️ Automatic retry budget exhausted for this issue's wake: run \`${run.id}\` failed ` +
+        `(error family: \`${errorFamily ?? "unknown"}\`) and all ${info.attempts}/${info.maxAttempts} ` +
+        `bounded transient retries were consumed.${failureSummary}`,
+      recoveryEligible
+        ? "Terminal-run recovery will queue at most one continuation run for this issue. If that " +
+          "continuation also fails, the issue will be moved to `blocked` for intervention instead of retrying further."
+        : `No automatic recovery continuation is eligible for this issue (status \`${issue.status}\`` +
+          `${issue.assigneeUserId ? ", user-assigned" : ""}), so this wake will not be retried automatically. ` +
+          "Re-wake it manually (assignee mention or status change) if the work is still needed.",
+    ].join("\n\n");
+
+    try {
+      const comment = await issuesSvc.addComment(issue.id, body, { runId: run.id }, { authorType: "system" });
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Bounded retry exhaustion recorded on the issue",
+        payload: { issueId: issue.id, commentId: comment?.id ?? null, recoveryEligible },
+      });
+      return { visibility: "commented" as const, issueId: issue.id, commentId: comment?.id ?? null, recoveryEligible };
+    } catch (err) {
+      logger.error({ err, runId: run.id, issueId: issue.id }, "failed to record bounded retry exhaustion on issue");
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "error",
+        message: "Failed to record bounded retry exhaustion on the issue",
+        payload: { issueId: issue.id, error: err instanceof Error ? err.message : String(err) },
+      }).catch(() => undefined);
+      return { visibility: "comment_failed" as const, issueId: issue.id };
+    }
+  }
+
   async function scheduleBoundedRetryForRun(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -5405,6 +5493,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const wakeReason = opts?.wakeReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON;
     const maxAttempts = Math.max(0, Math.floor(opts?.maxAttempts ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS));
     const nextAttempt = (run.scheduledRetryAttempt ?? 0) + 1;
+    const contextSnapshot = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(contextSnapshot.issueId);
+    // AUR-4230: a recovery continuation descending from an exhausted transient
+    // ladder gets no fresh budget; letting it restart at attempt 1 would make
+    // exhaustion → recovery → fresh ladder alternate without bound.
+    const inheritedTransientExhaustion =
+      retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON &&
+      contextSnapshot.transientRetryBudgetExhausted === true;
     const baseSchedule = opts?.delayMs != null
       ? nextAttempt <= maxAttempts
         ? {
@@ -5428,22 +5524,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null;
     const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
 
-    if (!baseSchedule) {
+    if (!baseSchedule || inheritedTransientExhaustion) {
       await appendRunEvent(run, await nextRunEventSeq(run.id), {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message: `Bounded retry exhausted after ${run.scheduledRetryAttempt ?? 0} scheduled attempts; no further automatic retry will be queued`,
+        message: inheritedTransientExhaustion
+          ? "Bounded retry suppressed: this recovery continuation descends from an exhausted transient retry ladder, so no fresh retry budget is granted"
+          : `Bounded retry exhausted after ${run.scheduledRetryAttempt ?? 0} scheduled attempts; no further automatic retry will be queued`,
         payload: {
           retryReason,
           scheduledRetryAttempt: run.scheduledRetryAttempt ?? 0,
           maxAttempts,
+          ...(inheritedTransientExhaustion ? { inheritedTransientExhaustion: true } : {}),
         },
       });
+      // AUR-4230 containment: exhaustion must never be issue-invisible. The
+      // inherited case posts no comment of its own because terminal-run
+      // recovery immediately moves the issue to blocked with its own comment.
+      const issueVisibility =
+        retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON && !inheritedTransientExhaustion
+          ? await makeBoundedRetryExhaustionIssueVisible(run, {
+              attempts: run.scheduledRetryAttempt ?? 0,
+              maxAttempts,
+            })
+          : null;
       return {
         outcome: "retry_exhausted" as const,
         attempt: nextAttempt,
         maxAttempts,
+        inheritedTransientExhaustion,
+        issueVisibility,
       };
     }
     const schedule =
@@ -5455,8 +5566,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         : baseSchedule;
 
-    const contextSnapshot = parseObject(run.contextSnapshot);
-    const issueId = readNonEmptyString(contextSnapshot.issueId);
     if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON) {
       const gate = await evaluateScheduledRetryGate({ run, agent, contextSnapshot, retryReason });
       if (!gate.allowed) {
@@ -8862,6 +8971,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const recoveryReason = issue.status === "todo" ? "issue_assignment_recovery" : "issue_continuation_needed";
       const recoverySource =
         issue.status === "todo" ? "issue.assignment_recovery" : "issue.continuation_recovery";
+      // AUR-4230: carry exhaustion lineage onto the continuation so a transient
+      // failure there ends in visible blocking instead of a fresh retry ladder.
+      const exhaustionLineage = didRunExhaustTransientRetryBudget(run)
+        ? { transientRetryBudgetExhausted: true }
+        : {};
       const now = new Date();
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
@@ -8874,6 +8988,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           payload: withRecoveryModelProfileHint({
             issueId: issue.id,
             retryOfRunId: run.id,
+            ...exhaustionLineage,
           }),
           status: "queued",
           requestedByActorType: "system",
@@ -8899,6 +9014,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             retryReason,
             source: recoverySource,
             retryOfRunId: run.id,
+            ...exhaustionLineage,
           }),
           sessionIdBefore: recoverySessionBefore,
           retryOfRunId: run.id,
@@ -10200,6 +10316,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     },
 
     reconcileStrandedAssignedIssues,
+
+    releaseIssueExecutionAndPromote,
 
     buildIssueGraphLivenessAutoRecoveryPreview,
 

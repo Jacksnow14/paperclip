@@ -3542,6 +3542,26 @@ export function issueRoutes(
       },
     });
 
+    // AUR-4171: a requested terminal status that a pending review/approval stage
+    // rewrote to `in_review` used to be invisible at HTTP 200. Record it durably so
+    // the bounce is auditable even if the caller ignores the response body.
+    if (transition.notice) {
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.execution_stage_pending_downgrade",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          identifier: issue.identifier,
+          ...transition.notice,
+        },
+      });
+    }
+
     if (existing.status === "in_progress" && issue.status !== existing.status && issue.status !== "in_progress") {
       await listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id])
         .then(async (handoffStates) => {
@@ -4002,7 +4022,13 @@ export function issueRoutes(
       }
     })();
 
-    res.json({ ...issueResponse, comment });
+    // AUR-4171: additive, non-breaking diagnostic channel for a silently downgraded status.
+    res.json({
+      ...issueResponse,
+      comment,
+      executionStageNotice: transition.notice ?? null,
+      ...(transition.notice ? { warnings: [transition.notice.message] } : {}),
+    });
   });
 
   router.delete("/issues/:id", async (req, res) => {

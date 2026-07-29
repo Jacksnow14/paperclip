@@ -52,10 +52,32 @@ type TransitionInput = {
   monitorExplicitlyUpdated?: boolean;
 };
 
+/**
+ * Emitted when a caller asked for a terminal status but a pending execution stage
+ * forced the issue back to `in_review`. The downgrade itself is correct; the defect
+ * this closes (AUR-4171) is that it used to happen silently at HTTP 200, so the
+ * executor could not tell "closed" from "quietly bounced".
+ */
+export type IssueExecutionStageNotice = {
+  code: "execution_stage_pending";
+  requestedStatus: string;
+  appliedStatus: "in_review";
+  stageId: string;
+  stageType: IssueExecutionStage["type"];
+  participant: {
+    type: IssueExecutionStagePrincipal["type"];
+    agentId: string | null;
+    userId: string | null;
+  };
+  requiredActions: ["approve", "request_changes"];
+  message: string;
+};
+
 type TransitionResult = {
   patch: Record<string, unknown>;
   decision?: Pick<IssueExecutionDecision, "stageId" | "stageType" | "outcome" | "body">;
   workflowControlledAssignment?: boolean;
+  notice?: IssueExecutionStageNotice | null;
 };
 
 const COMPLETED_STATUS: IssueExecutionState["status"] = "completed";
@@ -558,6 +580,43 @@ function buildChangesRequestedState(previous: IssueExecutionState, currentStage:
   };
 }
 
+function describeStagePrincipal(participant: IssueExecutionStagePrincipal) {
+  return participant.type === "agent"
+    ? `agent ${participant.agentId ?? "unknown"}`
+    : `user ${participant.userId ?? "unknown"}`;
+}
+
+/**
+ * AUR-4171: build the notice for a status downgrade caused by a pending stage.
+ * Only a caller that asked for something other than `in_review` is surprised by the
+ * result, so a plain `in_review` request (the normal hand-off) gets no notice.
+ */
+function buildStagePendingNotice(input: {
+  requestedStatus?: string;
+  stage: IssueExecutionStage;
+  participant: IssueExecutionStagePrincipal;
+}): IssueExecutionStageNotice | null {
+  const requestedStatus = input.requestedStatus;
+  if (!requestedStatus || requestedStatus === "in_review") return null;
+  return {
+    code: "execution_stage_pending",
+    requestedStatus,
+    appliedStatus: "in_review",
+    stageId: input.stage.id,
+    stageType: input.stage.type,
+    participant: {
+      type: input.participant.type,
+      agentId: input.participant.agentId ?? null,
+      userId: input.participant.userId ?? null,
+    },
+    requiredActions: ["approve", "request_changes"],
+    message:
+      `PATCH status=${requestedStatus} was applied as in_review: execution stage ${input.stage.id} ` +
+      `(${input.stage.type}) is still pending on ${describeStagePrincipal(input.participant)}. ` +
+      "It clears when that participant PATCHes the issue with a decision (approve or request_changes).",
+  };
+}
+
 function buildPendingStagePatch(input: {
   patch: Record<string, unknown>;
   previous: IssueExecutionState | null;
@@ -566,7 +625,8 @@ function buildPendingStagePatch(input: {
   participant: IssueExecutionStagePrincipal;
   returnAssignee: IssueExecutionStagePrincipal | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
-}) {
+  requestedStatus?: string;
+}): IssueExecutionStageNotice | null {
   input.patch.status = "in_review";
   Object.assign(input.patch, patchForPrincipal(input.participant));
   input.patch.executionState = buildPendingState({
@@ -576,6 +636,11 @@ function buildPendingStagePatch(input: {
     participant: input.participant,
     returnAssignee: input.returnAssignee,
     reviewRequest: input.reviewRequest,
+  });
+  return buildStagePendingNotice({
+    requestedStatus: input.requestedStatus,
+    stage: input.stage,
+    participant: input.participant,
   });
 }
 
@@ -675,7 +740,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         return { patch };
       }
 
-      buildPendingStagePatch({
+      const notice = buildPendingStagePatch({
         patch,
         previous: existingState,
         policy: input.policy,
@@ -683,10 +748,12 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         participant,
         returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
         reviewRequest: effectiveReviewRequest,
+        requestedStatus,
       });
       return {
         patch,
         workflowControlledAssignment: true,
+        notice,
       };
     }
 
@@ -722,7 +789,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           throw unprocessable(`No eligible ${nextStage.type} participant is configured for this issue`);
         }
 
-        buildPendingStagePatch({
+        const notice = buildPendingStagePatch({
           patch,
           previous: approvedState,
           policy: input.policy,
@@ -730,9 +797,11 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           participant,
           returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
           reviewRequest: input.reviewRequest ?? null,
+          requestedStatus,
         });
         return {
           patch,
+          notice,
           decision: {
             stageId: activeStage.id,
             stageType: activeStage.type,
@@ -779,7 +848,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     }
 
     if (stageStateDrifted) {
-      buildPendingStagePatch({
+      const notice = buildPendingStagePatch({
         patch,
         previous: existingState,
         policy: input.policy,
@@ -787,10 +856,12 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         participant: currentParticipant,
         returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
         reviewRequest: effectiveReviewRequest,
+        requestedStatus,
       });
       return {
         patch,
         workflowControlledAssignment: true,
+        notice,
       };
     }
 
@@ -850,7 +921,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     throw unprocessable(`No eligible ${pendingStage.type} participant is configured for this issue`);
   }
 
-  buildPendingStagePatch({
+  const notice = buildPendingStagePatch({
     patch,
     previous:
       skippedStageIds.length === (existingState?.completedStageIds ?? []).length
@@ -865,10 +936,12 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     participant,
     returnAssignee,
     reviewRequest: input.reviewRequest ?? null,
+    requestedStatus,
   });
   return {
     patch,
     workflowControlledAssignment: true,
+    notice,
   };
 }
 

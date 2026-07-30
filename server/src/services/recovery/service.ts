@@ -2214,7 +2214,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             comment:
               "Paperclip automatically retried dispatch for this assigned `todo` issue after a lost wake/run, " +
               `but it still has no live execution path.${failureSummary ?? ""} ` +
-              "Moving it to `blocked` so it is visible for intervention.",
+              "Escalating it to a recovery owner so it is visible for intervention.",
           });
           if (updated) {
             result.escalated += 1;
@@ -2296,7 +2296,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             latestRun: successfulRun,
             comment:
               "Paperclip automatically retried continuation for this assigned `in_progress` issue and the retry " +
-              "made progress, but it still has no live execution path. Moving it to `blocked` so it is visible for intervention.",
+              "made progress, but it still has no live execution path. Escalating it to a recovery owner so it is visible for intervention.",
           });
           if (updated) {
             result.escalated += 1;
@@ -2337,7 +2337,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           comment:
             "Paperclip automatically retried continuation for this assigned `in_progress` issue after its live " +
             `execution disappeared, but it still has no live execution path.${failureSummary ?? ""} ` +
-            "Moving it to `blocked` so it is visible for intervention.",
+            "Escalating it to a recovery owner so it is visible for intervention.",
         });
         if (updated) {
           result.escalated += 1;

@@ -10,8 +10,10 @@ import {
   companySkills,
   costEvents,
   createDb,
+  documents,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issues,
 } from "@paperclipai/db";
 import {
@@ -193,7 +195,20 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
     await db.delete(activityLog);
     await db.delete(costEvents);
     await db.delete(heartbeatRunEvents);
-    await db.delete(issues);
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      // Releasing a hung adapter above lets its run complete asynchronously,
+      // which can post an issue_comments row (e.g. run-handoff/continuation
+      // comments) after this teardown has already started. Retry alongside
+      // heartbeat_runs below rather than deleting once, for the same reason.
+      await db.delete(issueComments);
+      try {
+        await db.delete(issues);
+        break;
+      } catch (error) {
+        if (attempt === 4) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
     for (let attempt = 0; attempt < 5; attempt += 1) {
       // Re-clear every table that carries an FK to heartbeat_runs on each
       // attempt, not just heartbeat_run_events. Runs admitted by a test keep
@@ -224,6 +239,11 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
       }
     }
     for (let attempt = 0; attempt < 5; attempt += 1) {
+      // Deleting documents cascades to document_revisions and issue_documents,
+      // which otherwise block the companies delete below the same way
+      // issue_comments blocked issues above (async run completion writing a
+      // handoff document after teardown has already started).
+      await db.delete(documents);
       await db.delete(companySkills);
       try {
         await db.delete(companies);
@@ -269,7 +289,11 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
     return agentId;
   }
 
-  async function seedQueuedRun(companyId: string, agentId: string, opts?: { createdAt?: Date }) {
+  async function seedQueuedRun(
+    companyId: string,
+    agentId: string,
+    opts?: { createdAt?: Date; issueId?: string },
+  ) {
     const runId = randomUUID();
     const wakeupRequestId = randomUUID();
     const now = opts?.createdAt ?? new Date();
@@ -292,11 +316,28 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
       triggerDetail: "manual",
       status: "queued",
       wakeupRequestId,
-      contextSnapshot: {},
+      contextSnapshot: opts?.issueId ? { issueId: opts.issueId } : {},
       updatedAt: now,
       createdAt: now,
     });
     return runId;
+  }
+
+  let issueSeedCounter = 0;
+  async function seedIssue(companyId: string, opts?: { priority?: string; assigneeAgentId?: string }) {
+    issueSeedCounter += 1;
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: `Test issue ${issueSeedCounter}`,
+      status: "in_progress",
+      priority: opts?.priority ?? "medium",
+      assigneeAgentId: opts?.assigneeAgentId ?? null,
+      issueNumber: issueSeedCounter,
+      identifier: `T${issueSeedCounter}`,
+    });
+    return issueId;
   }
 
   // `pauseRecordedAt` is the row's createdAt -- the fixed point MAX_ADAPTER_QUOTA_PAUSE_MS
@@ -882,22 +923,29 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
         .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "running")))
         .then((rows) => rows.length);
 
-    // No agent may hold more than its equal share while others are waiting.
-    expect(await runningByAgent(greedyAgent)).toBe(1);
-
-    // ...and the agents that were starved in production must each get a slot.
+    // ...and the agents that were starved in production must each get a slot
+    // BEFORE anyone gets more than their equal share.
     expect(await runningByAgent(starvedAgentA)).toBe(1);
     expect(await runningByAgent(starvedAgentB)).toBe(1);
     expect((await heartbeat.getRun(starvedRunA))?.status).toBe("running");
     expect((await heartbeat.getRun(starvedRunB))?.status).toBe("running");
 
-    // The global ceiling is still respected — fairness must not overshoot it.
+    // AUR-4620 F2: once both starved agents have exhausted their queued work
+    // (their fair share was all they had), the cap has one slot left with
+    // nobody else waiting for it. greedyAgent still has a backlog, so it may
+    // now reclaim that idle slot -- this is the redistribution pass, not a
+    // regression of the fairness guarantee above: starvedAgentA/B already got
+    // their guaranteed slot with certainty before greedy could take a second.
+    expect(await runningByAgent(greedyAgent)).toBe(2);
+
+    // The global ceiling is still respected, and AUR-4620 means it's now
+    // fully used rather than left idle with queued work still available.
     const globalRunning = await db
       .select({ id: heartbeatRuns.id })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.status, "running"))
       .then((rows) => rows.length);
-    expect(globalRunning).toBeLessThanOrEqual(4);
+    expect(globalRunning).toBe(4);
   });
 
   // Guard the other half of the invariant (see doctrine: a gate proven only by a
@@ -924,11 +972,18 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
 
   // AUR-4620: agents that can never claim a slot right now (quota-paused
   // adapter, or an inadmissible status) must not shrink the ceiling for agents
-  // that actually can. Live incident: 3 permanently quota-paused codex_local
-  // agents with stale queued rows inflated contenders to 8, forcing ceiling=1
-  // for every agent including the 2 truly eligible ones -- cap sat at 2/4
-  // running against 280 queued. Two eligible agents against cap 4 should each
-  // get ceiling 2 (not floor(4/5)=1 if the 3 ineligible agents counted).
+  // that actually can. Live incident: several permanently quota-paused
+  // codex_local agents with stale queued rows inflated the contender count,
+  // forcing ceiling=1 for every agent including the truly eligible ones --
+  // cap sat at 2/4 running against 280 queued.
+  //
+  // Below: pausedAgentX itself holds no queued row (only the scheduled_retry
+  // that establishes the pause), so only 4 agentIds ever have a queued row --
+  // eligibleA, eligibleB, pausedAgentY, and terminatedAgent. Pre-fix, all 4
+  // counted as contenders -> ceiling floor(4/4)=1 each, leaving 2 of the 4
+  // global slots stranded since pausedAgentY and terminatedAgent can never
+  // claim theirs. Post-fix, both get excluded from the denominator, so the 2
+  // eligible agents should each get ceiling floor(4/2)=2.
   it("excludes quota-paused and inadmissible-status agents from the fair-share denominator", async () => {
     const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4 });
     const companyId = await seedCompany();
@@ -964,11 +1019,74 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
         .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "running")))
         .then((rows) => rows.length);
 
-    // Pre-fix: contenders counted all 5 agentIds with a queued row (5 including
-    // the 3 ineligible ones) -> ceiling floor(4/5) = 1 each, leaving 2 of the 4
-    // global slots unfillable since nothing ineligible can ever claim them.
+    // Pre-fix: contenders counted all 4 agentIds with a queued row (eligibleA,
+    // eligibleB, pausedAgentY, terminatedAgent) -> ceiling floor(4/4) = 1 each,
+    // leaving 2 of the 4 global slots unfillable since pausedAgentY and
+    // terminatedAgent can never claim theirs.
     expect(await runningByAgent(eligibleA)).toBe(2);
     expect(await runningByAgent(eligibleB)).toBe(2);
+
+    const globalRunning = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "running"))
+      .then((rows) => rows.length);
+    expect(globalRunning).toBe(4);
+  });
+
+  // AUR-4620 F2 (CTO review of PR #185). Filtering ineligible contenders out
+  // of the denominator (the test above) is not enough on its own: the ceiling
+  // formula floor(cap/contenders) collapses to 1 for *every* contender once
+  // contenders > cap, and nothing reclaims a contender's unused share of 1 for
+  // another agent that could use more. Reproduces that shape directly: 3
+  // "phantom" contenders are eligible (no quota pause, admissible status) and
+  // each hold one queued run of their own, so they inflate the denominator to
+  // 5 against cap 4 -- but their queued work is non-critical and gets shed
+  // under disk pressure every single pass, so they can never actually claim
+  // the 1-slot share the ceiling formula reserves for them. Two real agents
+  // hold deep, critical-priority backlogs capable of using more than a
+  // ceiling of 1 once it's freed. Without a redistribution pass this asserts
+  // globalRunning stays at 2 (only the fair-share floor, forever stranding
+  // the other 2 slots); with it, all 4 slots fill.
+  it("redistributes a contender's unclaimed fair share once cap < contenders (AUR-4620 F2)", async () => {
+    const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4, isDiskPressureActive: () => true });
+    const companyId = await seedCompany();
+
+    const phantomAgents: string[] = [];
+    for (let i = 0; i < 3; i += 1) {
+      const agentId = await seedAgent(companyId, { maxConcurrentRuns: 20, adapterType: "claude_local" });
+      phantomAgents.push(agentId);
+      // No issueId -> queuedIssue is null -> priority !== "critical" -> shed
+      // under disk pressure every pass, regardless of ceiling.
+      await seedQueuedRun(companyId, agentId, { createdAt: new Date(Date.now() - 70_000 + i) });
+    }
+
+    const realAgentA = await seedAgent(companyId, { maxConcurrentRuns: 20, adapterType: "claude_local" });
+    const realAgentB = await seedAgent(companyId, { maxConcurrentRuns: 20, adapterType: "claude_local" });
+    const criticalIssueA = await seedIssue(companyId, { priority: "critical", assigneeAgentId: realAgentA });
+    const criticalIssueB = await seedIssue(companyId, { priority: "critical", assigneeAgentId: realAgentB });
+    for (let i = 0; i < 3; i += 1) {
+      await seedQueuedRun(companyId, realAgentA, { createdAt: new Date(Date.now() - 50_000 + i), issueId: criticalIssueA });
+    }
+    for (let i = 0; i < 3; i += 1) {
+      await seedQueuedRun(companyId, realAgentB, { createdAt: new Date(Date.now() - 50_000 + i), issueId: criticalIssueB });
+    }
+
+    hangAdapterUntilReleased();
+    await heartbeat.resumeQueuedRuns();
+
+    const runningByAgent = async (agentId: string) =>
+      db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "running")))
+        .then((rows) => rows.length);
+
+    for (const phantomAgentId of phantomAgents) {
+      expect(await runningByAgent(phantomAgentId)).toBe(0);
+    }
+    expect(await runningByAgent(realAgentA)).toBe(2);
+    expect(await runningByAgent(realAgentB)).toBe(2);
 
     const globalRunning = await db
       .select({ id: heartbeatRuns.id })

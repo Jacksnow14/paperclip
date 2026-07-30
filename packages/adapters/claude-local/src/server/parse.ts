@@ -1,5 +1,9 @@
 import type { UsageSummary } from "@paperclipai/adapter-utils";
 import {
+  CLAUDE_CONTEXT_OVERFLOW_RE,
+  isClaudeContextOverflowMessage,
+} from "@paperclipai/adapter-utils";
+import {
   asString,
   asNumber,
   parseObject,
@@ -24,9 +28,10 @@ const CLAUDE_EXTRA_USAGE_RESET_RE =
 // unchanged can never succeed, so it must never share the transient/retryable
 // family. Live wording (2,394 rows, 2026-07-26..29) is exactly
 // `Claude run failed: subtype=success: Prompt is too long`.
+// AUR-4557: both forms of the wording test now live in adapter-utils, shared with the
+// heartbeat service. The substring form is only ever applied to text the model cannot
+// author; anything that can carry model prose goes through the anchored form.
 export { CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE } from "@paperclipai/adapter-utils";
-const CLAUDE_CONTEXT_OVERFLOW_RE =
-  /(?:prompt\s+is\s+too\s+long|input\s+length\s+and\s+`?max_tokens`?\s+exceed\s+context\s+limit|context\s+(?:length|window)\s+(?:limit\s+)?exceeded|exceeds?\s+(?:the\s+)?maximum\s+context\s+length|too\s+many\s+total\s+text\s+bytes)/i;
 
 export function parseClaudeStreamJson(stdout: string) {
   let sessionId: string | null = null;
@@ -389,23 +394,43 @@ export function extractClaudeRetryNotBefore(
  * of the 2,394 overflow runs was mis-tagged `claude_transient_upstream`: our agents
  * routinely *discuss* quota wording ("session limit", "usage limit reached") in the
  * conversation being resumed, so the transient regex matched the transcript content
- * rather than the actual failure. Matching only the adapter's own failure fields
- * keeps this classifier immune to that contamination.
+ * rather than the actual failure.
+ *
+ * AUR-4557: excluding `stdout`/`stderr` was NOT sufficient, and the original fix
+ * reproduced the bug class it was written to close. `parsed.result` IS the model's
+ * final assistant message on a stream-JSON result event, and `describeClaudeFailure`
+ * folds `parsed.result` into `errorMessage` — so a substring test over either one is
+ * still reading free-form model prose. An agent that ends a turn summarising "…the
+ * prompt is too long…" and then fails for an unrelated reason (or on a genuine 529)
+ * was classified as a deterministic overflow: no `errorFamily`, no retry ladder for a
+ * transient failure, and a forced session rotation. The rotation handoff itself
+ * embeds the reason string, so the mistake could re-seed itself on the next run.
+ *
+ * Fields are therefore split by who can author them:
+ *
+ *   TRUSTED      `parsed.errors[].message`, adapter/CLI stderr — the model cannot
+ *                write these, so a substring match is safe.
+ *   CONTAMINABLE `parsed.result`, `errorMessage` — may be model prose, so the wording
+ *                must OPEN the payload (see `isClaudeContextOverflowMessage`) rather
+ *                than merely appear somewhere inside it.
  */
 export function isClaudeContextOverflowError(input: {
   parsed?: Record<string, unknown> | null;
+  /** Adapter-derived failure summary; may embed the model's final message. Anchored. */
   errorMessage?: string | null;
+  /** Text the model cannot author (process stderr). Substring-matched. */
+  trustedText?: string | null;
 }): boolean {
   const parsed = input.parsed ?? null;
-  const haystack = [
-    input.errorMessage ?? "",
-    parsed ? asString(parsed.result, "") : "",
+
+  const trusted = [
+    input.trustedText ?? "",
     ...(parsed ? extractClaudeErrorMessages(parsed) : []),
-  ]
-    .filter(Boolean)
-    .join("\n");
-  if (!haystack) return false;
-  return CLAUDE_CONTEXT_OVERFLOW_RE.test(haystack);
+  ].filter(Boolean);
+  if (trusted.some((text) => CLAUDE_CONTEXT_OVERFLOW_RE.test(text))) return true;
+
+  const contaminable = [parsed ? asString(parsed.result, "") : "", input.errorMessage ?? ""];
+  return contaminable.some((text) => isClaudeContextOverflowMessage(text));
 }
 
 export function isClaudeTransientUpstreamError(input: {

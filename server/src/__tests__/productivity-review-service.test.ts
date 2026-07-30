@@ -1029,5 +1029,19 @@ describeEmbeddedPostgres("productivity review service", () => {
         CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
       );
     });
+
+    // AUR-4557: this invariant used to be a module-scope `for` loop with a `throw`.
+    // productivity-review is imported at startup (services/index.ts, heartbeat.ts), so
+    // an edit adding a code to both sets would have crashed the shared multi-tenant
+    // API on boot instead of failing a test. It is now a compile-time `AssertNever`
+    // (see the type in productivity-review.ts, which stops compiling on overlap); this
+    // is its runtime companion, so the invariant is covered without a boot crash.
+    it("keeps the deterministic and non-attributable code sets disjoint", () => {
+      const nonAttributable = new Set<string>(NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES);
+      const overlap = (DETERMINISTIC_ATTRIBUTABLE_ERROR_CODES as readonly string[]).filter(
+        (code) => nonAttributable.has(code),
+      );
+      expect(overlap).toEqual([]);
+    });
   });
 });

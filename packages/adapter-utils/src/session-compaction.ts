@@ -79,6 +79,61 @@ const CLAUDE_LOCAL_SESSION_POLICY: SessionCompactionPolicy = {
  */
 export const CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE = "claude_context_overflow";
 
+/**
+ * Wording that identifies a prompt-size rejection. Kept as a source string so the
+ * substring and anchored forms below can never drift apart.
+ */
+const CLAUDE_CONTEXT_OVERFLOW_PATTERN =
+  "(?:prompt\\s+is\\s+too\\s+long" +
+  "|input\\s+length\\s+and\\s+`?max_tokens`?\\s+exceed\\s+context\\s+limit" +
+  "|context\\s+(?:length|window)\\s+(?:limit\\s+)?exceeded" +
+  "|exceeds?\\s+(?:the\\s+)?maximum\\s+context\\s+length" +
+  "|too\\s+many\\s+total\\s+text\\s+bytes)";
+
+/** Substring form. ONLY safe on text the model cannot author. */
+export const CLAUDE_CONTEXT_OVERFLOW_RE = new RegExp(CLAUDE_CONTEXT_OVERFLOW_PATTERN, "i");
+
+/**
+ * Anchored form. The phrase must OPEN the payload and be followed by end-of-string
+ * or punctuation, so it matches a failure *value* but not the same words used inside
+ * a sentence.
+ *
+ *   "Prompt is too long"                                    -> match
+ *   "input length and `max_tokens` exceed context limit: …" -> match
+ *   "…fails because the prompt is too long, so I …"         -> NO match (mid-sentence)
+ *   "Prompt is too long fix landed"                         -> NO match (prose)
+ */
+const CLAUDE_CONTEXT_OVERFLOW_ANCHORED_RE = new RegExp(
+  `^(?:${CLAUDE_CONTEXT_OVERFLOW_PATTERN})(?=\\s*(?:$|[:.,;!?]))`,
+  "i",
+);
+
+/**
+ * `describeClaudeFailure` wraps the detail as `Claude run failed: subtype=<x>: <detail>`,
+ * and the no-parse path wraps stderr as `Claude exited with code <n>: <detail>`. Strip
+ * either wrapper so the anchored test sees the payload itself.
+ */
+const CLAUDE_FAILURE_WRAPPER_RE =
+  /^(?:claude\s+run\s+failed(?::\s*subtype=[^:\s]*)?|claude\s+exited\s+with\s+code\s+-?\d+):\s*/i;
+
+/**
+ * AUR-4557: true only when `value` *is* an overflow failure message, not when it
+ * merely mentions one.
+ *
+ * AUR-4513 shipped a classifier that excluded `stdout`/`stderr` but still read
+ * `parsed.result` — which IS the model's final assistant message — and `errorMessage`,
+ * which folds `parsed.result` in. That reproduced the very transcript-contamination
+ * bug it was written to fix: an agent that summarised "…the prompt is too long…" and
+ * then failed for an unrelated reason (or on a real 529) was coded as a deterministic
+ * overflow, losing its retry ladder and force-rotating its session.
+ */
+export function isClaudeContextOverflowMessage(value: string | null | undefined): boolean {
+  if (!value) return false;
+  const payload = value.trim().replace(CLAUDE_FAILURE_WRAPPER_RE, "").trim();
+  if (!payload) return false;
+  return CLAUDE_CONTEXT_OVERFLOW_ANCHORED_RE.test(payload);
+}
+
 export const LEGACY_SESSIONED_ADAPTER_TYPES = new Set([
   "acpx_local",
   "claude_local",

@@ -156,6 +156,7 @@ import {
   hasSessionCompactionThresholds,
   resolveSessionCompactionPolicy,
   CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
+  isClaudeContextOverflowMessage,
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
 import {
@@ -289,15 +290,33 @@ function resolveCodexTransientFallbackMode(attempt: number): CodexTransientFallb
 }
 
 export function readHeartbeatRunErrorFamily(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson"> &
+    Partial<Pick<typeof heartbeatRuns.$inferSelect, "error">>,
 ) {
   // AUR-4513: a context overflow is deterministic and must never inherit a
   // retryable family. This is checked BEFORE the persisted `errorFamily` on
-  // purpose: the 2,394 pre-fix overflow rows were written with
-  // `errorFamily: "transient_upstream"` in resultJson, and during a mixed-version
-  // deploy an older adapter can still emit that pairing. Trusting the persisted
-  // value first would keep those runs on the retry ladder forever.
+  // purpose: during a mixed-version deploy an older adapter can still emit an
+  // overflow paired with `errorFamily: "transient_upstream"` in resultJson, and
+  // trusting the persisted value first would keep those runs on the retry ladder.
   if (run.errorCode === CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE) {
+    return null;
+  }
+
+  // AUR-4557: the errorCode test alone cannot match a single PRE-FIX row. AUR-4513
+  // claimed it covered the 2,394 historical overflow runs, but a live sweep of 1,843
+  // `claude_local` runs across all 12 agents found 107/107 rows whose `error` contains
+  // "too long" carrying `claude_transient_upstream` — none carry the new code, because
+  // the code did not exist when they were written. Without this fallback every
+  // currently-wedged session must burn one more failed run post-deploy before the
+  // force-rotate branch can see it. The message test is the ANCHORED one, so this
+  // cannot re-introduce the prose contamination fixed above.
+  //
+  // Coverage caveat, stated rather than overclaimed: on the legacy
+  // `heartbeatRunSqlAsciiSafeColumns` projection `error` is selected as NULL, so this
+  // fallback does not fire there. That projection also nulls `resultJson`, so the
+  // persisted-family read below is already degraded in the same mode — this is no
+  // worse than the status quo, and `errorCode` (never nulled) still covers new rows.
+  if (isClaudeContextOverflowMessage(run.error ?? null)) {
     return null;
   }
 
@@ -331,8 +350,16 @@ function readTransientRetryNotBeforeFromRun(run: Pick<typeof heartbeatRuns.$infe
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
-function readTransientRecoveryContractFromRun(
-  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
+// AUR-4557: exported so the retry DECISION can be covered against a row read back out
+// of Postgres, not just the pure helper. This is the predicate the failed-run gate uses
+// before calling scheduleBoundedRetryForRun; testing it against a real row is what
+// catches a projection that drops `error` and silently kills the fallback below.
+export function readTransientRecoveryContractFromRun(
+  // `error` is carried through so the anchored overflow-message fallback in
+  // readHeartbeatRunErrorFamily can actually reach the retry decision. A guard keyed
+  // on a field the caller never passes is dead on arrival.
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson"> &
+    Partial<Pick<typeof heartbeatRuns.$inferSelect, "error">>,
 ) {
   return readHeartbeatRunErrorFamily(run) === "transient_upstream"
     ? {
@@ -3426,14 +3453,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const policy = parseSessionCompactionPolicy(agent);
-    if (!policy.enabled || !hasSessionCompactionThresholds(policy)) {
-      return {
-        rotate: false,
-        reason: null,
-        handoffMarkdown: null,
-        previousRunId: null,
-      };
-    }
+    // AUR-4557: this used to `return {rotate:false}` here, BEFORE the overflow branch
+    // below, so an agent with `sessionCompaction.enabled: false` (or every threshold
+    // 0) got no overflow rotation at all. A context overflow is deterministic — the
+    // resumed session re-sends the same over-long prompt and can never recover — so
+    // forced rotation must not be subordinate to threshold configuration, which is
+    // calibrated for gradual accumulation and by definition has not tripped. The
+    // gate is kept, but only for the threshold-driven reasons it actually governs.
+    const thresholdsActive = policy.enabled && hasSessionCompactionThresholds(policy);
 
     const fetchLimit = Math.max(policy.maxSessionRuns > 0 ? policy.maxSessionRuns + 1 : 0, 4);
     const runs = await db
@@ -3483,9 +3510,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // for gradual accumulation and by definition have not tripped yet.
     if (latestRun?.errorCode === CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE) {
       reason = "latest run failed with a context overflow (prompt too long)";
-    } else if (policy.maxSessionRuns > 0 && runs.length > policy.maxSessionRuns) {
+    } else if (thresholdsActive && policy.maxSessionRuns > 0 && runs.length > policy.maxSessionRuns) {
       reason = `session exceeded ${policy.maxSessionRuns} runs`;
     } else if (
+      thresholdsActive &&
       policy.maxRawInputTokens > 0 &&
       latestRawUsage &&
       latestRawUsage.inputTokens >= policy.maxRawInputTokens
@@ -3493,7 +3521,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       reason =
         `session raw input reached ${formatCount(latestRawUsage.inputTokens)} tokens ` +
         `(threshold ${formatCount(policy.maxRawInputTokens)})`;
-    } else if (policy.maxSessionAgeHours > 0 && sessionAgeHours >= policy.maxSessionAgeHours) {
+    } else if (
+      thresholdsActive &&
+      policy.maxSessionAgeHours > 0 &&
+      sessionAgeHours >= policy.maxSessionAgeHours
+    ) {
       reason = `session age reached ${Math.floor(sessionAgeHours)} hours`;
     }
 

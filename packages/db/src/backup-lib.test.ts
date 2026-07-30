@@ -641,11 +641,16 @@ describe("pruneOldBackups — retention logic", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-prune-bytes-"));
     cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
 
-    const now = new Date("2026-01-08T12:00:00Z");
+    // Must be real Date.now(), not a fixed past instant: AUR-4611's size-aware
+    // hourly count shrinks Tier 1 to 1 for this cap/size ratio, and the 2nd
+    // survivor is rescued by the daily tier's per-calendar-day dedup — which
+    // (see pruneOldBackups) only admits entries within `dailyDays` of the real
+    // wall clock, not of this fixture's own reference point.
+    const now = Date.now();
     const MB = 1024 * 1024;
     // 5 files 1h apart, each 10 MiB → 50 MiB total, cap at 25 MiB → must keep 2
     const timestamps = Array.from({ length: 5 }, (_, i) => ({
-      iso: new Date(now.getTime() - i * 60 * 60 * 1000).toISOString(),
+      iso: new Date(now - i * 60 * 60 * 1000).toISOString(),
       sizeBytes: 10 * MB,
     }));
     createBackupFiles(dir, "pc", timestamps);
@@ -697,6 +702,12 @@ describe("pruneOldBackups — retention logic", () => {
     cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
 
     const MB = 1024 * 1024;
+    // Must be real Date.now(), not a fixed past instant: pruneOldBackups'
+    // daily/weekly/monthly cutoffs (packages/db/src/backup-lib.ts) are computed
+    // against the real wall clock, not against this fixture's own reference
+    // point. A fixed-past "now" would make every entry here look older than
+    // the cutoffs and fall out of the ladder entirely instead of being
+    // deduped into it.
     const now = Date.now();
     const HOUR = 60 * 60 * 1000;
     const DAY = 24 * HOUR;
@@ -743,6 +754,102 @@ describe("pruneOldBackups — retention logic", () => {
     }
   });
 
+  it("size-aware hourly shrink keeps the full DR ladder under cap as dump size grows, with headroom (AUR-4611)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-prune-sizeaware-"));
+    cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+    // Must be real Date.now() — see the tier-aware eviction test above for why.
+    const now = Date.now();
+    const KB = 1024;
+    const HOUR = 60 * 60 * 1000;
+    const DAY = 24 * HOUR;
+    const at = (agoMs: number, sizeBytes: number) => ({ iso: new Date(now - agoMs).toISOString(), sizeBytes });
+
+    // Production-default ladder shape (hourlyCount 6, dailyDays 7, weeklyWeeks 4,
+    // monthlyMonths 1) with a dump size matching the AUR-4611 measured growth
+    // (370 MiB -> 548 MiB in 5 days), scaled down to KB so the test stays fast.
+    // A full 6-hourly + 12-anchor-reserve ladder no longer fits the historical
+    // "~18 dumps" framing at this size, so the hourly tier must shrink.
+    const DUMP_SIZE = 548 * KB;
+    const hourlyAgos = Array.from({ length: 6 }, (_, i) => i * HOUR);
+    const anchorAgos = [2 * DAY, 3 * DAY, 4 * DAY, 10 * DAY, 17 * DAY, 29 * DAY];
+    createBackupFiles(
+      dir,
+      "pc",
+      [...hourlyAgos, ...anchorAgos].map((ago) => at(ago, DUMP_SIZE)),
+    );
+
+    const maxBytes = 8192 * KB; // scaled 8 GiB default cap
+    const result = pruneOldBackups(dir, {
+      dailyDays: 7,
+      weeklyWeeks: 4,
+      monthlyMonths: 1,
+      hourlyCount: 6,
+      maxBytes,
+    }, "pc");
+
+    // The hard cap backstop never had to fire: the size-aware hourly shrink
+    // absorbed the growth on its own, so no DR-relevant tier was touched.
+    expect(result.evictedTiers).toEqual([]);
+    // Real headroom under the cap remains (not pinned at the edge).
+    expect(result.keptBytes).toBeLessThan(maxBytes);
+    expect(result.keptBytes).toBeGreaterThan(0);
+    // Every DR anchor survives.
+    for (const ago of anchorAgos) {
+      const safe = new Date(now - ago).toISOString().replace(/[:-]/g, "").replace("T", "-").slice(0, 15);
+      expect(fs.existsSync(path.join(dir, `pc-${safe}.sql.gz`))).toBe(true);
+    }
+    // The newest dump always survives.
+    const newestSafe = new Date(now).toISOString().replace(/[:-]/g, "").replace("T", "-").slice(0, 15);
+    expect(fs.existsSync(path.join(dir, `pc-${newestSafe}.sql.gz`))).toBe(true);
+  });
+
+  it("cap eviction reaching into the weekly tier is reported via evictedTiers — DR regression is no longer silent (AUR-4611)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-prune-weeklyalert-"));
+    cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+    // Must be real Date.now() — see the tier-aware eviction test above for why.
+    const now = Date.now();
+    const KB = 1024;
+    const HOUR = 60 * 60 * 1000;
+    const DAY = 24 * HOUR;
+    const at = (agoMs: number, sizeBytes: number) => ({ iso: new Date(now - agoMs).toISOString(), sizeBytes });
+
+    // A ladder so far past the size the cap was budgeted for that even the
+    // size-aware shrink (which floors at 1 hourly dump) cannot make the full
+    // daily/weekly/monthly ladder fit. This is the failure mode DoD item 2/3
+    // target: today's tier-aware eviction can no longer stop at the low-value
+    // hourly tier, and that DR-coverage regression must be reported, not silent.
+    const DUMP_SIZE = 100 * KB;
+    const hourlyAgos = [0]; // hourlyCount=1: nothing left to shrink away
+    const anchorAgos = [2 * DAY, 3 * DAY, 4 * DAY, 10 * DAY, 17 * DAY, 29 * DAY]; // 3 daily, 2 weekly, 1 monthly
+    createBackupFiles(
+      dir,
+      "pc",
+      [...hourlyAgos, ...anchorAgos].map((ago) => at(ago, DUMP_SIZE)),
+    );
+    // Full ladder (7 entries × 100 KiB = 700 KiB) badly overflows this cap.
+    const maxBytes = 250 * KB;
+
+    const result = pruneOldBackups(dir, {
+      dailyDays: 7,
+      weeklyWeeks: 4,
+      monthlyMonths: 1,
+      hourlyCount: 1,
+      maxBytes,
+    }, "pc");
+
+    expect(result.evictedTiers).toContain("weekly");
+    expect(result.keptBytes).toBeLessThanOrEqual(maxBytes);
+    // The single most valuable, longest-lived restore point (monthly) is the
+    // last thing sacrificed — it survives even though weekly did not.
+    const monthlySafe = new Date(now - 29 * DAY).toISOString().replace(/[:-]/g, "").replace("T", "-").slice(0, 15);
+    expect(fs.existsSync(path.join(dir, `pc-${monthlySafe}.sql.gz`))).toBe(true);
+    // The newest dump always survives.
+    const newestSafe = new Date(now).toISOString().replace(/[:-]/g, "").replace("T", "-").slice(0, 15);
+    expect(fs.existsSync(path.join(dir, `pc-${newestSafe}.sql.gz`))).toBe(true);
+  });
+
   it("tier fall-through: daily → weekly → monthly; nothing survives beyond monthlyMonths", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-prune-tiers-"));
     cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -782,9 +889,16 @@ describe("emergencyPruneBackups — disk-pressure remediation (AUR-4035 defect 3
 
     const MB = 1024 * 1024;
     const HOUR = 60 * 60 * 1000;
+    // Must be real Date.now() — see comment on the tier-aware eviction test
+    // above; pruneOldBackups' cutoffs are computed against the real clock.
     const now = Date.now();
     // The incident shape: 23 hourly dumps, retention whose hourly tier wants
-    // them all and whose byte cap they fit under.
+    // them all and whose byte cap they fit under. maxBytes is set above
+    // AUR-4611's size-aware floor for this shape (23 dumps × 10 MiB + a
+    // 12-slot daily/weekly/monthly reserve needs >= 350 MiB) so the control
+    // below still isolates "ladder pass alone, no cap pressure" — the
+    // pre-AUR-4035 defect this test's emergency-overlay fix targets — from
+    // AUR-4611's separate, already-proactive size-aware shrink.
     const timestamps = Array.from({ length: 23 }, (_, i) => ({
       iso: new Date(now - i * HOUR).toISOString(),
       sizeBytes: 10 * MB,
@@ -795,7 +909,7 @@ describe("emergencyPruneBackups — disk-pressure remediation (AUR-4035 defect 3
       weeklyWeeks: 4,
       monthlyMonths: 1,
       hourlyCount: 48,
-      maxBytes: 240 * MB,
+      maxBytes: 350 * MB,
     };
     const measure = () =>
       listBackupFiles(dir, "pc").reduce((sum, f) => sum + fs.statSync(path.join(dir, f)).size, 0);

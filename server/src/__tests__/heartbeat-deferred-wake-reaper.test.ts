@@ -65,13 +65,25 @@ describeEmbeddedPostgres("heartbeat stranded deferred-wake reaper", () => {
   }, 20_000);
 
   afterEach(async () => {
-    // Let any promoted run finish against the stubbed adapter before teardown, so
+    // Cancel anything still queued *first*. AUR-4143 made a completing run
+    // reallocate the freed slot in starvation order, so waiting on `running`
+    // alone never converges: each run that drains lets the next queued row in,
+    // and a run admitted between the check below and the truncate holds a
+    // RowShareLock that deadlocks the AccessExclusiveLock the cascade needs.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.status, "queued"));
+
+    // Then let any already-in-flight run finish against the stubbed adapter, so
     // the cascade below cannot deadlock against an in-flight run transaction.
-    for (let attempt = 0; attempt < 100; attempt += 1) {
+    // Not filtered by invocationSource: reallocation can admit runs from any
+    // source, and a missed one is exactly what deadlocks the truncate.
+    for (let attempt = 0; attempt < 200; attempt += 1) {
       const active = await db
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
-        .where(and(inArray(heartbeatRuns.status, ["running"]), eq(heartbeatRuns.invocationSource, "automation")));
+        .where(inArray(heartbeatRuns.status, ["running"]));
       if (active.length === 0) break;
       await new Promise((resolve) => setTimeout(resolve, 25));
     }

@@ -4423,8 +4423,10 @@ export function issueRoutes(
       // An agent may cancel/supersede its OWN pending interaction (the creator).
       const isCreator = req.actor.agentId != null && interaction.createdByAgentId === req.actor.agentId;
       // AUR-4245: the addressed agent may also clear an interaction another AGENT raised at it,
-      // so an agent-to-agent interaction can never strand as permanently pending. Interactions
-      // raised by a board user stay board-only to cancel — an agent must not discard a human ask.
+      // so an agent-to-agent interaction can never strand as permanently pending — the decider
+      // always has a non-mutating way to clear a duplicate ask without it being recorded as a
+      // rejection (AUR-4657). Interactions raised by a board user stay board-only to cancel —
+      // an agent must not discard a human ask.
       const isAddressedAgentOfAgentInteraction = req.actor.agentId != null
         && interaction.createdByAgentId != null
         && interaction.createdByAgentId !== req.actor.agentId

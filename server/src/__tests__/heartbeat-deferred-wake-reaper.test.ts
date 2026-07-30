@@ -65,19 +65,41 @@ describeEmbeddedPostgres("heartbeat stranded deferred-wake reaper", () => {
   }, 20_000);
 
   afterEach(async () => {
-    // Let any promoted run finish against the stubbed adapter before teardown, so
-    // the cascade below cannot deadlock against an in-flight run transaction.
-    for (let attempt = 0; attempt < 100; attempt += 1) {
+    // Let any promoted run finish against the stubbed adapter before teardown. A
+    // promotion's fire-and-forget executeRun() (started via startNextQueuedRunForAgent,
+    // heartbeat.ts) can itself enqueue a bounded liveness continuation
+    // (run-liveness-continuations.ts, max 2 attempts) that queues and claims another
+    // run for the same agent — so a single "wait for the promoted run" check is not
+    // enough; watch every status the chain can still be sitting in, not just "running"
+    // (a just-claimed continuation can still read "queued" for a moment), and don't
+    // assume the chain forever reuses invocationSource "automation".
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
       const active = await db
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
-        .where(and(inArray(heartbeatRuns.status, ["running"]), eq(heartbeatRuns.invocationSource, "automation")));
+        .where(inArray(heartbeatRuns.status, ["queued", "running"]));
       if (active.length === 0) break;
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
     // Cascade: promoted runs create runtime state and other company-scoped rows,
     // so ordered deletes trip foreign keys. Everything here hangs off companies.
-    await db.execute(sql`truncate table companies cascade`);
+    //
+    // truncate ... cascade takes an AccessExclusiveLock on every cascaded relation
+    // up front; a stray in-flight background write that survives the wait above
+    // (e.g. the reaper's own `select ... for update` from a continuation's promoted
+    // run) can still deadlock against it (AUR-4555: deadlock detected, 40P01). Each
+    // such chain is bounded and short-lived, so retry instead of letting that race
+    // fail the whole suite.
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        await db.execute(sql`truncate table companies cascade`);
+        return;
+      } catch (err) {
+        if (attempt === 4) throw err;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
   });
 
   afterAll(async () => {

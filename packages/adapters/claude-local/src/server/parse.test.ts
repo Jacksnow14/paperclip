@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
   claudeModelUsageTotals,
   parseClaudeStreamJson,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
+  isClaudeContextOverflowError,
   isClaudeProviderQuotaError,
   isClaudeTransientUpstreamError,
   isClaudePoisonedPreviousMessageIdError,
@@ -159,6 +161,21 @@ describe("isClaudeTransientUpstreamError", () => {
         errorMessage: "Invalid request_error: Unknown parameter 'foo'.",
       }),
     ).toBe(false);
+  });
+
+  it("does not classify prompt-size overflow as transient", () => {
+    const errorMessage = "Claude run failed: subtype=success: Prompt is too long";
+    expect(
+      isClaudeTransientUpstreamError({
+        errorMessage,
+      }),
+    ).toBe(false);
+    expect(
+      isClaudeContextOverflowError({
+        errorMessage,
+      }),
+    ).toBe(true);
+    expect(CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE).toBe("claude_context_overflow");
   });
 
   it("does not classify poisoned previous_message_id errors as transient", () => {

@@ -9,8 +9,10 @@ export {
   resetClaudeCliCapabilitiesCacheForTests,
 } from "./cli-capabilities.js";
 export {
+  CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
   parseClaudeStreamJson,
   describeClaudeFailure,
+  isClaudeContextOverflowError,
   isClaudeMaxTurnsResult,
   isClaudeProviderQuotaError,
   isClaudeRefusalResult,

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE } from "@paperclipai/adapter-claude-local/server";
 import {
   agents,
   agentRuntimeState,
@@ -422,6 +423,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       status: "failed",
       error: "upstream overload",
       errorCode: "adapter_failed",
+      resultJson: { errorFamily: "transient_upstream" },
       finishedAt: now,
       contextSnapshot: {
         issueId: randomUUID(),
@@ -1577,6 +1579,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       status: "failed",
       error: "upstream overload",
       errorCode: "adapter_failed",
+      resultJson: { errorFamily: "transient_upstream" },
       finishedAt: now,
       contextSnapshot: {
         issueId,
@@ -1732,6 +1735,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       status: "failed",
       error: "upstream overload",
       errorCode: "adapter_failed",
+      resultJson: { errorFamily: "transient_upstream" },
       finishedAt: now,
       contextSnapshot: {
         issueId,
@@ -1833,6 +1837,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       status: "failed",
       error: "upstream overload",
       errorCode: "adapter_failed",
+      resultJson: { errorFamily: "transient_upstream" },
       finishedAt: now,
       contextSnapshot: {
         issueId,
@@ -1943,6 +1948,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       status: "failed",
       error: "upstream overload",
       errorCode: "adapter_failed",
+      resultJson: { errorFamily: "transient_upstream" },
       finishedAt: now,
       contextSnapshot: {
         issueId,
@@ -2042,6 +2048,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       status: "failed",
       error: "still transient",
       errorCode: "adapter_failed",
+      resultJson: { errorFamily: "transient_upstream" },
       finishedAt: now,
       scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
       scheduledRetryReason: "transient_failure",
@@ -2305,5 +2312,39 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect((wakeupRequest?.payload as Record<string, unknown> | null)?.transientRetryNotBefore).toBe(
       retryNotBefore.toISOString(),
     );
+  });
+
+  it("does not schedule bounded retries for deterministic Claude prompt overflow failures", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-07-29T12:00:00.000Z");
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
+      errorFamily: null,
+      adapterType: "claude_local",
+      resultJson: {},
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(scheduled.outcome).toBe("not_retryable");
+    if (scheduled.outcome !== "not_retryable") return;
+    expect(scheduled.errorCode).toBe(CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE);
+
+    const retryCount = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId))
+      .then((rows) => rows[0]?.count ?? 0);
+    expect(retryCount).toBe(0);
   });
 });

@@ -238,6 +238,7 @@ import {
   type RuntimeStatusUpdate,
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
+import { CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE } from "@paperclipai/adapter-claude-local/server";
 import {
   readPaperclipSkillSyncPreference,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
@@ -478,6 +479,127 @@ function readTransientRecoveryContractFromRun(
         retryNotBefore: readTransientRetryNotBeforeFromRun(run),
       }
     : null;
+}
+
+function isClaudeContextOverflowRun(
+  run: Pick<SessionCompactionRunSummary, "errorCode"> | null | undefined,
+) {
+  return run?.errorCode === CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE;
+}
+
+function buildSessionCompactionHandoffMarkdown(input: {
+  sessionId: string;
+  issueId: string | null;
+  reason: string;
+  continuationSummaryBody?: string | null;
+  latestRun: SessionCompactionRunSummary;
+}) {
+  const latestSummary = summarizeHeartbeatRunListResultJson({
+    summary: input.latestRun.resultSummary,
+    result: input.latestRun.resultResult,
+    message: input.latestRun.resultMessage,
+    error: input.latestRun.resultError,
+    totalCostUsd: input.latestRun.resultTotalCostUsd,
+    costUsd: input.latestRun.resultCostUsd,
+    costUsdCamel: input.latestRun.resultCostUsdCamel,
+  });
+  const latestTextSummary =
+    readNonEmptyString(latestSummary?.summary) ??
+    readNonEmptyString(latestSummary?.result) ??
+    readNonEmptyString(latestSummary?.message) ??
+    readNonEmptyString(input.latestRun.error);
+
+  return [
+    "Paperclip session handoff:",
+    `- Previous session: ${input.sessionId}`,
+    input.issueId ? `- Issue: ${input.issueId}` : "",
+    `- Rotation reason: ${input.reason}`,
+    latestTextSummary ? `- Last run summary: ${latestTextSummary}` : "",
+    input.continuationSummaryBody
+      ? `- Issue continuation summary: ${input.continuationSummaryBody.slice(0, 1_500)}`
+      : "",
+    "Continue from the current task state. Rebuild only the minimum context you need.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+export function decideSessionCompactionForRuns(input: {
+  policy: SessionCompactionPolicy;
+  sessionId: string;
+  issueId: string | null;
+  continuationSummaryBody?: string | null;
+  runs: SessionCompactionRunSummary[];
+  oldestRun?: Pick<SessionCompactionRunSummary, "createdAt"> | null;
+}): SessionCompactionDecision {
+  const latestRun = input.runs[0] ?? null;
+  if (!latestRun) {
+    return {
+      rotate: false,
+      reason: null,
+      handoffMarkdown: null,
+      previousRunId: null,
+    };
+  }
+
+  const buildRotationDecision = (reason: string): SessionCompactionDecision => ({
+    rotate: true,
+    reason,
+    handoffMarkdown: buildSessionCompactionHandoffMarkdown({
+      sessionId: input.sessionId,
+      issueId: input.issueId,
+      reason,
+      continuationSummaryBody: input.continuationSummaryBody,
+      latestRun,
+    }),
+    previousRunId: latestRun.id,
+  });
+
+  if (isClaudeContextOverflowRun(latestRun)) {
+    return buildRotationDecision("previous Claude run hit the prompt-size limit");
+  }
+
+  if (!input.policy.enabled || !hasSessionCompactionThresholds(input.policy)) {
+    return {
+      rotate: false,
+      reason: null,
+      handoffMarkdown: null,
+      previousRunId: latestRun.id,
+    };
+  }
+
+  const oldestRun = input.oldestRun ?? input.runs[input.runs.length - 1] ?? latestRun;
+  const latestRawUsage = readRawUsageTotals(latestRun.usageJson);
+  const sessionAgeHours = Math.max(
+    0,
+    (new Date(latestRun.createdAt).getTime() - new Date(oldestRun.createdAt).getTime()) / (1000 * 60 * 60),
+  );
+
+  let reason: string | null = null;
+  if (input.policy.maxSessionRuns > 0 && input.runs.length > input.policy.maxSessionRuns) {
+    reason = `session exceeded ${input.policy.maxSessionRuns} runs`;
+  } else if (
+    input.policy.maxRawInputTokens > 0 &&
+    latestRawUsage &&
+    latestRawUsage.inputTokens >= input.policy.maxRawInputTokens
+  ) {
+    reason =
+      `session raw input reached ${formatCount(latestRawUsage.inputTokens)} tokens ` +
+      `(threshold ${formatCount(input.policy.maxRawInputTokens)})`;
+  } else if (input.policy.maxSessionAgeHours > 0 && sessionAgeHours >= input.policy.maxSessionAgeHours) {
+    reason = `session age reached ${Math.floor(sessionAgeHours)} hours`;
+  }
+
+  if (!reason) {
+    return {
+      rotate: false,
+      reason: null,
+      handoffMarkdown: null,
+      previousRunId: latestRun.id,
+    };
+  }
+
+  return buildRotationDecision(reason);
 }
 
 function isResolvedInteractionContinuationWakeContext(contextSnapshot: unknown) {
@@ -2218,6 +2340,21 @@ type SessionCompactionDecision = {
   reason: string | null;
   handoffMarkdown: string | null;
   previousRunId: string | null;
+};
+
+type SessionCompactionRunSummary = {
+  id: string;
+  createdAt: Date | string;
+  usageJson: unknown;
+  error: string | null;
+  errorCode: string | null;
+  resultSummary: string | null;
+  resultResult: string | null;
+  resultMessage: string | null;
+  resultError: string | null;
+  resultTotalCostUsd: string | null;
+  resultCostUsd: string | null;
+  resultCostUsdCamel: string | null;
 };
 
 interface ParsedIssueAssigneeAdapterOverrides {
@@ -7636,15 +7773,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const policy = parseSessionCompactionPolicy(agent);
-    if (!policy.enabled || !hasSessionCompactionThresholds(policy)) {
-      return {
-        rotate: false,
-        reason: null,
-        handoffMarkdown: null,
-        previousRunId: null,
-      };
-    }
-
     const fetchLimit = Math.max(policy.maxSessionRuns > 0 ? policy.maxSessionRuns + 1 : 0, 4);
     const runs = await db
       .select({
@@ -7652,6 +7780,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         createdAt: heartbeatRuns.createdAt,
         usageJson: heartbeatRuns.usageJson,
         error: heartbeatRuns.error,
+        errorCode: heartbeatRuns.errorCode,
         ...heartbeatRunListResultColumns,
       })
       .from(heartbeatRuns)
@@ -7668,79 +7797,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    const latestRun = runs[0] ?? null;
     const oldestRun =
       policy.maxSessionAgeHours > 0
         ? await getOldestRunForSession(agent.id, sessionId)
-        : runs[runs.length - 1] ?? latestRun;
-    const latestRawUsage = readRawUsageTotals(latestRun?.usageJson);
-    const sessionAgeHours =
-      latestRun && oldestRun
-        ? Math.max(
-            0,
-            (new Date(latestRun.createdAt).getTime() - new Date(oldestRun.createdAt).getTime()) / (1000 * 60 * 60),
-          )
-        : 0;
-
-    let reason: string | null = null;
-    if (policy.maxSessionRuns > 0 && runs.length > policy.maxSessionRuns) {
-      reason = `session exceeded ${policy.maxSessionRuns} runs`;
-    } else if (
-      policy.maxRawInputTokens > 0 &&
-      latestRawUsage &&
-      latestRawUsage.inputTokens >= policy.maxRawInputTokens
-    ) {
-      reason =
-        `session raw input reached ${formatCount(latestRawUsage.inputTokens)} tokens ` +
-        `(threshold ${formatCount(policy.maxRawInputTokens)})`;
-    } else if (policy.maxSessionAgeHours > 0 && sessionAgeHours >= policy.maxSessionAgeHours) {
-      reason = `session age reached ${Math.floor(sessionAgeHours)} hours`;
-    }
-
-    if (!reason || !latestRun) {
-      return {
-        rotate: false,
-        reason: null,
-        handoffMarkdown: null,
-        previousRunId: latestRun?.id ?? null,
-      };
-    }
-
-    const latestSummary = summarizeHeartbeatRunListResultJson({
-      summary: latestRun?.resultSummary,
-      result: latestRun?.resultResult,
-      message: latestRun?.resultMessage,
-      error: latestRun?.resultError,
-      totalCostUsd: latestRun?.resultTotalCostUsd,
-      costUsd: latestRun?.resultCostUsd,
-      costUsdCamel: latestRun?.resultCostUsdCamel,
+        : runs[runs.length - 1] ?? null;
+    return decideSessionCompactionForRuns({
+      policy,
+      sessionId,
+      issueId,
+      continuationSummaryBody: input.continuationSummaryBody,
+      runs,
+      oldestRun,
     });
-    const latestTextSummary =
-      readNonEmptyString(latestSummary?.summary) ??
-      readNonEmptyString(latestSummary?.result) ??
-      readNonEmptyString(latestSummary?.message) ??
-      readNonEmptyString(latestRun.error);
-
-    const handoffMarkdown = [
-      "Paperclip session handoff:",
-      `- Previous session: ${sessionId}`,
-      issueId ? `- Issue: ${issueId}` : "",
-      `- Rotation reason: ${reason}`,
-      latestTextSummary ? `- Last run summary: ${latestTextSummary}` : "",
-      input.continuationSummaryBody
-        ? `- Issue continuation summary: ${input.continuationSummaryBody.slice(0, 1_500)}`
-        : "",
-      "Continue from the current task state. Rebuild only the minimum context you need.",
-    ]
-      .filter(Boolean)
-      .join("\n");
-
-    return {
-      rotate: true,
-      reason,
-      handoffMarkdown,
-      previousRunId: latestRun.id,
-    };
   }
 
   async function resolveSessionBeforeForWakeup(
@@ -10208,13 +10276,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON
         ? readTransientRecoveryContractFromRun(run)
         : null;
+    const contextSnapshot = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(contextSnapshot.issueId);
+    if (retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON && !transientRecovery) {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message: "Bounded retry skipped because the failed run is not marked as a retryable transient failure",
+        payload: {
+          retryReason,
+          errorCode: run.errorCode ?? null,
+        },
+      });
+      return {
+        outcome: "not_retryable" as const,
+        reason: "Run is not eligible for bounded transient retry",
+        errorCode: run.errorCode ?? null,
+        issueId,
+      };
+    }
     const codexTransientFallbackMode =
       agent.adapterType === "codex_local" && transientRecovery?.errorFamily === "transient_upstream"
         ? resolveCodexTransientFallbackMode(nextAttempt)
         : null;
     const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
-    const contextSnapshot = parseObject(run.contextSnapshot);
-    const issueId = readNonEmptyString(contextSnapshot.issueId);
 
     if (!baseSchedule) {
       await appendRunEvent(run, await nextRunEventSeq(run.id), {

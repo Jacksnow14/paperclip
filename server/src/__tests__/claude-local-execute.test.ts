@@ -5,6 +5,7 @@ import path from "node:path";
 import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import {
+  CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
   claudeCommandSupportsEffortFlag,
   claudeSessionCwdMatchesExecutionTarget,
   execute,
@@ -1580,6 +1581,63 @@ describe("claude execute", () => {
 
       expect(result.exitCode).toBe(1);
       expect(result.errorCode).not.toBe("claude_transient_upstream");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("classifies prompt-size overflow with its own deterministic error code", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-overflow-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeFailingClaudeCommand(commandPath, {
+      resultEvent: {
+        type: "result",
+        subtype: "success",
+        session_id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+        is_error: true,
+        result: "Prompt is too long",
+      },
+    });
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+
+    try {
+      const result = await execute({
+        runId: "run-claude-overflow",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: { engine: "cli" },
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBe(CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE);
+      expect(result.errorFamily ?? null).toBeNull();
+      expect(result.retryNotBefore ?? null).toBeNull();
+      expect(result.resultJson?.retryNotBefore ?? null).toBeNull();
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
+import { CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE } from "@paperclipai/adapter-claude-local/server";
 import type { agents } from "@paperclipai/db";
 import { sessionCodec as codexSessionCodec } from "@paperclipai/adapter-codex-local/server";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
@@ -21,6 +22,7 @@ import {
   formatRuntimeWorkspaceWarningLog,
   mergeExecutionWorkspaceMetadataForPersistence,
   mergeCoalescedContextSnapshot,
+  decideSessionCompactionForRuns,
   preflightLowTrustWorkspaceIsolation,
   prioritizeProjectWorkspaceCandidatesForRun,
   parseSessionCompactionPolicy,
@@ -2540,7 +2542,7 @@ describe("prioritizeProjectWorkspaceCandidatesForRun", () => {
 });
 
 describe("parseSessionCompactionPolicy", () => {
-  it("disables Paperclip-managed rotation by default for codex and claude local", () => {
+  it("keeps codex adapter-managed and applies the measured claude_local defaults", () => {
     expect(parseSessionCompactionPolicy(buildAgent("codex_local"))).toEqual({
       enabled: true,
       maxSessionRuns: 0,
@@ -2549,9 +2551,9 @@ describe("parseSessionCompactionPolicy", () => {
     });
     expect(parseSessionCompactionPolicy(buildAgent("claude_local"))).toEqual({
       enabled: true,
-      maxSessionRuns: 0,
-      maxRawInputTokens: 0,
-      maxSessionAgeHours: 0,
+      maxSessionRuns: 12,
+      maxRawInputTokens: 150_000,
+      maxSessionAgeHours: 8,
     });
   });
 
@@ -2587,6 +2589,105 @@ describe("parseSessionCompactionPolicy", () => {
       maxSessionRuns: 25,
       maxRawInputTokens: 500_000,
       maxSessionAgeHours: 0,
+    });
+  });
+});
+
+describe("decideSessionCompactionForRuns", () => {
+  it("forces rotation when the latest Claude run hit prompt-size overflow even with thresholds disabled", () => {
+    const decision = decideSessionCompactionForRuns({
+      policy: {
+        enabled: true,
+        maxSessionRuns: 0,
+        maxRawInputTokens: 0,
+        maxSessionAgeHours: 0,
+      },
+      sessionId: "session-overflow",
+      issueId: "issue-1",
+      continuationSummaryBody: "Continue the current fix after rotating the session.",
+      runs: [
+        {
+          id: "run-overflow",
+          createdAt: new Date("2026-07-29T12:00:00.000Z"),
+          usageJson: null,
+          error: "Claude run failed: subtype=success: Prompt is too long",
+          errorCode: CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
+          resultSummary: null,
+          resultResult: null,
+          resultMessage: null,
+          resultError: null,
+          resultTotalCostUsd: null,
+          resultCostUsd: null,
+          resultCostUsdCamel: null,
+        },
+      ],
+    });
+
+    expect(decision.rotate).toBe(true);
+    expect(decision.reason).toContain("prompt-size limit");
+    expect(decision.previousRunId).toBe("run-overflow");
+    expect(decision.handoffMarkdown).toContain("Paperclip session handoff:");
+    expect(decision.handoffMarkdown).toContain("Issue continuation summary");
+  });
+
+  it("does not rotate a healthy Claude session under the recalibrated thresholds", () => {
+    const decision = decideSessionCompactionForRuns({
+      policy: {
+        enabled: true,
+        maxSessionRuns: 12,
+        maxRawInputTokens: 150_000,
+        maxSessionAgeHours: 8,
+      },
+      sessionId: "session-healthy",
+      issueId: "issue-2",
+      runs: [
+        {
+          id: "run-2",
+          createdAt: new Date("2026-07-29T12:00:00.000Z"),
+          usageJson: {
+            rawInputTokens: 1_200,
+            rawCachedInputTokens: 0,
+            rawOutputTokens: 300,
+          },
+          error: null,
+          errorCode: null,
+          resultSummary: "Kept working.",
+          resultResult: null,
+          resultMessage: null,
+          resultError: null,
+          resultTotalCostUsd: null,
+          resultCostUsd: null,
+          resultCostUsdCamel: null,
+        },
+        {
+          id: "run-1",
+          createdAt: new Date("2026-07-29T11:15:00.000Z"),
+          usageJson: {
+            rawInputTokens: 900,
+            rawCachedInputTokens: 0,
+            rawOutputTokens: 200,
+          },
+          error: null,
+          errorCode: null,
+          resultSummary: "Earlier progress.",
+          resultResult: null,
+          resultMessage: null,
+          resultError: null,
+          resultTotalCostUsd: null,
+          resultCostUsd: null,
+          resultCostUsdCamel: null,
+        },
+      ],
+      oldestRun: {
+        createdAt: new Date("2026-07-29T11:15:00.000Z"),
+      },
+    });
+
+    expect(decision).toEqual({
+      rotate: false,
+      reason: null,
+      handoffMarkdown: null,
+      previousRunId: "run-2",
     });
   });
 });

@@ -56,11 +56,13 @@ import {
   type LocalProcessSandboxOptions,
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import {
+  CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
   claudeModelUsageTotals,
   parseClaudeStreamJson,
   describeClaudeFailure,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
+  isClaudeContextOverflowError,
   isClaudeMaxTurnsResult,
   isClaudeProviderQuotaError,
   isClaudeRefusalResult,
@@ -982,9 +984,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           stderr: proc.stderr,
           errorMessage: fallbackErrorMessage,
         });
+      const contextOverflow =
+        !loginMeta.requiresLogin &&
+        !providerQuota &&
+        (proc.exitCode ?? 0) !== 0 &&
+        isClaudeContextOverflowError({
+          parsed: null,
+          stdout: proc.stdout,
+          stderr: proc.stderr,
+          errorMessage: fallbackErrorMessage,
+        });
       const transientUpstream =
         !loginMeta.requiresLogin &&
         !providerQuota &&
+        !contextOverflow &&
         (proc.exitCode ?? 0) !== 0 &&
         isClaudeTransientUpstreamError({
           parsed: null,
@@ -1009,6 +1022,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage: fallbackErrorMessage,
         })
         ? "model_not_found"
+        : contextOverflow
+        ? CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE
         : providerQuota
         ? "provider_quota"
         : transientUpstream
@@ -1113,12 +1128,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         stderr: proc.stderr,
         errorMessage,
       });
+    const contextOverflow =
+      failed &&
+      !loginMeta.requiresLogin &&
+      !clearSessionForMaxTurns &&
+      !poisonedPreviousMessageId &&
+      !providerQuota &&
+      isClaudeContextOverflowError({
+        parsed,
+        stdout: proc.stdout,
+        stderr: proc.stderr,
+        errorMessage,
+      });
     const transientUpstream =
       failed &&
       !loginMeta.requiresLogin &&
       !clearSessionForMaxTurns &&
       !poisonedPreviousMessageId &&
       !providerQuota &&
+      !contextOverflow &&
       isClaudeTransientUpstreamError({
         parsed,
         stdout: proc.stdout,
@@ -1146,6 +1174,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? "max_turns_exhausted"
       : failed && poisonedPreviousMessageId
       ? "claude_poisoned_previous_message_id"
+      : contextOverflow
+      ? CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE
       : providerQuota
       ? "provider_quota"
       : transientUpstream

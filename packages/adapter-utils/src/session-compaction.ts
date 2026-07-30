@@ -36,6 +36,18 @@ const ADAPTER_MANAGED_SESSION_POLICY: SessionCompactionPolicy = {
   maxSessionAgeHours: 0,
 };
 
+// claude_local uses the standard 200K context window. AUR-4476 measured the
+// first prompt-overflow failures at 16 runs / 13.0h, so rotate materially
+// earlier: 12 runs leaves 25% depth headroom and 8h leaves 38% age headroom.
+// Keep the raw-input guard as a secondary signal if the adapter starts
+// reporting a session-relevant input metric in the future.
+const CLAUDE_LOCAL_SESSION_POLICY: SessionCompactionPolicy = {
+  enabled: true,
+  maxSessionRuns: 12,
+  maxRawInputTokens: 150_000,
+  maxSessionAgeHours: 8,
+};
+
 export const LEGACY_SESSIONED_ADAPTER_TYPES = new Set([
   "claude_local",
   "codex_local",
@@ -51,7 +63,7 @@ export const ADAPTER_SESSION_MANAGEMENT: Record<string, AdapterSessionManagement
   claude_local: {
     supportsSessionResume: true,
     nativeContextManagement: "confirmed",
-    defaultSessionCompaction: ADAPTER_MANAGED_SESSION_POLICY,
+    defaultSessionCompaction: CLAUDE_LOCAL_SESSION_POLICY,
   },
   codex_local: {
     supportsSessionResume: true,

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE } from "@paperclipai/adapter-claude-local/server";
 import {
   activityLog,
   agents,
@@ -120,22 +121,30 @@ describeEmbeddedPostgres("productivity review service", () => {
     count: number;
     now: Date;
     withRunComments?: boolean;
+    startIndex?: number;
+    status?: string;
+    errorCode?: string | null;
+    error?: string | null;
   }) {
     const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
-    for (let index = 0; index < input.count; index += 1) {
+    const startIndex = input.startIndex ?? 0;
+    for (let offset = 0; offset < input.count; offset += 1) {
+      const index = startIndex + offset;
       const runId = randomUUID();
       const createdAt = new Date(input.now.getTime() - index * 60_000);
       runs.push({
         id: runId,
         companyId: input.companyId,
         agentId: input.agentId,
-        status: "succeeded",
+        status: input.status ?? "succeeded",
         invocationSource: "assignment",
         triggerDetail: "system",
         startedAt: createdAt,
         finishedAt: new Date(createdAt.getTime() + 30_000),
         contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
-        livenessState: "advanced",
+        livenessState: input.status && input.status !== "succeeded" ? "failed" : "advanced",
+        errorCode: input.errorCode ?? null,
+        error: input.error ?? null,
         nextAction: "Continue processing the next batch.",
         createdAt,
         updatedAt: createdAt,
@@ -709,6 +718,59 @@ describeEmbeddedPostgres("productivity review service", () => {
       .where(eq(activityLog.action, "issue.productivity_review_continuation_held"));
     expect(activities).toHaveLength(1);
     expect(activities[0]?.entityId).toBe(seeded.issueId);
+  });
+
+  it("counts the AUR-4212 prompt-overflow run mix as attributable work failure, not infra noise", async () => {
+    const now = new Date("2026-07-26T06:43:53.341Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date("2026-07-25T22:55:00.000Z"),
+    });
+    const overflowMessage = "Claude run failed: subtype=success: Prompt is too long";
+
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 8,
+      now: new Date("2026-07-25T23:20:00.000Z"),
+      status: "failed",
+      errorCode: CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
+      error: overflowMessage,
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now: new Date("2026-07-26T01:15:00.000Z"),
+      status: "failed",
+      errorCode: CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
+      error: overflowMessage,
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 1,
+      now,
+      status: "scheduled_retry",
+      errorCode: null,
+      error: null,
+      startIndex: 0,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    expect(review?.description).toContain("Terminal sampled runs: 9");
+    expect(review?.description).toContain("No-comment completed-run streak: 9");
+    expect(review?.description).toContain("Active queued/running/scheduled runs: 1");
   });
 
   it("clamps poisoned requestDepth metadata instead of aborting productivity reconciliation", async () => {

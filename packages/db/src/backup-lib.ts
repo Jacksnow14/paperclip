@@ -1,4 +1,4 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
@@ -374,6 +374,31 @@ export function getNewestBackupAgeMs(backupDir: string, filenamePrefix = "paperc
 
 // A dump takes ~1 minute; a lock this old belongs to a crashed producer.
 const BACKUP_LOCK_STALE_MS = 60 * 60 * 1000;
+
+// In-flight dumps are staged in a dotfile subdirectory of backupDir so pruneOldBackups'
+// readdir scan (which only matches `${filenamePrefix}-*.sql(.gz)` entries, never dotfiles)
+// can never see — let alone evict — a dump that isn't finished yet (AUR-4644). The
+// completed artifact is renameSync'd into backupDir atomically as the very last step.
+function inflightStagingDir(backupDir: string, filenamePrefix: string): string {
+  return resolve(backupDir, `.${filenamePrefix}-inflight`);
+}
+
+// Sweeps staging leftovers from a producer that crashed mid-dump, using the same
+// staleness bar as the producer lock so an orphaned partial file doesn't accumulate
+// forever in a location pruneOldBackups can't reach.
+function sweepStaleStagingFiles(stagingDir: string, staleMs = BACKUP_LOCK_STALE_MS): void {
+  if (!existsSync(stagingDir)) return;
+  const now = Date.now();
+  for (const name of readdirSync(stagingDir)) {
+    const fullPath = resolve(stagingDir, name);
+    try {
+      const stat = statSync(fullPath);
+      if (now - stat.mtimeMs > staleMs) unlinkSync(fullPath);
+    } catch {
+      // raced deletion — skip
+    }
+  }
+}
 
 function backupProducerLockPath(backupDir: string, filenamePrefix: string): string {
   return resolve(backupDir, `.${filenamePrefix}-backup.lock`);
@@ -833,6 +858,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   const excludedTableNames = normalizeTableNameSet(opts.excludeTables);
   const nullifiedColumnsByTable = normalizeNullifyColumnMap(opts.nullifyColumns);
   mkdirSync(opts.backupDir, { recursive: true });
+  const stagingDir = inflightStagingDir(opts.backupDir, filenamePrefix);
+  mkdirSync(stagingDir, { recursive: true });
+  sweepStaleStagingFiles(stagingDir);
 
   // Producer guards run before any client or file is created.
   if (opts.minIntervalMs !== undefined && opts.minIntervalMs > 0) {
@@ -853,9 +881,10 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     sqlClosed = true;
     await sql.end();
   };
-  const sqlFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
-  const backupFile = `${sqlFile}.gz`;
-  const writer = createBufferedTextFileWriter(sqlFile);
+  const stagingSqlFile = resolve(stagingDir, `${filenamePrefix}-${timestamp()}.sql`);
+  const stagingGzFile = `${stagingSqlFile}.gz`;
+  const finalGzFile = resolve(opts.backupDir, basename(stagingGzFile));
+  const writer = createBufferedTextFileWriter(stagingSqlFile);
 
   try {
     if (backupEngine === "pg_dump" || (backupEngine === "auto" && canUsePgDump)) {
@@ -864,21 +893,22 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         await closeSql();
         await runPgDumpBackup({
           connectionString: opts.connectionString,
-          backupFile,
+          backupFile: stagingGzFile,
           connectTimeout,
         });
         await writer.abort();
-        const sizeBytes = statSync(backupFile).size;
+        renameSync(stagingGzFile, finalGzFile);
+        const sizeBytes = statSync(finalGzFile).size;
         const pruneResult = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
         return {
-          backupFile,
+          backupFile: finalGzFile,
           sizeBytes,
           prunedCount: pruneResult.prunedCount,
           prunedBytes: pruneResult.prunedBytes,
         };
       } catch (error) {
-        if (existsSync(backupFile)) {
-          try { unlinkSync(backupFile); } catch { /* ignore */ }
+        if (existsSync(stagingGzFile)) {
+          try { unlinkSync(stagingGzFile); } catch { /* ignore */ }
         }
         if (backupEngine === "pg_dump") {
           throw error;
@@ -1274,28 +1304,30 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
     await writer.close();
 
-    // Compress the SQL file with gzip
-    const sqlReadStream = createReadStream(sqlFile);
-    const gzWriteStream = createWriteStream(backupFile);
+    // Compress the SQL file with gzip, still fully within the staging dir
+    const sqlReadStream = createReadStream(stagingSqlFile);
+    const gzWriteStream = createWriteStream(stagingGzFile);
     await pipeline(sqlReadStream, createGzip(), gzWriteStream);
-    unlinkSync(sqlFile);
+    unlinkSync(stagingSqlFile);
 
-    const sizeBytes = statSync(backupFile).size;
+    // Atomic rename is the only moment the dump becomes visible to pruneOldBackups.
+    renameSync(stagingGzFile, finalGzFile);
+    const sizeBytes = statSync(finalGzFile).size;
     const pruneResult = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
 
     return {
-      backupFile,
+      backupFile: finalGzFile,
       sizeBytes,
       prunedCount: pruneResult.prunedCount,
       prunedBytes: pruneResult.prunedBytes,
     };
   } catch (error) {
     await writer.abort();
-    if (existsSync(backupFile)) {
-      try { unlinkSync(backupFile); } catch { /* ignore */ }
+    if (existsSync(stagingGzFile)) {
+      try { unlinkSync(stagingGzFile); } catch { /* ignore */ }
     }
-    if (existsSync(sqlFile)) {
-      try { unlinkSync(sqlFile); } catch { /* ignore */ }
+    if (existsSync(stagingSqlFile)) {
+      try { unlinkSync(stagingSqlFile); } catch { /* ignore */ }
     }
     throw error;
   } finally {

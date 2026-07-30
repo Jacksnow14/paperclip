@@ -7063,6 +7063,42 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { reaped: reaped.length, runIds: reaped };
   }
 
+  // Agents that currently have queued work, oldest-queued first. Ordering is
+  // starvation-first and deterministic (the pre-AUR-4143 query had no ORDER BY,
+  // so arbitrary heap order became de-facto priority).
+  async function listQueuedAgentsByStarvation(companyId?: string) {
+    return db
+      .select({
+        agentId: heartbeatRuns.agentId,
+        oldestQueuedAt: sql<string>`min(${heartbeatRuns.createdAt})`,
+      })
+      .from(heartbeatRuns)
+      .where(
+        companyId
+          ? and(eq(heartbeatRuns.status, "queued"), eq(heartbeatRuns.companyId, companyId))
+          : eq(heartbeatRuns.status, "queued"),
+      )
+      .groupBy(heartbeatRuns.agentId)
+      .orderBy(asc(sql`min(${heartbeatRuns.createdAt})`));
+  }
+
+  // AUR-4143: an equal share of the global cap per contending agent. Derived
+  // here rather than accepted from callers on purpose — see
+  // startNextQueuedRunForAgent. With one contender this is the full cap, so an
+  // uncontended agent still gets the whole host budget.
+  async function resolveContendedCeiling() {
+    const globalCap = resolveGlobalRunCap();
+    const [row] = await db
+      .select({ contenders: sql<number>`count(distinct ${heartbeatRuns.agentId})` })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "queued"));
+    // Any agent reaching this point has queued rows of its own (callers with an
+    // empty queue return before claiming), so it is always one of the contenders.
+    const contenders = Math.max(1, Number(row?.contenders ?? 0));
+    if (contenders <= 1) return globalCap;
+    return Math.max(1, Math.floor(globalCap / contenders));
+  }
+
   // AUR-4143: the global run cap is a shared resource, but per-agent
   // maxConcurrentRuns defaults to AGENT_DEFAULT_MAX_CONCURRENT_RUNS (20) while
   // the host cap derives from memory (4 on a 7.7GB box). A single agent could
@@ -7073,34 +7109,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // engineers sat on 74 queued runs aging 14h+, each computing
   // availableSlots = min(20 - 0, 4 - 4) = 0 and returning empty forever.
   //
-  // Fix: drive agents starvation-first (oldest queued run wins, deterministic)
-  // and hand each one a *contended ceiling* — an equal share of the global cap
-  // — so no agent can hold more than its share while another agent has queued
-  // work waiting. The ceiling is a ceiling on concurrent holdings, not on
-  // claims per pass; limiting only per-pass claims would still let a long-lived
-  // agent accumulate a monopoly one slot at a time across successive ticks.
-  async function resumeQueuedRuns() {
-    const queuedAgents = await db
-      .select({
-        agentId: heartbeatRuns.agentId,
-        oldestQueuedAt: sql<string>`min(${heartbeatRuns.createdAt})`,
-      })
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.status, "queued"))
-      .groupBy(heartbeatRuns.agentId)
-      .orderBy(asc(sql`min(${heartbeatRuns.createdAt})`));
-
+  // Fix: drive agents starvation-first and cap each at a contended ceiling — an
+  // equal share of the global cap — so no agent can hold more than its share
+  // while another agent has queued work waiting. The ceiling bounds concurrent
+  // holdings, not claims per pass; bounding only per-pass claims would still let
+  // a long-lived agent accumulate a monopoly one slot at a time across ticks.
+  // `companyId` narrows which queues get driven. The scheduler tick drives every
+  // company (the run cap is host-wide); the post-run reallocation in executeRun
+  // narrows to the completing run's company so a single completion cannot fan
+  // out admission across unrelated tenants.
+  async function resumeQueuedRuns(opts?: { companyId?: string }) {
+    const queuedAgents = await listQueuedAgentsByStarvation(opts?.companyId);
     if (queuedAgents.length === 0) return;
 
-    // With a single contending agent this is the full cap, so an uncontended
-    // agent still gets to use the whole host budget.
-    const contendedCeiling = Math.max(
-      1,
-      Math.floor(resolveGlobalRunCap() / queuedAgents.length),
-    );
-
     for (const { agentId } of queuedAgents) {
-      await startNextQueuedRunForAgent(agentId, { contendedCeiling });
+      await startNextQueuedRunForAgent(agentId);
     }
   }
 
@@ -7206,14 +7229,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
-  async function startNextQueuedRunForAgent(
-    agentId: string,
-    opts?: {
-      // AUR-4143: max concurrent runs this agent may *hold* while other agents
-      // have queued work waiting. Omitted (direct wake paths) means uncontended.
-      contendedCeiling?: number;
-    },
-  ) {
+  // AUR-4143: the fair-share ceiling is derived inside this function and is NOT
+  // a caller-supplied option. The first cut of the fix took it as a parameter,
+  // and only resumeQueuedRuns passed it — the other 8 call sites got undefined,
+  // which meant an infinite ceiling and a total bypass of fair share. The worst
+  // of those is executeRun's outer `finally`, which fires on *every* run
+  // termination: a completing agent re-drove its own queue with no ceiling at
+  // the exact instant a slot freed, while the fair path only ticks every 30s
+  // (config.heartbeatSchedulerIntervalMs). Whatever distribution existed when
+  // the cap saturated therefore became permanent, and an agent at zero stayed
+  // at zero. Deriving the ceiling here makes every admission path fair by
+  // construction instead of by every caller remembering.
+  async function startNextQueuedRunForAgent(agentId: string) {
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
       if (!agent) return [];
@@ -7252,9 +7279,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // AUR-4143: fair-share ceiling. When other agents also have queued work,
       // this agent may not hold more than its equal share of the global cap, so
       // a chatty agent cannot starve the rest of the fleet indefinitely.
-      const contendedSlots = opts?.contendedCeiling == null
-        ? Number.POSITIVE_INFINITY
-        : Math.max(0, opts.contendedCeiling - runningCount);
+      const contendedSlots = Math.max(0, (await resolveContendedCeiling()) - runningCount);
       const availableSlots = Math.max(
         0,
         Math.min(
@@ -8686,7 +8711,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           });
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
           activeRunExecutions.delete(run.id);
-          await startNextQueuedRunForAgent(run.agentId);
+          // AUR-4143: drive the whole queue starvation-first, not just this
+          // agent. A per-agent re-drive here handed the just-freed slot straight
+          // back to the agent that freed it, which is how a continuously
+          // backlogged agent kept a permanent grip on the cap: the fair path
+          // only ticks every 30s, so it never saw free capacity. The ceiling
+          // alone cannot fix this — a completing agent's runningCount has
+          // already dropped, so it is entitled to its share again and would win
+          // the race. Reallocating in starvation order is what breaks the grip.
+          await resumeQueuedRuns({ companyId: run.companyId }).catch((err) => {
+            logger.error({ err, agentId: run.agentId, runId: run.id }, "post-run queue drive failed");
+          });
         }
   }
 

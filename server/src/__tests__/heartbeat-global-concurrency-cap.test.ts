@@ -415,8 +415,32 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
     })();
     expect(settledStatuses).toContain("succeeded");
 
-    expect(await heartbeat.startNextQueuedRunForAgent(agentC)).toHaveLength(1);
-    expect((await heartbeat.getRun(runC))?.status).toBe("running");
+    // AUR-4143: the completing run's `finally` now drives the whole queue in
+    // starvation order rather than re-driving only its own agent, so the freed
+    // slot is reallocated to agentC automatically. This used to require the
+    // explicit startNextQueuedRunForAgent(agentC) call below, which is why that
+    // call now returns [] — there is nothing left queued for it to claim.
+    const runCStatus = await (async () => {
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        const status = (await heartbeat.getRun(runC))?.status;
+        if (status === "running") return status;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return (await heartbeat.getRun(runC))?.status;
+    })();
+    expect(runCStatus).toBe("running");
+
+    // Exactly one run was admitted into the freed slot — the ceiling still holds.
+    const globalRunning = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "running"))
+      .then((rows) => rows.length);
+    expect(globalRunning).toBe(2);
+
+    // Re-driving agentC explicitly is now a no-op rather than a second claim.
+    expect(await heartbeat.startNextQueuedRunForAgent(agentC)).toHaveLength(0);
   }, 20_000);
 
   it("suppresses new run admission for an agent quota-paused until a parsed reset time (AUR-4055)", async () => {
@@ -616,6 +640,87 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
       .then((rows) => rows.length);
     expect(running).toBe(4);
   });
+
+  // AUR-4143 review follow-up (CEO). The first cut of the fix took the ceiling
+  // as a caller-supplied option, and only resumeQueuedRuns passed it. The other
+  // 8 call sites — retry promotion, assignment dispatch, and most importantly
+  // executeRun's `finally` — passed nothing, which meant an infinite ceiling.
+  // Fairness must hold on a *direct* admission call, not only via the fair tick.
+  it("enforces fair share on direct admission paths, not just the fair tick", async () => {
+    const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 2 });
+    const companyId = await seedCompany();
+    const greedyAgent = await seedAgent(companyId, { maxConcurrentRuns: 20 });
+    const starvedAgent = await seedAgent(companyId, { maxConcurrentRuns: 20 });
+
+    const base = Date.now() - 60_000;
+    for (let i = 0; i < 3; i += 1) {
+      await seedQueuedRun(companyId, greedyAgent, { createdAt: new Date(base + i) });
+    }
+    await seedQueuedRun(companyId, starvedAgent, { createdAt: new Date(base + 10_000) });
+
+    hangAdapterUntilReleased();
+
+    // Two contenders against a cap of 2 means a ceiling of 1 each. Pre-fix this
+    // direct call had no ceiling and took both slots, leaving starvedAgent at 0.
+    expect(await heartbeat.startNextQueuedRunForAgent(greedyAgent)).toHaveLength(1);
+    expect(await heartbeat.startNextQueuedRunForAgent(starvedAgent)).toHaveLength(1);
+  });
+
+  // The mechanism that actually starved Claude Code Fast: executeRun's finally
+  // re-drove only the completing agent, handing the just-freed slot straight
+  // back to it. A holdings ceiling alone cannot fix this — the completing
+  // agent's runningCount has already dropped to 0, so it is entitled to its
+  // share again. Only reallocating in starvation order breaks the grip.
+  it("hands a freed slot to the starved agent, not back to the agent that freed it", async () => {
+    const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 1 });
+    const companyId = await seedCompany();
+    const greedyAgent = await seedAgent(companyId, { maxConcurrentRuns: 20 });
+    const starvedAgent = await seedAgent(companyId, { maxConcurrentRuns: 20 });
+
+    // starvedAgent's wake is the oldest, so starvation-first ordering must
+    // prefer it the moment capacity appears.
+    const base = Date.now() - 120_000;
+    const starvedRun = await seedQueuedRun(companyId, starvedAgent, {
+      createdAt: new Date(base),
+    });
+    for (let i = 0; i < 2; i += 1) {
+      await seedQueuedRun(companyId, greedyAgent, { createdAt: new Date(base + 60_000 + i) });
+    }
+
+    hangAdapterUntilReleased();
+
+    // greedyAgent holds the only slot. Its remaining queued run is younger than
+    // starvedAgent's, so once this one completes the slot is not its to keep.
+    expect(await heartbeat.startNextQueuedRunForAgent(greedyAgent)).toHaveLength(1);
+    expect((await heartbeat.getRun(starvedRun))?.status).toBe("queued");
+
+    // Let greedyAgent's run finish; its `finally` re-drives the queue.
+    const deadline = Date.now() + 10_000;
+    while (adapterReleases.length < 1 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    adapterReleases.shift()?.();
+
+    const starvedStatus = await (async () => {
+      const settleBy = Date.now() + 10_000;
+      while (Date.now() < settleBy) {
+        const status = (await heartbeat.getRun(starvedRun))?.status;
+        if (status && status !== "queued") return status;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      return (await heartbeat.getRun(starvedRun))?.status;
+    })();
+
+    // Pre-fix: greedyAgent recaptured its own slot and this stayed "queued".
+    expect(starvedStatus).not.toBe("queued");
+
+    const greedyRunning = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, greedyAgent), eq(heartbeatRuns.status, "running")))
+      .then((rows) => rows.length);
+    expect(greedyRunning).toBe(0);
+  }, 30_000);
 
   it("stops retrying after the bounded attempt count is exhausted", async () => {
     const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4 });

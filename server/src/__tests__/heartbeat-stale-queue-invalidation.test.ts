@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { eq, or, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -89,6 +89,18 @@ async function waitForCondition(fn: () => Promise<boolean>, timeoutMs = 3_000) {
 }
 
 async function cleanupHeartbeatInvalidationFixture(db: ReturnType<typeof createDb>) {
+  // Quiesce the scheduler before deleting anything. AUR-4143 made a completing
+  // run re-drive the queue in starvation order, so leftover queued rows keep
+  // being admitted *during* teardown and each new run writes fresh
+  // issue_comments / activity_log rows. That defeats the retry loop below
+  // outright: every attempt races a newly admitted run rather than converging.
+  // Cancelling queued rows first is the same guard the global-concurrency-cap
+  // fixture already uses.
+  await db
+    .update(heartbeatRuns)
+    .set({ status: "cancelled", finishedAt: new Date(), updatedAt: new Date() })
+    .where(or(eq(heartbeatRuns.status, "queued"), eq(heartbeatRuns.status, "running")));
+
   for (let attempt = 0; attempt < 5; attempt += 1) {
     try {
       await db.delete(companySkills);

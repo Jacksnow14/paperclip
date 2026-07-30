@@ -232,6 +232,27 @@ When creating a pull request (via `gh pr create` or any other method), you **mus
 - **Model Used** — the AI model that produced or assisted with the change (provider, exact model ID, context window, capabilities). Write "None — human-authored" if no AI was used.
 - **Checklist** — all items checked
 
+### Self-merge policy (AUR-4509 / AUR-4661)
+
+Default: every PR takes the review path. An agent may merge its own PR (self-merge) ONLY when ALL four legs hold:
+
+1. **Non-control-plane** — the diff touches no `server/src/**` and no `packages/**`.
+2. **No status-mutation surface** — the change cannot PATCH issue/agent/run status or otherwise mutate board state.
+3. **No auth/secret surface** — no credentials, tokens, auth logic, or secret resolution anywhere in the diff.
+4. **Has tests** — the PR carries test coverage exercising the change.
+
+To use it, declare the intent in the PR body on its own line:
+
+```
+Self-merge: yes
+```
+
+The `policy` CI job enforces leg 1 mechanically (`.github/workflows/pr.yml`): a PR carrying that marker whose diff touches `server/src/**` or `packages/**` fails the check. Legs 2–4 are judgement legs — the marker is your attestation, and a wrong attestation is a review finding against you.
+
+Calibration precedent (AUR-4509): applied to the 23 CLEAN PRs stalled in the 07-26..07-29 merge freeze, this filter admitted 6; it correctly held back #7 and #121 (no tests; #7 also edits merge tooling and AGENTS.md) and #160 (secret resolution).
+
+Why this exists: that freeze showed reviewed, mergeable work can sit for days because merging was nobody's clear right. The `merge-debt` class in `scripts/deploy/check-deploy-drift.sh` alarms on the pile-up; this policy is the release valve that lets safe PRs land without waiting on a reviewer. Both must stay live (see the header of that script for the AUR-4509 "merged" fallacy).
+
 ## 11. Definition of Done
 
 A change is done when all are true:

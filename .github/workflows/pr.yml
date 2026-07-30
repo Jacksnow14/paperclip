@@ -31,6 +31,29 @@ jobs:
             exit 1
           fi
 
+      - name: Enforce self-merge path policy (AUR-4661)
+        env:
+          # Via env, never inline interpolation — the body is untrusted input.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # Self-merge policy (AGENTS.md §10, AUR-4509/AUR-4661): a PR declaring
+          # "Self-merge: yes" must not touch control-plane paths. The judgement
+          # legs (no status mutation, no auth/secret surface, has tests) stay
+          # with the attester; this enforces the mechanical leg.
+          if ! grep -qiE '^[[:space:]]*self-merge:[[:space:]]*yes[[:space:]]*$' <<<"$PR_BODY"; then
+            echo "No self-merge declaration; full review path applies."
+            exit 0
+          fi
+          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")"
+          blocked="$(printf '%s\n' "$changed" | grep -E '^(server/src/|packages/)' || true)"
+          if [[ -n "$blocked" ]]; then
+            echo "Self-merge declared, but the diff touches control-plane paths:"
+            printf '%s\n' "$blocked" | sed 's/^/  /'
+            echo "Remove the 'Self-merge: yes' marker and take the review path (AGENTS.md §10)."
+            exit 1
+          fi
+          echo "Self-merge declaration is path-eligible (no server/src/** or packages/** changes)."
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:

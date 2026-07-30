@@ -45,12 +45,39 @@ const ADAPTER_MANAGED_SESSION_POLICY: SessionCompactionPolicy = {
 // next turn's input growth plus output, well under the 200K limit. This is the
 // safety net for (and complements) the CLI-side 1M lock: even if a future CLI
 // version changes its auto-upgrade behaviour, Paperclip rotates first.
+// AUR-4513 recalibration. The values above were dead in practice: measured over the
+// 39 sessions that ever overflowed, the empirical onset of `Prompt is too long` was
+//
+//   metric                            | min  | p05  | median | max
+//   session depth (runs) at overflow   |   16 |   40 |     66 |  129
+//   session age (hours) at overflow    | 13.0 | 20.2 |   34.9 | 70.8
+//
+// `maxSessionRuns: 200` sits ABOVE the observed max of 129, so it could never fire
+// before the wall; `maxSessionAgeHours: 72` misses the max observed onset of 70.8h by
+// 1.2h. Both are now set strictly below the observed MINIMUM, not the median, because
+// the minimum is the only value that protects every session rather than half of them:
+//   - 12 runs => 25% headroom under the 16-run minimum
+//   - 8 hours => 38% headroom under the 13.0h minimum
+// `maxRawInputTokens: 150_000` is retained but is not load-bearing for claude_local:
+// rawInputTokens is a per-turn uncached delta (fleet max 6,579) and never tracks
+// resumed-session context, so this threshold has fired twice ever, both times on the
+// generic 2M default. The run/age pair is what actually protects the session.
 const CLAUDE_LOCAL_SESSION_POLICY: SessionCompactionPolicy = {
   enabled: true,
-  maxSessionRuns: 200,
+  maxSessionRuns: 12,
   maxRawInputTokens: 150_000,
-  maxSessionAgeHours: 72,
+  maxSessionAgeHours: 8,
 };
+
+/**
+ * AUR-4513: error code for a deterministic prompt-size rejection.
+ *
+ * Lives here rather than in the claude-local adapter because both the adapter (which
+ * emits it) and the heartbeat service (which forces session rotation on it) need it,
+ * and importing the adapter's server entry into the service would pull in its whole
+ * child_process module graph.
+ */
+export const CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE = "claude_context_overflow";
 
 export const LEGACY_SESSIONED_ADAPTER_TYPES = new Set([
   "acpx_local",

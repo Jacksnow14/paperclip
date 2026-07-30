@@ -643,12 +643,29 @@ describe("parseSessionCompactionPolicy", () => {
     // claude_local pins the standard 200K window (the CLI is blocked from
     // auto-upgrading to the paid 1M beta), so Paperclip must rotate the session
     // before raw input crosses ~200K instead of relying on unbounded growth.
+    //
+    // AUR-4513 recalibrated the run/age pair. The previous 200 runs / 72 hours could
+    // not fire before the wall: measured over the 39 sessions that ever overflowed,
+    // the MINIMUM onset was 16 runs / 13.0h and the MAXIMUM was 129 runs / 70.8h, so
+    // 200 was unreachable and 72h missed the worst case by 1.2h. These values sit
+    // below the observed minimum (25% and 38% headroom) rather than the median,
+    // because only the minimum protects every session instead of half of them.
     expect(parseSessionCompactionPolicy(buildAgent("claude_local"))).toEqual({
       enabled: true,
-      maxSessionRuns: 200,
+      maxSessionRuns: 12,
       maxRawInputTokens: 150_000,
-      maxSessionAgeHours: 72,
+      maxSessionAgeHours: 8,
     });
+  });
+
+  it("keeps the claude local thresholds strictly under the measured overflow onset (AUR-4513)", () => {
+    // Guard against a future "just raise it a bit" edit silently re-crossing the
+    // empirical floor. 16 runs / 13.0h are the minimum observed onsets.
+    const policy = parseSessionCompactionPolicy(buildAgent("claude_local"));
+    expect(policy.maxSessionRuns).toBeGreaterThan(0);
+    expect(policy.maxSessionRuns).toBeLessThan(16);
+    expect(policy.maxSessionAgeHours).toBeGreaterThan(0);
+    expect(policy.maxSessionAgeHours).toBeLessThan(13);
   });
 
   it("keeps conservative defaults for adapters without confirmed native compaction", () => {

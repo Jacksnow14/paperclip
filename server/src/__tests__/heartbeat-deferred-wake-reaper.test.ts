@@ -89,7 +89,41 @@ describeEmbeddedPostgres("heartbeat stranded deferred-wake reaper", () => {
     }
     // Cascade: promoted runs create runtime state and other company-scoped rows,
     // so ordered deletes trip foreign keys. Everything here hangs off companies.
-    await db.execute(sql`truncate table companies cascade`);
+    //
+    // AUR-4648: the drain above shrinks the deadlock window but cannot close
+    // it — a scheduler continuation can open a fresh transaction between the
+    // last `running` check and the truncate acquiring its cascade locks, and
+    // that session's RowShareLock cycles with the truncate's
+    // AccessExclusiveLock (40P01, observed across four branches on
+    // 2026-07-30, including with this suite running alone in a serialized
+    // shard — so the partner is this process's own machinery, not another
+    // suite). Postgres resolves the cycle by killing a victim; when the
+    // victim is us, back off and retry: the partner completes instantly
+    // against the stubbed adapter, so the next attempt has the field to
+    // itself. A permanent lock holder would still exhaust the retries and
+    // fail loudly here.
+    let truncateError: unknown;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        await db.execute(sql`truncate table companies cascade`);
+        truncateError = undefined;
+        break;
+      } catch (error) {
+        let code: string | undefined;
+        for (
+          let cause: unknown = error;
+          cause && typeof cause === "object";
+          cause = (cause as { cause?: unknown }).cause
+        ) {
+          code = (cause as { code?: string }).code;
+          if (code) break;
+        }
+        if (code !== "40P01") throw error;
+        truncateError = error;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    }
+    if (truncateError !== undefined) throw truncateError;
   });
 
   afterAll(async () => {

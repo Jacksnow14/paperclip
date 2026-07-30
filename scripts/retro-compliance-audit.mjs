@@ -28,6 +28,23 @@ const CONTENT_BOTS = new Set([
 const CTO = '371a1b08-0286-4a12-a516-f587f42df5eb';
 
 /**
+ * Category used when capturing gap records (AUR-4151, AUR-4334).
+ *
+ * `metadata.category` is not a free-text label: memory.ts `resolveReviewState()`
+ * auto-accepts only categories in its AUTO_ACCEPT_CATEGORIES allowlist and files
+ * everything else as `reviewState: 'pending'`. Pending records are invisible to
+ * the recall/search path, which hard-filters `reviewState = 'accepted'`.
+ *
+ * So the semantic name `retrospective_compliance_gap` — which is NOT in that
+ * allowlist — made every gap record unreadable, turning this audit's durable
+ * enforcement record into a silent no-op. The wire category must be an
+ * allowlisted one (`lesson`); the semantic name moves to `compliance_category`,
+ * which nothing gates on.
+ */
+export const GAP_CATEGORY = 'lesson';
+export const COMPLIANCE_CATEGORY = 'retrospective_compliance_gap';
+
+/**
  * Retrospective heading detector — matches the literal `## Retrospective` heading.
  *
  * MISFILED-RETRO HARDENING (AUR-3203): a bare `## Retrospective` string is not enough.
@@ -246,7 +263,8 @@ export async function main({ hours, apply, apiUrl, apiKey, companyId, runIssueId
         title: `retrospective-compliance/missing/${m.identifier}`,
         content: `Closed issue ${m.identifier} ("${m.title}") has no '## Retrospective' comment. Assignee ${m.assigneeName ?? 'unassigned'}; manager notified: ${m.managerName}.`,
         metadata: {
-          category: 'retrospective_compliance_gap',
+          category: GAP_CATEGORY,
+          compliance_category: COMPLIANCE_CATEGORY,
           gap_type: 'missing_retro',
           issue_identifier: m.identifier, issue_id: m.id, title: m.title,
           assignee_agent_id: m.assigneeAgentId, manager_agent_id: m.managerId,
@@ -266,7 +284,8 @@ export async function main({ hours, apply, apiUrl, apiKey, companyId, runIssueId
         title: `retrospective-compliance/scorecard-missing/${m.identifier}`,
         content: `Closed issue ${m.identifier} ("${m.title}") is missing scorecard captures: [${missing}]. Assignee ${m.assigneeName ?? 'unassigned'}; manager notified: ${m.managerName}.`,
         metadata: {
-          category: 'retrospective_compliance_gap',
+          category: GAP_CATEGORY,
+          compliance_category: COMPLIANCE_CATEGORY,
           gap_type: 'missing_scorecard',
           missing_records: [m.missingPerf && 'performance_scorecard', m.missingAdj && 'scorecard_adjusted'].filter(Boolean),
           issue_identifier: m.identifier, issue_id: m.id, title: m.title,

@@ -908,8 +908,35 @@ function rewriteUrlHostToLoopback(rawUrl: string): string {
   return `${parsed.protocol}//127.0.0.1${port}${path}${parsed.search}${parsed.hash}`;
 }
 
+function slugifyAgentName(name: string): string {
+  const slug = name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || "agent";
+}
+
+/**
+ * Derives a per-agent git identity so commits are attributable per-run instead
+ * of all landing under the repo's shared `[user] name` config (AUR-4030).
+ * `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env beats repo/global git config, so this
+ * covers every worktree with no per-checkout setup.
+ */
+function buildAgentGitIdentityEnv(agent: { id: string; name: string }): Record<string, string> {
+  const shortId = agent.id.replace(/-/g, "").slice(0, 8) || agent.id;
+  const gitName = `${agent.name} (agent ${shortId})`;
+  const gitEmail = `${slugifyAgentName(agent.name)}-${shortId}@agents.paperclip.local`;
+  return {
+    GIT_AUTHOR_NAME: gitName,
+    GIT_AUTHOR_EMAIL: gitEmail,
+    GIT_COMMITTER_NAME: gitName,
+    GIT_COMMITTER_EMAIL: gitEmail,
+  };
+}
+
 export function buildPaperclipEnv(
-  agent: { id: string; companyId: string },
+  agent: { id: string; companyId: string; name?: string },
   opts: { preferLoopback?: boolean } = {},
 ): Record<string, string> {
   const resolveHostForUrl = (rawHost: string): string => {
@@ -921,6 +948,7 @@ export function buildPaperclipEnv(
   const vars: Record<string, string> = {
     PAPERCLIP_AGENT_ID: agent.id,
     PAPERCLIP_COMPANY_ID: agent.companyId,
+    ...(agent.name ? buildAgentGitIdentityEnv({ id: agent.id, name: agent.name }) : {}),
   };
   const runtimeHost = resolveHostForUrl(
     process.env.PAPERCLIP_LISTEN_HOST ?? process.env.HOST ?? "localhost",

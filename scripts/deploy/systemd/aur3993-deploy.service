@@ -1,0 +1,10 @@
+[Unit]
+Description=AUR-3993 guarded deploy tick — restart into the live activated release during a quiet window
+Documentation=https://paperclip/AUR/issues/AUR-3993
+
+[Service]
+Type=oneshot
+ExecStart=/home/ievgen/paperclip-data/aur3993-deploy-tick.sh
+# The tick holds a flock and can run ~5min while verifying a restart; the timer
+# keeps firing meanwhile and those overlapping ticks exit 0 immediately.
+TimeoutStartSec=900

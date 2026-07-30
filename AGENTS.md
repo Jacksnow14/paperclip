@@ -99,7 +99,7 @@ pnpm db:generate
 4. Validate compile:
 
 ```sh
-pnpm -r typecheck
+pnpm typecheck:changed
 ```
 
 Notes:
@@ -123,15 +123,26 @@ pnpm test:release-smoke
 
 Run the browser suites only when your change touches them or when you are explicitly verifying CI/release flows.
 
-For normal issue work, run the smallest relevant verification first. Do not default to repo-wide typecheck/build/test on every heartbeat when a narrower check is enough to prove the change.
+For normal issue work, run the smallest relevant verification first: `pnpm typecheck:changed`. Do not default to repo-wide typecheck/build/test on every heartbeat when a narrower check is enough to prove the change.
 
 Run this full check before claiming repo work done in a PR-ready hand-off, or when the change scope is broad enough that targeted checks are not sufficient:
 
 ```sh
-pnpm -r typecheck
+pnpm typecheck
 pnpm test:run
 pnpm build
 ```
+
+This box has 7.7 GB RAM and a history of OOM kills from `pnpm -r typecheck`'s
+default workspace-concurrency of 4 (>5 GB concurrent demand vs ~2.4-4.4 GB
+available — the kernel reaps the biggest child silently, with zero cost
+events; this burned the rate-limit window on AUR-3534). `pnpm typecheck` and
+`pnpm typecheck:changed` now run `scripts/typecheck.mjs`, which typechecks
+serially and clamps the heap to 3072 MB (server `tsc --noEmit` measured at
+2529 MB peak RSS, completes in 42s at that cap — see AUR-3545/AUR-4064).
+**Do not set `NODE_OPTIONS=--max-old-space-size` yourself** — the runner
+strips and clamps it regardless of what you pass; raising it is what caused
+the AUR-3924 OOM cluster.
 
 If anything cannot be run, explicitly report what was not run and why.
 
@@ -226,7 +237,7 @@ When creating a pull request (via `gh pr create` or any other method), you **mus
 A change is done when all are true:
 
 1. Behavior matches `doc/SPEC-implementation.md`
-2. Typecheck, tests, and build pass
+2. Typecheck, tests, and build pass (`pnpm typecheck:changed` day-to-day, `pnpm typecheck` for a PR-ready hand-off — see §7)
 3. Contracts are synced across db/shared/server/ui
 4. Docs updated when behavior or commands change
 5. PR description follows the [PR template](.github/PULL_REQUEST_TEMPLATE.md) with all sections filled in (including Model Used)

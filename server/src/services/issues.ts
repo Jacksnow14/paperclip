@@ -23,6 +23,7 @@ import {
   issueDocuments,
   issueReadStates,
   issueThreadInteractions,
+  issueTombstones,
   issues,
   labels,
   projectWorkspaces,
@@ -63,6 +64,7 @@ import {
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
@@ -75,6 +77,7 @@ import {
 } from "./issue-tree-control.js";
 import { parseIssueGraphLivenessIncidentKey } from "./recovery/origins.js";
 import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
+import { recoveryActionDormancyCutoff } from "./issue-recovery-actions.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -1410,6 +1413,7 @@ async function listIssueBlockerAttentionMap(
           eq(issueRecoveryActions.companyId, companyId),
           inArray(issueRecoveryActions.status, ["active", "escalated"]),
           inArray(issueRecoveryActions.sourceIssueId, explicitWaitCandidateIds),
+          gt(issueRecoveryActions.lastAttemptAt, recoveryActionDormancyCutoff()),
         ),
       );
     for (const row of recoveryActionRows) activeRecoveryWaitIssueIds.add(row.sourceIssueId);
@@ -2763,6 +2767,7 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
+  const recoveryActionsSvc = issueRecoveryActionService(db);
 
   async function getIssueByUuid(id: string) {
     const row = await db
@@ -3834,6 +3839,28 @@ export function issueService(db: Db) {
       return getIssueByIdentifier(identifier);
     },
 
+    /**
+     * Looks up a tombstone (issue-was-deleted record) by `AUR-NNNN`
+     * identifier or UUID, scoped to `companyId`. Used to distinguish "this
+     * identifier referred to a real, since-deleted issue" from "this
+     * identifier never existed" (AUR-4091).
+     */
+    getTombstoneByIdentifierOrUuid: async (companyId: string, raw: string) => {
+      const id = raw.trim();
+      const identifier = normalizeIssueReferenceIdentifier(id);
+      const condition = identifier
+        ? and(eq(issueTombstones.companyId, companyId), eq(issueTombstones.identifier, identifier))
+        : isUuidLike(id)
+          ? and(eq(issueTombstones.companyId, companyId), eq(issueTombstones.issueId, id))
+          : null;
+      if (!condition) return null;
+      return db
+        .select()
+        .from(issueTombstones)
+        .where(condition)
+        .then((rows) => rows[0] ?? null);
+    },
+
     getCurrentScheduledRetry: async (issueId: string) => {
       const issue = await db
         .select({ id: issues.id, companyId: issues.companyId })
@@ -4540,6 +4567,20 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+        if (issueData.status !== undefined) {
+          // An active recovery action tracks a stranded issue. Once the issue reaches a terminal
+          // status the tracker is obsolete, so close it out in the same transaction as the status
+          // write — otherwise `activeRecoveryAction` accumulates orphans and stops being a usable
+          // signal (AUR-4299). No-ops for non-terminal statuses.
+          await recoveryActionsSvc.resolveActiveForTerminalIssues(
+            {
+              companyId: existing.companyId,
+              sourceIssueIds: [updated.id],
+              issueStatus: updated.status,
+            },
+            tx,
+          );
+        }
         if (nextLabelIds !== undefined) {
           await syncIssueLabels(updated.id, existing.companyId, nextLabelIds, tx);
         }
@@ -4639,6 +4680,18 @@ export function issueService(db: Db) {
           .where(eq(issues.id, id))
           .returning()
           .then((rows) => rows[0] ?? null);
+
+        if (removedIssue) {
+          await tx
+            .insert(issueTombstones)
+            .values({
+              companyId: removedIssue.companyId,
+              issueId: removedIssue.id,
+              identifier: removedIssue.identifier,
+              title: removedIssue.title,
+            })
+            .onConflictDoNothing();
+        }
 
         if (removedIssue && attachmentAssetIds.length > 0) {
           await tx

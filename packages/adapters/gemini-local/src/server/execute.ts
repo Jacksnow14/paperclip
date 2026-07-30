@@ -55,7 +55,7 @@ import {
   isGeminiUnknownSessionError,
   parseGeminiJsonl,
 } from "./parse.js";
-import { firstNonEmptyLine } from "./utils.js";
+import { selectFatalStderrLine } from "./utils.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -582,15 +582,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     const parsedError = typeof attempt.parsed.errorMessage === "string" ? attempt.parsed.errorMessage.trim() : "";
-    const stderrLine = firstNonEmptyLine(attempt.proc.stderr);
+    const stderrLine = selectFatalStderrLine(attempt.proc.stderr);
     const structuredFailure = attempt.parsed.resultEvent
       ? describeGeminiFailure(attempt.parsed.resultEvent)
       : null;
-    const fallbackErrorMessage =
+    const exitCode = attempt.proc.exitCode;
+    const baseErrorMessage =
       parsedError ||
       structuredFailure ||
       stderrLine ||
-      `Gemini exited with code ${attempt.proc.exitCode ?? -1}`;
+      "Gemini exited with a non-zero status";
+    // Always surface the exit code alongside the diagnostic — truncating to a
+    // bare message (however well-selected) is how an operator ends up
+    // guessing at the failure instead of reading it off the run record.
+    const fallbackErrorMessage =
+      typeof exitCode === "number" && exitCode !== 0 && !baseErrorMessage.includes(`exit code ${exitCode}`)
+        ? `${baseErrorMessage} (exit code ${exitCode})`
+        : baseErrorMessage;
     const failed = (attempt.proc.exitCode ?? 0) !== 0;
     const clearSessionForTurnLimit = isGeminiTurnLimitResult(
       attempt.parsed.resultEvent,

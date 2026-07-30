@@ -20,6 +20,8 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { issueService } from "../services/issues.js";
+import { issueTreeControlService } from "../services/issue-tree-control.js";
 import { recoveryService } from "../services/recovery/service.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -763,5 +765,222 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow?.status).toBe("active");
+  });
+
+  it("Class B durable-blocker sweep skips a durable blocked issue guarded by a fresh recovery action (AUR-4300)", async () => {
+    const { companyId, prefix } = await seedCompany();
+    const blockedIssueId = randomUUID();
+    const eightDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+    await db.insert(issues).values({
+      id: blockedIssueId,
+      companyId,
+      title: "Durably blocked with no blocker edge",
+      status: "blocked",
+      priority: "medium",
+      issueNumber: 3,
+      identifier: `${prefix}-3`,
+      createdAt: eightDaysAgo,
+      updatedAt: eightDaysAgo,
+    });
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId: blockedIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "board",
+      cause: "stranded_assigned_issue",
+      fingerprint: `test:${blockedIssueId}`,
+      nextAction: "Restore a live execution path.",
+      lastAttemptAt: new Date(),
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const result = await recovery.reconcileIssueGraphLiveness({ force: true });
+
+    expect(result.classBSkippedOtherRecoveryAction).toBe(1);
+    expect(result.classBNudged).toBe(0);
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, blockedIssueId));
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({ kind: "stranded_assigned_issue", status: "active" });
+  });
+
+  it("Class B durable-blocker sweep proceeds once the guarding recovery action's one-shot wake goes dormant (AUR-4300)", async () => {
+    const { companyId, prefix } = await seedCompany();
+    const blockedIssueId = randomUUID();
+    const eightDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+    await db.insert(issues).values({
+      id: blockedIssueId,
+      companyId,
+      title: "Durably blocked with no blocker edge",
+      status: "blocked",
+      priority: "medium",
+      issueNumber: 3,
+      identifier: `${prefix}-3`,
+      createdAt: eightDaysAgo,
+      updatedAt: eightDaysAgo,
+    });
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId: blockedIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "board",
+      cause: "stranded_assigned_issue",
+      fingerprint: `test:${blockedIssueId}`,
+      nextAction: "Restore a live execution path.",
+      lastAttemptAt: new Date(Date.now() - 25 * 60 * 60 * 1000),
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const result = await recovery.reconcileIssueGraphLiveness({ force: true });
+
+    expect(result.classBSkippedOtherRecoveryAction).toBe(0);
+    expect(result.classBNudged).toBe(1);
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.sourceIssueId, blockedIssueId), eq(issueRecoveryActions.status, "active")));
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({ kind: "issue_graph_liveness", attemptCount: 2 });
+  });
+
+  describe("terminal source issue resolves the recovery action (AUR-4299)", () => {
+    async function seedActiveAction(companyId: string, sourceIssueId: string, ownerAgentId: string) {
+      return issueRecoveryActionService(db).upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId,
+        cause: "stranded_assigned_issue",
+        fingerprint: `stranded:${sourceIssueId}`,
+        nextAction: "Restore a live execution path.",
+      });
+    }
+
+    async function readAction(actionId: string) {
+      const [row] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, actionId));
+      return row!;
+    }
+
+    it("resolves the action when the source issue is completed through issueService.update", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const action = await seedActiveAction(companyId, sourceIssueId, managerId);
+      expect(action.status).toBe("active");
+
+      await issueService(db).update(sourceIssueId, { status: "done" });
+
+      const row = await readAction(action.id);
+      expect(row.status).toBe("resolved");
+      expect(row.outcome).toBe("restored");
+      expect(row.resolvedAt).toBeInstanceOf(Date);
+      expect(
+        await issueRecoveryActionService(db).getActiveForIssue(companyId, sourceIssueId),
+      ).toBeNull();
+    });
+
+    it("cancels the action when the source issue is cancelled through issueService.update", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const action = await seedActiveAction(companyId, sourceIssueId, managerId);
+
+      await issueService(db).update(sourceIssueId, { status: "cancelled" });
+
+      const row = await readAction(action.id);
+      expect(row.status).toBe("cancelled");
+      expect(row.outcome).toBe("cancelled");
+      expect(
+        await issueRecoveryActionService(db).getActiveForIssue(companyId, sourceIssueId),
+      ).toBeNull();
+    });
+
+    // Control: proves the hook discriminates on terminal status rather than resolving on any
+    // update at all. Without this, the two tests above would still pass if the hook were
+    // unconditional — and an unconditional hook would destroy every live recovery action.
+    it("leaves the action active for non-terminal status transitions", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const action = await seedActiveAction(companyId, sourceIssueId, managerId);
+
+      await issueService(db).update(sourceIssueId, { status: "in_review" });
+      expect((await readAction(action.id)).status).toBe("active");
+
+      await issueService(db).update(sourceIssueId, { status: "blocked" });
+      expect((await readAction(action.id)).status).toBe("active");
+
+      // A non-status update must not touch it either.
+      await issueService(db).update(sourceIssueId, { title: "Renamed" });
+      expect((await readAction(action.id)).status).toBe("active");
+
+      expect(
+        await issueRecoveryActionService(db).getActiveForIssue(companyId, sourceIssueId),
+      ).toMatchObject({ id: action.id });
+    });
+
+    it("resolves actions cancelled through the issue-tree bulk path, which bypasses issueService.update", async () => {
+      const { companyId, managerId, sourceIssueId, prefix } = await seedCompany();
+      const childIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: childIssueId,
+        companyId,
+        parentId: sourceIssueId,
+        title: "Child of stranded work",
+        status: "in_progress",
+        priority: "medium",
+        issueNumber: 2,
+        identifier: `${prefix}-2`,
+      });
+      const childAction = await seedActiveAction(companyId, childIssueId, managerId);
+
+      const treeSvc = issueTreeControlService(db);
+      const hold = await treeSvc.createHold(companyId, sourceIssueId, {
+        mode: "cancel",
+        reason: "tree cancelled",
+        actor: { actorType: "user", actorId: "board-user", userId: "board-user" },
+      });
+      const cancelled = await treeSvc.cancelIssueStatusesForHold(companyId, sourceIssueId, hold.hold.id);
+      expect(cancelled.updatedIssueIds).toContain(childIssueId);
+
+      const row = await readAction(childAction.id);
+      expect(row.status).toBe("cancelled");
+      expect(row.outcome).toBe("cancelled");
+    });
+
+    it("is scoped to the company and idempotent on repeat terminal writes", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const action = await seedActiveAction(companyId, sourceIssueId, managerId);
+      const svc = issueRecoveryActionService(db);
+
+      // Wrong company must not resolve it.
+      expect(
+        await svc.resolveActiveForTerminalIssues({
+          companyId: randomUUID(),
+          sourceIssueIds: [sourceIssueId],
+          issueStatus: "done",
+        }),
+      ).toEqual([]);
+      expect((await readAction(action.id)).status).toBe("active");
+
+      const first = await svc.resolveActiveForTerminalIssues({
+        companyId,
+        sourceIssueIds: [sourceIssueId],
+        issueStatus: "done",
+      });
+      expect(first).toHaveLength(1);
+      const resolvedAt = (await readAction(action.id)).resolvedAt;
+
+      // Second call matches nothing and must not rewrite the resolution timestamp.
+      const second = await svc.resolveActiveForTerminalIssues({
+        companyId,
+        sourceIssueIds: [sourceIssueId],
+        issueStatus: "done",
+      });
+      expect(second).toEqual([]);
+      expect((await readAction(action.id)).resolvedAt).toEqual(resolvedAt);
+    });
   });
 });

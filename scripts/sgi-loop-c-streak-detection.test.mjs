@@ -6,9 +6,11 @@ import {
   selectForCreation,
   hasOpenSelfEditIssue,
   canonicalizeAgentKey,
+  orderByWorkTime,
+  workDateMs,
 } from './sgi-loop-c-streak-detection.mjs';
 
-const REF_DATE = new Date('2026-07-25T00:00:00Z');
+const REF_DATE = new Date('2026-07-26T00:00:00Z');
 
 function daysAgoIso(days) {
   const d = new Date(REF_DATE);
@@ -16,24 +18,177 @@ function daysAgoIso(days) {
   return d.toISOString();
 }
 
+const daysAgoDate = (days) => daysAgoIso(days).slice(0, 10);
+
 // records[i] is `days` days old; index 0 = most recent when `days` ascends.
-function makeRecs(qualities, { startDaysAgo = 0, stepDays = 3, rework = [] } = {}) {
+// Each record carries a real `performance/{agent}/{type}/{YYYY-MM-DD}` title,
+// because that date — not createdAt — is what the trend detectors order by
+// (AUR-4233). createdAt is spread across the same days, so these fixtures are
+// the well-behaved (non-backfilled) case.
+function makeRecs(qualities, { startDaysAgo = 0, stepDays = 3, rework = [], withTitles = true } = {}) {
   // qualities given oldest → newest, matching the issue's shorthand (e.g. "5,4,4").
   const newestFirst = qualities.slice().reverse();
-  return newestFirst.map((q, i) => ({
-    quality_signal: q,
-    rework_required: rework[qualities.length - 1 - i] === true,
-    createdAt: daysAgoIso(startDaysAgo + i * stepDays),
-  }));
+  return newestFirst.map((q, i) => {
+    const daysAgo = startDaysAgo + i * stepDays;
+    return {
+      ...(withTitles ? { title: `performance/agent-x/feature/${daysAgoDate(daysAgo)}` } : {}),
+      quality_signal: q,
+      rework_required: rework[qualities.length - 1 - i] === true,
+      createdAt: daysAgoIso(daysAgo),
+    };
+  });
 }
 
-// ── (a) non-strict decline triggers Detector B ──────────────────────────────
+/** Explicit fixture for backfill shapes, where work date and createdAt diverge. */
+function rec(workDate, quality, { rework = false, createdAt } = {}) {
+  return {
+    title: `performance/agent-x/feature/${workDate}`,
+    quality_signal: quality,
+    rework_required: rework,
+    createdAt,
+  };
+}
 
-test('5,4,4 non-strict decline (oldest→newest) triggers detector B', () => {
+// ── (a) Detector B fires only on a genuine decline (AUR-4233) ───────────────
+
+test('5,4,4 with no rework does NOT trigger detector B — quality 4 is good work', () => {
+  // Flipped from the pre-AUR-4233 test that codified the false positive.
+  // This is the exact shape of the live AUR-4215 / AUR-4216 triggers.
   const recs = makeRecs([5, 4, 4]);
+  const result = evaluateBucket(recs, REF_DATE);
+  assert.equal(result.skip, 'no_trigger');
+});
+
+test('5,3,2 with rework triggers detector B — a real decline still fires', () => {
+  const recs = makeRecs([5, 3, 2], { rework: [false, true, true] });
   const result = evaluateBucket(recs, REF_DATE);
   assert.ok(!result.skip, `expected a trigger, got skip=${result.skip}`);
   assert.ok(result.triggers.some((t) => t.detector === 'B'), 'detector B should fire');
+});
+
+// ── Gate 1: absolute-quality floor — both directions ────────────────────────
+
+test('quality floor CLEARS a healthy streak: 5,4,4 even WITH rework does not trigger B', () => {
+  const recs = makeRecs([5, 4, 4], { rework: [true, true, true] });
+  const result = evaluateBucket(recs, REF_DATE);
+  assert.ok(
+    !result.triggers || !result.triggers.some((t) => t.detector === 'B'),
+    'min quality 4 is at the floor — detector B must not fire',
+  );
+});
+
+test('quality floor FIRES once the window dips below it: 5,4,3 with rework triggers B', () => {
+  const recs = makeRecs([5, 4, 3], { rework: [false, false, true] });
+  const result = evaluateBucket(recs, REF_DATE);
+  assert.ok(!result.skip, `expected a trigger, got skip=${result.skip}`);
+  assert.ok(result.triggers.some((t) => t.detector === 'B'), 'min quality 3 is below the floor');
+});
+
+// ── Gate 2: rework gate — both directions ───────────────────────────────────
+
+test('rework gate CLEARS a no-rework streak: 5,4,3 with zero rework does not trigger B', () => {
+  const recs = makeRecs([5, 4, 3]);
+  const result = evaluateBucket(recs, REF_DATE);
+  assert.equal(result.skip, 'no_trigger');
+});
+
+test('rework gate FIRES when one record in the window required rework: 5,4,3 triggers B', () => {
+  const recs = makeRecs([5, 4, 3], { rework: [false, true, false] });
+  const result = evaluateBucket(recs, REF_DATE);
+  assert.ok(!result.skip);
+  assert.ok(result.triggers.some((t) => t.detector === 'B'));
+});
+
+// ── Gate 3: work-time ordering, not insertion order ─────────────────────────
+
+test('detector B reads the trend from work date, not createdAt write order', () => {
+  // Backfilled in *reverse*: the newest work was inserted first. Ordering by
+  // createdAt would read this as 2→3→5 (improving) and miss a real regression.
+  const recs = [
+    rec('2026-07-20', 2, { rework: true, createdAt: '2026-07-25T10:00:00.100Z' }),
+    rec('2026-07-15', 3, { createdAt: '2026-07-25T10:00:00.200Z' }),
+    rec('2026-07-10', 5, { createdAt: '2026-07-25T10:00:00.300Z' }),
+  ];
+  const result = evaluateBucket(recs, REF_DATE);
+  assert.ok(!result.skip, `expected a trigger, got skip=${result.skip}`);
+  const b = result.triggers.find((t) => t.detector === 'B');
+  assert.ok(b, 'detector B should fire on the true 5→3→2 work-order decline');
+  assert.match(b.desc, /5→3→2/);
+});
+
+test('an unresolvable same-day tie inside a backfill burst fails closed to no_trigger', () => {
+  // Two records share a work date and were written 100ms apart, so nothing
+  // establishes which is newer. Even though a 5→3→2 decline with rework is
+  // present, the detector must refuse to report a direction.
+  const recs = [
+    rec('2026-07-20', 2, { rework: true, createdAt: '2026-07-25T10:00:00.100Z' }),
+    rec('2026-07-20', 3, { rework: true, createdAt: '2026-07-25T10:00:00.200Z' }),
+    rec('2026-07-10', 5, { rework: true, createdAt: '2026-07-25T10:00:00.300Z' }),
+  ];
+  const result = evaluateBucket(recs, REF_DATE);
+  assert.equal(result.skip, 'no_trigger');
+  assert.ok(result.unorderable.includes('ambiguous_detector_b_window'));
+});
+
+test('a window with no parseable work date fails closed rather than trusting createdAt', () => {
+  const recs = makeRecs([5, 3, 2], { rework: [true, true, true], withTitles: false });
+  const result = evaluateBucket(recs, REF_DATE);
+  assert.equal(result.skip, 'no_trigger');
+  assert.ok(result.unorderable.includes('missing_work_date'));
+});
+
+test('the same-day tie guard CLEARS when createdAt is genuinely spread out', () => {
+  // Same duplicated work date, but written 3 hours apart — not a backfill
+  // burst, so createdAt is a legitimate tiebreaker and B stays live.
+  const recs = [
+    rec('2026-07-20', 2, { rework: true, createdAt: '2026-07-20T18:00:00.000Z' }),
+    rec('2026-07-20', 3, { rework: true, createdAt: '2026-07-20T15:00:00.000Z' }),
+    rec('2026-07-10', 5, { rework: true, createdAt: '2026-07-10T12:00:00.000Z' }),
+  ];
+  const result = evaluateBucket(recs, REF_DATE);
+  assert.ok(!result.skip, `expected a trigger, got skip=${result.skip}`);
+  assert.ok(result.triggers.some((t) => t.detector === 'B'));
+  assert.deepEqual(result.unorderable, []);
+});
+
+// ── Regression: the three live false positives of 2026-07-26T06:49 ──────────
+
+test('regression AUR-4215 — CMO/infra 5→4→4, all success, zero rework → no_trigger', () => {
+  // Distinct work dates and spread createdAt, so only the floor and rework
+  // gates can suppress this one.
+  const recs = [
+    rec('2026-07-24', 4, { createdAt: '2026-07-24T09:00:00.000Z' }),
+    rec('2026-07-20', 4, { createdAt: '2026-07-20T09:00:00.000Z' }),
+    rec('2026-07-16', 5, { createdAt: '2026-07-16T09:00:00.000Z' }),
+  ];
+  const result = evaluateBucket(recs, REF_DATE);
+  assert.equal(result.skip, 'no_trigger');
+});
+
+test('regression AUR-4216 — CFO/infra 5→4→4 backfilled within 12 seconds → no_trigger', () => {
+  // createdAt-newest first, as the live records were written. By insertion
+  // order this reads 5→4→4; by work date the two 2026-06-14 records tie
+  // inside the burst, so no direction is establishable at all.
+  const recs = [
+    rec('2026-07-03', 4, { createdAt: '2026-07-25T10:18:22.000Z' }),
+    rec('2026-06-14', 4, { createdAt: '2026-07-25T10:18:14.000Z' }),
+    rec('2026-06-14', 5, { createdAt: '2026-07-25T10:18:10.000Z' }),
+  ];
+  const result = evaluateBucket(recs, REF_DATE);
+  assert.equal(result.skip, 'no_trigger');
+  assert.ok(result.unorderable.includes('ambiguous_detector_b_window'));
+});
+
+test('regression AUR-4217 — CFO/feature 5→5→4, records 54ms apart, title dates reversed → no_trigger', () => {
+  // The record createdAt calls "most recent" (quality 4) is titled 2026-07-08,
+  // the *oldest* work of the three. The declared decline is exactly backwards.
+  const recs = [
+    rec('2026-07-08', 4, { createdAt: '2026-07-25T10:18:10.958Z' }),
+    rec('2026-07-09', 5, { createdAt: '2026-07-25T10:18:10.915Z' }),
+    rec('2026-07-09', 5, { createdAt: '2026-07-25T10:18:10.904Z' }),
+  ];
+  const result = evaluateBucket(recs, REF_DATE);
+  assert.equal(result.skip, 'no_trigger');
 });
 
 // ── (b) flat 4,4,4 does NOT trigger ─────────────────────────────────────────
@@ -65,19 +220,57 @@ test('25-record bucket with flat quality does not trigger detector A', () => {
   assert.equal(result.skip, 'no_trigger');
 });
 
+test('detector A splits recent/baseline by work date, not createdAt (AUR-4233)', () => {
+  // Written newest-work-first in one burst: by createdAt the "recent 5" would
+  // be the five *oldest* records (all quality 5), inverting the delta to -0.6.
+  const qualitiesOldestFirst = [...Array.from({ length: 20 }, () => 5), 5, 4, 4, 4, 5];
+  const base = Date.parse('2026-07-25T10:00:00.000Z');
+  const recs = qualitiesOldestFirst.map((q, i) => ({
+    // work date ascends with i — index 24 is the newest work
+    title: `performance/agent-x/feature/${daysAgoDate(60 - i * 2)}`,
+    quality_signal: q,
+    rework_required: false,
+    // createdAt *descends* with i — newest work inserted first, 40ms apart
+    createdAt: new Date(base - i * 40).toISOString(),
+  }));
+  const result = evaluateBucket(recs, REF_DATE);
+  assert.ok(!result.skip, `expected a trigger, got skip=${result.skip}`);
+  const a = result.triggers.find((t) => t.detector === 'A');
+  assert.ok(a, 'detector A should fire on the work-ordered split');
+  assert.ok(Math.abs(a.severity - 0.6) < 1e-9, `severity should be ~0.6, got ${a.severity}`);
+});
+
+test('detector A fails closed when work dates are missing', () => {
+  const baselineQ = Array.from({ length: 20 }, () => 5);
+  const recentQ = [5, 4, 4, 4, 5];
+  const recs = makeRecs([...baselineQ, ...recentQ], { withTitles: false });
+  const result = evaluateBucket(recs, REF_DATE);
+  assert.equal(result.skip, 'no_trigger');
+  assert.ok(result.unorderable.includes('missing_work_date'));
+});
+
 // ── (d) staleness guard ──────────────────────────────────────────────────────
 
 test('a bucket whose most-recent record is older than 30 days is skipped as stale', () => {
-  // Even though the pattern would trigger B, the newest record is 40 days old.
-  const recs = makeRecs([5, 4, 4], { startDaysAgo: 40 });
+  const recs = makeRecs([5, 3, 2], { startDaysAgo: 40, rework: [true, true, true] });
   const result = evaluateBucket(recs, REF_DATE);
   assert.equal(result.skip, 'stale');
 });
 
 test('a bucket whose most-recent record is within 30 days is evaluated normally', () => {
-  const recs = makeRecs([5, 4, 4], { startDaysAgo: 29 });
+  const recs = makeRecs([5, 3, 2], { startDaysAgo: 29, rework: [true, true, true] });
   const result = evaluateBucket(recs, REF_DATE);
   assert.ok(!result.skip);
+});
+
+test('staleness is measured from work date, so a freshly backfilled old bucket is still stale', () => {
+  const recs = [
+    rec('2026-05-01', 5, { rework: true, createdAt: '2026-07-25T10:00:00.100Z' }),
+    rec('2026-04-20', 3, { rework: true, createdAt: '2026-07-25T10:00:00.200Z' }),
+    rec('2026-04-10', 2, { rework: true, createdAt: '2026-07-25T10:00:00.300Z' }),
+  ];
+  const result = evaluateBucket(recs, REF_DATE);
+  assert.equal(result.skip, 'stale');
 });
 
 // ── Detector C — sustained low absolute quality ─────────────────────────────
@@ -86,6 +279,13 @@ test('recent5 mean <= 2.5 triggers detector C', () => {
   const recs = makeRecs([2, 2, 3, 2, 3]); // mean 2.4
   const result = evaluateBucket(recs, REF_DATE);
   assert.ok(!result.skip);
+  assert.ok(result.triggers.some((t) => t.detector === 'C'));
+});
+
+test('detector C stays live when work dates are missing — it is a level, not a trend', () => {
+  const recs = makeRecs([2, 2, 3, 2, 3], { withTitles: false });
+  const result = evaluateBucket(recs, REF_DATE);
+  assert.ok(!result.skip, 'the fail-closed rule must not take the level detectors offline');
   assert.ok(result.triggers.some((t) => t.detector === 'C'));
 });
 
@@ -110,6 +310,42 @@ test('fewer than 3 records is skipped as too_few_records, not evaluated', () => 
   const recs = makeRecs([4, 4]);
   const result = evaluateBucket(recs, REF_DATE);
   assert.equal(result.skip, 'too_few_records');
+});
+
+// ── work-date parsing / ordering units ──────────────────────────────────────
+
+test('workDateMs prefers an explicit metadata date over the title date', () => {
+  const withMeta = workDateMs({ title: 'performance/a/feature/2026-07-08', work_date: '2026-01-02' });
+  assert.equal(withMeta, Date.parse('2026-01-02T00:00:00Z'));
+});
+
+test('workDateMs falls back to the title date and returns null when there is none', () => {
+  assert.equal(workDateMs({ title: 'performance/a/feature/2026-07-08' }), Date.parse('2026-07-08T00:00:00Z'));
+  assert.equal(workDateMs({ title: 'performance/a/feature' }), null);
+  assert.equal(workDateMs({}), null);
+});
+
+test('workDateMs accepts the same-day disambiguating suffixes agents actually write', () => {
+  // Real live titles. One unparseable record fails its whole bucket closed, so
+  // rejecting these would black out healthy buckets rather than protect them.
+  const expect = (title, date) =>
+    assert.equal(workDateMs({ title }), Date.parse(`${date}T00:00:00Z`), title);
+  expect('performance/a/research/2026-07-26-b', '2026-07-26');
+  expect('performance/a/ops/2026-05-28-f2', '2026-05-28');
+  expect('performance/a/bug/2026-06-03-AUR-793', '2026-06-03');
+  expect('performance/a/infra/2026-06-22b', '2026-06-22');
+  // ...but a title with no date at all still refuses.
+  assert.equal(workDateMs({ title: 'performance/a/ops//bin/bash' }), null);
+  assert.equal(workDateMs({ title: 'performance/a/ops/not-a-date' }), null);
+});
+
+test('orderByWorkTime refuses outright when any record lacks a work date', () => {
+  const out = orderByWorkTime([
+    rec('2026-07-20', 4, { createdAt: '2026-07-20T00:00:00Z' }),
+    { quality_signal: 3, rework_required: false, createdAt: '2026-07-21T00:00:00Z' },
+  ]);
+  assert.equal(out.ordered, null);
+  assert.equal(out.reason, 'missing_work_date');
 });
 
 // ── (e) cooldown suppresses a repeat trigger ────────────────────────────────

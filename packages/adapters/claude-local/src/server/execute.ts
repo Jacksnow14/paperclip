@@ -56,6 +56,8 @@ import {
   isClaudeMaxTurnsResult,
   isClaudeTransientUpstreamError,
   isClaudeUnknownSessionError,
+  isClaudeContextOverflowError,
+  CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
 } from "./parse.js";
 import { prepareClaudeConfigSeed } from "./claude-config.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
@@ -856,8 +858,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             errorMessage: fallbackErrorMessage,
           })
         : null;
+      // AUR-4513: deterministic prompt-size rejection wins over the transient
+      // classifier, which false-positives on quota wording inside the transcript.
+      const contextOverflow =
+        !loginMeta.requiresLogin &&
+        (proc.exitCode ?? 0) !== 0 &&
+        // AUR-4557: this is the no-parse path, so `fallbackErrorMessage` is built from
+        // process stderr, which the model cannot author. Pass it as trusted text
+        // (substring-matched) rather than as `errorMessage` (anchored), because the
+        // CLI prints the API rejection mid-line rather than as the whole payload.
+        isClaudeContextOverflowError({ parsed: null, trustedText: fallbackErrorMessage });
       const errorCode = loginMeta.requiresLogin
         ? "claude_auth_required"
+        : contextOverflow
+        ? CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE
         : transientUpstream
         ? "claude_transient_upstream"
         : null;
@@ -938,10 +952,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage,
         })
       : null;
+    // AUR-4513: this is the path the 2,394 live overflow rows took. `Prompt is too
+    // long` matches no transient pattern itself -- it was tagged transient because
+    // the haystack folds in the resumed transcript. Classify it deterministically.
+    const contextOverflow =
+      failed &&
+      !loginMeta.requiresLogin &&
+      !clearSessionForMaxTurns &&
+      isClaudeContextOverflowError({ parsed, errorMessage });
     const resolvedErrorCode = loginMeta.requiresLogin
       ? "claude_auth_required"
       : failed && clearSessionForMaxTurns
       ? "max_turns_exhausted"
+      : contextOverflow
+      ? CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE
       : transientUpstream
       ? "claude_transient_upstream"
       : null;

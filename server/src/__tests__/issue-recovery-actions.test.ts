@@ -764,4 +764,84 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow?.status).toBe("active");
   });
+
+  it("Class B durable-blocker sweep skips a durable blocked issue guarded by a fresh recovery action (AUR-4300)", async () => {
+    const { companyId, prefix } = await seedCompany();
+    const blockedIssueId = randomUUID();
+    const eightDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+    await db.insert(issues).values({
+      id: blockedIssueId,
+      companyId,
+      title: "Durably blocked with no blocker edge",
+      status: "blocked",
+      priority: "medium",
+      issueNumber: 3,
+      identifier: `${prefix}-3`,
+      createdAt: eightDaysAgo,
+      updatedAt: eightDaysAgo,
+    });
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId: blockedIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "board",
+      cause: "stranded_assigned_issue",
+      fingerprint: `test:${blockedIssueId}`,
+      nextAction: "Restore a live execution path.",
+      lastAttemptAt: new Date(),
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const result = await recovery.reconcileIssueGraphLiveness({ force: true });
+
+    expect(result.classBSkippedOtherRecoveryAction).toBe(1);
+    expect(result.classBNudged).toBe(0);
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, blockedIssueId));
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({ kind: "stranded_assigned_issue", status: "active" });
+  });
+
+  it("Class B durable-blocker sweep proceeds once the guarding recovery action's one-shot wake goes dormant (AUR-4300)", async () => {
+    const { companyId, prefix } = await seedCompany();
+    const blockedIssueId = randomUUID();
+    const eightDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+    await db.insert(issues).values({
+      id: blockedIssueId,
+      companyId,
+      title: "Durably blocked with no blocker edge",
+      status: "blocked",
+      priority: "medium",
+      issueNumber: 3,
+      identifier: `${prefix}-3`,
+      createdAt: eightDaysAgo,
+      updatedAt: eightDaysAgo,
+    });
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId: blockedIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "board",
+      cause: "stranded_assigned_issue",
+      fingerprint: `test:${blockedIssueId}`,
+      nextAction: "Restore a live execution path.",
+      lastAttemptAt: new Date(Date.now() - 25 * 60 * 60 * 1000),
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+    const result = await recovery.reconcileIssueGraphLiveness({ force: true });
+
+    expect(result.classBSkippedOtherRecoveryAction).toBe(0);
+    expect(result.classBNudged).toBe(1);
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.sourceIssueId, blockedIssueId), eq(issueRecoveryActions.status, "active")));
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({ kind: "issue_graph_liveness", attemptCount: 2 });
+  });
 });

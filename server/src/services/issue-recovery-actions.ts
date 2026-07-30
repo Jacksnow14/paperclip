@@ -12,6 +12,25 @@ import type {
 const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
 const MAX_UPSERT_RETRIES = 3;
 
+/**
+ * A recovery action's wake is fired exactly once (source.ts:1942) and is never
+ * re-armed by any sweeper (no `listOpen`, no attempt-count-driven retry). Once
+ * that single wake is lost, an `active`/`escalated` row sits forever and
+ * suppresses every liveness sweep that treats it as a waiting path
+ * (issue-graph-liveness.ts, blockerAttention, Class B durable-blocker sweep).
+ *
+ * 24h matches the existing `DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS`
+ * convention for this same liveness domain: long enough to absorb a wake landing
+ * in a temporarily quota-exhausted lane (which recovers same-day), short enough
+ * that a genuinely lost wake stops blinding recovery within one day instead of
+ * the weeks observed live (AUR-4300: 7-58 day dormant rows still suppressing).
+ */
+export const RECOVERY_ACTION_DORMANCY_HOURS = 24;
+
+export function recoveryActionDormancyCutoff(now: Date = new Date()): Date {
+  return new Date(now.getTime() - RECOVERY_ACTION_DORMANCY_HOURS * 60 * 60 * 1000);
+}
+
 type IssueRecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type DbOrTransaction = Db | DbTransaction;

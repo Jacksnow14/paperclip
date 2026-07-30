@@ -164,8 +164,14 @@ export const ROUTING_RATIONALE_CATEGORY = "routing_rationale";
  * written but not who it routed to, so a re-route cannot be distinguished from
  * the original decision — the reader is forced to guess by matching the issue's
  * current assignee, which reports a false gap on every re-route (AUR-4280).
- * The forward key shape `routing/{issueId}/{ownerId}` derives its owner suffix
- * from this field, so a blank one also makes the key unbuildable.
+ *
+ * This is a distinct value from the `{ownerId}` suffix in the forward key
+ * shape `routing/{issueId}/{ownerId}`: `ownerId` is the DECIDER — the capturing
+ * agent's own id — not `chosen_agent`, the agent the decision picked. The two
+ * are the same value only when an agent routes an issue to itself. The server
+ * does not build the title; each capturing agent supplies it per doctrine, so
+ * `chosen_agent` being required here just guarantees the row records who was
+ * picked, whatever suffix the caller chose for the title.
  *
  * Returns an empty array when `metadata.category` isn't `routing_rationale`, or
  * when every check passes.
@@ -180,8 +186,8 @@ export function checkRoutingRationaleMetadataViolations(
   if (isBlankMetadataValue(chosenAgent)) {
     errors.push(
       `metadata.chosen_agent is required for category '${ROUTING_RATIONALE_CATEGORY}' — ` +
-      "it names the agent the routing decision selected, and keys the " +
-      "routing/{issueId}/{ownerId} record so a re-route does not clobber the prior owner's rationale.",
+      "it names the agent the routing decision selected. Key the record's title " +
+      "routing/{issueId}/{yourAgentId} using your OWN agent id (the decider), not chosen_agent.",
     );
   } else if (typeof chosenAgent !== "string") {
     errors.push("metadata.chosen_agent must be a string agent id");

@@ -17,8 +17,10 @@ export const MAX_ADAPTER_QUOTA_PAUSE_MS = 6 * 60 * 60 * 1000;
 // AUR-4139: agents in these states cannot clear a quota wall (admission already refuses
 // them in startNextQueuedRunForAgent), so a scheduled_retry row they own carries no live
 // signal about the shared credential and must not gate their siblings. Mirrors the
-// inadmissible set in heartbeat.ts.
-const QUOTA_PAUSE_INELIGIBLE_AGENT_STATUSES = ["paused", "terminated", "pending_approval"];
+// inadmissible set in heartbeat.ts. Exported (AUR-4620) so resolveContendedCeiling can
+// exclude the same agents from the fair-share contender count — an agent that can never
+// be admitted must not shrink everyone else's share of the global cap.
+export const QUOTA_PAUSE_INELIGIBLE_AGENT_STATUSES = ["paused", "terminated", "pending_approval"];
 
 // AUR-4139: provider session limits are scoped to the credential/account behind an
 // adapter (one CLI session, one subscription) — not to an individual Paperclip agent.

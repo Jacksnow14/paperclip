@@ -860,6 +860,10 @@ const heartbeatRunListColumns = {
   continuationAttempt: heartbeatRuns.continuationAttempt,
   lastUsefulActionAt: heartbeatRuns.lastUsefulActionAt,
   nextAction: heartbeatRuns.nextAction,
+  workspaceCwd: heartbeatRuns.workspaceCwd,
+  workspaceSource: heartbeatRuns.workspaceSource,
+  workspaceId: heartbeatRuns.workspaceId,
+  workspaceWarnings: heartbeatRuns.workspaceWarnings,
   createdAt: heartbeatRuns.createdAt,
   updatedAt: heartbeatRuns.updatedAt,
 } as const;
@@ -8107,6 +8111,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           startedAt,
           sessionIdBefore: runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId,
           contextSnapshot: context,
+          // AUR-4645: realized workspace (post project-workspace + git_worktree
+          // realization), not the raw resolver output — this is the cwd the run
+          // actually executed in. Keyed on workspaceCwd, not workspaceSource: a
+          // project-bound routine with no primary workspace cwd reports source
+          // "project_primary" while cwd is an agent-home fallback (AUR-4231).
+          workspaceCwd: executionWorkspace.cwd,
+          workspaceSource: executionWorkspace.source,
+          workspaceId: executionWorkspace.workspaceId,
+          workspaceWarnings: runtimeWorkspaceWarnings,
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id))

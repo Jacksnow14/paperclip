@@ -71,6 +71,11 @@ const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueR
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const DIRECT_BLOCKER_TERMINAL_STATUSES = new Set(["done", "cancelled"]);
+// AUR-4250: how many cooldown-spaced recovery attempts an issue stays dispatchable for before
+// stranded-work recovery falls back to `blocked`. Attempts are spaced by the 24h recovery-action
+// dormancy window, so this is ~3 days of daily retries before the durable AUR-4168 missing-edge
+// sweep takes over.
+const MAX_DISPATCHABLE_STRANDED_RECOVERY_ATTEMPTS = 3;
 const MISSING_BLOCKER_EDGE_REMINDER_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const MISSING_BLOCKER_EDGE_ESCALATION_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 // Class A (terminal_only) auto-recovery flips an issue blocked -> todo. The
@@ -1884,6 +1889,37 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     const recoveryCause = input.recoveryCause ?? "stranded_assigned_issue";
+
+    // AUR-4250: escalation cooldown.
+    //
+    // `reconcileStrandedAssignedIssues` has no cooldown of its own — historically the only
+    // thing that stopped it re-escalating the same issue every scheduler tick was the
+    // `status: "blocked"` write below dropping the issue out of the `todo`/`in_progress`
+    // candidate filter. That made `blocked` load-bearing as a loop-breaker, which is why the
+    // no-blocker strand could not simply be removed.
+    //
+    // The wake idempotency key embeds `attemptCount` (see enqueueSourceScopedStrandedRecoveryWake),
+    // so every re-escalation mints a fresh key and wake-dedup can never collapse the repeats;
+    // the escalation comment is gated on `attemptCount === 1`, so every repeat is silent. Each
+    // repeat also refreshes `lastAttemptAt`, which keeps the AUR-4168 durable `missing_edge`
+    // sweep suppressed (that sweep skips issues with a non-dormant recovery action), so the
+    // issue suppresses its own backstop indefinitely.
+    //
+    // Gate re-escalation on the same 24h dormancy window the rest of the liveness machinery
+    // uses. This is what lets the status write below stop stranding the issue.
+    const existingAction = await recoveryActionsSvc.getActiveForIssue(
+      input.issue.companyId,
+      input.issue.id,
+    );
+    if (
+      existingAction &&
+      existingAction.kind !== "issue_graph_liveness" &&
+      existingAction.lastAttemptAt &&
+      new Date(existingAction.lastAttemptAt) > recoveryActionDormancyCutoff()
+    ) {
+      return null;
+    }
+
     const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
       issue: input.issue,
       previousStatus: input.previousStatus,
@@ -1892,9 +1928,29 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
     });
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+
+    // AUR-4250: do not mint `blocked` with zero blocker edges.
+    //
+    // Per AUR-4257 a `blocked` issue with no blocker edges gets no execution at all, so writing
+    // it here destroyed the very recovery path this function had just built (an invokable owner
+    // plus an enqueued wake). Measured on the live fleet: 21/21 recovery-minted zero-edge blocked
+    // issues had an invokable owner and an enqueued wake — nothing was actually blocked.
+    //
+    // When there are real unresolved blockers, `blocked` is honest — keep it. When there are none
+    // but we do have an invokable recovery owner, leave the issue dispatchable and reassign it to
+    // that owner; the cooldown above (not the status) is now the loop-breaker. Once attempts are
+    // exhausted, fall back to `blocked`: by then the action is >24h dormant, so the AUR-4168
+    // sweep is no longer suppressed and re-arms at its 7d/30d stages.
+    const attemptsExhausted = recoveryAction.attemptCount > MAX_DISPATCHABLE_STRANDED_RECOVERY_ATTEMPTS;
+    const keepDispatchable = blockerIds.length === 0 &&
+      Boolean(recoveryAction.ownerAgentId) &&
+      !attemptsExhausted;
+    const nextStatus = keepDispatchable ? "todo" as const : "blocked" as const;
     const updated = await issuesSvc.update(input.issue.id, {
-      status: "blocked",
-      blockedByIssueIds: blockerIds,
+      status: nextStatus,
+      // Only reconcile blocker edges when we are actually blocking. Passing an empty list would
+      // delete every `blocks` relation, including edges to already-resolved blockers.
+      ...(keepDispatchable ? {} : { blockedByIssueIds: blockerIds }),
       assigneeAgentId: recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
     });
     if (!updated) return null;
@@ -1924,6 +1980,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         "",
         `- Recovery action: \`${recoveryAction.id}\``,
         `- Recovery owner: ${agentUiLink(recoveryOwner, prefix)}`,
+        `- Issue status: \`${nextStatus}\`${keepDispatchable
+          ? " — left dispatchable and reassigned to the recovery owner, because nothing is actually blocking it. Retries are spaced by a 24h cooldown."
+          : ""}`,
         "- Next action: the recovery owner should either restore a live execution path or record the manual resolution on the source issue.",
       ].join("\n")
       : [
@@ -1980,7 +2039,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       entityId: input.issue.id,
       details: {
         identifier: input.issue.identifier,
-        status: "blocked",
+        status: nextStatus,
+        keptDispatchable: keepDispatchable,
+        recoveryAttemptCount: recoveryAction.attemptCount,
         previousStatus: input.previousStatus,
         source: input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
           ? "recovery.reconcile_successful_run_handoff_missing_state"
@@ -2004,6 +2065,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       recoveryCause,
     });
 
+    // AUR-4250: this re-assert must target `nextStatus`, not an unconditional `blocked`.
+    // Re-blocking here would undo the dispatchable path chosen above.
     if (recoveryAction.ownerAgentId && recoveryAction.ownerAgentId === input.issue.assigneeAgentId) {
       const [currentIssue] = await db
         .select({
@@ -2015,15 +2078,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .limit(1);
       if (
         currentIssue &&
-        (currentIssue.status !== "blocked" ||
+        (currentIssue.status !== nextStatus ||
           currentIssue.assigneeAgentId !== recoveryAction.ownerAgentId)
       ) {
-        const reblocked = await issuesSvc.update(input.issue.id, {
-          status: "blocked",
-          blockedByIssueIds: blockerIds,
+        const reasserted = await issuesSvc.update(input.issue.id, {
+          status: nextStatus,
+          ...(keepDispatchable ? {} : { blockedByIssueIds: blockerIds }),
           assigneeAgentId: recoveryAction.ownerAgentId,
         });
-        if (reblocked) return reblocked;
+        if (reasserted) return reasserted;
       }
     }
 

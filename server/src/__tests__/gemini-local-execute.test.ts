@@ -432,4 +432,95 @@ describe("gemini execute", () => {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
+
+  // AUR-4038: gemini-cli wrote a cosmetic "256-color support not detected"
+  // warning to stderr alongside the fatal IneligibleTierError. Picking the
+  // wrong stderr line masked a 100% adapter outage for 24h+ because every
+  // recorded run error looked like a terminal-settings issue. Prove the fix
+  // holds regardless of which side of the fatal line the warning lands on.
+  it("prefers the fatal auth error over a trailing 256-color warning and includes the exit code", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-gemini-noise-after-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "gemini");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeFailingGeminiCommand(commandPath, {
+      stderr: [
+        "Error authenticating: IneligibleTierError: This client is no longer supported for",
+        "Gemini Code Assist for individuals.",
+        "Warning: 256-color support not detected. Using a terminal with at least 256-color",
+        "support is recommended for a better visual experience.",
+      ].join("\n"),
+      exitCode: 55,
+    });
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+
+    try {
+      const result = await execute({
+        runId: "run-noise-after",
+        agent: { id: "a1", companyId: "c1", name: "G", adapterType: "gemini_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { command: commandPath, cwd: workspace },
+        context: {},
+        authToken: "t",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(55);
+      expect(result.errorMessage).toContain("IneligibleTierError");
+      expect(result.errorMessage).toContain("exit code 55");
+      expect(result.errorMessage).not.toContain("256-color");
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = previousHome;
+      }
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers the fatal auth error over a leading 256-color warning (the AUR-4038 stderr order)", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-gemini-noise-before-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "gemini");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeFailingGeminiCommand(commandPath, {
+      stderr: [
+        "Warning: 256-color support not detected. Using a terminal with at least 256-color",
+        "support is recommended for a better visual experience.",
+        "Error authenticating: IneligibleTierError: This client is no longer supported for",
+        "Gemini Code Assist for individuals.",
+      ].join("\n"),
+      exitCode: 55,
+    });
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+
+    try {
+      const result = await execute({
+        runId: "run-noise-before",
+        agent: { id: "a1", companyId: "c1", name: "G", adapterType: "gemini_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { command: commandPath, cwd: workspace },
+        context: {},
+        authToken: "t",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(55);
+      expect(result.errorMessage).toContain("IneligibleTierError");
+      expect(result.errorMessage).toContain("exit code 55");
+      expect(result.errorMessage).not.toContain("256-color");
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = previousHome;
+      }
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
 });

@@ -89,6 +89,32 @@ export interface StartedServer {
   databaseUrl: string;
 }
 
+type IssueGraphLivenessReconciliationSummary = {
+  escalationsCreated?: number;
+  obsoleteRecoveriesRetired?: number;
+  obsoleteRecoveryBlockerRelationsRemoved?: number;
+  classAAutoRecovered?: number;
+  classBNudged?: number;
+  classBEscalated?: number;
+  issueGraphRecoveryActionsResolved?: number;
+  actionErrors?: number;
+};
+
+export function shouldLogIssueGraphLivenessReconciliation(
+  reconciled: IssueGraphLivenessReconciliationSummary,
+): boolean {
+  return (
+    (reconciled.escalationsCreated ?? 0) > 0 ||
+    (reconciled.obsoleteRecoveriesRetired ?? 0) > 0 ||
+    (reconciled.obsoleteRecoveryBlockerRelationsRemoved ?? 0) > 0 ||
+    (reconciled.classAAutoRecovered ?? 0) > 0 ||
+    (reconciled.classBNudged ?? 0) > 0 ||
+    (reconciled.classBEscalated ?? 0) > 0 ||
+    (reconciled.issueGraphRecoveryActionsResolved ?? 0) > 0 ||
+    (reconciled.actionErrors ?? 0) > 0
+  );
+}
+
 export async function startServer(): Promise<StartedServer> {
   let config = loadConfig();
   initTelemetry({ enabled: config.telemetryEnabled });
@@ -944,6 +970,12 @@ export async function startServer(): Promise<StartedServer> {
       .then(() => heartbeat.promoteDueScheduledRetries())
       .then(async (promotion) => {
         await heartbeat.resumeQueuedRuns();
+        // Must precede the stranded sweep: a parked deferred wake counts as an active
+        // execution path, so an un-reaped dead letter hides the issue from that sweep.
+        const reapedWakes = await heartbeat.reapStrandedDeferredWakes();
+        if (reapedWakes.promoted > 0 || reapedWakes.retired > 0) {
+          logger.warn({ ...reapedWakes }, "startup deferred-wake reaper drained stranded wakes");
+        }
         const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
         if (
           promotion.promoted > 0 ||
@@ -961,8 +993,11 @@ export async function startServer(): Promise<StartedServer> {
       })
       .then(async () => {
         const reconciled = await heartbeat.reconcileIssueGraphLiveness();
-        if (reconciled.escalationsCreated > 0) {
-          logger.warn({ ...reconciled }, "startup issue-graph liveness reconciliation created escalations");
+        if (shouldLogIssueGraphLivenessReconciliation(reconciled)) {
+          logger.warn(
+            { ...reconciled },
+            "startup issue-graph liveness reconciliation changed issue state or recorded action errors",
+          );
         }
       })
       .then(async () => {
@@ -1010,6 +1045,12 @@ export async function startServer(): Promise<StartedServer> {
         .then(() => heartbeat.promoteDueScheduledRetries())
         .then(async (promotion) => {
           await heartbeat.resumeQueuedRuns();
+          // Must precede the stranded sweep: a parked deferred wake counts as an active
+          // execution path, so an un-reaped dead letter hides the issue from that sweep.
+          const reapedWakes = await heartbeat.reapStrandedDeferredWakes();
+          if (reapedWakes.promoted > 0 || reapedWakes.retired > 0) {
+            logger.warn({ ...reapedWakes }, "periodic deferred-wake reaper drained stranded wakes");
+          }
           const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
           if (
             promotion.promoted > 0 ||
@@ -1027,8 +1068,11 @@ export async function startServer(): Promise<StartedServer> {
         })
         .then(async () => {
           const reconciled = await heartbeat.reconcileIssueGraphLiveness();
-          if (reconciled.escalationsCreated > 0) {
-            logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation created escalations");
+          if (shouldLogIssueGraphLivenessReconciliation(reconciled)) {
+            logger.warn(
+              { ...reconciled },
+              "periodic issue-graph liveness reconciliation changed issue state or recorded action errors",
+            );
           }
         })
         .then(async () => {

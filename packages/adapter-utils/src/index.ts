@@ -45,6 +45,7 @@ export type {
 export {
   ADAPTER_SESSION_MANAGEMENT,
   LEGACY_SESSIONED_ADAPTER_TYPES,
+  CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
   getAdapterSessionManagement,
   readSessionCompactionOverride,
   resolveSessionCompactionPolicy,

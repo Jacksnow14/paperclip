@@ -11,8 +11,18 @@
 #   --force     rebuild an existing release directory for the same SHA.
 #   --activate  atomically point /opt/paperclip/app/current at the new release.
 #               Takes effect on the next start of paperclip.service; this script
-#               NEVER restarts the service.
+#               NEVER restarts the service. Direct --activate is refused unless
+#               the safe-deploy wrapper marks the call gated, or break-glass is
+#               explicitly set for an emergency bypass.
 set -euo pipefail
+
+# AUR-4134: the guard that refuses to delete a release a live process is
+# executing from. Lives here, in the inner script, and NOT only in the
+# safe-deploy wrapper — the wrapper is bypassable by invoking this script
+# directly, which is exactly how AUR-4127 fired.
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=scripts/deploy/release-guard.sh
+source "$SCRIPT_DIR/release-guard.sh"
 
 REPO=${PAPERCLIP_DEPLOY_SRC_REPO:-/home/ievgen/paperclip}
 APP_ROOT=${PAPERCLIP_DEPLOY_APP_ROOT:-/opt/paperclip/app}
@@ -29,6 +39,21 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+if [[ "$ACTIVATE" -eq 1 ]]; then
+  if [[ "${PAPERCLIP_DEPLOY_BREAK_GLASS:-0}" == "1" ]]; then
+    cat >&2 <<'EOF'
+WARNING: PAPERCLIP_DEPLOY_BREAK_GLASS=1 bypassing safe-deploy.sh protections for build-release.sh --activate
+WARNING: this skips the memory floor/watchdog, sampler verification, post-activation watch, and automatic rollback
+EOF
+  elif [[ "${PAPERCLIP_DEPLOY_GATED:-0}" != "1" ]]; then
+    cat >&2 <<'EOF'
+refusing direct build-release.sh --activate: use scripts/deploy/safe-deploy.sh --activate
+emergency bypass only: set PAPERCLIP_DEPLOY_BREAK_GLASS=1 and rerun to make an explicit, logged exception
+EOF
+    exit 1
+  fi
+fi
 
 git -C "$REPO" fetch --quiet origin
 SHA=$(git -C "$REPO" rev-parse --verify "${REF}^{commit}")
@@ -48,8 +73,12 @@ if [[ -e "$RELEASE" ]]; then
     echo "release $RELEASE already exists (use --force to rebuild)" >&2
     exit 1
   fi
-  [[ "$RELEASE" == "$APP_ROOT/releases/"?* ]] || { echo "unsafe release path: $RELEASE" >&2; exit 1; }
-  sudo rm -rf "$RELEASE"
+  # AUR-4134: --force must hard-fail against a release that is running, is
+  # `current`, or is `previous`. The guard owns that set — do not restate it
+  # here, because a comment claiming a narrower policy than the code enforces
+  # is exactly what let the original gap through review (AUR-4127).
+  assert_deletable "$APP_ROOT" "$RELEASE" || exit 1
+  $PAPERCLIP_DEPLOY_RM "$RELEASE"
 fi
 
 sudo install -d -o root -g root -m 755 "$APP_ROOT" "$APP_ROOT/releases"
@@ -96,28 +125,28 @@ sudo chmod -R go-w "$RELEASE"
 
 if [[ "$ACTIVATE" -eq 1 ]]; then
   echo "==> activating $SHA12"
+  # AUR-4134: remember what we are moving off, before we lose the pointer.
+  # Retention protects `previous` so a rollback target always survives.
+  PREV_NAME=$(release_name_of_link "$APP_ROOT/current")
+  if [[ -n "$PREV_NAME" && "$PREV_NAME" != "$SHA12" ]]; then
+    sudo ln -sfn "releases/$PREV_NAME" "$APP_ROOT/previous.next"
+    sudo mv -T "$APP_ROOT/previous.next" "$APP_ROOT/previous"
+  fi
   sudo ln -sfn "releases/$SHA12" "$APP_ROOT/current.next"
   sudo mv -T "$APP_ROOT/current.next" "$APP_ROOT/current"
 fi
 
-echo "==> pruning old releases (keep active + 2 most recent)"
-CURRENT_TARGET=""
-if [[ -L "$APP_ROOT/current" ]]; then
-  CURRENT_TARGET=$(readlink -f "$APP_ROOT/current" || true)
-fi
-KEPT=0
-for dir in $(ls -1t "$APP_ROOT/releases" 2>/dev/null); do
-  path="$APP_ROOT/releases/$dir"
-  if [[ "$(readlink -f "$path")" == "$CURRENT_TARGET" ]]; then
-    continue
-  fi
-  KEPT=$((KEPT + 1))
-  if [[ "$KEPT" -gt 2 ]]; then
-    [[ "$path" == "$APP_ROOT/releases/"?* ]] || continue
-    echo "    pruning $path"
-    sudo rm -rf "$path"
-  fi
-done
+# AUR-4134: retention that never reaps a running release, `current`, or
+# `previous`. Keeps 2 BEYOND that protected set — the protected releases are
+# not charged against the budget, which is what the old "keep active + 2 most
+# recent" wording got wrong: on 25 Jul it kept two builds nobody was running
+# and reaped the one production was executing.
+echo "==> pruning old releases (keep running + current + previous, then 2 most recent)"
+prune_releases "$APP_ROOT" 2
+
+# The invariant, checked independently of how the protected set was computed,
+# so it still fires on a kill path nobody thought of.
+assert_running_releases_intact "$APP_ROOT" || exit 1
 
 echo "release ready: $RELEASE (sha $SHA)"
 [[ "$ACTIVATE" -eq 1 ]] && echo "activated: $APP_ROOT/current -> releases/$SHA12 (applies on next service start)"

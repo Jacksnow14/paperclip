@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, gt, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { clampIssueRequestDepth } from "@paperclipai/shared";
+import { CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE } from "@paperclipai/adapter-utils";
 import {
   agents,
   companies,
@@ -19,6 +20,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
+import { findActiveAdapterQuotaPause } from "./quota-pause.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
 export const DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS = 10;
@@ -59,7 +61,37 @@ export const NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES = [
   "claude_auth_required",
 ] as const;
 
+// AUR-4513: codes for failures that are DETERMINISTIC -- re-running the same work
+// unchanged reproduces them. Unlike the provider-capacity codes above, nothing
+// external will ever clear these, so a run carrying one is real evidence that the
+// agent is wedged and must stay attributable and escalate. AUR-4212 reported a
+// permanently-wedged agent as "0 attributable" precisely because its overflow runs
+// were mis-coded `claude_transient_upstream` and swallowed by the exclusion above.
+//
+// Adding a code to BOTH lists would reproduce that bug under a new name, so the
+// invariant is enforced at module load rather than left to a comment.
+export const DETERMINISTIC_ATTRIBUTABLE_ERROR_CODES = [
+  CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
+] as const;
+
+for (const code of DETERMINISTIC_ATTRIBUTABLE_ERROR_CODES) {
+  if ((NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES as readonly string[]).includes(code)) {
+    throw new Error(
+      `productivity-review misconfigured: "${code}" is both deterministic-attributable and ` +
+        `non-attributable. A deterministic error must escalate (AUR-4513/AUR-4212).`,
+    );
+  }
+}
+
 function isInfraKilledRun(run: Pick<HeartbeatRunRow, "errorCode" | "error">) {
+  // A deterministic failure is never an infra kill, even if a future edit adds its
+  // code to the non-attributable list.
+  if (
+    run.errorCode != null &&
+    (DETERMINISTIC_ATTRIBUTABLE_ERROR_CODES as readonly string[]).includes(run.errorCode)
+  ) {
+    return false;
+  }
   return (
     (run.errorCode != null &&
       (NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES as readonly string[]).includes(run.errorCode)) ||
@@ -132,6 +164,8 @@ type ProductivityReviewEvidence = {
   commentCountLastSixHours: number;
   elapsedMs: number | null;
   zeroRecentActivity: boolean;
+  quotaPaused: boolean;
+  quotaPausedUntil: Date | null;
   latestRuns: HeartbeatRunRow[];
   latestComments: Array<typeof issueComments.$inferSelect>;
   costCents: number;
@@ -589,7 +623,18 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       : null;
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
-    const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
+    const longActiveRaw = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
+    // AUR-4139: a wall-clock "long active" episode can be entirely explained by a
+    // provider quota pause shared across every agent on this adapter's credential
+    // (AUR-4055/quota-pause.ts) -- the issue isn't dark, admission is correctly
+    // refusing to burn zero-token runs against a wall that hasn't cleared yet. Gate
+    // longActive on the absence of an active pause so the stall watchdog doesn't
+    // mistake a suppressed run queue for agent inactivity.
+    const activeQuotaPause = longActiveRaw
+      ? await findActiveAdapterQuotaPause(db, sourceIssue.companyId, sourceAgent.adapterType, now)
+      : null;
+    const quotaPaused = activeQuotaPause !== null;
+    const longActive = longActiveRaw && !quotaPaused;
     // AUR-4014: episode age and activity rate are orthogonal. A long-active episode with zero
     // runs, zero assignee comments, and zero active runs in the last hour is a stall (the issue
     // went dark) -- a completely different failure from a long episode that is still producing
@@ -606,6 +651,11 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     if (!trigger) return null;
 
     const triggerReasons: string[] = [];
+    if (quotaPaused && activeQuotaPause) {
+      triggerReasons.push(
+        `adapter quota pause active for ${sourceAgent.adapterType} until ${activeQuotaPause.scheduledRetryAt.toISOString()} (via agent ${activeQuotaPause.agentId}) -- this suppressed the long-active/stalled trigger for this episode`,
+      );
+    }
     if (noComment) triggerReasons.push(`${noCommentStreak} consecutive completed issue-linked runs had no run-created issue comment (${infraKilledTerminalRuns.length} infra-killed runs in the sampled window were excluded from this streak)`);
     if (trigger === "stalled_active_episode") {
       // Gated on the resolved `trigger`, not the raw `stalled` boolean: if a different trigger
@@ -652,6 +702,8 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       commentCountLastSixHours: assigneeRunCommentCountLastSixHours,
       elapsedMs,
       zeroRecentActivity,
+      quotaPaused,
+      quotaPausedUntil: activeQuotaPause?.scheduledRetryAt ?? null,
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
       costCents: costRow.costCents,

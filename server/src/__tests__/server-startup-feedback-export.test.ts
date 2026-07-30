@@ -179,6 +179,10 @@ vi.mock("../services/feedback-share-client.js", () => ({
   createFeedbackTraceShareClientFromConfig: vi.fn(() => ({ id: "feedback-share-client" })),
 }));
 
+vi.mock("../services/plugin-worker-manager.js", () => ({
+  createPluginWorkerManager: vi.fn(() => ({ id: "plugin-worker-manager" })),
+}));
+
 vi.mock("../startup-banner.js", () => ({
   printStartupBanner: vi.fn(),
 }));
@@ -196,7 +200,7 @@ vi.mock("../auth/better-auth.js", () => ({
   resolveBetterAuthSessionFromHeaders: vi.fn(async () => null),
 }));
 
-import { startServer } from "../index.ts";
+import { startServer, shouldLogIssueGraphLivenessReconciliation } from "../index.ts";
 
 describe("startServer feedback export wiring", () => {
   beforeEach(() => {
@@ -218,6 +222,28 @@ describe("startServer feedback export wiring", () => {
       storageService: { id: "storage-service" },
       serverPort: 3210,
     });
+  });
+
+  it("treats durable blocker-actuation and action errors as log-worthy even when legacy escalations stay at zero", () => {
+    expect(shouldLogIssueGraphLivenessReconciliation({
+      escalationsCreated: 0,
+      classAAutoRecovered: 3,
+      classBNudged: 14,
+      classBEscalated: 0,
+      issueGraphRecoveryActionsResolved: 2,
+      actionErrors: 1,
+    })).toBe(true);
+
+    expect(shouldLogIssueGraphLivenessReconciliation({
+      escalationsCreated: 0,
+      classAAutoRecovered: 0,
+      classBNudged: 0,
+      classBEscalated: 0,
+      issueGraphRecoveryActionsResolved: 0,
+      actionErrors: 0,
+      obsoleteRecoveriesRetired: 0,
+      obsoleteRecoveryBlockerRelationsRemoved: 0,
+    })).toBe(false);
   });
 });
 

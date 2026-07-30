@@ -11,6 +11,7 @@ import {
   environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issueRelations,
   issues,
 } from "@paperclipai/db";
@@ -26,8 +27,10 @@ import {
   SUPERSEDED_BY_SOURCE_SUCCESS_ERROR_CODE,
   heartbeatService,
   isTransientAdapterLaunchFailureMessage,
+  readHeartbeatRunErrorFamily,
   resolveAdapterRunOutcome,
 } from "../services/heartbeat.ts";
+import { CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE } from "@paperclipai/adapter-utils";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -53,6 +56,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(environmentLeases);
     await db.delete(issueRelations);
+    await db.delete(issueComments);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
@@ -627,6 +631,10 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       outcome: "retry_exhausted",
       attempt: 3,
       maxAttempts: 2,
+      // AUR-4230: containment is gated to the transient retry reason; the
+      // max-turn continuation path keeps its own accounting and stays silent.
+      inheritedTransientExhaustion: false,
+      issueVisibility: null,
     });
 
     const runCount = await db
@@ -1154,6 +1162,8 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       outcome: "retry_exhausted",
       attempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length + 1,
       maxAttempts: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
+      inheritedTransientExhaustion: false,
+      issueVisibility: { visibility: "no_issue", issueId: null },
     });
 
     const runCount = await db
@@ -1684,5 +1694,320 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       const cancelled = await heartbeat.cancelSupersededRetryRunsForSourceRun(randomUUID());
       expect(cancelled).toHaveLength(0);
     });
+  });
+
+  describe("bounded retry exhaustion issue visibility (AUR-4230)", () => {
+    async function seedExhaustionFixture(input?: {
+      issueStatus?: string;
+      assigneeUserId?: string | null;
+      assigneeAgentId?: string | null;
+      scheduledRetryAttempt?: number;
+      contextOverrides?: Record<string, unknown>;
+    }) {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const issueId = randomUUID();
+      const runId = randomUUID();
+      const now = new Date("2026-07-26T07:00:00.000Z");
+      const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+      });
+
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "ClaudeCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: {
+          heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 },
+        },
+        permissions: {},
+      });
+
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Issue whose wake is running out of retry budget",
+        status: input?.issueStatus ?? "in_progress",
+        priority: "critical",
+        assigneeAgentId: input?.assigneeAgentId === undefined ? agentId : input.assigneeAgentId,
+        assigneeUserId: input?.assigneeUserId ?? null,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      });
+
+      const scheduledRetryAttempt =
+        input?.scheduledRetryAttempt ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        status: "failed",
+        error: "You've hit your weekly limit · resets 11am (UTC)",
+        errorCode: "claude_transient_upstream",
+        finishedAt: now,
+        scheduledRetryAttempt,
+        scheduledRetryReason: scheduledRetryAttempt > 0 ? "transient_failure" : null,
+        resultJson: { errorFamily: "transient_upstream" },
+        contextSnapshot: {
+          issueId,
+          wakeReason: "transient_failure_retry",
+          retryReason: "transient_failure",
+          ...(input?.contextOverrides ?? {}),
+        },
+        updatedAt: now,
+        createdAt: now,
+      });
+
+      return { companyId, agentId, issueId, runId, now };
+    }
+
+    async function listIssueCommentsFor(issueId: string) {
+      return db
+        .select({
+          id: issueComments.id,
+          body: issueComments.body,
+          authorType: issueComments.authorType,
+          createdByRunId: issueComments.createdByRunId,
+        })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId))
+        .then((rows) => rows);
+    }
+
+    it("posts an issue-level artifact when the transient retry budget exhausts (AC1)", async () => {
+      const { issueId, runId, now } = await seedExhaustionFixture();
+
+      const exhausted = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+      expect(exhausted).toMatchObject({
+        outcome: "retry_exhausted",
+        inheritedTransientExhaustion: false,
+        issueVisibility: { visibility: "commented", issueId, recoveryEligible: true },
+      });
+
+      const comments = await listIssueCommentsFor(issueId);
+      expect(comments).toHaveLength(1);
+      expect(comments[0].authorType).toBe("system");
+      expect(comments[0].createdByRunId).toBe(runId);
+      expect(comments[0].body).toContain(runId);
+      expect(comments[0].body).toContain(
+        `${BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length}/${BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length}`,
+      );
+      expect(comments[0].body).toContain("transient_upstream");
+      expect(comments[0].body).toContain("claude_transient_upstream");
+
+      const retryRuns = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.retryOfRunId, runId))
+        .then((rows) => rows[0]?.count ?? 0);
+      expect(retryRuns).toBe(0);
+
+      const visibilityEvent = await db
+        .select({ message: heartbeatRunEvents.message, payload: heartbeatRunEvents.payload })
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, runId))
+        .orderBy(sql`${heartbeatRunEvents.id} desc`)
+        .then((rows) => rows[0] ?? null);
+      expect(visibilityEvent?.message).toBe("Bounded retry exhaustion recorded on the issue");
+      expect(visibilityEvent?.payload).toMatchObject({ issueId, recoveryEligible: true });
+    });
+
+    it("does not post the exhaustion artifact twice for the same run", async () => {
+      const { issueId, runId, now } = await seedExhaustionFixture();
+
+      const first = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+      expect(first).toMatchObject({ issueVisibility: { visibility: "commented" } });
+      const second = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+      expect(second).toMatchObject({ issueVisibility: { visibility: "already_commented" } });
+
+      const comments = await listIssueCommentsFor(issueId);
+      expect(comments).toHaveLength(1);
+    });
+
+    it("does not fire the exhaustion path for attempts inside the budget (AC2)", async () => {
+      const { issueId, runId, now } = await seedExhaustionFixture({
+        scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length - 1,
+      });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+      expect(scheduled.outcome).toBe("scheduled");
+
+      const comments = await listIssueCommentsFor(issueId);
+      expect(comments).toHaveLength(0);
+    });
+
+    it("names the destroyed wake when no recovery continuation is eligible", async () => {
+      const { issueId, runId, now } = await seedExhaustionFixture({
+        issueStatus: "in_review",
+        assigneeUserId: randomUUID(),
+      });
+
+      const exhausted = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+      expect(exhausted).toMatchObject({
+        issueVisibility: { visibility: "commented", issueId, recoveryEligible: false },
+      });
+
+      const comments = await listIssueCommentsFor(issueId);
+      expect(comments).toHaveLength(1);
+      expect(comments[0].body).toContain("No automatic recovery continuation is eligible");
+    });
+
+    it("skips the exhaustion artifact for issues in a terminal status", async () => {
+      const { issueId, runId, now } = await seedExhaustionFixture({ issueStatus: "done" });
+
+      const exhausted = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+      expect(exhausted).toMatchObject({ issueVisibility: { visibility: "issue_terminal", issueId } });
+
+      const comments = await listIssueCommentsFor(issueId);
+      expect(comments).toHaveLength(0);
+    });
+
+    it("refuses a fresh transient ladder to a recovery continuation descended from an exhausted ladder", async () => {
+      const { issueId, runId, now } = await seedExhaustionFixture({
+        scheduledRetryAttempt: 0,
+        contextOverrides: {
+          wakeReason: "issue_continuation_needed",
+          retryReason: "issue_continuation_needed",
+          transientRetryBudgetExhausted: true,
+        },
+      });
+
+      const exhausted = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+      expect(exhausted).toMatchObject({
+        outcome: "retry_exhausted",
+        inheritedTransientExhaustion: true,
+        // No duplicate comment from the inherited case: terminal-run recovery
+        // moves the issue to blocked with its own comment.
+        issueVisibility: null,
+      });
+
+      const retryRuns = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.retryOfRunId, runId))
+        .then((rows) => rows[0]?.count ?? 0);
+      expect(retryRuns).toBe(0);
+
+      const comments = await listIssueCommentsFor(issueId);
+      expect(comments).toHaveLength(0);
+    });
+
+    it("stamps exhaustion lineage onto the recovery continuation queued for an exhausted run (wiring)", async () => {
+      const { companyId, agentId, issueId, runId } = await seedExhaustionFixture();
+
+      // Occupy the agent's single run slot so the queued recovery run is not
+      // admitted into execution by startNextQueuedRunForAgent during the test.
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        status: "running",
+        contextSnapshot: { issueId: randomUUID() },
+        updatedAt: new Date("2026-07-26T07:00:00.000Z"),
+        createdAt: new Date("2026-07-26T07:00:00.000Z"),
+      });
+
+      const run = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0]!);
+      await heartbeat.releaseIssueExecutionAndPromote(run);
+
+      const recoveryRun = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "queued")))
+        .then((rows) => rows[0] ?? null);
+      expect(recoveryRun).not.toBeNull();
+      const recoveryContext = recoveryRun!.contextSnapshot as Record<string, unknown>;
+      expect(recoveryContext.issueId).toBe(issueId);
+      expect(recoveryContext.retryReason).toBe("issue_continuation_needed");
+      expect(recoveryContext.transientRetryBudgetExhausted).toBe(true);
+
+      // End-to-end: when that continuation also fails transiently, it is not
+      // granted a fresh ladder.
+      const failedAt = new Date("2026-07-26T07:30:00.000Z");
+      await db
+        .update(heartbeatRuns)
+        .set({
+          status: "failed",
+          error: "You've hit your weekly limit · resets 11am (UTC)",
+          errorCode: "claude_transient_upstream",
+          resultJson: { errorFamily: "transient_upstream" },
+          finishedAt: failedAt,
+          updatedAt: failedAt,
+        })
+        .where(eq(heartbeatRuns.id, recoveryRun!.id));
+
+      const exhausted = await heartbeat.scheduleBoundedRetry(recoveryRun!.id, {
+        now: failedAt,
+        random: () => 0.5,
+      });
+      expect(exhausted).toMatchObject({
+        outcome: "retry_exhausted",
+        inheritedTransientExhaustion: true,
+      });
+      const ladderRuns = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.retryOfRunId, recoveryRun!.id))
+        .then((rows) => rows[0]?.count ?? 0);
+      expect(ladderRuns).toBe(0);
+    });
+  });
+});
+
+// AUR-4513: a prompt-size rejection is deterministic. Re-sending the same over-long
+// prompt can never succeed, so it must not enter the transient retry ladder. Live
+// scale before the fix: 2,120 overflow runs in 48h against 2,140 retries scheduled off
+// an overflow parent -- a >1:1 ratio, i.e. the loop fed itself.
+describe("context overflow is never transient-retryable (AUR-4513)", () => {
+  it("assigns no error family to an overflow run, so no transient retry is scheduled", () => {
+    expect(
+      readHeartbeatRunErrorFamily({
+        errorCode: CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
+        resultJson: null,
+      }),
+    ).toBeNull();
+  });
+
+  it("ignores a stale persisted transient family on an overflow run", () => {
+    // Exactly the shape of the 2,394 pre-fix rows, and of anything a mixed-version
+    // deploy can still emit: overflow code paired with a transient errorFamily.
+    expect(
+      readHeartbeatRunErrorFamily({
+        errorCode: CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
+        resultJson: {
+          errorFamily: "transient_upstream",
+          retryNotBefore: "2026-07-30T04:00:00.000Z",
+        },
+      }),
+    ).toBeNull();
+  });
+
+  // Controls: the genuinely transient codes must keep their retry ladder, otherwise
+  // this change would be a blanket retry kill rather than a targeted one.
+  it("still marks the transient upstream codes retryable", () => {
+    expect(
+      readHeartbeatRunErrorFamily({ errorCode: "claude_transient_upstream", resultJson: null }),
+    ).toBe("transient_upstream");
+    expect(
+      readHeartbeatRunErrorFamily({ errorCode: "codex_transient_upstream", resultJson: null }),
+    ).toBe("transient_upstream");
+    expect(
+      readHeartbeatRunErrorFamily({ errorCode: null, resultJson: { errorFamily: "provider_quota" } }),
+    ).toBe("provider_quota");
   });
 });

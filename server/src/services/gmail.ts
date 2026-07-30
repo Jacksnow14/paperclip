@@ -199,6 +199,13 @@ export interface GmailSendOptions {
   cc?: string | string[];
   replyTo?: string;
   attachments?: GmailAttachmentInput[];
+  /**
+   * AUR-4479: opt in to a send whose entire recipient set is on our own domain.
+   * Self-addressed probes (capability tests, booking smoketests) are legitimate,
+   * but a self-send must be a deliberate act — never the accidental outcome of
+   * reply-recipient resolution.
+   */
+  allowSelfAddressed?: boolean;
 }
 
 export interface GmailReplyOptions {
@@ -208,6 +215,8 @@ export interface GmailReplyOptions {
   cc?: string | string[];
   replyTo?: string;
   attachments?: GmailAttachmentInput[];
+  /** AUR-4479: see GmailSendOptions.allowSelfAddressed. */
+  allowSelfAddressed?: boolean;
 }
 
 export interface GmailListOptions {
@@ -276,6 +285,44 @@ function extractHeader(
   name: string,
 ): string {
   return (headers ?? []).find((h) => h.name?.toLowerCase() === name.toLowerCase())?.value ?? "";
+}
+
+// AUR-4479 — self-address detection.
+//
+// Pulls every address out of an RFC 5322 address header, which may be a bare
+// address, an angle-bracket display-name form, or a comma-separated list:
+//   `Alex at Auranode <alex@tryauranode.com>, jane@example.com`
+export function extractEmailAddresses(headerValue: string | undefined | null): string[] {
+  if (!headerValue) return [];
+  const addresses: string[] = [];
+  const pattern = /<([^<>@\s]+@[^<>@\s]+)>|([^\s,<>()]+@[^\s,<>()]+)/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(headerValue)) !== null) {
+    const address = (match[1] ?? match[2] ?? "").trim().replace(/[.,;:]+$/, "");
+    if (address) addresses.push(address.toLowerCase());
+  }
+  return addresses;
+}
+
+function isOwnDomain(address: string): boolean {
+  return address.toLowerCase().endsWith(`@${DOMAIN}`);
+}
+
+/** True when the header names at least one address on our own domain. */
+export function isSelfAddress(headerValue: string | undefined | null): boolean {
+  return extractEmailAddresses(headerValue).some(isOwnDomain);
+}
+
+/**
+ * True only when EVERY resolved recipient is on our own domain — i.e. the
+ * message reaches nobody outside the company. A mixed set still reaches a real
+ * external party, so it is not a self-addressed send.
+ */
+export function isSelfAddressedOnly(values: Array<string | string[] | undefined>): boolean {
+  const all = values
+    .flatMap((v) => (Array.isArray(v) ? v : v ? [v] : []))
+    .flatMap((v) => extractEmailAddresses(v));
+  return all.length > 0 && all.every(isOwnDomain);
 }
 
 export interface GmailMessagePart {
@@ -470,6 +517,31 @@ export function createGmailService() {
       }
     }
 
+    // AUR-4479 belt-and-braces: a send whose ENTIRE recipient set is on our own
+    // domain reaches nobody. Gmail accepts it, returns a message id, and the
+    // caller records a delivered send — the success signal is not the same
+    // object as the outcome. On a threaded/reply send this is always a bug (the
+    // recipient was resolved, not chosen), so hard-block it. A non-threaded
+    // self-send is a legitimate probe, so only warn.
+    if (!opts.allowSelfAddressed && isSelfAddressedOnly([opts.to, opts.cc])) {
+      if (opts.replyToMessageId) {
+        logger.error(
+          { alias, to: opts.to, cc: opts.cc, subject: opts.subject, replyToMessageId: opts.replyToMessageId },
+          "gmail-guard: BLOCKED self-addressed threaded send (AUR-4479)",
+        );
+        throw badRequest(
+          `Refusing to send: every recipient of this threaded reply is on our own domain (${DOMAIN}), ` +
+            `so it would reach nobody while still returning a message id. ` +
+            `Resolved recipients: to=${opts.to}${opts.cc ? `, cc=${JSON.stringify(opts.cc)}` : ""}. ` +
+            `Pass allowSelfAddressed:true only if a self-addressed send is genuinely intended.`,
+        );
+      }
+      logger.warn(
+        { alias, to: opts.to, cc: opts.cc, subject: opts.subject },
+        "gmail: self-addressed non-threaded send (allowed; pass allowSelfAddressed to declare intent) (AUR-4479)",
+      );
+    }
+
     // AUR-2682 service-layer chokepoint: classify EVERY outbound, regardless
     // of which code path called us (direct send, replyInThread, future
     // callers). Gated categories are hard-blocked unless the caller has
@@ -551,11 +623,55 @@ export function createGmailService() {
     const original = await getMessage(alias, targetMessageId);
     const headers = original.payload?.headers;
     const subject = extractHeader(headers, "Subject") || "(no subject)";
-    const replyTo = extractHeader(headers, "Reply-To") || extractHeader(headers, "From");
+    let replyTo = extractHeader(headers, "Reply-To") || extractHeader(headers, "From");
+    let recipientSourceMessageId = targetMessageId;
+    const threadId = opts.threadId ?? original.threadId ?? undefined;
+
+    // AUR-4479: NEVER self-address. The reply recipient was previously taken
+    // from the From: of the thread's last message, which is correct only when
+    // that message is inbound. On any follow-up WE spoke last, so From: is our
+    // own alias and the reply was addressed to ourselves — sent successfully,
+    // message id returned, reaching nobody. Walk backwards for the last message
+    // whose sender is not us and address the reply to them instead.
+    if (!opts.allowSelfAddressed && (!replyTo || isSelfAddress(replyTo))) {
+      const external = threadId ? await findLastExternalSender(alias, threadId) : null;
+      if (!external) {
+        throw badRequest(
+          `Refusing to reply in thread ${threadId ?? targetMessageId}: no external participant found ` +
+            `(every message is from ${DOMAIN}), so the reply would be addressed to ourselves and reach ` +
+            `nobody. Pass allowSelfAddressed:true only if a self-addressed send is genuinely intended.`,
+        );
+      }
+      logger.warn(
+        {
+          alias,
+          threadId,
+          anchorMessageId: targetMessageId,
+          selfAddressedCandidate: replyTo || null,
+          recoveredRecipient: external.address,
+          recoveredFromMessageId: external.messageId,
+        },
+        "gmail: last message in thread is ours — recovered external reply recipient (AUR-4479)",
+      );
+      replyTo = external.address;
+      recipientSourceMessageId = external.messageId;
+    }
     if (!replyTo) {
       throw new Error(`Could not determine reply-to address for message ${targetMessageId}`);
     }
-    return sendMessage(
+    // Log the recipient at RESOLUTION time, not just at send time, so a future
+    // misfire is greppable even if the send itself never happens.
+    logger.info(
+      {
+        alias,
+        threadId,
+        anchorMessageId: targetMessageId,
+        recipientSourceMessageId,
+        resolvedRecipient: replyTo,
+      },
+      "gmail: reply recipient resolved (AUR-4479)",
+    );
+    const sent = await sendMessage(
       alias,
       {
         to: replyTo,
@@ -565,9 +681,38 @@ export function createGmailService() {
         cc: opts.cc,
         replyTo: opts.replyTo,
         attachments: opts.attachments,
+        allowSelfAddressed: opts.allowSelfAddressed,
       },
       guard,
     );
+    // AUR-4479: surface the resolved recipient so callers can ASSERT on who was
+    // actually addressed. A returned message id proves dispatch, not delivery
+    // to the intended party.
+    return { ...sent, resolvedRecipient: replyTo, recipientSourceMessageId };
+  }
+
+  // AUR-4479: walk a thread newest-first and return the last sender who is not
+  // us. Thread messages come back in "full" format with headers already
+  // attached; fall back to a per-message fetch only if they are missing.
+  async function findLastExternalSender(
+    alias: GmailAlias,
+    threadId: string,
+  ): Promise<{ address: string; messageId: string } | null> {
+    const thread = await getThread(alias, threadId);
+    const messages = thread.messages ?? [];
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const message = messages[i];
+      if (!message?.id) continue;
+      let headers = message.payload?.headers;
+      if (!headers) {
+        headers = (await getMessage(alias, message.id)).payload?.headers;
+      }
+      const candidate = extractHeader(headers, "Reply-To") || extractHeader(headers, "From");
+      if (candidate && !isSelfAddress(candidate)) {
+        return { address: candidate, messageId: message.id };
+      }
+    }
+    return null;
   }
 
   async function listThreads(alias: GmailAlias, opts?: GmailListOptions) {

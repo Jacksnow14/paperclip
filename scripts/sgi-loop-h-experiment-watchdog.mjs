@@ -38,10 +38,21 @@
  *          over the budget ceiling.
  *      (c) Runaway ceiling — only if horizon not yet reached: tokens_spent
  *          (in-scope only) >= budget_cap_tokens -> rejected (budget_exceeded).
+ *   3b. PENDING-APPROVAL SWEEP (AUR-4124, doctrine step 2b) — every
+ *       status:"proposed" record, invisible to every step above, is swept
+ *       after activation: reconcile an already-resolved board_approval_id
+ *       (approved -> approved / rejected -> rejected + conclusion), surface a
+ *       missing board_approval_id as "unapproved", or age a still-pending
+ *       approval and escalate once at 7d (board request_confirmation on this
+ *       routine's OWN execution issue) and once more at 14d (founder
+ *       Telegram), both guarded by metadata fields so a second run is a
+ *       silent no-op. Never self-approves (guardrail #6) — only makes a
+ *       stall loud.
  *   5. ADOPT/REJECT measured: delta>=expected -> Loop C self-edit issue,
  *      status: adopted, conclusion(adopted, loop_c_issue_id); else rejected
  *      (negative_result).
- *   6. Summary comment on the execution issue.
+ *   6. Summary comment on the execution issue — always carries a
+ *      "Pending board approval: N" line, even at zero (AUR-4124).
  *
  * Scope isolation logic (validateExperimentScope / measureExperimentScoped /
  * filterScorecardsByScope) is imported from scripts/sgi-loop-h-experiment-scope.mjs
@@ -52,6 +63,8 @@
  *   node scripts/sgi-loop-h-experiment-watchdog.mjs            # advance + write
  *   node scripts/sgi-loop-h-experiment-watchdog.mjs --dry-run  # print only, no writes
  */
+
+import { execFile } from 'node:child_process';
 
 import {
   measureExperimentScoped,
@@ -147,13 +160,18 @@ async function postComment(issueId, body) {
 }
 
 /** GET /approvals/:id — NOT /companies/:companyId/approvals/:id (that route doesn't exist). */
-async function getApprovalStatus(approvalId) {
+async function getApproval(approvalId) {
   if (!approvalId) return null;
   const data = await apiFetch(`/api/approvals/${approvalId}`);
   if (data._notFound) return null;
-  return data && data.status || null;
+  return data || null;
+}
+async function getApprovalStatus(approvalId) {
+  const approval = await getApproval(approvalId);
+  return (approval && approval.status) || null;
 }
 const APPROVED = new Set(['approved', 'accepted']);
+const REJECTED = new Set(['rejected', 'denied']);
 
 /** Parse "+12%" / "-5%" / "0.1" into a comparable numeric delta (percent units). */
 export function parseDelta(v) {
@@ -223,6 +241,41 @@ export function decideAdopt(measuredDeltaStr, expectedDeltaStr) {
   const measured = parseDelta(measuredDeltaStr);
   const expected = parseDelta(expectedDeltaStr);
   return measured != null && expected != null && measured >= expected;
+}
+
+/**
+ * Pure decision for one `status: "proposed"` record's stale-approval sweep
+ * (AUR-4124, doctrine step 2b). No I/O — takes the already-fetched approval
+ * status/createdAt so this is unit-testable without a live API.
+ *
+ *   no board_approval_id                          -> unapproved
+ *   approval accepted (APPROVED set)               -> reconcile_approved
+ *   approval denied/rejected (REJECTED set)        -> reconcile_rejected
+ *   still pending, age>=14d, no founder guard set  -> founder_alert
+ *   still pending, age>=7d,  no escalate guard set -> escalate
+ *   still pending, otherwise                       -> pending (silent, counted)
+ */
+export function decideStaleApproval(record, approvalStatus, approvalCreatedAt, todayIso) {
+  const m = record.metadata || {};
+  if (!m.board_approval_id) {
+    return { action: 'unapproved', ageDays: null, reason: 'missing board_approval_id' };
+  }
+  const status = String(approvalStatus || '').toLowerCase();
+  if (APPROVED.has(status)) {
+    return { action: 'reconcile_approved', ageDays: null, reason: `approval ${status}` };
+  }
+  if (REJECTED.has(status)) {
+    return { action: 'reconcile_rejected', ageDays: null, reason: `approval ${status}` };
+  }
+  const rawAge = Math.floor((Date.parse(`${todayIso}T00:00:00Z`) - Date.parse(approvalCreatedAt)) / 86400000);
+  const ageDays = Number.isFinite(rawAge) ? Math.max(0, rawAge) : 0;
+  if (ageDays >= 14 && !m.stale_founder_alerted_at) {
+    return { action: 'founder_alert', ageDays, reason: `pending ${ageDays}d (>=14d threshold)` };
+  }
+  if (ageDays >= 7 && !m.stale_escalated_at) {
+    return { action: 'escalate', ageDays, reason: `pending ${ageDays}d (>=7d threshold)` };
+  }
+  return { action: 'pending', ageDays, reason: `pending ${ageDays}d` };
 }
 
 /**
@@ -350,6 +403,70 @@ async function createLoopCIssue(exp) {
   return { identifier: iss.identifier || iss.id, id: iss.id };
 }
 
+/**
+ * File the 7d escalation for a stale-pending approval as a
+ * request_confirmation interaction on the routine's OWN execution issue —
+ * never the CEO-owned parent issue (it 403s on any write, AUR-4124). Returns
+ * true only on a genuine write (or a dry-run no-op) so the caller only
+ * stamps `stale_escalated_at` on success; a failed write must retry next run.
+ */
+async function escalateStaleApproval(e, ageDays) {
+  const m = e.metadata;
+  const id = m.id || e.id;
+  if (!TASK_ID) return false;
+  if (DRY_RUN) return true;
+  const body = `Board approval \`${m.board_approval_id}\` for experiment \`${id}\` has been pending ${ageDays}d ` +
+    `with no board decision. Hypothesis: ${m.hypothesis || '—'}. Target agent: ${m.target_agent_id || '—'}. ` +
+    'Please resolve (approve/reject) in the board approvals queue.';
+  try {
+    await apiFetch(`/api/issues/${TASK_ID}/interactions`, {
+      method: 'POST',
+      body: JSON.stringify({
+        kind: 'request_confirmation',
+        continuationPolicy: 'wake_assignee',
+        idempotencyKey: `sgi-loop-h:stale-approval:${id}:${m.board_approval_id}`,
+        payload: { version: 1, title: `Stale board approval — experiment ${id}`, prompt: body, body },
+      }),
+    });
+    return true;
+  } catch (err) {
+    console.error(`escalateStaleApproval failed for ${id}:`, err.message);
+    return false;
+  }
+}
+
+/**
+ * Founder-gated escalation for an approval stale >=14d (doctrine step 2b /
+ * guardrail #8). Non-fatal by design: any failure — including the shared
+ * fleet rate-limit — must never crash the routine, and a rate-limited send
+ * must leave `stale_founder_alerted_at` unset so the next run retries.
+ */
+async function founderAlertStaleApproval(e, ageDays) {
+  const m = e.metadata;
+  const id = m.id || e.id;
+  if (DRY_RUN) return true;
+  const message = `Board approval stale ${ageDays}d — experiment ${id} (issue ${TASK_ID || '?'}). Please resolve.`;
+  try {
+    const result = await new Promise((resolve) => {
+      execFile('/home/ievgen/bot/notify_founder.sh', [message], (err, stdout, stderr) => {
+        resolve({ err, stdout: String(stdout || ''), stderr: String(stderr || '') });
+      });
+    });
+    if (result.err) {
+      console.error(`founderAlertStaleApproval failed for ${id}:`, result.err.message);
+      return false;
+    }
+    if (/blocked:\s*rate-limit/i.test(`${result.stdout}\n${result.stderr}`)) {
+      console.error(`founderAlertStaleApproval rate-limited for ${id}, will retry next run`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error(`founderAlertStaleApproval failed for ${id}:`, err.message);
+    return false;
+  }
+}
+
 // ---- Main ------------------------------------------------------------------
 
 async function main() {
@@ -412,6 +529,72 @@ async function main() {
     e.metadata = next;
     if (m.target_agent_id) runningByAgent.set(m.target_agent_id, (runningByAgent.get(m.target_agent_id) || 0) + 1);
     summary.activated.push({ id: m.id || e.id, agent });
+  }
+
+  // 3b) PENDING-APPROVAL SWEEP (AUR-4124, doctrine step 2b) — a "proposed"
+  // record is invisible to every step above; this is the liveness gate.
+  const pendingApproval = {
+    reconciledApproved: [], reconciledRejected: [], unapproved: [],
+    escalated: [], founderAlerted: [], pending: [], details: [],
+  };
+  for (const e of experiments) {
+    const m = e.metadata;
+    if (m.status !== 'proposed') continue;
+    const id = m.id || e.id;
+
+    const approval = m.board_approval_id ? await getApproval(m.board_approval_id) : null;
+    const decision = decideStaleApproval(e, approval && approval.status, approval && approval.createdAt, TODAY);
+
+    if (decision.action === 'reconcile_approved') {
+      const next = { ...m, status: 'approved' };
+      if (!DRY_RUN) await patchRecordMetadata(e.id, next);
+      e.metadata = next;
+      pendingApproval.reconciledApproved.push({ id, approvalId: m.board_approval_id });
+      continue;
+    }
+
+    if (decision.action === 'reconcile_rejected') {
+      const next = { ...m, status: 'rejected', rejected_at: NOW_ISO };
+      if (!DRY_RUN) await patchRecordMetadata(e.id, next);
+      e.metadata = next;
+      if (!concludedIds.has(id)) await writeConclusion(e, 'rejected', 'board_rejected');
+      pendingApproval.reconciledRejected.push({ id, approvalId: m.board_approval_id });
+      continue;
+    }
+
+    // Still proposed after this run — always counted toward the mandatory
+    // pending-approval line, whichever of unapproved/escalate/founder_alert/pending it is.
+    pendingApproval.details.push({ id, approvalId: m.board_approval_id || null, ageDays: decision.ageDays });
+
+    if (decision.action === 'unapproved') {
+      pendingApproval.unapproved.push({ id });
+      continue;
+    }
+
+    if (decision.action === 'escalate' || decision.action === 'founder_alert') {
+      if (!m.stale_escalated_at) {
+        const ok = await escalateStaleApproval(e, decision.ageDays);
+        if (ok) {
+          const next = { ...e.metadata, stale_escalated_at: NOW_ISO };
+          if (!DRY_RUN) await patchRecordMetadata(e.id, next);
+          e.metadata = next;
+          pendingApproval.escalated.push({ id, ageDays: decision.ageDays });
+        }
+      }
+      if (decision.action === 'founder_alert') {
+        const ok = await founderAlertStaleApproval(e, decision.ageDays);
+        if (ok) {
+          const next = { ...e.metadata, stale_founder_alerted_at: NOW_ISO };
+          if (!DRY_RUN) await patchRecordMetadata(e.id, next);
+          e.metadata = next;
+          pendingApproval.founderAlerted.push({ id, ageDays: decision.ageDays });
+        }
+      }
+      continue;
+    }
+
+    // decision.action === 'pending' — silent, but already counted in `details`.
+    pendingApproval.pending.push({ id, ageDays: decision.ageDays });
   }
 
   // 4) MEASURE running experiments — scope gate FIRST, then cap-sanity → horizon → budget.
@@ -505,12 +688,23 @@ async function main() {
     measured: summary.measured.length,
     adopted: summary.adopted.length,
     rejected: summary.rejected.length,
+    pendingApproval: pendingApproval.details.length,
   };
+
+  // Mandatory pending-approval line (AUR-4124) — "no stalls" must be an
+  // affirmative signal, so this prints even at zero, in every branch below.
+  const oldestPending = pendingApproval.details.reduce(
+    (max, d) => (d.ageDays != null && (!max || d.ageDays > max.ageDays) ? d : max), null,
+  );
+  const pendingLine = oldestPending
+    ? `Pending board approval: **${counts.pendingApproval}** proposed (oldest ${oldestPending.ageDays}d — ${oldestPending.id}/${oldestPending.approvalId || 'no-approval-id'}).`
+    : `Pending board approval: **${counts.pendingApproval}**.`;
 
   if (TASK_ID && !DRY_RUN) {
     const lines = [];
     lines.push(`## SGI Loop H — Experiment Watchdog (${TODAY})`);
     lines.push('');
+    const fmt = (arr, f) => arr.map(f).join('\n');
     if (!experiments.length) {
       lines.push('**No experiment records in the pipeline** (project-scoped query) — nothing to activate, measure, or conclude. Steady-state no-op.');
       lines.push('');
@@ -521,7 +715,6 @@ async function main() {
         (counts.needsScope ? `, **${counts.needsScope}** parked needs_scope` : '') +
         (counts.contention ? `, **${counts.contention}** held (1-per-agent contention)` : '') +
         (counts.blocked ? `, **${counts.blocked}** awaiting board approval` : '') + '.');
-      const fmt = (arr, f) => arr.map(f).join('\n');
       if (summary.activated.length) lines.push('\n**Activated (→ running):**\n' + fmt(summary.activated, a => `- \`${a.id}\` (agent ${a.agent})`));
       if (summary.needsScope.length) lines.push('\n**Parked (needs_scope — AUR-3202):**\n' + fmt(summary.needsScope, a => `- \`${a.id}\` — ${a.reason}`));
       if (summary.recalibrated.length) lines.push('\n**Cap recalibrated (kept running):**\n' + fmt(summary.recalibrated, a => `- \`${a.id}\` — budget_cap_tokens ${a.oldCap || '(unset)'} → ${a.newCap} (reachable=${a.reachable}, p95=${a.p95PerTask})`));
@@ -531,10 +724,17 @@ async function main() {
       if (summary.contention.length) lines.push('\n**Held (1-per-agent):**\n' + fmt(summary.contention, a => `- \`${a.id}\` (agent ${a.agent} already has a running experiment)`));
       if (summary.blocked.length) lines.push('\n**Awaiting board approval:**\n' + fmt(summary.blocked, a => `- \`${a.id}\` — ${a.reason}`));
     }
+    lines.push('');
+    lines.push(pendingLine);
+    if (pendingApproval.unapproved.length) lines.push('\n**Unapproved (missing board_approval_id — a Drafter bug, never activated):**\n' + fmt(pendingApproval.unapproved, a => `- \`${a.id}\``));
+    if (pendingApproval.escalated.length) lines.push('\n**Escalated (>=7d pending, board request_confirmation filed on this issue):**\n' + fmt(pendingApproval.escalated, a => `- \`${a.id}\` — ${a.ageDays}d`));
+    if (pendingApproval.founderAlerted.length) lines.push('\n**Founder-alerted (>=14d pending, Telegram sent):**\n' + fmt(pendingApproval.founderAlerted, a => `- \`${a.id}\` — ${a.ageDays}d`));
+    if (pendingApproval.reconciledApproved.length) lines.push('\n**Reconciled → approved (board had already accepted):**\n' + fmt(pendingApproval.reconciledApproved, a => `- \`${a.id}\``));
+    if (pendingApproval.reconciledRejected.length) lines.push('\n**Reconciled → rejected (board had already denied):**\n' + fmt(pendingApproval.reconciledRejected, a => `- \`${a.id}\``));
     await postComment(TASK_ID, lines.join('\n'));
   }
 
-  return { date: TODAY, dryRun: DRY_RUN, counts, summary };
+  return { date: TODAY, dryRun: DRY_RUN, counts, summary, pendingApproval };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

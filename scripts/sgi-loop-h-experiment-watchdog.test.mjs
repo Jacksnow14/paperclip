@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   measureExperiment,
   decideAdopt,
+  decideStaleApproval,
   scorecardsForAgent,
   measuredDeltaPct,
 } from "./sgi-loop-h-experiment-watchdog.mjs";
@@ -161,4 +162,103 @@ test("measuredDeltaPct inverts sign for rework_rate (lower is better)", () => {
   const d = measuredDeltaPct("rework_rate", baseline, period);
   // rework dropped from 50% to 0% — an improvement, so pct must be POSITIVE.
   assert.equal(d.pct, 100);
+});
+
+// ---- decideStaleApproval (AUR-4124 pending-approval sweep) ----------------
+
+function proposed(overrides = {}) {
+  return {
+    id: "rec-proposed-1",
+    metadata: {
+      category: "experiment",
+      id: "exp-proposed-1",
+      status: "proposed",
+      board_approval_id: "approval-1",
+      hypothesis: "test hypothesis",
+      target_agent_id: "agent-1",
+      ...overrides,
+    },
+  };
+}
+
+test("decideStaleApproval: missing board_approval_id -> unapproved, never activated", () => {
+  const record = proposed({ board_approval_id: undefined });
+  const result = decideStaleApproval(record, null, null, "2026-07-30");
+  assert.equal(result.action, "unapproved");
+  assert.equal(result.ageDays, null);
+});
+
+test("decideStaleApproval: accepted approval -> reconcile_approved (honors an existing board decision)", () => {
+  const record = proposed();
+  const result = decideStaleApproval(record, "approved", "2026-07-13T07:05:09.945Z", "2026-07-30");
+  assert.equal(result.action, "reconcile_approved");
+});
+
+test("decideStaleApproval: 'accepted' status (alt spelling) also reconciles approved", () => {
+  const record = proposed();
+  const result = decideStaleApproval(record, "accepted", "2026-07-13T07:05:09.945Z", "2026-07-30");
+  assert.equal(result.action, "reconcile_approved");
+});
+
+test("decideStaleApproval: rejected approval -> reconcile_rejected", () => {
+  const record = proposed();
+  const result = decideStaleApproval(record, "rejected", "2026-07-13T07:05:09.945Z", "2026-07-30");
+  assert.equal(result.action, "reconcile_rejected");
+});
+
+test("decideStaleApproval: denied approval (alt spelling) also reconciles rejected", () => {
+  const record = proposed();
+  const result = decideStaleApproval(record, "denied", "2026-07-13T07:05:09.945Z", "2026-07-30");
+  assert.equal(result.action, "reconcile_rejected");
+});
+
+test("decideStaleApproval: <7d pending -> pending, no side effect", () => {
+  const record = proposed();
+  // 2026-07-25 -> 2026-07-30 is 5 days.
+  const result = decideStaleApproval(record, "pending", "2026-07-25T00:00:00.000Z", "2026-07-30");
+  assert.equal(result.action, "pending");
+  assert.equal(result.ageDays, 5);
+});
+
+test("decideStaleApproval: >=7d pending escalates exactly once — second call with stale_escalated_at set does not re-escalate", () => {
+  const record = proposed();
+  // 2026-07-20 -> 2026-07-30 is 10 days.
+  const first = decideStaleApproval(record, "pending", "2026-07-20T00:00:00.000Z", "2026-07-30");
+  assert.equal(first.action, "escalate");
+  assert.equal(first.ageDays, 10);
+
+  // Same age, but the caller has now stamped the guard field after a
+  // successful escalation write — the sweep must not fire again.
+  const escalated = proposed({ stale_escalated_at: "2026-07-30T00:00:00.000Z" });
+  const second = decideStaleApproval(escalated, "pending", "2026-07-20T00:00:00.000Z", "2026-07-30");
+  assert.equal(second.action, "pending");
+  assert.equal(second.ageDays, 10);
+});
+
+test("decideStaleApproval: >=14d pending triggers founder_alert", () => {
+  const record = proposed();
+  // 2026-07-13T07:05 -> 2026-07-30T00:00 is 16 full days (floor).
+  const result = decideStaleApproval(record, "pending", "2026-07-13T07:05:09.945Z", "2026-07-30");
+  assert.equal(result.action, "founder_alert");
+  assert.equal(result.ageDays, 16);
+});
+
+test("decideStaleApproval: >=14d pending but already founder-alerted AND already escalated stays pending (both guards respected)", () => {
+  const record = proposed({
+    stale_escalated_at: "2026-07-26T00:00:00.000Z",
+    stale_founder_alerted_at: "2026-07-27T00:00:00.000Z",
+  });
+  const result = decideStaleApproval(record, "pending", "2026-07-13T07:05:09.945Z", "2026-07-30");
+  assert.equal(result.action, "pending");
+  assert.equal(result.ageDays, 16);
+});
+
+test("decideStaleApproval: >=14d pending with escalation already stamped still fires founder_alert (mirrors live b74d3a83)", () => {
+  // Live fixture: stale_escalated_at was set manually pre-mechanism on
+  // 2026-07-26; the sweep must not re-escalate but must still recognize the
+  // founder threshold once the record crosses 14d.
+  const record = proposed({ stale_escalated_at: "2026-07-26T00:00:00.000Z" });
+  const result = decideStaleApproval(record, "pending", "2026-07-13T07:05:09.945Z", "2026-07-30");
+  assert.equal(result.action, "founder_alert");
+  assert.equal(result.ageDays, 16);
 });

@@ -9,6 +9,7 @@ import {
   flagTitle,
   resolveCancelReason,
   resolveFlagOwner,
+  hasPendingInteractionInList,
   CEO_AGENT_ID,
   HUMAN_GATED_TOKEN,
 } from './check-stalled-blocked.mjs';
@@ -147,6 +148,29 @@ test('resolveCancelReason: cancels when target now has a real blocker attached',
   const target = { status: 'blocked', blockerAttention: { state: 'covered', unresolvedBlockerCount: 1 } };
   const reason = resolveCancelReason({ target, targetId: 'AUR-4032' });
   assert.match(reason, /now has a real blocker/);
+});
+
+// ── hasPendingInteractionInList (AUR-4275) ───────────────────────────────────
+
+test('hasPendingInteractionInList: true when a pending interaction is present (AUR-1879 shape)', () => {
+  assert.equal(hasPendingInteractionInList([
+    { id: '41e09620-0c34-4ccc-a2ea-74743e0f47b3', kind: 'request_confirmation', status: 'pending' },
+  ]), true);
+});
+
+test('hasPendingInteractionInList: false when interactions exist but none are pending', () => {
+  assert.equal(hasPendingInteractionInList([
+    { kind: 'ask_user_questions', status: 'answered' },
+    { kind: 'request_confirmation', status: 'accepted' },
+  ]), false);
+});
+
+test('hasPendingInteractionInList: false for an empty list', () => {
+  assert.equal(hasPendingInteractionInList([]), false);
+});
+
+test('hasPendingInteractionInList: handles a {items: [...]} wrapper response shape', () => {
+  assert.equal(hasPendingInteractionInList({ items: [{ kind: 'ask_user_questions', status: 'pending' }] }), true);
 });
 
 // ── resolveFlagOwner ──────────────────────────────────────────────────────────

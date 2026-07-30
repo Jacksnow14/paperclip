@@ -16,6 +16,7 @@ import {
   buildInvocationEnvForLogs,
   sanitizeInheritedSecretEnv,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+  ensureClaudeWorkspaceTrusted,
   ensureCommandResolvable,
   ensurePathInEnv,
   ensureUserLocalBinInPath,
@@ -1626,4 +1627,69 @@ describe.skipIf(!hasUserSystemdScopes)("runChildProcess memory ceiling wiring (A
     expect(survived.exitCode).toBe(0);
     expect(survived.stdout).toContain("ALLOCATED 180");
   }, 60_000);
+});
+
+describe("ensureClaudeWorkspaceTrusted (AUR-4374)", () => {
+  async function withTempConfig(
+    initial: unknown,
+    run: (configPath: string) => Promise<void>,
+  ) {
+    const configPath = path.join(os.tmpdir(), `aur4374-claude-json-${randomUUID()}.json`);
+    await fs.writeFile(configPath, JSON.stringify(initial), "utf8");
+    try {
+      await run(configPath);
+    } finally {
+      await fs.unlink(configPath).catch(() => {});
+    }
+  }
+
+  it("firing case: an untrusted workspace gets marked trusted, preserving unrelated config", async () => {
+    await withTempConfig(
+      { userId: "fixture-user", projects: { "/other/cwd": { hasTrustDialogAccepted: true, foo: "bar" } } },
+      async (configPath) => {
+        const changed = await ensureClaudeWorkspaceTrusted("/home/ievgen/Auranode-deliverability", {
+          configPath,
+        });
+        expect(changed).toBe(true);
+
+        const written = JSON.parse(await fs.readFile(configPath, "utf8"));
+        expect(written.userId).toBe("fixture-user");
+        expect(written.projects["/other/cwd"]).toEqual({ hasTrustDialogAccepted: true, foo: "bar" });
+        expect(written.projects["/home/ievgen/Auranode-deliverability"].hasTrustDialogAccepted).toBe(true);
+      },
+    );
+  });
+
+  it("passing case: an already-trusted workspace is a no-op (no write)", async () => {
+    await withTempConfig(
+      { projects: { "/home/ievgen/Auranode-deliverability": { hasTrustDialogAccepted: true } } },
+      async (configPath) => {
+        const before = await fs.readFile(configPath, "utf8");
+        const changed = await ensureClaudeWorkspaceTrusted("/home/ievgen/Auranode-deliverability", {
+          configPath,
+        });
+        expect(changed).toBe(false);
+        const after = await fs.readFile(configPath, "utf8");
+        expect(after).toBe(before);
+      },
+    );
+  });
+
+  it("does not create or touch a config file that does not exist", async () => {
+    const configPath = path.join(os.tmpdir(), `aur4374-missing-${randomUUID()}.json`);
+    const changed = await ensureClaudeWorkspaceTrusted("/some/cwd", { configPath });
+    expect(changed).toBe(false);
+    await expect(fs.stat(configPath)).rejects.toThrow();
+  });
+
+  it("does not touch an unparseable config file", async () => {
+    await withTempConfig("not-actually-written-as-json", async (configPath) => {
+      await fs.writeFile(configPath, "{not valid json", "utf8");
+      const before = await fs.readFile(configPath, "utf8");
+      const changed = await ensureClaudeWorkspaceTrusted("/some/cwd", { configPath });
+      expect(changed).toBe(false);
+      const after = await fs.readFile(configPath, "utf8");
+      expect(after).toBe(before);
+    });
+  });
 });

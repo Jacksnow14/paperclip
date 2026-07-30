@@ -1782,6 +1782,84 @@ export async function ensureAbsoluteDirectory(
   }
 }
 
+/**
+ * Marks `cwd` as a trusted workspace in the local Claude Code CLI config
+ * (`~/.claude.json`), so `permissions.allow` entries in that workspace's
+ * `.claude/settings.json` are honored instead of silently dropped (AUR-4374).
+ * No-op when the flag is already set, the config file is absent, or it isn't
+ * parseable JSON — this must never risk corrupting the host's live CLI config.
+ * Returns true only when it actually wrote a change.
+ */
+export async function ensureClaudeWorkspaceTrusted(
+  cwd: string,
+  opts: { configPath?: string; onLog?: (stream: "stdout" | "stderr", message: string) => Promise<void> } = {},
+): Promise<boolean> {
+  const configPath = opts.configPath ?? path.join(os.homedir(), ".claude.json");
+  const onLog = opts.onLog ?? (async () => {});
+
+  let raw: string;
+  try {
+    raw = await fs.readFile(configPath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    await onLog(
+      "stderr",
+      `[paperclip] Warning: could not read ${configPath} to trust workspace "${cwd}": ${
+        err instanceof Error ? err.message : String(err)
+      }\n`,
+    );
+    return false;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    await onLog(
+      "stderr",
+      `[paperclip] Warning: ${configPath} is not valid JSON; skipping workspace-trust provisioning for "${cwd}".\n`,
+    );
+    return false;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return false;
+
+  const config = parsed as Record<string, unknown>;
+  const projects =
+    typeof config.projects === "object" && config.projects !== null && !Array.isArray(config.projects)
+      ? (config.projects as Record<string, unknown>)
+      : {};
+  const existingEntry =
+    typeof projects[cwd] === "object" && projects[cwd] !== null && !Array.isArray(projects[cwd])
+      ? (projects[cwd] as Record<string, unknown>)
+      : {};
+  if (existingEntry.hasTrustDialogAccepted === true) return false;
+
+  config.projects = { ...projects, [cwd]: { ...existingEntry, hasTrustDialogAccepted: true } };
+
+  const tmpPath = `${configPath}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    await fs.writeFile(tmpPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+    await fs.rename(tmpPath, configPath);
+  } catch (err) {
+    await fs
+      .unlink(tmpPath)
+      .catch(() => {});
+    await onLog(
+      "stderr",
+      `[paperclip] Warning: could not write ${configPath} to trust workspace "${cwd}": ${
+        err instanceof Error ? err.message : String(err)
+      }\n`,
+    );
+    return false;
+  }
+
+  await onLog(
+    "stdout",
+    `[paperclip] Marked workspace "${cwd}" as trusted in ${configPath} (permissions.allow entries will now be honored).\n`,
+  );
+  return true;
+}
+
 export async function resolvePaperclipSkillsDir(
   moduleDir: string,
   additionalCandidates: string[] = [],

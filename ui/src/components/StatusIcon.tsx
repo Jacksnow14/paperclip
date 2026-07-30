@@ -65,6 +65,10 @@ function blockedAttentionLabel(blockerAttention: IssueBlockerAttention | null | 
       : "Blocked · a blocker was cancelled — remove the relation or replace it";
   }
 
+  if (blockerAttention.reason === "no_blocker_recorded") {
+    return "Blocked · no blocker recorded — attach one or give it a real disposition";
+  }
+
   return "Blocked";
 }
 

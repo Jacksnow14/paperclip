@@ -568,7 +568,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     // "done vs cancelled" fixture test below, which locks this equivalence directly.
     expect(parent?.blockerAttention).toMatchObject({
       state: "needs_attention",
-      reason: "attention_required",
+      reason: "no_blocker_recorded",
       unresolvedBlockerCount: 0,
       attentionBlockerCount: 0,
       sampleBlockerIdentifier: null,
@@ -662,7 +662,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
     // Both children resolved (one done, one cancelled) -> empty frontier -> attention,
     // same as the pre-existing "no known blocker" anomaly (CTO review on PR #112).
-    expect(parent?.blockerAttention).toMatchObject({ state: "needs_attention", reason: "attention_required" });
+    expect(parent?.blockerAttention).toMatchObject({ state: "needs_attention", reason: "no_blocker_recorded" });
 
     const wakeableParent = await svc.getWakeableParentAfterChildCompletion(parentId);
     expect(wakeableParent?.id).toBe(parentId);
@@ -700,7 +700,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     // Locks the premise the whole fix rests on: a cancelled child must classify identically
     // to a done child. Flipping either fixture's status must not change this assertion.
     expect(cancelledParent?.blockerAttention).toEqual(doneParent?.blockerAttention);
-    expect(doneParent?.blockerAttention).toMatchObject({ state: "needs_attention", reason: "attention_required", unresolvedBlockerCount: 0 });
+    expect(doneParent?.blockerAttention).toMatchObject({ state: "needs_attention", reason: "no_blocker_recorded", unresolvedBlockerCount: 0 });
   });
 
   it("does not let cancelling an already-covered blocker increase attentionBlockerCount (monotonicity, CTO review on PR #112)", async () => {
@@ -733,7 +733,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
 
     const after = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
     expect(after?.blockerAttention.attentionBlockerCount).toBeLessThanOrEqual(before?.blockerAttention.attentionBlockerCount ?? 0);
-    expect(after?.blockerAttention).toMatchObject({ state: "needs_attention", reason: "attention_required", attentionBlockerCount: 0 });
+    expect(after?.blockerAttention).toMatchObject({ state: "needs_attention", reason: "no_blocker_recorded", attentionBlockerCount: 0 });
   });
 
   it("treats open liveness escalation blockers as covered waiting paths", async () => {
@@ -992,6 +992,207 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       reason: "missing_successful_run_disposition",
       owner: { type: "agent", agentId },
       action: { label: "Choose disposition" },
+    });
+  });
+
+  // ── Scheduler parity (AUR-4664) ─────────────────────────────────────────────
+  // The scheduler skips wakes as issue_dependencies_blocked based on
+  // listIssueDependencyReadinessMap, which ignores the dependent's own status.
+  // blockerAttention must agree: any scheduler-skipped issue reports a
+  // non-"none" state, and a scheduler-ready issue without a blocked status
+  // reports "none". Live counterexamples: AUR-4149 (todo, one todo blocker,
+  // 465 skips, reported none/0) vs AUR-4187 (blocked, one todo blocker,
+  // reported covered/1) — same shape, different answer, purely because the
+  // walk was rooted on the dependent's own status.
+
+  it("FIRES on the AUR-4149 shape: a todo issue with an idle todo explicit blocker reports needs_attention, not none (AUR-4664)", async () => {
+    const { companyId, agentId } = await createCompany("PSP");
+    const dependentId = await insertIssue({
+      companyId,
+      identifier: "PSP-1",
+      title: "Scheduler-skipped todo dependent",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PSP-2",
+      title: "Idle todo blocker with no active work",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: dependentId });
+
+    // The scheduler's own predicate refuses this issue…
+    const readiness = (await svc.listDependencyReadiness(companyId, [dependentId])).get(dependentId);
+    expect(readiness?.isDependencyReady).toBe(false);
+    expect(readiness?.unresolvedBlockerCount).toBe(1);
+
+    // …so the attention surface must not read none/0.
+    const dependent = (await svc.list(companyId, { status: "todo" })).find((issue) => issue.id === dependentId);
+    expect(dependent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      unresolvedBlockerCount: 1,
+      attentionBlockerCount: 1,
+      sampleBlockerIdentifier: "PSP-2",
+    });
+  });
+
+  it("PASSES a genuinely-unblocked todo issue: no relations at all stays none/0 (AUR-4664)", async () => {
+    const { companyId, agentId } = await createCompany("PSQ");
+    const freeId = await insertIssue({
+      companyId,
+      identifier: "PSQ-1",
+      title: "Nothing blocks this",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+
+    const free = (await svc.list(companyId, { status: "todo" })).find((issue) => issue.id === freeId);
+    expect(free?.blockerAttention).toMatchObject({ state: "none", unresolvedBlockerCount: 0 });
+  });
+
+  it("PASSES a todo issue whose only explicit blocker is done — scheduler-ready must stay none (AUR-4664)", async () => {
+    const { companyId, agentId } = await createCompany("PSR");
+    const dependentId = await insertIssue({
+      companyId,
+      identifier: "PSR-1",
+      title: "Dependent with a resolved blocker",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    const doneBlockerId = await insertIssue({
+      companyId,
+      identifier: "PSR-2",
+      title: "Done blocker",
+      status: "done",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: doneBlockerId, blockedIssueId: dependentId });
+
+    const dependent = (await svc.list(companyId, { status: "todo" })).find((issue) => issue.id === dependentId);
+    expect(dependent?.blockerAttention).toMatchObject({ state: "none", unresolvedBlockerCount: 0 });
+  });
+
+  it("counts only the open blocker on the AUR-2819 shape: one done + one open blocker yields unresolved=1, non-none (AUR-4664)", async () => {
+    const { companyId, agentId } = await createCompany("PSS");
+    const dependentId = await insertIssue({
+      companyId,
+      identifier: "PSS-1",
+      title: "Dependent with mixed blockers",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    const doneBlockerId = await insertIssue({
+      companyId,
+      identifier: "PSS-2",
+      title: "Done blocker",
+      status: "done",
+      assigneeAgentId: agentId,
+    });
+    const openBlockerId = await insertIssue({
+      companyId,
+      identifier: "PSS-3",
+      title: "Still-open blocker",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: doneBlockerId, blockedIssueId: dependentId });
+    await block({ companyId, blockerIssueId: openBlockerId, blockedIssueId: dependentId });
+
+    // Kills the "any resolved blocker collapses to all-resolved" hypothesis
+    // from the CEO's AUR-2819 fixture: the done blocker resolves, the open one
+    // counts, and the state is non-none.
+    const dependent = (await svc.list(companyId, { status: "todo" })).find((issue) => issue.id === dependentId);
+    expect(dependent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      unresolvedBlockerCount: 1,
+      attentionBlockerCount: 1,
+      sampleBlockerIdentifier: "PSS-3",
+    });
+  });
+
+  it("reports covered for a todo issue whose blocker has a running execution path — the AUR-4187 control generalized off blocked status (AUR-4664)", async () => {
+    const { companyId, agentId } = await createCompany("PST");
+    const dependentId = await insertIssue({
+      companyId,
+      identifier: "PST-1",
+      title: "Dependent on active work",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    const activeBlockerId = await insertIssue({
+      companyId,
+      identifier: "PST-2",
+      title: "Blocker being worked right now",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: activeBlockerId, blockedIssueId: dependentId });
+    await activeRun({ companyId, agentId, issueId: activeBlockerId });
+
+    const dependent = (await svc.list(companyId, { status: "todo" })).find((issue) => issue.id === dependentId);
+    expect(dependent?.blockerAttention).toMatchObject({
+      state: "covered",
+      reason: "active_dependency",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      attentionBlockerCount: 0,
+    });
+  });
+
+  it("does not count a todo parent's own subtasks as blockers — children never gate the scheduler (AUR-4664)", async () => {
+    const { companyId, agentId } = await createCompany("PSU");
+    const parentId = await insertIssue({
+      companyId,
+      identifier: "PSU-1",
+      title: "Todo parent with active children",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await insertIssue({
+      companyId,
+      identifier: "PSU-2",
+      title: "Open child without a blocks relation",
+      status: "in_progress",
+      parentId,
+      assigneeAgentId: agentId,
+    });
+
+    const parent = (await svc.list(companyId, { status: "todo" })).find((issue) => issue.id === parentId);
+    expect(parent?.blockerAttention).toMatchObject({ state: "none", unresolvedBlockerCount: 0 });
+  });
+
+  it("keeps a cancelled explicit blocker unresolved for a todo dependent, matching the scheduler (AUR-4664)", async () => {
+    const { companyId, agentId } = await createCompany("PSV");
+    const dependentId = await insertIssue({
+      companyId,
+      identifier: "PSV-1",
+      title: "Dependent on a cancelled blocker",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    const cancelledBlockerId = await insertIssue({
+      companyId,
+      identifier: "PSV-2",
+      title: "Cancelled explicit blocker",
+      status: "cancelled",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: cancelledBlockerId, blockedIssueId: dependentId });
+
+    // The scheduler treats a cancelled explicit blocker as unresolved
+    // (readiness resolves on done alone), so the attention surface must too.
+    const readiness = (await svc.listDependencyReadiness(companyId, [dependentId])).get(dependentId);
+    expect(readiness?.isDependencyReady).toBe(false);
+
+    const dependent = (await svc.list(companyId, { status: "todo" })).find((issue) => issue.id === dependentId);
+    expect(dependent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "cancelled_blocker",
+      unresolvedBlockerCount: 1,
+      sampleBlockerIdentifier: "PSV-2",
     });
   });
 });

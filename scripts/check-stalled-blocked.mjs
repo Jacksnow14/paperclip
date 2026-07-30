@@ -17,7 +17,20 @@
  * `blockedBy`, not `blockerAttention`; both ship on the plain list endpoint).
  * This watchdog is the first consumer of that signal.
  *
- * Two distinct classes (do not collapse them — see AUR-3937):
+ * Three distinct classes (do not collapse them — see AUR-3937, AUR-4664):
+ *   - chain         — a todo/in_progress issue the scheduler refuses to run
+ *                     (`issue_dependencies_blocked`) whose unresolved blocker
+ *                     has no active work path. AUR-4664: the six worst-stalled
+ *                     chains in the company (AUR-4149: 465 skipped wakes) were
+ *                     invisible to this watchdog by construction, because
+ *                     blockerAttention was only computed for `blocked`-status
+ *                     issues and this script only scanned `blocked`-status
+ *                     issues. Requires the AUR-4664 server fix to be deployed
+ *                     (blockerAttention now has scheduler parity); each
+ *                     candidate is additionally confirmed against per-issue
+ *                     `blockedBy` (ground truth the list endpoint omits)
+ *                     before filing, so a regression in the field produces a
+ *                     loud CONTRADICTION line instead of a silent false flag.
  *   - stalled      — auto-blocked by lost-run recovery, or blocked with no
  *                     stated reason. Drift. Needs a real disposition.
  *   - human-gated   — genuinely waiting on the founder or an external party.
@@ -103,6 +116,36 @@ export function hasNoBlocker(issue) {
 }
 
 /**
+ * Statuses where the scheduler would actually attempt execution — an
+ * `issue_dependencies_blocked` skip on one of these is a wake the fleet
+ * wanted to run and could not. `blocked` is deliberately excluded (that is
+ * the hasNoBlocker/stalled/human-gated domain above); `in_review` waits on a
+ * review participant, `backlog` is not scheduled.
+ */
+export const SCHEDULER_GATED_STATUSES = new Set(['todo', 'in_progress']);
+
+/**
+ * True for the AUR-4664 class: a schedulable issue the scheduler will skip as
+ * `issue_dependencies_blocked` (unresolvedBlockerCount > 0) whose blocker
+ * chain has no active work path (needs_attention or stalled — a `covered`
+ * chain is a healthy pipeline, someone is on it, do not flag).
+ *
+ * Reads `blockerAttention` from the LIST endpoint, which is only sound on a
+ * server carrying the AUR-4664 fix — before it, todo/in_progress issues
+ * always read none/0 and this predicate simply never fires (fail-quiet, not
+ * fail-wrong). Callers must confirm against per-issue `blockedBy` before
+ * mutating (see confirmSchedulerGated in main), because the company list
+ * endpoint does not return `blockedBy` at all.
+ */
+export function isSchedulerGatedStalled(issue) {
+  if (!SCHEDULER_GATED_STATUSES.has(issue.status)) return false;
+  const attention = issue.blockerAttention;
+  if (!attention) return false;
+  if (!(attention.unresolvedBlockerCount > 0)) return false;
+  return attention.state === 'needs_attention' || attention.state === 'stalled';
+}
+
+/**
  * Grades a no-blocker `blocked` issue as 'stalled' or 'human-gated'.
  * @param {{ title?: string, description?: string }} issue
  * @returns {'stalled'|'human-gated'}
@@ -133,18 +176,49 @@ export function hasPendingInteractionInList(interactionsResponse) {
   return list.some((i) => i.status === 'pending');
 }
 
-/** Matches both flag title formats produced in the wild. */
-export const FLAG_REGEX = /stalled-blocked(?:-mismodelled)?:\s*(AUR-\d+)/i;
+/** Matches all three flag title formats produced in the wild. */
+export const FLAG_REGEX = /stalled-blocked(?:-mismodelled|-chain)?:\s*(AUR-\d+)/i;
+
+/** True when a flag issue title is the AUR-4664 chain class rather than the no-blocker class. */
+export function isChainFlagTitle(title) {
+  return /stalled-blocked-chain:/i.test(title ?? '');
+}
 
 export function flagTitle(targetId, grade) {
+  if (grade === 'chain') {
+    return `stalled-blocked-chain: ${targetId} scheduler-skipped with an unworked blocker`;
+  }
   return grade === 'human-gated'
     ? `stalled-blocked-mismodelled: ${targetId} blocked with no blocker (human-gated)`
     : `stalled-blocked: ${targetId} blocked with no blocker`;
 }
 
-export function buildFlagDescription(issue, grade) {
+export function buildFlagDescription(issue, grade, openBlockers = []) {
   const id = issue.identifier ?? issue.id;
   const hrs = Math.round(hoursSince(issue.updatedAt));
+  if (grade === 'chain') {
+    const blockerList = openBlockers
+      .map((b) => `\`${b.identifier ?? b.id}\` (\`${b.status}\`)`)
+      .join(', ');
+    return [
+      `## Scheduler-skipped issue whose blocker chain has no active work`,
+      '',
+      `**${id}** ("${issue.title}") is \`${issue.status}\` but the scheduler will refuse every wake for it ` +
+        `as \`issue_dependencies_blocked\`: it is blocked by ${blockerList || 'an unresolved blocker'}, ` +
+        `and \`blockerAttention\` reports no active work path on that chain ` +
+        `(state \`${issue.blockerAttention?.state}\`, ${issue.blockerAttention?.unresolvedBlockerCount} unresolved). ` +
+        `Last updated ${hrs}h ago.`,
+      '',
+      'Confirmed against per-issue `blockedBy` (the company list endpoint does not return it — AUR-4664). ' +
+        'Every wake the fleet queues for this issue is burned as a skip until the blocker moves (AUR-4149 burned ' +
+        '465 wakes this way with nothing filed).',
+      '',
+      `Please drive the blocker: start or reassign it, re-route it to a live lane, or remove the stale relation ` +
+        `if it no longer applies.`,
+      '',
+      'exec.routing-rationale: skip',
+    ].join('\n');
+  }
   if (grade === 'human-gated') {
     return [
       `## Blocked issue reads as human-gated, but is mis-modelled`,
@@ -178,14 +252,25 @@ export function buildFlagDescription(issue, grade) {
 
 /**
  * Returns a cancel reason string if an open flag should be auto-resolved, or
- * null if it is still valid and should remain open.
- * @param {{ target: object|null, targetId: string }} opts
+ * null if it is still valid and should remain open. `kind` distinguishes the
+ * no-blocker classes (flag stays open only while the target is `blocked` with
+ * no blocker) from the AUR-4664 chain class (flag stays open only while the
+ * target is scheduler-gated with an unworked blocker) — running the
+ * no-blocker rules against a chain flag would insta-cancel it, since chain
+ * targets are never status `blocked`.
+ * @param {{ target: object|null, targetId: string, kind?: 'no-blocker'|'chain' }} opts
  */
-export function resolveCancelReason({ target, targetId }) {
+export function resolveCancelReason({ target, targetId, kind = 'no-blocker' }) {
   if (!target || ['done', 'cancelled'].includes(target.status)) {
     return target
       ? `Auto-resolved by stalled-blocked-watchdog: ${targetId} is ${target.status}.`
       : `Auto-resolved by stalled-blocked-watchdog: ${targetId} not found among open issues.`;
+  }
+  if (kind === 'chain') {
+    if (!isSchedulerGatedStalled(target)) {
+      return `Auto-resolved by stalled-blocked-watchdog: ${targetId} is no longer scheduler-gated with an unworked blocker (status=${target.status}, blockerAttention.state=${target.blockerAttention?.state ?? 'absent'}).`;
+    }
+    return null;
   }
   if (target.status !== 'blocked') {
     return `Auto-resolved by stalled-blocked-watchdog: ${targetId} is no longer \`blocked\` (now \`${target.status}\`).`;
@@ -295,6 +380,31 @@ export async function main({ apply, apiUrl, apiKey, companyId }) {
   const candidates = blockedIssues.filter(hasNoBlocker);
   const graded = candidates.map((issue) => ({ issue, grade: gradeBlockedIssue(issue) }));
 
+  // ── AUR-4664 chain class: scheduler-gated issues with an unworked blocker ──
+  // The list endpoint's blockerAttention is the cheap prefilter; every
+  // candidate is then confirmed against per-issue `blockedBy` (which the list
+  // endpoint does NOT return) so a blockerAttention regression produces a
+  // loud contradiction, never a false flag. Filing on the field alone would
+  // rebuild this watchdog on the exact surface AUR-4664 proved unreliable.
+  const chainPrefilter = allIssues.filter(isSchedulerGatedStalled);
+  const chainCandidates = [];
+  const chainContradictions = [];
+  for (const issue of chainPrefilter) {
+    let detail;
+    try {
+      detail = await apiGet(`/api/issues/${issue.id}`);
+    } catch (err) {
+      console.error(`    WARN: could not confirm ${issue.identifier} via per-issue GET — skipping (${err.message})`);
+      continue;
+    }
+    const openBlockers = (detail.blockedBy ?? []).filter((b) => b.status !== 'done');
+    if (openBlockers.length > 0) {
+      chainCandidates.push({ issue, openBlockers });
+    } else {
+      chainContradictions.push(issue);
+    }
+  }
+
   // A human-gated candidate that already carries a pending first-class
   // interaction is NOT mis-modelled — the "nothing attached" premise in
   // buildFlagDescription's human-gated branch would be false for it. Check
@@ -321,6 +431,17 @@ export async function main({ apply, apiUrl, apiKey, companyId }) {
   awaitingHuman.forEach(({ issue }) => {
     console.log(`    - ${issue.identifier} [${issue.priority}] already has a pending interaction — not filing.`);
   });
+  console.log(`\n  CHAIN — scheduler-gated with an unworked blocker (${chainCandidates.length}):`);
+  chainCandidates.forEach(({ issue, openBlockers }) => {
+    const blockers = openBlockers.map((b) => `${b.identifier ?? b.id}:${b.status}`).join(', ');
+    console.log(`    - ${issue.identifier} [${issue.priority}] status=${issue.status} blockedBy=[${blockers}] attention=${issue.blockerAttention?.state}/${issue.blockerAttention?.unresolvedBlockerCount}`);
+  });
+  if (chainContradictions.length > 0) {
+    console.log(`\n  CONTRADICTION — blockerAttention says gated, per-issue blockedBy says ready (${chainContradictions.length}):`);
+    chainContradictions.forEach((issue) => {
+      console.log(`    - ${issue.identifier} attention=${issue.blockerAttention?.state}/${issue.blockerAttention?.unresolvedBlockerCount} but no open blockedBy row — blockerAttention has regressed (AUR-4664 class), NOT filing`);
+    });
+  }
   console.log();
 
   const failedMutations = [];
@@ -336,7 +457,8 @@ export async function main({ apply, apiUrl, apiKey, companyId }) {
     if (!match) continue;
     const targetId = match[1];
     const target = issueByIdentifier.get(targetId) ?? null;
-    const reason = resolveCancelReason({ target, targetId });
+    const kind = isChainFlagTitle(flag.title) ? 'chain' : 'no-blocker';
+    const reason = resolveCancelReason({ target, targetId, kind });
     if (reason) {
       toCancel.push({ flag, targetId, reason });
     } else {
@@ -366,8 +488,18 @@ export async function main({ apply, apiUrl, apiKey, companyId }) {
 
   // ── Phase B: detect + file ───────────────────────────────────────────────────
   console.log('── Phase B: Detect and file new flags ──');
-  const toFile = graded.filter(({ issue, pendingInteraction }) => !openFlagTargets.has(issue.identifier) && !pendingInteraction);
-  const skippedDedup = graded.filter(({ issue, pendingInteraction }) => openFlagTargets.has(issue.identifier) && !pendingInteraction);
+  const chainToFile = chainCandidates.filter(({ issue }) => !openFlagTargets.has(issue.identifier));
+  const chainSkippedDedup = chainCandidates.filter(({ issue }) => openFlagTargets.has(issue.identifier));
+  const toFile = [
+    ...graded
+      .filter(({ issue, pendingInteraction }) => !openFlagTargets.has(issue.identifier) && !pendingInteraction)
+      .map(({ issue, grade }) => ({ issue, grade, openBlockers: [] })),
+    ...chainToFile.map(({ issue, openBlockers }) => ({ issue, grade: 'chain', openBlockers })),
+  ];
+  const skippedDedup = [
+    ...graded.filter(({ issue, pendingInteraction }) => openFlagTargets.has(issue.identifier) && !pendingInteraction),
+    ...chainSkippedDedup,
+  ];
 
   if (skippedDedup.length > 0) {
     console.log(`  SKIPPED-DEDUP — open flag exists (${skippedDedup.length}):`);
@@ -378,7 +510,7 @@ export async function main({ apply, apiUrl, apiKey, companyId }) {
   if (toFile.length === 0) {
     console.log('  No new flags to file.\n');
   } else {
-    for (const { issue, grade } of toFile) {
+    for (const { issue, grade, openBlockers } of toFile) {
       const id = issue.identifier ?? issue.id;
       const owner = resolveFlagOwner(issue);
       const title = flagTitle(id, grade);
@@ -388,7 +520,7 @@ export async function main({ apply, apiUrl, apiKey, companyId }) {
           `file flag for ${id}`,
           () => apiPost(`/api/companies/${companyId}/issues`, {
             title,
-            description: buildFlagDescription(issue, grade),
+            description: buildFlagDescription(issue, grade, openBlockers),
             status: 'todo',
             priority: grade === 'human-gated' ? 'low' : issue.priority,
             assigneeAgentId: owner,
@@ -402,8 +534,9 @@ export async function main({ apply, apiUrl, apiKey, companyId }) {
   }
 
   console.log('── Summary ──');
-  console.log(`  Candidates:      ${candidates.length} (stalled=${graded.filter((g) => g.grade === 'stalled').length}, human-gated=${graded.filter((g) => g.grade === 'human-gated').length})`);
+  console.log(`  Candidates:      ${candidates.length} (stalled=${graded.filter((g) => g.grade === 'stalled').length}, human-gated=${graded.filter((g) => g.grade === 'human-gated').length}) + chain=${chainCandidates.length}`);
   console.log(`  Awaiting-human:  ${awaitingHuman.length} (correctly modelled, not filed)`);
+  console.log(`  Contradictions:  ${chainContradictions.length} (blockerAttention vs blockedBy — investigate, not filed)`);
   console.log(`  Resolved:        ${toCancel.length}`);
   console.log(`  Filed:           ${toFile.length}`);
   console.log(`  Skipped-dedup:   ${skippedDedup.length}`);

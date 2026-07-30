@@ -1190,10 +1190,27 @@ async function listIssueBlockerAttentionMap(
   companyId: string,
   issueRows: IssueBlockerAttentionInputNode[],
 ): Promise<Map<string, IssueBlockerAttention>> {
-  const roots = issueRows.filter((row) => row.companyId === companyId && row.status === "blocked");
+  const companyRows = issueRows.filter((row) => row.companyId === companyId);
+  // Scheduler parity (AUR-4664): the scheduler's dependency gate reads
+  // listIssueDependencyReadinessMap — the same map consulted here — and it
+  // ignores the dependent's own status, so a todo issue with an unresolved
+  // explicit blocker is refused execution (issue_dependencies_blocked) exactly
+  // like a blocked one. Rooting this walk on status === "blocked" alone left
+  // every such issue reporting none/0 while the scheduler skipped it hundreds
+  // of times (AUR-4149: 465 skips). Any row the scheduler would skip must walk
+  // the graph and report a non-none state.
+  const readinessMap = await listIssueDependencyReadinessMap(
+    dbOrTx,
+    companyId,
+    companyRows.map((row) => row.id),
+  );
+  const roots = companyRows.filter(
+    (row) => row.status === "blocked" || readinessMap.get(row.id)?.isDependencyReady === false,
+  );
+  const rootIds = new Set(roots.map((root) => root.id));
   const attentionMap = new Map<string, IssueBlockerAttention>();
   for (const row of issueRows) {
-    if (row.status !== "blocked") {
+    if (!rootIds.has(row.id) && row.status !== "blocked") {
       attentionMap.set(row.id, createIssueBlockerAttention());
     }
   }
@@ -1534,7 +1551,17 @@ async function listIssueBlockerAttentionMap(
 
   for (const root of roots) {
     const allTopLevelEdges = edgesByIssueId.get(root.id) ?? [];
-    const topLevelEdges = allTopLevelEdges.filter((edge) => !isBlockerAttentionEdgeResolved(edge, nodesById));
+    // A status="blocked" root keeps the historical top-level set: explicit
+    // relations plus structural children, resolved per
+    // isBlockerAttentionEdgeResolved. Any other root is only here because the
+    // scheduler's dependency gate refuses to run it, and that gate counts
+    // explicit `blocks` relations resolved by "done" alone — including a todo
+    // parent's own subtasks here would report it blocked by work the scheduler
+    // never gates on.
+    const schedulerUnresolved = new Set(readinessMap.get(root.id)?.unresolvedBlockerIssueIds ?? []);
+    const topLevelEdges = root.status === "blocked"
+      ? allTopLevelEdges.filter((edge) => !isBlockerAttentionEdgeResolved(edge, nodesById))
+      : allTopLevelEdges.filter((edge) => schedulerUnresolved.has(edge.blockerIssueId));
     if (topLevelEdges.length === 0) {
       // A "blocked" root with no live blocker edge needs attention regardless of how it
       // got there: no recorded blocker at all (the pre-existing anomalous case), all
@@ -1543,7 +1570,10 @@ async function listIssueBlockerAttentionMap(
       // "had a done blocker" from "never had one" without spending the node budget on
       // resolved rows — and we must not treat cancelled as more resolving than done
       // (CTO review on PR #112, AUR-3959): same operator signal either way, one state.
-      attentionMap.set(root.id, createIssueBlockerAttention({ state: "needs_attention", reason: "attention_required" }));
+      // The reason is distinct from attention_required so consumers can tell "status
+      // says blocked but nothing is recorded as blocking it" apart from "a real blocker
+      // needs attention" without re-deriving it from blockedBy (AUR-4664, CEO sweep).
+      attentionMap.set(root.id, createIssueBlockerAttention({ state: "needs_attention", reason: "no_blocker_recorded" }));
       continue;
     }
 

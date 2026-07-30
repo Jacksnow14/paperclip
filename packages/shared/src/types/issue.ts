@@ -149,8 +149,22 @@ export type IssueBlockerAttentionReason =
   | "stalled_review"
   | "attention_required"
   | "cancelled_blocker"
+  // status="blocked" with no live blocker edge at all (AUR-4105 drift class) —
+  // distinct from attention_required, which means a real blocker exists and
+  // needs attention (AUR-4664: consumers could not tell these apart).
+  | "no_blocker_recorded"
   | null;
 
+// Scheduler-parity guarantee (AUR-4664): the state is non-"none" for exactly
+// the issues the scheduler would skip as issue_dependencies_blocked (an
+// unresolved explicit `blocks` relation, i.e. blocker status !== "done"),
+// regardless of the issue's own status, plus any status="blocked" issue. Both
+// surfaces read the same predicate (listIssueDependencyReadinessMap). Before
+// AUR-4664 the field was computed ONLY for status="blocked" issues and
+// silently reported none/0 for scheduler-skipped todo/in_progress issues — a
+// consumer that may run against a pre-AUR-4664 server must join per-issue
+// `blockedBy` (the company list endpoint does not return it) rather than
+// trusting this field alone.
 export interface IssueBlockerAttention {
   state: IssueBlockerAttentionState;
   reason: IssueBlockerAttentionReason;

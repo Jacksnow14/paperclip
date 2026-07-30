@@ -7,6 +7,8 @@ import {
   hoursSince,
   FLAG_REGEX,
   flagTitle,
+  isChainFlagTitle,
+  isSchedulerGatedStalled,
   resolveCancelReason,
   resolveFlagOwner,
   hasPendingInteractionInList,
@@ -42,6 +44,54 @@ test('hasNoBlocker: false when blockerAttention is absent', () => {
 test('hasNoBlocker: false for state "stalled" (a blocker chain is itself stalled, not "no blocker")', () => {
   assert.equal(hasNoBlocker({
     blockerAttention: { state: 'stalled', unresolvedBlockerCount: 1 },
+  }), false);
+});
+
+// ── isSchedulerGatedStalled (AUR-4664 chain class) ────────────────────────────
+
+test('isSchedulerGatedStalled: FIRES on the AUR-4149 shape — todo with an unworked unresolved blocker', () => {
+  assert.equal(isSchedulerGatedStalled({
+    status: 'todo',
+    blockerAttention: { state: 'needs_attention', unresolvedBlockerCount: 1, attentionBlockerCount: 1 },
+  }), true);
+});
+
+test('isSchedulerGatedStalled: FIRES on a stalled-review chain for an in_progress dependent', () => {
+  assert.equal(isSchedulerGatedStalled({
+    status: 'in_progress',
+    blockerAttention: { state: 'stalled', unresolvedBlockerCount: 1, stalledBlockerCount: 1 },
+  }), true);
+});
+
+test('isSchedulerGatedStalled: PASSES a genuinely-unblocked todo issue (state none, zero unresolved)', () => {
+  assert.equal(isSchedulerGatedStalled({
+    status: 'todo',
+    blockerAttention: { state: 'none', unresolvedBlockerCount: 0 },
+  }), false);
+});
+
+test('isSchedulerGatedStalled: PASSES a covered chain — someone is working the blocker (AUR-4187 shape)', () => {
+  assert.equal(isSchedulerGatedStalled({
+    status: 'todo',
+    blockerAttention: { state: 'covered', reason: 'active_dependency', unresolvedBlockerCount: 1, coveredBlockerCount: 1 },
+  }), false);
+});
+
+test('isSchedulerGatedStalled: PASSES blocked-status issues — that is the hasNoBlocker/stalled/human-gated domain', () => {
+  assert.equal(isSchedulerGatedStalled({
+    status: 'blocked',
+    blockerAttention: { state: 'needs_attention', unresolvedBlockerCount: 1 },
+  }), false);
+});
+
+test('isSchedulerGatedStalled: PASSES when blockerAttention is absent (pre-AUR-4664 server — fail-quiet)', () => {
+  assert.equal(isSchedulerGatedStalled({ status: 'todo' }), false);
+});
+
+test('isSchedulerGatedStalled: PASSES needs_attention with zero unresolved — that is the no-blocker anomaly, not a chain', () => {
+  assert.equal(isSchedulerGatedStalled({
+    status: 'todo',
+    blockerAttention: { state: 'needs_attention', unresolvedBlockerCount: 0 },
   }), false);
 });
 
@@ -114,6 +164,20 @@ test('FLAG_REGEX: does not match unrelated titles', () => {
   assert.equal(FLAG_REGEX.test('Refactor the widget factory'), false);
 });
 
+test('flagTitle + FLAG_REGEX: chain title round-trips the target identifier (AUR-4664)', () => {
+  const title = flagTitle('AUR-4149', 'chain');
+  assert.match(title, /^stalled-blocked-chain:/);
+  const match = FLAG_REGEX.exec(title);
+  assert.ok(match);
+  assert.equal(match[1], 'AUR-4149');
+});
+
+test('isChainFlagTitle: discriminates chain flags from both no-blocker flag formats', () => {
+  assert.equal(isChainFlagTitle(flagTitle('AUR-4149', 'chain')), true);
+  assert.equal(isChainFlagTitle(flagTitle('AUR-3347', 'stalled')), false);
+  assert.equal(isChainFlagTitle(flagTitle('AUR-3945', 'human-gated')), false);
+});
+
 // ── resolveCancelReason (Phase A auto-resolve) ───────────────────────────────
 
 test('resolveCancelReason: null (stays open) when target is still blocked with no blocker', () => {
@@ -148,6 +212,37 @@ test('resolveCancelReason: cancels when target now has a real blocker attached',
   const target = { status: 'blocked', blockerAttention: { state: 'covered', unresolvedBlockerCount: 1 } };
   const reason = resolveCancelReason({ target, targetId: 'AUR-4032' });
   assert.match(reason, /now has a real blocker/);
+});
+
+test('resolveCancelReason (chain): null (stays open) while the target is still scheduler-gated with an unworked blocker', () => {
+  const target = { status: 'todo', blockerAttention: { state: 'needs_attention', unresolvedBlockerCount: 1 } };
+  assert.equal(resolveCancelReason({ target, targetId: 'AUR-4149', kind: 'chain' }), null);
+});
+
+test('resolveCancelReason (chain): does NOT insta-cancel because the target is not status blocked (AUR-4664 regression trap)', () => {
+  // The no-blocker rules cancel any non-`blocked` target; chain targets are
+  // never `blocked`, so running those rules against a chain flag kills it on
+  // the next sweep. The kind switch exists to prevent exactly that.
+  const target = { status: 'todo', blockerAttention: { state: 'needs_attention', unresolvedBlockerCount: 1 } };
+  assert.notEqual(resolveCancelReason({ target, targetId: 'AUR-4149' }), null);
+  assert.equal(resolveCancelReason({ target, targetId: 'AUR-4149', kind: 'chain' }), null);
+});
+
+test('resolveCancelReason (chain): cancels once the chain is covered — someone started the blocker', () => {
+  const target = { status: 'todo', blockerAttention: { state: 'covered', unresolvedBlockerCount: 1, coveredBlockerCount: 1 } };
+  const reason = resolveCancelReason({ target, targetId: 'AUR-4149', kind: 'chain' });
+  assert.match(reason, /no longer scheduler-gated/);
+});
+
+test('resolveCancelReason (chain): cancels once the blocker resolves entirely', () => {
+  const target = { status: 'todo', blockerAttention: { state: 'none', unresolvedBlockerCount: 0 } };
+  const reason = resolveCancelReason({ target, targetId: 'AUR-4149', kind: 'chain' });
+  assert.match(reason, /no longer scheduler-gated/);
+});
+
+test('resolveCancelReason (chain): cancels when the target is done', () => {
+  const reason = resolveCancelReason({ target: { status: 'done' }, targetId: 'AUR-4149', kind: 'chain' });
+  assert.match(reason, /is done/);
 });
 
 // ── hasPendingInteractionInList (AUR-4275) ───────────────────────────────────

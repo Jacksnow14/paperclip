@@ -1573,7 +1573,14 @@ async function resolveSpawnTarget(
 
   if (process.platform !== "win32") {
     const memoryCeilingMb = options.memoryCeilingMb;
-    if (typeof memoryCeilingMb === "number" && memoryCeilingMb > 0) {
+    // Only ceiling a command that actually resolved. For a missing
+    // executable, systemd-run itself spawns fine and reports the missing
+    // target as a non-zero exit with a stderr line — which would reclassify
+    // spawn failures (ENOENT → "Failed to start command") as command
+    // failures for every runChildProcess caller that discriminates the two
+    // (e.g. opencode model discovery). A command that cannot be found
+    // cannot exceed a memory ceiling.
+    if (resolved != null && typeof memoryCeilingMb === "number" && memoryCeilingMb > 0) {
       const wrapped = await wrapWithMemoryCeiling(executable, args, env, memoryCeilingMb);
       if (wrapped) return wrapped;
       if (!warnedMemoryCeilingUnavailable) {

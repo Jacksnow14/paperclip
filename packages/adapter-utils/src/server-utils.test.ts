@@ -1454,6 +1454,23 @@ describe.skipIf(!hasUserSystemdScopes)("runChildProcess memory ceiling wiring (A
     expect(seen.swapMax).toBe("0");
   }, 30_000);
 
+  it("a missing executable still fails as a spawn error, not a systemd-run exit", async () => {
+    // systemd-run spawns fine for a nonexistent target and reports it as a
+    // non-zero exit + stderr line. Callers discriminate spawn failures from
+    // command failures (opencode model discovery relies on the ENOENT
+    // classification), so the ceiling must not wrap an unresolvable command.
+    await expect(
+      runChildProcess(randomUUID(), "__paperclip_missing_command_aur4536__", [], {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 10,
+        graceSec: 1,
+        onLog: async () => {},
+        memoryCeilingMb: 128,
+      }),
+    ).rejects.toThrow("Failed to start command");
+  }, 30_000);
+
   it("mutation control: memoryCeilingMb null leaves the child unceilinged", async () => {
     const seen = await runPrintingCgroup(null);
     expect(seen.path).not.toMatch(TRANSIENT_RUN_SCOPE);

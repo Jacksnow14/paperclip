@@ -42,6 +42,7 @@ import { accessRoutes } from "./routes/access.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import { adapterRoutes } from "./routes/adapters.js";
 import { gmailRoutes } from "./routes/gmail.js";
+import { workspaceBillingRoutes } from "./routes/workspace-billing.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { applyUiBranding } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
@@ -215,6 +216,7 @@ export async function createApp(
   api.use(inboxDismissalRoutes(db));
   api.use(instanceSettingsRoutes(db));
   api.use(gmailRoutes(db));
+  api.use(workspaceBillingRoutes(db));
   // Startup capability check — warn loudly so deploy logs surface misconfiguration early.
   if (!process.env.GOOGLE_WORKSPACE_SA_KEY) {
     logger.warn("GOOGLE_WORKSPACE_SA_KEY not set — Gmail API capability disabled (routes mounted, calls will return 422); intake poller will not start");

@@ -76,6 +76,7 @@ import {
 } from "./issue-tree-control.js";
 import { parseIssueGraphLivenessIncidentKey } from "./recovery/origins.js";
 import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
+import { recoveryActionDormancyCutoff } from "./issue-recovery-actions.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -1411,6 +1412,7 @@ async function listIssueBlockerAttentionMap(
           eq(issueRecoveryActions.companyId, companyId),
           inArray(issueRecoveryActions.status, ["active", "escalated"]),
           inArray(issueRecoveryActions.sourceIssueId, explicitWaitCandidateIds),
+          gt(issueRecoveryActions.lastAttemptAt, recoveryActionDormancyCutoff()),
         ),
       );
     for (const row of recoveryActionRows) activeRecoveryWaitIssueIds.add(row.sourceIssueId);

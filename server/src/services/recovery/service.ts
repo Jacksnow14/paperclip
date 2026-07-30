@@ -33,7 +33,7 @@ import { redactSensitiveText } from "../../redaction.js";
 import { logActivity } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
-import { issueRecoveryActionService } from "../issue-recovery-actions.js";
+import { issueRecoveryActionService, recoveryActionDormancyCutoff } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { issueService } from "../issues.js";
 import { getRunLogStore } from "../run-log-store.js";
@@ -2429,6 +2429,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               and(
                 inArray(issueRecoveryActions.status, ["active", "escalated"]),
                 inArray(issueRecoveryActions.sourceIssueId, issueIdsUnderAnalysis),
+                gt(issueRecoveryActions.lastAttemptAt, recoveryActionDormancyCutoff()),
               ),
             );
       }),
@@ -2941,6 +2942,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         and(
           inArray(issueRecoveryActions.sourceIssueId, [...new Set(sourceIssueIds)]),
           inArray(issueRecoveryActions.status, ["active", "escalated"]),
+          gt(issueRecoveryActions.lastAttemptAt, recoveryActionDormancyCutoff()),
         ),
       )
       .orderBy(desc(issueRecoveryActions.updatedAt));

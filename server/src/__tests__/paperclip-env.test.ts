@@ -1,3 +1,7 @@
+import { execSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildPaperclipEnv } from "../adapters/utils.js";
 
@@ -187,6 +191,46 @@ describe("buildPaperclipEnv", () => {
       const env = buildPaperclipEnv({ id: "abc12345-0000-0000-0000-000000000000", companyId: "company-1", name: "Böö & Co. (v2)" });
 
       expect(env.GIT_AUTHOR_EMAIL).toBe("b-co-v2-abc12345@agents.paperclip.local");
+    });
+
+    it("a commit made with the injected env carries the agent identity, beating repo config", () => {
+      const repo = mkdtempSync(join(tmpdir(), "git-identity-"));
+      try {
+        const run = (args: string, env: NodeJS.ProcessEnv) =>
+          execSync(`git ${args}`, { cwd: repo, env }).toString();
+
+        run("init -q .", process.env);
+        // control must reproduce the defect: a conflicting repo-level identity
+        run("config user.name 'Paperclip CTO'", process.env);
+        run("config user.email 'cto@tryauranode.com'", process.env);
+
+        // control commit: no GIT_* env at all, so it must fall back to repo config
+        run(`commit -q --allow-empty -m control`, process.env);
+
+        const envA = buildPaperclipEnv({
+          id: "38c3252d-ef90-48e9-8969-5c2a7d337e54",
+          companyId: "company-1",
+          name: "Claude Code Fast",
+        });
+        run(`commit -q --allow-empty -m agent-a`, { ...process.env, ...envA });
+
+        const envB = buildPaperclipEnv({
+          id: "e8f947d2-761e-44b2-b576-3dbcc85b24bf",
+          companyId: "company-1",
+          name: "Claude Code Max",
+        });
+        run(`commit -q --allow-empty -m agent-b`, { ...process.env, ...envB });
+
+        const log = run(`log "--format=%an <%ae>"`, process.env).trim().split("\n");
+
+        expect(log).toHaveLength(3);
+        expect(new Set(log).size).toBe(3); // three distinct identities: control + agent A + agent B
+        expect(log.some((l) => l.includes("Paperclip CTO"))).toBe(true); // control reproduces the shared-identity defect
+        expect(log).toContain(`${envA.GIT_AUTHOR_NAME} <${envA.GIT_AUTHOR_EMAIL}>`);
+        expect(log).toContain(`${envB.GIT_AUTHOR_NAME} <${envB.GIT_AUTHOR_EMAIL}>`);
+      } finally {
+        rmSync(repo, { recursive: true, force: true });
+      }
     });
   });
 });

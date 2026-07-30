@@ -162,6 +162,7 @@ run_tick() { # extra env as KEY=VAL args
     PAPERCLIP_DEPLOY_RUN_COUNTS_CMD="cat $COUNTS" \
     PAPERCLIP_DEPLOY_MEM_FLOOR_MB=0 \
     PAPERCLIP_DEPLOY_SUDO= \
+    PAPERCLIP_DEPLOY_RM="rm -rf" \
     PAPERCLIP_DEPLOY_QUIESCE_INTERVAL_SEC=1 \
     PAPERCLIP_DEPLOY_HEALTH_TIMEOUT_SEC=6 \
     PAPERCLIP_DEPLOY_HEALTH_POLL_SEC=1 \
@@ -318,11 +319,14 @@ mv "$TMP/parked-$G12" "$APP/releases/$G12"
 # ================================================================================
 # H. Build backoff: 3 failed builds of one sha -> quarantine + SEV2, and the
 #    4th tick does NOT try again (no 3GB build attempt every 10 min forever).
-point_current "$SHA_G"; set_master "$SHA_N"; : > "$ALERTS"; rm -f "$BUILD_LOG"
+#    The sha must have NO complete release on disk: one that does is armed by
+#    the flip-only resume path without any build (asserted in I1).
+SHA_H=$(fixture_commit "never built release")
+point_current "$SHA_G"; set_master "$SHA_H"; : > "$ALERTS"; rm -f "$BUILD_LOG"
 rm -f "$STATE_DIR/auto-deploy.quarantine" "$STATE_DIR/auto-deploy.build-failures"
 for i in 1 2 3 4; do run_tick; done
 builds=$(wc -l < "$BUILD_LOG" 2>/dev/null || echo 0)
-if [[ "$builds" == "3" ]] && grep -q "^$SHA_N auto-arm-build-failed" "$STATE_DIR/auto-deploy.quarantine"; then
+if [[ "$builds" == "3" ]] && grep -q "^$SHA_H auto-arm-build-failed" "$STATE_DIR/auto-deploy.quarantine"; then
   ok "H: 3 failed builds quarantine the sha; tick 4 does not rebuild"
 else
   fail "H: 3 failed builds quarantine the sha; tick 4 does not rebuild" "builds=$builds quarantine=$(cat "$STATE_DIR/auto-deploy.quarantine" 2>/dev/null)"
@@ -330,6 +334,94 @@ fi
 grep -q "auto-arm-build-failed" "$ALERTS" \
   && ok "H: build quarantine escalated SEV2" \
   || fail "H: build quarantine escalated SEV2" "alerts=$(cat "$ALERTS")"
+
+# ================================================================================
+# I. Arm goes through the safety wrapper (AUR-4155/AUR-4029 world) and the flip
+#    is auto-deploy's own.
+# I1: a COMPLETE release already on disk (build-info.json sha matches) is
+#     flipped without invoking the build wrapper at all, and stays dark.
+rm -f "$STATE_DIR/auto-deploy.quarantine" "$STATE_DIR/auto-deploy.build-failures"
+point_current "$SHA_G"; set_master "$SHA_N"; rm -f "$BUILD_LOG"; set_counts 0 0
+ts0=$(unit_start_ts)
+run_tick; rc=$?
+if [[ "$(readlink "$APP/current")" == "releases/$N12" && ! -s "$BUILD_LOG" \
+      && "$(unit_start_ts)" == "$ts0" && "$rc" == 0 ]]; then
+  ok "I1: complete release on disk is flipped without a rebuild, no restart (dark)"
+else
+  fail "I1: complete release on disk is flipped without a rebuild, no restart (dark)" \
+    "rc=$rc current=$(readlink "$APP/current") build_log=$(cat "$BUILD_LOG" 2>/dev/null)"
+fi
+
+# I2: no release on disk -> build wrapper invoked with --build-only (NEVER
+#     --activate: that is refused since AUR-4155), then auto-deploy flips.
+SHA_I=$(fixture_commit "built via wrapper"); I12=${SHA_I:0:12}
+cat > "$BUILD" <<STUB
+#!/usr/bin/env bash
+printf 'build %s\n' "\$*" >> "$BUILD_LOG"
+sha=""
+while [[ \$# -gt 0 ]]; do case "\$1" in --ref) sha="\$2"; shift 2 ;; *) shift ;; esac; done
+d="$APP/releases/\${sha:0:12}"
+mkdir -p "\$d"
+cp "$APP/releases/$G12/serve.py" "$APP/releases/$G12/run.sh" "\$d/" 2>/dev/null
+printf '{"sha":"%s"}' "\$sha" > "\$d/build-info.json"
+STUB
+set_master "$SHA_I"
+ts0=$(unit_start_ts)
+run_tick; rc=$?
+if grep -q -- "--ref $SHA_I --build-only" "$BUILD_LOG" && ! grep -q -- "--activate" "$BUILD_LOG" \
+   && [[ "$(readlink "$APP/current")" == "releases/$I12" && "$(unit_start_ts)" == "$ts0" && "$rc" == 0 ]]; then
+  ok "I2: build via wrapper --build-only, flip is auto-deploy's own, still dark"
+else
+  fail "I2: build via wrapper --build-only, flip is auto-deploy's own, still dark" \
+    "rc=$rc current=$(readlink "$APP/current") build_log=$(cat "$BUILD_LOG" 2>/dev/null)"
+fi
+
+# I3: a preflight/watchdog refusal from the wrapper is a busy BOX, not a bad
+#     SHA: three refused ticks must not strike, quarantine, or page.
+SHA_J=$(fixture_commit "refused by preflight")
+cat > "$BUILD" <<STUB
+#!/usr/bin/env bash
+printf 'build %s\n' "\$*" >> "$BUILD_LOG"
+echo "FATAL: preflight did not clear within 60s: mem_avail 1900MB < floor 2500MB" >&2
+exit 1
+STUB
+set_master "$SHA_J"; : > "$ALERTS"; rm -f "$BUILD_LOG"
+for i in 1 2 3; do run_tick; done
+if ! grep -q "^$SHA_J " "$STATE_DIR/auto-deploy.quarantine" 2>/dev/null && [[ ! -s "$ALERTS" ]] \
+   && [[ "$(wc -l < "$BUILD_LOG")" == "3" ]]; then
+  ok "I3: preflight refusals retry every tick — no strikes, no quarantine, no SEV2"
+else
+  fail "I3: preflight refusals retry every tick — no strikes, no quarantine, no SEV2" \
+    "quarantine=$(cat "$STATE_DIR/auto-deploy.quarantine" 2>/dev/null) alerts=$(cat "$ALERTS" 2>/dev/null) builds=$(wc -l < "$BUILD_LOG" 2>/dev/null)"
+fi
+grep -q "arm skipped: safe-deploy preflight/watchdog refused" "$TMP/auto.log" \
+  && ok "I3: the skip is named in the log (not silently swallowed)" \
+  || fail "I3: the skip is named in the log (not silently swallowed)" "$(tail -5 "$TMP/auto.log" 2>/dev/null)"
+
+# I4: a PARTIAL release dir (no matching build-info.json — build died mid-way)
+#     is cleared under the AUR-4134 guard and rebuilt, then flipped.
+SHA_K=$(fixture_commit "partial then rebuilt"); K12=${SHA_K:0:12}
+mkdir -p "$APP/releases/$K12"
+touch "$APP/releases/$K12/half-written.tmp"
+cat > "$BUILD" <<STUB
+#!/usr/bin/env bash
+printf 'build %s\n' "\$*" >> "$BUILD_LOG"
+sha=""
+while [[ \$# -gt 0 ]]; do case "\$1" in --ref) sha="\$2"; shift 2 ;; *) shift ;; esac; done
+d="$APP/releases/\${sha:0:12}"
+mkdir -p "\$d"
+cp "$APP/releases/$G12/serve.py" "$APP/releases/$G12/run.sh" "\$d/" 2>/dev/null
+printf '{"sha":"%s"}' "\$sha" > "\$d/build-info.json"
+STUB
+set_master "$SHA_K"; rm -f "$BUILD_LOG"
+run_tick; rc=$?
+if [[ ! -e "$APP/releases/$K12/half-written.tmp" && "$(readlink "$APP/current")" == "releases/$K12" && "$rc" == 0 ]] \
+   && grep -q -- "--ref $SHA_K --build-only" "$BUILD_LOG"; then
+  ok "I4: partial release dir cleared (guarded) and rebuilt, then flipped"
+else
+  fail "I4: partial release dir cleared (guarded) and rebuilt, then flipped" \
+    "rc=$rc current=$(readlink "$APP/current") leftover=$(ls "$APP/releases/$K12" 2>/dev/null | tr '\n' ' ')"
+fi
 
 echo
 if [[ "$FAILURES" -eq 0 ]]; then

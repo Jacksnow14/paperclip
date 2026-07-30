@@ -20,11 +20,13 @@ systemctl --user enable --now paperclip-auto-deploy.timer
 
 # Bootstrap: the timer's ExecStart lives inside the ACTIVE release
 # (current/scripts/deploy/auto-deploy.sh). If the active release predates
-# AUR-4028, no tick can ever run — build master once, timed, to cross that
-# gap. Every subsequent arm is the timer's job, not a human's.
+# AUR-4028, no tick can ever run — run ONE tick from this checkout to cross
+# that gap (arm via safe-deploy --build-only + flip, with every guard; direct
+# build-release.sh --activate is refused since AUR-4155). Every subsequent arm
+# is the timer's job, not a human's.
 if [[ ! -x /opt/paperclip/app/current/scripts/deploy/auto-deploy.sh ]]; then
-  echo "==> bootstrap: active release predates auto-deploy.sh; building origin/master once (timed)"
-  time "$HERE/build-release.sh" --ref origin/master --activate
+  echo "==> bootstrap: active release predates auto-deploy.sh; running one auto-deploy tick from $HERE (timed)"
+  time "$HERE/auto-deploy.sh"
 fi
 
 echo "auto-deploy timer installed (user-level); state: /var/lib/paperclip/auto-deploy.state; log: /var/log/paperclip-auto-deploy.log"

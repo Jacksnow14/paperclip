@@ -2,10 +2,16 @@
 # AUR-4028: auto-deploy tick. One script, two stages, one lock.
 #
 #   Stage 1 (arm, enabled on landing): if origin/master moved past the activated
-#   release, build it via build-release.sh --activate. Symlink-only; restarts
-#   nothing. Guarded by a memory preflight (this box OOMs, see AUR-3924) and a
-#   3-strikes-per-SHA quarantine so a broken master tip cannot trigger a 3 GB
-#   build attempt every 10 minutes forever.
+#   release, build it via safe-deploy.sh --build-only (AUR-4029: preflight +
+#   cgroup-bounded, watchdogged build — an unattended 10-minute builder is
+#   exactly the caller that must not run an unbounded 3.6 GB compile), then
+#   atomically flip `current` here. Restarts nothing. Direct
+#   build-release.sh --activate is refused since AUR-4155; the flip idiom below
+#   is the same one safe-deploy.sh uses. Guarded by a memory preflight
+#   (this box OOMs, see AUR-3924) and a 3-strikes-per-SHA quarantine so a
+#   broken master tip cannot trigger a 3 GB build attempt every 10 minutes
+#   forever. A safe-deploy PREFLIGHT/WATCHDOG refusal is a busy box, not a bad
+#   SHA: it is never counted as a strike, only retried next tick.
 #
 #   Stage 2 (make it live, DISABLED by default: PAPERCLIP_AUTO_RESTART_ENABLED=0):
 #   when the running SHA differs from the activated SHA, wait for quiescence
@@ -32,6 +38,11 @@ set -uo pipefail
 
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 
+# AUR-4134 deletion guard (assert_deletable + PAPERCLIP_DEPLOY_RM): the only
+# sanctioned way to remove a release directory. Sourceable, no side effects.
+# shellcheck source=scripts/deploy/release-guard.sh
+source "$HERE/release-guard.sh"
+
 APP_ROOT=${PAPERCLIP_DEPLOY_APP_ROOT:-/opt/paperclip/app}
 REMOTE=${PAPERCLIP_DEPLOY_REMOTE:-https://github.com/Jacksnow14/paperclip.git}
 HEALTH_URL=${PAPERCLIP_HEALTH_URL:-http://127.0.0.1:3100/api/health}
@@ -40,7 +51,10 @@ STATE_DIR=${PAPERCLIP_DEPLOY_STATE_DIR:-/var/lib/paperclip}
 LOCK_FILE=${PAPERCLIP_DEPLOY_LOCK_FILE:-/var/lock/paperclip-deploy.lock}
 LOG_FILE=${PAPERCLIP_AUTO_DEPLOY_LOG:-/var/log/paperclip-auto-deploy.log}
 NOTIFY=${PAPERCLIP_DEPLOY_NOTIFY:-/home/ievgen/bot/notify_founder.sh}
-BUILD_CMD=${PAPERCLIP_DEPLOY_BUILD_CMD:-$HERE/build-release.sh}
+BUILD_CMD=${PAPERCLIP_DEPLOY_BUILD_CMD:-$HERE/safe-deploy.sh}
+# How long a tick lets safe-deploy's preflight wait for a quiet box. Short on
+# purpose: a refused tick is a no-strike skip and the timer retries in 10 min.
+ARM_PREFLIGHT_WAIT=${PAPERCLIP_DEPLOY_ARM_PREFLIGHT_WAIT_SEC:-60}
 RUN_COUNTS_CMD=${PAPERCLIP_DEPLOY_RUN_COUNTS_CMD:-${PAPERCLIP_DEPLOY_NODE:-/usr/bin/node} $HERE/query-active-runs.mjs}
 MEM_FLOOR_MB=${PAPERCLIP_DEPLOY_MEM_FLOOR_MB:-2500}
 RESTART_ENABLED=${PAPERCLIP_AUTO_RESTART_ENABLED:-0}
@@ -57,6 +71,7 @@ STATE_FILE=$STATE_DIR/auto-deploy.state
 QUAR_FILE=$STATE_DIR/auto-deploy.quarantine
 FAIL_FILE=$STATE_DIR/auto-deploy.build-failures
 HALT_FILE=$STATE_DIR/auto-deploy.halt
+BUILD_OUT=$STATE_DIR/auto-deploy.last-build.out
 
 log() {
   local line
@@ -232,29 +247,81 @@ else
     write_state
     log "arm skipped: $NOTE"
   else
-    PHASE=building ARMED_SHA=$master_sha NOTE=-
-    write_state
-    log "arming $master_sha (activated=$activated_sha, MemAvailable=${mem_avail_mb}MB)"
-    build_args=(--ref origin/master --activate)
-    # A leftover release dir for this sha (e.g. a build that died after the
-    # clone) blocks a plain rebuild; --force clears it.
-    [[ -e "$APP_ROOT/releases/${master_sha:0:12}" ]] && build_args+=(--force)
-    t0=$(date +%s)
-    if $BUILD_CMD "${build_args[@]}" >> "$LOG_FILE" 2>&1; then
-      t1=$(date +%s)
-      set_fail_count "$master_sha" 0
-      activated_sha=$(read_activated_sha)
-      log "armed $activated_sha in $(( t1 - t0 ))s (build wall time)"
+    rel12=${master_sha:0:12}
+    release_dir="$APP_ROOT/releases/$rel12"
+    built_sha=$(python3 -c "import json; print(json.load(open('$release_dir/build-info.json'))['sha'])" 2>/dev/null || echo none)
+    arm_built=0 arm_blocked=0
+    if [[ "$built_sha" == "$master_sha" ]]; then
+      # build-release.sh writes build-info.json LAST, after its own artifact
+      # asserts, so a matching sha means a complete build is already on disk —
+      # e.g. a previous tick that died between build and flip. Flip only.
+      log "arming $master_sha: release $rel12 already built — flip only"
+      arm_built=1
     else
-      n=$(( $(fail_count "$master_sha") + 1 ))
-      set_fail_count "$master_sha" "$n"
-      log "auto-arm-build-failed: build failed ($n/$MAX_BUILD_FAILURES) for $master_sha — see $LOG_FILE"
-      if (( n >= MAX_BUILD_FAILURES )); then
-        quarantine "$master_sha" auto-arm-build-failed
-        notify SEV2 "auto-arm-build-failed: $MAX_BUILD_FAILURES consecutive release builds of master $master_sha failed; SHA quarantined, auto-deploy will NOT retry it. Production unaffected (still on $activated_sha). Fix master or the builder, then remove the line from $QUAR_FILE. https://paperclip/AUR/issues/AUR-4028"
+      if [[ -e "$release_dir" ]]; then
+        # A leftover dir WITHOUT a matching build-info.json is a partial build
+        # (died mid-clone/compile); build-release.sh refuses to reuse it. Clear
+        # it under the AUR-4134 guard — never a running/current/previous
+        # release. If the guard refuses, skip the doomed build (it would only
+        # burn a quarantine strike on an infra condition).
+        if assert_deletable "$APP_ROOT" "$release_dir" 2>>"$LOG_FILE"; then
+          log "arming $master_sha: clearing partial release dir $rel12 first"
+          $PAPERCLIP_DEPLOY_RM "$release_dir"
+        else
+          arm_blocked=1
+          PHASE=arm-blocked-partial-release ARMED_SHA=$master_sha NOTE="releases/$rel12 incomplete but protected (running/current/previous?) — not deleting"
+          write_state
+          log "arm blocked: $NOTE"
+        fi
       fi
-      PHASE=build-failed ARMED_SHA=$master_sha NOTE="failures=$n/$MAX_BUILD_FAILURES"
-      write_state
+      if (( ! arm_blocked )); then
+        PHASE=building ARMED_SHA=$master_sha NOTE=-
+        write_state
+        log "arming $master_sha (activated=$activated_sha, MemAvailable=${mem_avail_mb}MB)"
+        # safe-deploy.sh --build-only (AUR-4029): preflight + cgroup-bounded,
+        # watchdogged build. Direct build-release.sh --activate is refused
+        # since AUR-4155; the flip is ours, below, after the build succeeds.
+        t0=$(date +%s)
+        if PAPERCLIP_DEPLOY_PREFLIGHT_WAIT_SEC=$ARM_PREFLIGHT_WAIT \
+             $BUILD_CMD --ref "$master_sha" --build-only > "$BUILD_OUT" 2>&1; then
+          t1=$(date +%s)
+          arm_built=1
+          log "built $rel12 in $(( t1 - t0 ))s (build wall time)"
+        fi
+        cat "$BUILD_OUT" >> "$LOG_FILE" 2>/dev/null || true
+      fi
+    fi
+    if (( arm_built )); then
+      if repoint_current "$rel12"; then
+        set_fail_count "$master_sha" 0
+        activated_sha=$(read_activated_sha)
+        log "armed $activated_sha (current -> releases/$rel12)"
+      else
+        # Infra failure, not a property of the SHA: no strike. The next tick
+        # finds the complete release on disk and retries the flip alone.
+        PHASE=arm-flip-failed ARMED_SHA=$master_sha NOTE="repoint of current to releases/$rel12 failed"
+        write_state
+        log "arm flip FAILED: $NOTE"
+      fi
+    elif (( ! arm_blocked )); then
+      if grep -qE 'preflight did not clear within|WATCHDOG: mem_avail' "$BUILD_OUT" 2>/dev/null; then
+        # safe-deploy refused for resources (busy box) or its watchdog stopped
+        # the build to protect the host. Not a property of the SHA: no strike,
+        # retry next tick.
+        PHASE=arm-skipped-preflight ARMED_SHA=- NOTE="safe-deploy preflight/watchdog refused for $master_sha (box busy)"
+        write_state
+        log "arm skipped: $NOTE — detail in $BUILD_OUT"
+      else
+        n=$(( $(fail_count "$master_sha") + 1 ))
+        set_fail_count "$master_sha" "$n"
+        log "auto-arm-build-failed: build failed ($n/$MAX_BUILD_FAILURES) for $master_sha — see $BUILD_OUT"
+        if (( n >= MAX_BUILD_FAILURES )); then
+          quarantine "$master_sha" auto-arm-build-failed
+          notify SEV2 "auto-arm-build-failed: $MAX_BUILD_FAILURES consecutive release builds of master $master_sha failed; SHA quarantined, auto-deploy will NOT retry it. Production unaffected (still on $activated_sha). Fix master or the builder, then remove the line from $QUAR_FILE. https://paperclip/AUR/issues/AUR-4028"
+        fi
+        PHASE=build-failed ARMED_SHA=$master_sha NOTE="failures=$n/$MAX_BUILD_FAILURES"
+        write_state
+      fi
     fi
   fi
 fi
@@ -270,9 +337,14 @@ running_sha=$H_SHA
 RUNNING_SHA_S=$running_sha
 
 if [[ "$running_sha" == "$activated_sha" ]]; then
-  PHASE=idle ARMED_SHA=- WAITING_SINCE=- NOTE=-
+  # Keep an arm outcome from THIS tick (skip/fail/blocked) visible in the
+  # state file instead of flattening it to idle — the drift detector's
+  # behind-origin-master alert carries auto=<phase>, and "idle" there would
+  # hide exactly why master is not getting armed.
+  [[ "$PHASE" == "idle" ]] && { ARMED_SHA=- NOTE=-; }
+  WAITING_SINCE=-
   write_state
-  log "in sync: running == activated == ${running_sha:0:12}"
+  log "in sync: running == activated == ${running_sha:0:12} (phase=$PHASE)"
   exit 0
 fi
 

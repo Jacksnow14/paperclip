@@ -1012,4 +1012,98 @@ describe("agent issue mutation checkout ownership", () => {
       );
     });
   });
+
+  describe("ownership-exempt routing fields (AUR-4120)", () => {
+    const projectWorkspaceId = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+
+    it("allows a cross-agent PATCH containing only exempt fields (subset of the allowlist)", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }),
+        ...patch,
+      }));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ projectWorkspaceId, executionWorkspacePreference: "isolated_workspace" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ projectWorkspaceId, executionWorkspacePreference: "isolated_workspace" }),
+      );
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.updated",
+          entityId: issueId,
+          actorId: peerAgentId,
+          details: expect.objectContaining({
+            ownershipExemptFieldMutation: true,
+            ownershipExemptFields: expect.arrayContaining(["projectWorkspaceId", "executionWorkspacePreference"]),
+            actorAgentId: peerAgentId,
+            assigneeAgentId: ownerAgentId,
+          }),
+        }),
+      );
+    });
+
+    it("rejects a cross-agent PATCH mixing an exempt field with an ownership-bearing field — no partial application", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ projectWorkspaceId, status: "cancelled" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects a cross-agent PATCH of an ownership-bearing field alone, exactly as before this change", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ priority: "low" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("allows the owning agent's own PATCH of exempt fields unchanged", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }),
+        ...patch,
+      }));
+
+      const res = await request(await createApp(ownerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ projectWorkspaceId });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ projectWorkspaceId }),
+      );
+      expect(mockLogActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ details: expect.objectContaining({ ownershipExemptFieldMutation: true }) }),
+      );
+    });
+
+    it("rejects an exempt-only PATCH from an agent outside the issue's company (membership authz still applies)", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: ownerAgentId }));
+
+      const res = await request(await createApp(peerActor({ companyId: "99999999-9999-4999-8999-999999999999" })))
+        .patch(`/api/issues/${issueId}`)
+        .send({ projectWorkspaceId });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Agent key cannot access another company");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+  });
 });

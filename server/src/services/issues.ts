@@ -23,6 +23,7 @@ import {
   issueDocuments,
   issueReadStates,
   issueThreadInteractions,
+  issueTombstones,
   issues,
   labels,
   projectWorkspaces,
@@ -75,6 +76,7 @@ import {
 } from "./issue-tree-control.js";
 import { parseIssueGraphLivenessIncidentKey } from "./recovery/origins.js";
 import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
+import { recoveryActionDormancyCutoff } from "./issue-recovery-actions.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -1410,6 +1412,7 @@ async function listIssueBlockerAttentionMap(
           eq(issueRecoveryActions.companyId, companyId),
           inArray(issueRecoveryActions.status, ["active", "escalated"]),
           inArray(issueRecoveryActions.sourceIssueId, explicitWaitCandidateIds),
+          gt(issueRecoveryActions.lastAttemptAt, recoveryActionDormancyCutoff()),
         ),
       );
     for (const row of recoveryActionRows) activeRecoveryWaitIssueIds.add(row.sourceIssueId);
@@ -3834,6 +3837,28 @@ export function issueService(db: Db) {
       return getIssueByIdentifier(identifier);
     },
 
+    /**
+     * Looks up a tombstone (issue-was-deleted record) by `AUR-NNNN`
+     * identifier or UUID, scoped to `companyId`. Used to distinguish "this
+     * identifier referred to a real, since-deleted issue" from "this
+     * identifier never existed" (AUR-4091).
+     */
+    getTombstoneByIdentifierOrUuid: async (companyId: string, raw: string) => {
+      const id = raw.trim();
+      const identifier = normalizeIssueReferenceIdentifier(id);
+      const condition = identifier
+        ? and(eq(issueTombstones.companyId, companyId), eq(issueTombstones.identifier, identifier))
+        : isUuidLike(id)
+          ? and(eq(issueTombstones.companyId, companyId), eq(issueTombstones.issueId, id))
+          : null;
+      if (!condition) return null;
+      return db
+        .select()
+        .from(issueTombstones)
+        .where(condition)
+        .then((rows) => rows[0] ?? null);
+    },
+
     getCurrentScheduledRetry: async (issueId: string) => {
       const issue = await db
         .select({ id: issues.id, companyId: issues.companyId })
@@ -4639,6 +4664,18 @@ export function issueService(db: Db) {
           .where(eq(issues.id, id))
           .returning()
           .then((rows) => rows[0] ?? null);
+
+        if (removedIssue) {
+          await tx
+            .insert(issueTombstones)
+            .values({
+              companyId: removedIssue.companyId,
+              issueId: removedIssue.id,
+              identifier: removedIssue.identifier,
+              title: removedIssue.title,
+            })
+            .onConflictDoNothing();
+        }
 
         if (removedIssue && attachmentAssetIds.length > 0) {
           await tx

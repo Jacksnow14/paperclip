@@ -10,6 +10,7 @@ import {
   createDb,
   heartbeatRuns,
   issueApprovals,
+  issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
   issues,
@@ -48,6 +49,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     await db.delete(activityLog);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(issueRecoveryActions);
     await db.delete(issueRelations);
     await db.delete(issues);
     await db.delete(agents);
@@ -128,6 +130,24 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       issueId: input.blockerIssueId,
       relatedIssueId: input.blockedIssueId,
       type: "blocks",
+    });
+  }
+
+  async function sourceScopedRecoveryAction(input: {
+    companyId: string;
+    sourceIssueId: string;
+    lastAttemptAt: Date;
+  }) {
+    await db.insert(issueRecoveryActions).values({
+      companyId: input.companyId,
+      sourceIssueId: input.sourceIssueId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "board",
+      cause: "stranded_assigned_issue",
+      fingerprint: `test:${input.sourceIssueId}`,
+      nextAction: "Restore a live execution path.",
+      lastAttemptAt: input.lastAttemptAt,
     });
   }
 
@@ -218,6 +238,61 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       coveredBlockerCount: 1,
       attentionBlockerCount: 0,
       sampleBlockerIdentifier: "PBU-2",
+    });
+  });
+
+  it("treats a freshly-attempted recovery action as a covered waiting path (AUR-4300)", async () => {
+    const { companyId } = await createCompany("PBR");
+    const parentId = await insertIssue({ companyId, identifier: "PBR-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PBR-2",
+      title: "Stranded blocker with a live recovery action",
+      status: "blocked",
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+    await sourceScopedRecoveryAction({
+      companyId,
+      sourceIssueId: blockerId,
+      lastAttemptAt: new Date(),
+    });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "covered",
+      reason: "active_dependency",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      attentionBlockerCount: 0,
+      sampleBlockerIdentifier: "PBR-2",
+    });
+  });
+
+  it("stops treating a dormant recovery action as a waiting path once its one-shot wake goes stale (AUR-4300)", async () => {
+    const { companyId } = await createCompany("PBD");
+    const parentId = await insertIssue({ companyId, identifier: "PBD-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PBD-2",
+      title: "Stranded blocker whose one-shot wake was lost",
+      status: "blocked",
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+    await sourceScopedRecoveryAction({
+      companyId,
+      sourceIssueId: blockerId,
+      lastAttemptAt: new Date(Date.now() - 25 * 60 * 60 * 1000),
+    });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 1,
+      sampleBlockerIdentifier: "PBD-2",
     });
   });
 

@@ -23,7 +23,16 @@
  *   - human-gated   — genuinely waiting on the founder or an external party.
  *                     Legitimately parked; the long-term fix is a first-class
  *                     founder-gate blocker or interaction, not a bare
- *                     `blocked`. Flagged as mis-modelled, not re-paged.
+ *                     `blocked`. Flagged as mis-modelled, not re-paged — but
+ *                     only when it actually IS bare: a human-gated candidate
+ *                     that already carries a pending issue-thread interaction
+ *                     (GET /api/issues/:id/interactions) is correctly
+ *                     modelled already and is reported under a separate
+ *                     AWAITING-HUMAN bucket instead of filed (AUR-4275 — the
+ *                     detector previously asserted "nothing attached"
+ *                     without ever checking, and filed false mis-modelled
+ *                     flags against AUR-1879 and AUR-2162, which both had a
+ *                     pending interaction).
  *
  * Shape mirrors scripts/check-routing-rationale.mjs (Phase A auto-resolve,
  * Phase B detect+file), for the same reason that script uses it: an agent
@@ -109,6 +118,21 @@ export function hoursSince(isoTimestamp, now = new Date()) {
   return (now.getTime() - new Date(isoTimestamp).getTime()) / (1000 * 60 * 60);
 }
 
+/**
+ * True when a GET /api/issues/:id/interactions response includes at least
+ * one pending interaction — i.e. the target already has a first-class
+ * human-gate mechanism attached, so it is not "a bare `blocked` status with
+ * nothing attached" (AUR-4275: AUR-1879 and AUR-2162 were both filed as
+ * mis-modelled while carrying a pending interaction).
+ * @param {unknown} interactionsResponse
+ */
+export function hasPendingInteractionInList(interactionsResponse) {
+  const list = Array.isArray(interactionsResponse)
+    ? interactionsResponse
+    : (interactionsResponse?.items ?? []);
+  return list.some((i) => i.status === 'pending');
+}
+
 /** Matches both flag title formats produced in the wild. */
 export const FLAG_REGEX = /stalled-blocked(?:-mismodelled)?:\s*(AUR-\d+)/i;
 
@@ -181,6 +205,10 @@ function makeApiHelpers(API_URL, headers) {
     return res.json();
   }
 
+  async function hasPendingInteraction(issueId) {
+    return hasPendingInteractionInList(await apiGet(`/api/issues/${issueId}/interactions`));
+  }
+
   async function apiPatch(path, body) {
     const res = await fetch(`${API_URL}${path}`, {
       method: 'PATCH',
@@ -201,7 +229,7 @@ function makeApiHelpers(API_URL, headers) {
     return res.json();
   }
 
-  return { apiGet, apiPatch, apiPost };
+  return { apiGet, apiPatch, apiPost, hasPendingInteraction };
 }
 
 function extractStatusCode(errorMessage) {
@@ -241,7 +269,7 @@ export async function main({ apply, apiUrl, apiKey, companyId }) {
     Authorization: `Bearer ${apiKey}`,
     'Content-Type': 'application/json',
   };
-  const { apiGet, apiPatch, apiPost } = makeApiHelpers(apiUrl, headers);
+  const { apiGet, apiPatch, apiPost, hasPendingInteraction } = makeApiHelpers(apiUrl, headers);
 
   if (!apply) {
     console.log('[DRY-RUN] No changes will be written. Pass --apply to execute.\n');
@@ -267,14 +295,31 @@ export async function main({ apply, apiUrl, apiKey, companyId }) {
   const candidates = blockedIssues.filter(hasNoBlocker);
   const graded = candidates.map((issue) => ({ issue, grade: gradeBlockedIssue(issue) }));
 
+  // A human-gated candidate that already carries a pending first-class
+  // interaction is NOT mis-modelled — the "nothing attached" premise in
+  // buildFlagDescription's human-gated branch would be false for it. Check
+  // before filing, not after (AUR-4275): filing first and disproving later
+  // costs a full heartbeat per target and mis-teaches the reader.
+  for (const g of graded) {
+    g.pendingInteraction = g.grade === 'human-gated'
+      ? await hasPendingInteraction(g.issue.id)
+      : false;
+  }
+
+  const awaitingHuman = graded.filter((g) => g.grade === 'human-gated' && g.pendingInteraction);
+
   console.log(`── Scan: ${blockedIssues.length} blocked issue(s), ${candidates.length} with no unresolved blocker ──\n`);
   console.log(`  STALLED (${graded.filter((g) => g.grade === 'stalled').length}):`);
   graded.filter((g) => g.grade === 'stalled').forEach(({ issue }) => {
     console.log(`    - ${issue.identifier} [${issue.priority}] assignee=${issue.assigneeAgentId ?? 'none'} updated=${Math.round(hoursSince(issue.updatedAt))}h ago`);
   });
   console.log(`\n  HUMAN-GATED (${graded.filter((g) => g.grade === 'human-gated').length}):`);
-  graded.filter((g) => g.grade === 'human-gated').forEach(({ issue }) => {
-    console.log(`    - ${issue.identifier} [${issue.priority}] assignee=${issue.assigneeAgentId ?? 'none'} updated=${Math.round(hoursSince(issue.updatedAt))}h ago`);
+  graded.filter((g) => g.grade === 'human-gated').forEach(({ issue, pendingInteraction }) => {
+    console.log(`    - ${issue.identifier} [${issue.priority}] assignee=${issue.assigneeAgentId ?? 'none'} updated=${Math.round(hoursSince(issue.updatedAt))}h ago${pendingInteraction ? ' (pending interaction)' : ''}`);
+  });
+  console.log(`\n  AWAITING-HUMAN (correctly modelled, ${awaitingHuman.length}):`);
+  awaitingHuman.forEach(({ issue }) => {
+    console.log(`    - ${issue.identifier} [${issue.priority}] already has a pending interaction — not filing.`);
   });
   console.log();
 
@@ -321,8 +366,8 @@ export async function main({ apply, apiUrl, apiKey, companyId }) {
 
   // ── Phase B: detect + file ───────────────────────────────────────────────────
   console.log('── Phase B: Detect and file new flags ──');
-  const toFile = graded.filter(({ issue }) => !openFlagTargets.has(issue.identifier));
-  const skippedDedup = graded.filter(({ issue }) => openFlagTargets.has(issue.identifier));
+  const toFile = graded.filter(({ issue, pendingInteraction }) => !openFlagTargets.has(issue.identifier) && !pendingInteraction);
+  const skippedDedup = graded.filter(({ issue, pendingInteraction }) => openFlagTargets.has(issue.identifier) && !pendingInteraction);
 
   if (skippedDedup.length > 0) {
     console.log(`  SKIPPED-DEDUP — open flag exists (${skippedDedup.length}):`);
@@ -357,11 +402,12 @@ export async function main({ apply, apiUrl, apiKey, companyId }) {
   }
 
   console.log('── Summary ──');
-  console.log(`  Candidates:    ${candidates.length} (stalled=${graded.filter((g) => g.grade === 'stalled').length}, human-gated=${graded.filter((g) => g.grade === 'human-gated').length})`);
-  console.log(`  Resolved:      ${toCancel.length}`);
-  console.log(`  Filed:         ${toFile.length}`);
-  console.log(`  Skipped-dedup: ${skippedDedup.length}`);
-  console.log(`  Failed:        ${failedMutations.length}`);
+  console.log(`  Candidates:      ${candidates.length} (stalled=${graded.filter((g) => g.grade === 'stalled').length}, human-gated=${graded.filter((g) => g.grade === 'human-gated').length})`);
+  console.log(`  Awaiting-human:  ${awaitingHuman.length} (correctly modelled, not filed)`);
+  console.log(`  Resolved:        ${toCancel.length}`);
+  console.log(`  Filed:           ${toFile.length}`);
+  console.log(`  Skipped-dedup:   ${skippedDedup.length}`);
+  console.log(`  Failed:          ${failedMutations.length}`);
   if (failedMutations.length > 0) {
     for (const { label, status } of failedMutations) console.log(`    - ${label} → ${status}`);
     console.log('  Re-run the watchdog to retry the above (idempotent).');

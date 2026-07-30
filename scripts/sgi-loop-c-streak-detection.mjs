@@ -13,9 +13,29 @@
  *
  *   A — baseline-delta regression: mean(last 5) <= mean(prior 20) - 0.5
  *   B — non-strict decline (small buckets, 3 <= n < 10): last 3 records
- *       non-increasing oldest→newest AND total drop >= 1
+ *       non-increasing oldest→newest AND total drop >= 1 AND min(quality)
+ *       below the absolute floor AND at least one record required rework
  *   C — sustained low absolute quality: mean(last 5) <= 2.5
  *   D — rework streak (relaxed): >= 3 of the last 5 have rework_required
+ *
+ * AUR-4233 — the *trend* detectors (A and B) order records by work time (the
+ * scorecard's own `performance/{agent}/{type}/{YYYY-MM-DD}` date, or an
+ * explicit metadata date), never by `createdAt`. For backfilled scorecards
+ * `createdAt` is the insertion timestamp, so a `createdAt` "trend" is an
+ * artifact of backfill write order — all three self-edit issues filed by the
+ * 2026-07-26T06:49 run were false positives of exactly that shape (AUR-4217's
+ * three records were written 54ms apart with their title dates in the
+ * opposite order to `createdAt`). Where a work order cannot be established —
+ * no parseable date, or a same-day tie inside a backfill burst — the trend
+ * detectors fail closed to `no_trigger`: a detector that cannot tell which
+ * record is newer must not report a direction. The level-based detectors
+ * (C, D) and the staleness guard are not trend detectors, so they use a
+ * best-effort work-time-then-createdAt ordering instead of failing closed.
+ *
+ * Detector B additionally requires an absolute-quality floor breach and a
+ * rework signal (AUR-4233). Quality 4 with `rework_required: false` is good
+ * work, and a no-rework streak is not a regression; without those gates B
+ * duplicated Detector C at a noise-level threshold and inverted its purpose.
  *
  * A staleness guard (skip if most-recent record > 30 days old) runs first
  * so relaxed rules can't resurrect dead/retired-agent buckets. Because all
@@ -65,6 +85,17 @@ const DETECTOR_B_MAX_BUCKET = 10; // small-bucket detector applies while n < 10
 const DETECTOR_C_THRESHOLD = 2.5;
 const DETECTOR_D_MIN_REWORK = 3; // of the last RECENT_N
 const CREATE_CAP = 3;
+
+// ---- Detector B false-positive gates (AUR-4233) ----------------------------
+
+// Absolute-quality floor: a window whose worst record is still >= this is good
+// work, not a regression, whatever its slope. Genuinely low quality is
+// Detector C's job, so B must not duplicate it at a noise-level threshold.
+const DETECTOR_B_QUALITY_FLOOR = 4;
+
+// Records whose createdAt values all fall inside this span were written by one
+// backfill burst, so createdAt carries no work-order information at all.
+const BACKFILL_CLUSTER_MS = 5 * 60 * 1000;
 
 function headers() {
   return {
@@ -177,6 +208,89 @@ function ageDays(refDate, iso) {
   return (refDate.getTime() - t) / (1000 * 60 * 60 * 24);
 }
 
+// ---- Work-time ordering (AUR-4233) -----------------------------------------
+
+// `performance/{agent_id}/{task_type}/{YYYY-MM-DD}` — the trailing path segment
+// is the date the work was actually scored, which is what a trend is over.
+// Agents routinely append a disambiguating suffix when they score twice in one
+// day ('2026-07-26-b', '2026-06-03-AUR-793', '2026-06-22b'), so only the date
+// *prefix* of the final segment is required. Since one unparseable record
+// fails its whole bucket closed, an over-strict parser silently blacks out
+// healthy buckets — 21 such records took out 10 of 38 buckets before this.
+const TITLE_WORK_DATE_RE = /^(\d{4}-\d{2}-\d{2})/;
+
+/**
+ * Epoch ms of a scorecard's *work* date — an explicit metadata date if the
+ * record carries one, else the title's trailing YYYY-MM-DD. Null when neither
+ * is present or parseable; callers decide whether that is fatal.
+ */
+function workDateMs(rec) {
+  const explicit = rec.work_date ?? rec.date ?? null;
+  let src = typeof explicit === 'string' ? explicit.slice(0, 10) : null;
+  if (!src) {
+    const segments = String(rec.title || '').split('/');
+    const m = TITLE_WORK_DATE_RE.exec(segments[segments.length - 1] || '');
+    src = m ? m[1] : null;
+  }
+  if (!src || !/^\d{4}-\d{2}-\d{2}$/.test(src)) return null;
+  const t = Date.parse(`${src}T00:00:00Z`);
+  return Number.isNaN(t) ? null : t;
+}
+
+function createdAtMs(rec) {
+  const t = new Date(rec.createdAt).getTime();
+  return Number.isNaN(t) ? null : t;
+}
+
+/**
+ * Best-effort newest-first time for the *level*-based consumers (staleness
+ * guard, detectors C and D). Work date when known, insertion time otherwise.
+ * These are not trend detectors, so an imperfect ordering degrades which five
+ * records get averaged — it cannot invent a direction — and failing them
+ * closed would take Loop C's genuine-badness detectors offline.
+ */
+function effectiveTimeMs(rec) {
+  const wd = workDateMs(rec);
+  return wd !== null ? wd : (createdAtMs(rec) ?? -Infinity);
+}
+
+/**
+ * Newest-first ordering for the *trend* detectors, or a refusal.
+ *
+ * Returns `{ ordered: rec[], ambiguousAt: Set<number> }` where `ambiguousAt`
+ * holds each index i whose order relative to i-1 could not be established, or
+ * `{ ordered: null, reason }` when no record-level work time exists at all.
+ * A caller must treat an ambiguous index that straddles a boundary it depends
+ * on as fail-closed — see `evaluateBucket`.
+ */
+export function orderByWorkTime(recs) {
+  const items = recs.map((r) => ({ rec: r, wd: workDateMs(r), ca: createdAtMs(r) }));
+  if (items.some((it) => it.wd === null)) {
+    return { ordered: null, reason: 'missing_work_date' };
+  }
+
+  // When every createdAt lands inside one short burst the records were
+  // backfilled together, so createdAt cannot break a same-day tie.
+  const cas = items.map((it) => it.ca).filter((v) => v !== null);
+  const backfillClustered =
+    cas.length === items.length &&
+    cas.length >= 2 &&
+    Math.max(...cas) - Math.min(...cas) < BACKFILL_CLUSTER_MS;
+
+  const sorted = items.slice().sort((a, b) => {
+    if (b.wd !== a.wd) return b.wd - a.wd;
+    return backfillClustered ? 0 : (b.ca ?? 0) - (a.ca ?? 0);
+  });
+
+  const ambiguousAt = new Set();
+  if (backfillClustered) {
+    for (let i = 1; i < sorted.length; i += 1) {
+      if (sorted[i].wd === sorted[i - 1].wd) ambiguousAt.add(i);
+    }
+  }
+  return { ordered: sorted.map((it) => it.rec), ambiguousAt, reason: null };
+}
+
 /**
  * Evaluate one {agent_id, task_type} bucket's records against detectors A–D.
  * `recs` items: { quality_signal: number|null, rework_required: boolean, createdAt: string }.
@@ -184,43 +298,72 @@ function ageDays(refDate, iso) {
  * { triggers: [{ detector, severity, desc }], severity, mostRecentAgeDays }.
  */
 function evaluateBucket(recs, refDate) {
-  const sorted = recs.slice().sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  // Level-based ordering: work date where known, insertion time otherwise.
+  // Used by the staleness guard and detectors C/D (see effectiveTimeMs).
+  const sorted = recs.slice().sort((a, b) => effectiveTimeMs(b) - effectiveTimeMs(a));
   if (sorted.length < 3) return { skip: 'too_few_records' };
 
-  const mostRecentAgeDays = ageDays(refDate, sorted[0].createdAt);
+  const mostRecentTime = effectiveTimeMs(sorted[0]);
+  const mostRecentAgeDays = Number.isFinite(mostRecentTime)
+    ? (refDate.getTime() - mostRecentTime) / (1000 * 60 * 60 * 24)
+    : Infinity;
   if (mostRecentAgeDays > STALENESS_DAYS) return { skip: 'stale' };
+
+  // Trend-safe ordering for detectors A and B. `null` ordered => refuse both
+  // (AUR-4233): without a work order there is no direction to report.
+  const trend = orderByWorkTime(recs);
+  const trendOrdered = trend.ordered;
+  const ambiguousAt = trend.ambiguousAt || new Set();
+  const unorderable = [];
+  if (!trendOrdered) unorderable.push(trend.reason);
 
   const triggers = [];
   const recent = sorted.slice(0, RECENT_N);
   const qRecent = recent.map((r) => r.quality_signal).filter((v) => typeof v === 'number');
 
-  // Detector A — baseline-delta regression.
-  const baseline = sorted.slice(RECENT_N, RECENT_N + BASELINE_N);
+  // Detector A — baseline-delta regression, over the *work*-ordered records.
+  // Only a tie straddling the recent/baseline boundary can move a record
+  // between the two groups; ties inside a group leave both means unchanged.
+  const aOrdered = trendOrdered && !ambiguousAt.has(RECENT_N) ? trendOrdered : null;
+  if (trendOrdered && !aOrdered) unorderable.push('ambiguous_recent_baseline_boundary');
+  const aRecent = aOrdered ? aOrdered.slice(0, RECENT_N) : [];
+  const baseline = aOrdered ? aOrdered.slice(RECENT_N, RECENT_N + BASELINE_N) : [];
+  const qARecent = aRecent.map((r) => r.quality_signal).filter((v) => typeof v === 'number');
   const qBaseline = baseline.map((r) => r.quality_signal).filter((v) => typeof v === 'number');
-  if (recent.length >= RECENT_N && baseline.length >= BASELINE_MIN && qRecent.length && qBaseline.length) {
-    const meanRecent = mean(qRecent);
+  if (aRecent.length >= RECENT_N && baseline.length >= BASELINE_MIN && qARecent.length && qBaseline.length) {
+    const meanRecent = mean(qARecent);
     const meanBaseline = mean(qBaseline);
     const delta = meanBaseline - meanRecent;
     if (delta >= DETECTOR_A_DELTA) {
       triggers.push({
         detector: 'A',
         severity: delta,
-        desc: `baseline-delta regression — recent${qRecent.length} mean ${meanRecent.toFixed(2)} vs prior${qBaseline.length} mean ${meanBaseline.toFixed(2)} (Δ=${delta.toFixed(2)})`,
+        desc: `baseline-delta regression — recent${qARecent.length} mean ${meanRecent.toFixed(2)} vs prior${qBaseline.length} mean ${meanBaseline.toFixed(2)} (Δ=${delta.toFixed(2)})`,
       });
     }
   }
 
   // Detector B — non-strict decline, small buckets only (3 <= n < 10).
-  if (sorted.length >= 3 && sorted.length < DETECTOR_B_MAX_BUCKET) {
-    const [n1, n2, n3] = sorted; // n1 = most recent, n3 = oldest of the 3
-    if ([n1, n2, n3].every((r) => typeof r.quality_signal === 'number')) {
+  // Needs a trustworthy work order across the 3-record window *and* across the
+  // window boundary (index 3 decides which records are even in the window).
+  const bWindowAmbiguous = [1, 2, 3].some((i) => ambiguousAt.has(i));
+  if (trendOrdered && bWindowAmbiguous) unorderable.push('ambiguous_detector_b_window');
+  const bOrdered = trendOrdered && !bWindowAmbiguous ? trendOrdered : null;
+  if (bOrdered && bOrdered.length >= 3 && bOrdered.length < DETECTOR_B_MAX_BUCKET) {
+    const [n1, n2, n3] = bOrdered; // n1 = most recent, n3 = oldest of the 3
+    const window = [n1, n2, n3];
+    if (window.every((r) => typeof r.quality_signal === 'number')) {
       const nonIncreasing = n3.quality_signal >= n2.quality_signal && n2.quality_signal >= n1.quality_signal;
       const drop = n3.quality_signal - n1.quality_signal;
-      if (nonIncreasing && drop >= 1) {
+      // AUR-4233 gates: good-but-slightly-lower work is not a regression.
+      const minQuality = Math.min(...window.map((r) => r.quality_signal));
+      const belowFloor = minQuality < DETECTOR_B_QUALITY_FLOOR;
+      const anyRework = window.some((r) => r.rework_required === true);
+      if (nonIncreasing && drop >= 1 && belowFloor && anyRework) {
         triggers.push({
           detector: 'B',
           severity: drop,
-          desc: `non-strict decline (oldest→newest): ${n3.quality_signal}→${n2.quality_signal}→${n1.quality_signal}`,
+          desc: `non-strict decline (oldest→newest by work date): ${n3.quality_signal}→${n2.quality_signal}→${n1.quality_signal}, min quality ${minQuality} (<${DETECTOR_B_QUALITY_FLOOR}) with rework`,
         });
       }
     }
@@ -250,9 +393,18 @@ function evaluateBucket(recs, refDate) {
     }
   }
 
-  if (!triggers.length) return { skip: 'no_trigger' };
+  // Never silent: a trend detector that refused to run says so, so a bucket
+  // going dark reads as a refusal rather than as a clean bill of health.
+  const unorderableReasons = [...new Set(unorderable)];
 
-  return { triggers, severity: Math.max(...triggers.map((t) => t.severity)), mostRecentAgeDays };
+  if (!triggers.length) return { skip: 'no_trigger', unorderable: unorderableReasons };
+
+  return {
+    triggers,
+    severity: Math.max(...triggers.map((t) => t.severity)),
+    mostRecentAgeDays,
+    unorderable: unorderableReasons,
+  };
 }
 
 /** True if any open issue title mentions "self-edit required" and the agent id (existing per-agent dedup, unchanged). */
@@ -341,6 +493,9 @@ async function main() {
     if (!buckets.has(key)) buckets.set(key, { agent_id, task_type, recs: [] });
     buckets.get(key).recs.push({
       title: r.title,
+      // Work date (AUR-4233): prefer an explicit metadata date, else the
+      // title's trailing YYYY-MM-DD. Never createdAt — that is insertion time.
+      work_date: m.work_date || m.date || m.completed_at || null,
       quality_signal: typeof m.quality_signal === 'number' ? m.quality_signal : null,
       rework_required: m.rework_required === true,
       createdAt: r.createdAt || r.created_at || '',
@@ -359,11 +514,16 @@ async function main() {
   const skippedNoAgent = [];
   let evaluated = 0;
 
+  const unorderableBuckets = {};
+
   for (const [key, b] of buckets) {
     const result = evaluateBucket(b.recs, now);
     if (result.skip === 'too_few_records') { skippedTooFew.push(key); continue; }
     evaluated += 1;
     if (result.skip === 'stale') { skippedStale.push(key); continue; }
+    for (const reason of result.unorderable || []) {
+      unorderableBuckets[reason] = (unorderableBuckets[reason] || 0) + 1;
+    }
     if (result.skip === 'no_trigger') continue;
 
     if (!liveAgents.has(b.agent_id)) {
@@ -378,6 +538,9 @@ async function main() {
   console.log(`Buckets total: ${buckets.size}, evaluated (≥3 recs): ${evaluated}, triggered: ${triggered.length}`);
   for (const t of triggered) console.log(`  TRIGGER ${t.key} (severity=${t.severity.toFixed(2)}) — ${t.patternDesc}`);
   if (skippedStale.length) console.log(`  skipped (stale, >${STALENESS_DAYS}d): ${skippedStale.join(', ')}`);
+  if (Object.keys(unorderableBuckets).length) {
+    console.log(`  trend detectors refused (no trustworthy work order): ${JSON.stringify(unorderableBuckets)}`);
+  }
   if (skippedNoAgent.length) console.log(`  skipped (agent gone): ${skippedNoAgent.join(', ')}`);
 
   // Existing open-issue dedup + new closed-issue cooldown lookups.
@@ -491,12 +654,14 @@ async function main() {
     parentResolved: !!parentId,
     malformedAgentKeys,
     unresolvedAgentKeys,
+    unorderableBuckets,
   }, null, 2));
 }
 
 export {
   mean,
   ageDays,
+  workDateMs,
   evaluateBucket,
   hasOpenSelfEditIssue,
   withinCooldown,

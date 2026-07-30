@@ -1,0 +1,14 @@
+# AUR-4025: the sampler (paperclip-mem-watch.timer) has been writing v4 rows
+# every 5 minutes since 2026-07-25 16:05 UTC and nothing was reading them --
+# monitorNextCheckAt stayed null on AUR-3924, so the 16:02 UTC breach woke no
+# one. This looks, every 5 minutes, forever, independent of any agent run.
+[Unit]
+Description=Run paperclip host-memory breach check every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+RandomizedDelaySec=20
+
+[Install]
+WantedBy=timers.target

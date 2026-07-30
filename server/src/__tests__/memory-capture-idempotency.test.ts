@@ -185,6 +185,132 @@ describeEmbeddedPostgres("memoryService capture idempotency (AUR-4022)", () => {
     expect(allRecords).toHaveLength(2);
   });
 
+  // AUR-4522: the fix appends a 5th segment (the issue id) to scorecard titles to make
+  // them collision-free. This only works if the existing 4-segment titlePrefix queries
+  // (routing-rationale watchdog, performance-aware routing, Loop C/D/F-2) still match a
+  // 5-segment title — confirmed empirically live before propagating doctrine, and pinned
+  // here as a regression test against the real ILIKE prefix match in the DB.
+  it("matches a 5-segment issue-suffixed scorecard title against the existing 4-segment titlePrefix query", async () => {
+    const { companyId } = await setUpCompanyWithBinding();
+
+    await svc.capture(companyId, {
+      bindingKey: "primary",
+      source: { kind: "manual_note" as const },
+      content: "Legacy 4-segment scorecard",
+      title: "performance/agent-9/bug/2026-07-30",
+      metadata: { category: "performance_scorecard", issue_id: "AUR-5001" },
+    }, actor);
+
+    await svc.capture(companyId, {
+      bindingKey: "primary",
+      source: { kind: "manual_note" as const },
+      content: "New 5-segment scorecard",
+      title: "performance/agent-9/bug/2026-07-30/AUR-5002",
+      metadata: { category: "performance_scorecard", issue_id: "AUR-5002" },
+    }, actor);
+
+    const results = await svc.listRecords(
+      companyId,
+      { titlePrefix: "performance/agent-9/bug/", limit: 50, offset: 0, includeDeleted: false, includeRevoked: false, includeExpired: false, includeSuperseded: false },
+      actor,
+    );
+
+    expect(results.map((r) => r.title).sort()).toEqual([
+      "performance/agent-9/bug/2026-07-30",
+      "performance/agent-9/bug/2026-07-30/AUR-5002",
+    ]);
+  });
+
+  // AUR-4522: date-bucketed scorecard titles collide whenever an agent closes more than
+  // one same-type issue on the same day. Combined with `upsert: true`, the second capture
+  // silently overwrote the first row's data in place — no warning, no revision history.
+  // These tests prove the loud-failure signal fires only when it should: on a genuine
+  // cross-issue collision, never on a same-issue re-capture.
+  describe("upsertOverwrite detection (AUR-4522)", () => {
+    it("flags upsertOverwrite when upsert:true clobbers a row belonging to a different issue", async () => {
+      const { companyId } = await setUpCompanyWithBinding();
+      const sharedTitle = "performance/agent-1/bug/2026-07-30";
+
+      const first = await svc.capture(companyId, {
+        bindingKey: "primary",
+        source: { kind: "manual_note" as const },
+        content: "Scorecard for AUR-2001",
+        title: sharedTitle,
+        metadata: { category: "performance_scorecard", issue_id: "AUR-2001", token_cost: 5000 },
+      }, actor);
+      expect(first.upsertOverwrite).toBeUndefined();
+
+      const second = await svc.capture(companyId, {
+        bindingKey: "primary",
+        source: { kind: "manual_note" as const },
+        content: "Scorecard for AUR-2002",
+        title: sharedTitle,
+        metadata: { category: "performance_scorecard", issue_id: "AUR-2002", token_cost: 9000 },
+        upsert: true,
+      }, actor);
+
+      expect(second.dedup).toBe(true);
+      expect(second.records[0].id).toBe(first.records[0].id);
+      expect(second.upsertOverwrite).toEqual({
+        recordId: first.records[0].id,
+        previousIssueId: "AUR-2001",
+        incomingIssueId: "AUR-2002",
+      });
+    });
+
+    it("does not flag upsertOverwrite on a genuine same-issue re-capture", async () => {
+      const { companyId } = await setUpCompanyWithBinding();
+      const sharedTitle = "performance/agent-1/bug/2026-07-30-AUR-3001";
+
+      const first = await svc.capture(companyId, {
+        bindingKey: "primary",
+        source: { kind: "manual_note" as const },
+        content: "Initial scorecard for AUR-3001",
+        title: sharedTitle,
+        metadata: { category: "performance_scorecard", issue_id: "AUR-3001", token_cost: 4000 },
+      }, actor);
+
+      const second = await svc.capture(companyId, {
+        bindingKey: "primary",
+        source: { kind: "manual_note" as const },
+        content: "Corrected scorecard for AUR-3001",
+        title: sharedTitle,
+        metadata: { category: "performance_scorecard", issue_id: "AUR-3001", token_cost: 4200 },
+        upsert: true,
+      }, actor);
+
+      expect(second.dedup).toBe(true);
+      expect(second.records[0].id).toBe(first.records[0].id);
+      expect(second.upsertOverwrite).toBeUndefined();
+    });
+
+    it("does not flag upsertOverwrite when the existing row has no metadata.issue_id", async () => {
+      const { companyId } = await setUpCompanyWithBinding();
+      const sharedTitle = "synthesis/2026-07-30";
+
+      const first = await svc.capture(companyId, {
+        bindingKey: "primary",
+        source: { kind: "manual_note" as const },
+        content: "First synthesis pass",
+        title: sharedTitle,
+        metadata: { category: "synthesis" },
+      }, actor);
+
+      const second = await svc.capture(companyId, {
+        bindingKey: "primary",
+        source: { kind: "manual_note" as const },
+        content: "Second synthesis pass",
+        title: sharedTitle,
+        metadata: { category: "synthesis", issue_id: "AUR-4001" },
+        upsert: true,
+      }, actor);
+
+      expect(second.dedup).toBe(true);
+      expect(second.records[0].id).toBe(first.records[0].id);
+      expect(second.upsertOverwrite).toBeUndefined();
+    });
+  });
+
   it("scopes the idempotencyKey to the capturing owner, so two owners sharing a key do not collide (CTO review blocker #3)", async () => {
     const { companyId } = await setUpCompanyWithBinding();
     const key = "synthesis/2026-07-25";

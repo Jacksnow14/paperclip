@@ -1080,6 +1080,77 @@ describe("memory routes", () => {
     });
   });
 
+  // ── Part C.1: Destructive-upsert warning (AUR-4522) ─────────────────────────
+
+  describe("POST /companies/:companyId/memory/capture — destructive upsert warning", () => {
+    const captureBody = {
+      source: { kind: "issue", issueId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" },
+      content: "Test capture content",
+      upsert: true,
+    };
+
+    it("warns when an upsert overwrote a record belonging to a different issue", async () => {
+      mockMemoryService.capture.mockResolvedValue({
+        operation: { id: "op-6", bindingId: bindingId, source: { kind: "issue" } },
+        records: [{
+          id: "33300000-0000-4000-8000-000000000000",
+          reviewState: "accepted",
+          scopeType: "org",
+          scope: {},
+        }],
+        dedup: true,
+        upsertOverwrite: {
+          recordId: "33300000-0000-4000-8000-000000000000",
+          previousIssueId: "AUR-1001",
+          incomingIssueId: "AUR-1002",
+        },
+      });
+      const app = createApp({
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        companyIds: [companyA],
+        isInstanceAdmin: false,
+      });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send(captureBody);
+
+      expect(res.status).toBe(201);
+      expect(res.body.warnings.some((w: string) => w.includes("AUR-1001") && w.includes("AUR-1002"))).toBe(true);
+    });
+
+    it("does not warn on a genuine same-issue upsert re-capture", async () => {
+      mockMemoryService.capture.mockResolvedValue({
+        operation: { id: "op-7", bindingId: bindingId, source: { kind: "issue" } },
+        records: [{
+          id: "44400000-0000-4000-8000-000000000000",
+          reviewState: "accepted",
+          scopeType: "org",
+          scope: {},
+        }],
+        dedup: true,
+      });
+      const app = createApp({
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        companyIds: [companyA],
+        isInstanceAdmin: false,
+      });
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send(captureBody);
+
+      expect(res.status).toBe(201);
+      expect(res.body.warnings).toEqual([]);
+    });
+  });
+
   // ── Part D: Router-read category scope guard (AUR-3925) ────────────────────
 
   describe("POST /companies/:companyId/memory/capture — router-read scope guard", () => {

@@ -29,6 +29,7 @@ export { workspaceRuntimeServices } from "./workspace_runtime_services.js";
 export { projectGoals } from "./project_goals.js";
 export { goals } from "./goals.js";
 export { issues } from "./issues.js";
+export { issueTombstones } from "./issue_tombstones.js";
 export { issueRecoveryActions } from "./issue_recovery_actions.js";
 export { issueReferenceMentions } from "./issue_reference_mentions.js";
 export { issueRelations } from "./issue_relations.js";

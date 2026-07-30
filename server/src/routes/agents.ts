@@ -3151,19 +3151,52 @@ export function agentRoutes(
       pausedAt: (agent as { pausedAt?: Date | string | null }).pausedAt ?? null,
     }));
 
+    // Classification reads the newest terminal runs ONLY. Queued rows are the
+    // newest rows in the table, so fetching one shared window lets a deep
+    // backlog evict the terminal history the classifier needs — a quota-starved
+    // agent with 200 queued runs reads as healthy `no_recent_runs`, the exact
+    // blindness this route exists to remove. Queue depth gets its own query so
+    // it stays exact while classification stays backlog-proof.
+    const terminalRunColumns = {
+      status: heartbeatRuns.status,
+      createdAt: heartbeatRuns.createdAt,
+      finishedAt: heartbeatRuns.finishedAt,
+      error: heartbeatRuns.error,
+    };
     const runsByAgent = new Map<string, FleetCapacityRunInput[]>(
       await Promise.all(
         capacityAgents.map(async (agent) => {
-          const runs = await heartbeat.list(companyId, agent.id, FLEET_CAPACITY_RUN_WINDOW);
+          const [terminalRuns, queuedRuns] = await Promise.all([
+            db
+              .select(terminalRunColumns)
+              .from(heartbeatRuns)
+              .where(
+                and(
+                  eq(heartbeatRuns.companyId, companyId),
+                  eq(heartbeatRuns.agentId, agent.id),
+                  inArray(heartbeatRuns.status, ["succeeded", "failed"]),
+                ),
+              )
+              .orderBy(desc(heartbeatRuns.createdAt))
+              .limit(FLEET_CAPACITY_RUN_WINDOW),
+            db
+              .select({ status: heartbeatRuns.status, createdAt: heartbeatRuns.createdAt })
+              .from(heartbeatRuns)
+              .where(
+                and(
+                  eq(heartbeatRuns.companyId, companyId),
+                  eq(heartbeatRuns.agentId, agent.id),
+                  inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+                ),
+              ),
+          ]);
           return [
             agent.id,
-            runs.map((run) => ({
-              status: run.status,
-              createdAt: run.createdAt,
-              finishedAt: run.finishedAt,
-              error: (run as { error?: string | null }).error ?? null,
-            })),
-          ] as const;
+            [
+              ...terminalRuns,
+              ...queuedRuns.map((run) => ({ ...run, finishedAt: null, error: null })),
+            ],
+          ] as [string, FleetCapacityRunInput[]];
         }),
       ),
     );

@@ -1,0 +1,13 @@
+# AUR-4028: production ran five days stale because deploys needed a human to
+# remember. This arms every merge to master automatically, every 10 minutes,
+# forever. User-level on purpose — see paperclip-auto-deploy.service.
+[Unit]
+Description=Run paperclip auto-deploy every 10 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

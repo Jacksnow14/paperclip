@@ -922,6 +922,62 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
     expect(running).toBe(4);
   });
 
+  // AUR-4620: agents that can never claim a slot right now (quota-paused
+  // adapter, or an inadmissible status) must not shrink the ceiling for agents
+  // that actually can. Live incident: 3 permanently quota-paused codex_local
+  // agents with stale queued rows inflated contenders to 8, forcing ceiling=1
+  // for every agent including the 2 truly eligible ones -- cap sat at 2/4
+  // running against 280 queued. Two eligible agents against cap 4 should each
+  // get ceiling 2 (not floor(4/5)=1 if the 3 ineligible agents counted).
+  it("excludes quota-paused and inadmissible-status agents from the fair-share denominator", async () => {
+    const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4 });
+    const companyId = await seedCompany();
+
+    const eligibleA = await seedAgent(companyId, { maxConcurrentRuns: 20, adapterType: "claude_local" });
+    const eligibleB = await seedAgent(companyId, { maxConcurrentRuns: 20, adapterType: "claude_local" });
+    for (let i = 0; i < 2; i += 1) {
+      await seedQueuedRun(companyId, eligibleA, { createdAt: new Date(Date.now() - 60_000 + i) });
+    }
+    for (let i = 0; i < 2; i += 1) {
+      await seedQueuedRun(companyId, eligibleB, { createdAt: new Date(Date.now() - 60_000 + i) });
+    }
+
+    // Two codex_local agents permanently walled off behind a shared quota pause,
+    // each still holding a stale queued row.
+    const pausedAgentX = await seedAgent(companyId, { maxConcurrentRuns: 20, adapterType: "codex_local" });
+    const pausedAgentY = await seedAgent(companyId, { maxConcurrentRuns: 20, adapterType: "codex_local" });
+    await seedActiveQuotaPause(companyId, pausedAgentX, new Date(Date.now() + 60 * 60 * 1000));
+    await seedQueuedRun(companyId, pausedAgentY);
+
+    // A terminated agent with a stale queued row nobody ever cleaned up.
+    const terminatedAgent = await seedAgent(companyId, { maxConcurrentRuns: 20, adapterType: "codex_local" });
+    await seedQueuedRun(companyId, terminatedAgent);
+    await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, terminatedAgent));
+
+    hangAdapterUntilReleased();
+    await heartbeat.resumeQueuedRuns();
+
+    const runningByAgent = async (agentId: string) =>
+      db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "running")))
+        .then((rows) => rows.length);
+
+    // Pre-fix: contenders counted all 5 agentIds with a queued row (5 including
+    // the 3 ineligible ones) -> ceiling floor(4/5) = 1 each, leaving 2 of the 4
+    // global slots unfillable since nothing ineligible can ever claim them.
+    expect(await runningByAgent(eligibleA)).toBe(2);
+    expect(await runningByAgent(eligibleB)).toBe(2);
+
+    const globalRunning = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "running"))
+      .then((rows) => rows.length);
+    expect(globalRunning).toBe(4);
+  });
+
   // AUR-4143 review follow-up (CEO). The first cut of the fix took the ceiling
   // as a caller-supplied option, and only resumeQueuedRuns passed it. The other
   // 8 call sites — retry promotion, assignment dispatch, and most importantly

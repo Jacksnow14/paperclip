@@ -58,7 +58,7 @@ import type {
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
-import { findActiveAdapterQuotaPause } from "./quota-pause.js";
+import { findActiveAdapterQuotaPause, QUOTA_PAUSE_INELIGIBLE_AGENT_STATUSES } from "./quota-pause.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
@@ -7108,15 +7108,52 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // here rather than accepted from callers on purpose — see
   // startNextQueuedRunForAgent. With one contender this is the full cap, so an
   // uncontended agent still gets the whole host budget.
-  async function resolveContendedCeiling() {
+  //
+  // AUR-4620: the contender count must exclude agents that can never actually
+  // consume a slot right now — the same two conditions startNextQueuedRunForAgent
+  // itself checks before an agent even reaches the ceiling math (ineligible
+  // agent.status, or an active adapter-wide quota pause). Before this fix a
+  // fleet with several quota-paused/errored agents holding stale queued rows
+  // (e.g. codex_local agents parked behind a shared session-limit wall) still
+  // counted toward `contenders`, shrinking every *actually eligible* agent's
+  // share below what the free global cap could support. Measured live on
+  // AUR-4562/AUR-4620: contenders=8 (3 permanently quota-paused codex_local
+  // agents included) forced ceiling=1 for every agent, and the cap sat at 2/4
+  // running with 280 queued while the two eligible agents (capped at 1 each)
+  // had no way to claim the two slots nothing else could ever take. Scoped by
+  // companyId — cross-tenant queued rows must not shrink this company's share
+  // (mirrors findActiveAdapterQuotaPause's own companyId scoping).
+  async function resolveContendedCeiling(companyId: string) {
     const globalCap = resolveGlobalRunCap();
-    const [row] = await db
-      .select({ contenders: sql<number>`count(distinct ${heartbeatRuns.agentId})` })
+    const candidates = await db
+      .selectDistinct({
+        agentId: heartbeatRuns.agentId,
+        adapterType: agents.adapterType,
+      })
       .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.status, "queued"));
+      .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
+      .where(
+        and(
+          eq(heartbeatRuns.status, "queued"),
+          eq(agents.companyId, companyId),
+          notInArray(agents.status, QUOTA_PAUSE_INELIGIBLE_AGENT_STATUSES),
+        ),
+      );
+    if (candidates.length === 0) return globalCap;
+    const distinctAdapterTypes = [...new Set(candidates.map((row) => row.adapterType))];
+    const now = new Date();
+    const pausedAdapterTypes = new Set<string>();
+    for (const adapterType of distinctAdapterTypes) {
+      const pause = await findActiveAdapterQuotaPause(db, companyId, adapterType, now);
+      if (pause) pausedAdapterTypes.add(adapterType);
+    }
+    const eligibleAgentIds = new Set(
+      candidates.filter((row) => !pausedAdapterTypes.has(row.adapterType)).map((row) => row.agentId),
+    );
     // Any agent reaching this point has queued rows of its own (callers with an
-    // empty queue return before claiming), so it is always one of the contenders.
-    const contenders = Math.max(1, Number(row?.contenders ?? 0));
+    // empty queue return before claiming), so it is always one of the contenders
+    // — even if every *other* candidate got excluded above.
+    const contenders = Math.max(1, eligibleAgentIds.size);
     if (contenders <= 1) return globalCap;
     return Math.max(1, Math.floor(globalCap / contenders));
   }
@@ -7312,16 +7349,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // AUR-4143: fair-share ceiling. When other agents also have queued work,
       // this agent may not hold more than its equal share of the global cap, so
       // a chatty agent cannot starve the rest of the fleet indefinitely.
-      const contendedSlots = Math.max(0, (await resolveContendedCeiling()) - runningCount);
-      const availableSlots = Math.max(
-        0,
-        Math.min(
-          policy.maxConcurrentRuns - runningCount,
-          globalCap - globalRunningCount,
-          contendedSlots,
-        ),
-      );
-      if (availableSlots <= 0) return [];
+      const contendedCeiling = await resolveContendedCeiling(agent.companyId);
+      const contendedSlots = Math.max(0, contendedCeiling - runningCount);
+      const policySlots = policy.maxConcurrentRuns - runningCount;
+      const globalSlots = globalCap - globalRunningCount;
+      const availableSlots = Math.max(0, Math.min(policySlots, globalSlots, contendedSlots));
+      if (availableSlots <= 0) {
+        // AUR-4620: this was a silent `return []` — the exact gap the 16-minute
+        // external census on AUR-4562 had to fill by hand. Naming the binding
+        // constraint here makes "slot free but nothing admitted" diagnosable
+        // from the log alone.
+        const bindingConstraint =
+          globalSlots <= 0 ? "global_cap" : policySlots <= 0 ? "agent_policy_cap" : "contended_ceiling";
+        logger.info(
+          {
+            agentId,
+            bindingConstraint,
+            runningCount,
+            policyMaxConcurrentRuns: policy.maxConcurrentRuns,
+            globalCap,
+            globalRunningCount,
+            contendedCeiling,
+          },
+          "startNextQueuedRunForAgent: no available slots; run admission suppressed",
+        );
+        return [];
+      }
 
       const queuedRuns = await db
         .select()
@@ -7369,6 +7422,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const diskPressure = checkDiskPressure();
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+      let diskShedCount = 0;
       for (const queuedRun of prioritizedRuns) {
         if (claimedRuns.length >= availableSlots) break;
         // Disk pressure gate: shed non-critical run admission until disk recovers.
@@ -7376,10 +7430,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (diskPressure) {
           const queuedIssueId = readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId);
           const queuedIssue = queuedIssueId ? issueById.get(queuedIssueId) : null;
-          if (queuedIssue?.priority !== "critical") continue;
+          if (queuedIssue?.priority !== "critical") {
+            diskShedCount += 1;
+            continue;
+          }
         }
         const claimed = await claimQueuedRun(queuedRun);
         if (claimed) claimedRuns.push(claimed);
+      }
+      // AUR-4620: per-run shed was a silent `continue` — summarize instead of
+      // logging one line per shed run (a queue in the hundreds would flood the
+      // log at the 30s scheduler cadence otherwise).
+      if (diskShedCount > 0) {
+        logger.info(
+          { agentId, diskShedCount, claimedCount: claimedRuns.length, availableSlots },
+          "startNextQueuedRunForAgent: disk pressure shed non-critical queued runs",
+        );
       }
       if (claimedRuns.length === 0) return [];
 

@@ -448,6 +448,104 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
   );
 });
 
+describeEmbeddedPostgres("runDatabaseBackup — in-flight dump vs concurrent prune (AUR-4644)", () => {
+  it(
+    "does not lose an in-flight dump to a concurrent emergencyPruneBackups pass",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-inflight-race-");
+      const prefix = "pc";
+      const sourceSql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."inflight_race_test" (
+            "id" serial PRIMARY KEY,
+            "label" text NOT NULL
+          );
+        `);
+        await sourceSql`
+          INSERT INTO "public"."inflight_race_test" ("label")
+          VALUES ('row-1'), ('row-2'), ('row-3')
+        `;
+      } finally {
+        await sourceSql.end();
+      }
+
+      // A pre-existing "completed" backup, deliberately future-dated so the
+      // byte-cap eviction's "protect the newest" guard latches onto it —
+      // forcing the real in-flight dump to be the one considered for eviction,
+      // deterministically, regardless of exact mtime timing during the write.
+      const bystanderPath = path.join(backupDir, `${prefix}-20200101-000000.sql.gz`);
+      fs.writeFileSync(bystanderPath, Buffer.alloc(8192, 1));
+      const future = new Date(Date.now() + 60 * 60 * 1000);
+      fs.utimesSync(bystanderPath, future, future);
+
+      // The backup job's own retention is generous — its post-completion prune
+      // must not touch the dump it just produced.
+      const retention = {
+        dailyDays: 1,
+        weeklyWeeks: 1,
+        monthlyMonths: 1,
+        hourlyCount: 6,
+        maxBytes: 10 * 1024 * 1024,
+      };
+      // A disk-pressure monitor runs emergencyPruneBackups independently, on its
+      // own much tighter policy — this is the concurrent actor the regression is
+      // about. Tiny cap: whatever is visible in backupDir at the instant it fires
+      // breaches it immediately.
+      const emergencyRetention = { ...retention, maxBytes: 1024 };
+
+      // Watch the backup dir (and any subdirectory that appears in it) for the
+      // in-flight dump's plain .sql file, and fire a real emergencyPruneBackups
+      // pass the instant it shows up — reproducing a disk-monitor prune racing
+      // a live backup, without relying on fragile sleep-based timing.
+      const watchers: fs.FSWatcher[] = [];
+      let pruneFired = false;
+      let pruneError: unknown = null;
+      const triggerPrune = () => {
+        if (pruneFired) return;
+        pruneFired = true;
+        try {
+          emergencyPruneBackups(backupDir, emergencyRetention, prefix);
+        } catch (err) {
+          pruneError = err;
+        }
+      };
+      const watchDir = (dir: string) => {
+        const watcher = fs.watch(dir, (_eventType, filename) => {
+          if (!filename) return;
+          if (filename.endsWith(".sql") && !filename.endsWith(".sql.gz")) {
+            triggerPrune();
+            return;
+          }
+          if (pruneFired) return;
+          const candidate = path.join(dir, filename);
+          if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+            watchDir(candidate);
+          }
+        });
+        watchers.push(watcher);
+      };
+      watchDir(backupDir);
+      cleanups.push(() => watchers.forEach((w) => w.close()));
+
+      const result = await runDatabaseBackup({
+        connectionString,
+        backupDir,
+        retention,
+        filenamePrefix: prefix,
+        backupEngine: "javascript",
+      });
+
+      expect(pruneFired).toBe(true);
+      expect(pruneError).toBeNull();
+      expect(fs.existsSync(result.backupFile)).toBe(true);
+      expect(result.backupFile.endsWith(".sql.gz")).toBe(true);
+    },
+    20_000,
+  );
+});
+
 // ---------------------------------------------------------------------------
 // Retention logic unit tests — no real DB required
 // ---------------------------------------------------------------------------

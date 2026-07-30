@@ -28,10 +28,17 @@ const QUOTA_PAUSE_INELIGIBLE_AGENT_STATUSES = ["paused", "terminated", "pending_
 // zero-token runs against a wall they can't clear. Scoped by companyId so agents in
 // different companies (and thus different credential grants) never cross-suppress.
 //
-// The max horizon is anchored to the row's `updatedAt` (when the retry was scheduled),
-// NOT to `now`. A ceiling of `now + MAX` is not a bound at all — it slides forward as
-// fast as time does and can never expire, so a misparsed multi-day reset would still
-// suppress the whole fleet for its full duration while merely *reporting* a 6h horizon.
+// The max horizon is anchored to the row's `createdAt` — the arming instant, since both
+// arming paths INSERT a fresh scheduled_retry row rather than transitioning an existing
+// one — and NOT to `now`. A ceiling of `now + MAX` is not a bound at all: it slides
+// forward as fast as time does and can never expire, so a misparsed multi-day reset would
+// still suppress the whole fleet for its full duration while merely *reporting* a 6h
+// horizon. `createdAt` rather than `updatedAt` because `createdAt` is immutable by
+// construction (`.defaultNow()`, absent from every `db.update(heartbeatRuns)` site),
+// whereas `updatedAt` is stable only as an emergent property of no writer currently
+// touching a paused row — and if that ever changed the bound would silently slide and
+// restore the multi-day fleet outage AUR-4055/AUR-4139 exist to kill. Do not "simplify"
+// this back to `updatedAt`.
 // The clamp therefore lives in the WHERE clause, where it decides whether the row still
 // matches, rather than only in the returned value: the caller gates on presence alone.
 //

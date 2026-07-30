@@ -853,7 +853,11 @@ const BLOCKER_ATTENTION_OPEN_RECOVERY_TERMINAL_STATUSES = ["done", "cancelled"];
 const BLOCKER_ATTENTION_RESOLVED_STATUSES = ["done", "cancelled"];
 const BLOCKER_ATTENTION_MAX_DEPTH = 8;
 const BLOCKER_ATTENTION_MAX_NODES = 2000;
-const BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES = new Set(["active", "idle", "running", "error"]);
+// "error" is deliberately excluded (AUR-4273): an agent stuck in `error` is the one
+// genuine routing fault this set needs to distinguish from healthy queued work (see
+// AUR-4292/AUR-4302), so a blocker assigned to an `error` agent must still raise
+// attentionBlockerCount rather than being treated as invokable.
+const BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES = new Set(["active", "idle", "running"]);
 
 type IssueBlockerAttentionNode = {
   id: string;
@@ -1558,9 +1562,15 @@ async function listIssueBlockerAttentionMap(
 
     if (node.assigneeAgentId) {
       const assignee = agentsById.get(node.assigneeAgentId);
-      if (!assignee || assignee.companyId !== companyId || !BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES.has(assignee.status)) {
-        return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null, sampleBlockerCancelled: false };
+      // A blocker sitting open with no active run/wake row yet (AUR-4273) is
+      // indistinguishable from a dead node UNLESS its assignee is a healthy agent that
+      // will pick it up on its own next turn — an invokable agent is a live wait path,
+      // just like activeIssueIds/activeRecoveryWaitIssueIds above, so it must cover the
+      // path rather than fall through to attentionBlockerCount.
+      if (assignee && assignee.companyId === companyId && BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES.has(assignee.status)) {
+        return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null, sampleBlockerCancelled: false };
       }
+      return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null, sampleBlockerCancelled: false };
     }
 
     return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null, sampleBlockerCancelled: false };

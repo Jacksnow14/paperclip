@@ -243,6 +243,7 @@ describe("startServer feedback export wiring", () => {
       actionErrors: 0,
       obsoleteRecoveriesRetired: 0,
       obsoleteRecoveryBlockerRelationsRemoved: 0,
+      openNonTerminalIssues: 0,
     })).toBe(false);
   });
 
@@ -310,6 +311,18 @@ describe("startServer feedback export wiring", () => {
       actionErrors: 0,
       classBNoop: 5,
     })).toBe(false);
+  });
+
+  it("treats Class C open-non-terminal issues as log-worthy on their own (AUR-4273)", () => {
+    expect(shouldLogIssueGraphLivenessReconciliation({
+      escalationsCreated: 0,
+      classAAutoRecovered: 0,
+      classBNudged: 0,
+      classBEscalated: 0,
+      issueGraphRecoveryActionsResolved: 0,
+      actionErrors: 0,
+      openNonTerminalIssues: 17,
+    })).toBe(true);
   });
 });
 

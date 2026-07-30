@@ -193,6 +193,14 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
     await db.delete(heartbeatRunEvents);
     await db.delete(issues);
     for (let attempt = 0; attempt < 5; attempt += 1) {
+      // Re-clear every table that carries an FK to heartbeat_runs on each
+      // attempt, not just heartbeat_run_events. Runs admitted by a test keep
+      // executing while teardown starts, so they write fresh activity_log and
+      // cost_events rows *after* the bulk deletes above — leaving a permanent
+      // 23503 on activity_log_run_id_heartbeat_runs_id_fk that retrying the
+      // heartbeat_runs delete alone can never clear.
+      await db.delete(activityLog);
+      await db.delete(costEvents);
       await db.delete(heartbeatRunEvents);
       try {
         await db.delete(heartbeatRuns);

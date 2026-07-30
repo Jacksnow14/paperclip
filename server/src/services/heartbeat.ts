@@ -7063,15 +7063,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { reaped: reaped.length, runIds: reaped };
   }
 
+  // AUR-4143: the global run cap is a shared resource, but per-agent
+  // maxConcurrentRuns defaults to AGENT_DEFAULT_MAX_CONCURRENT_RUNS (20) while
+  // the host cap derives from memory (4 on a 7.7GB box). A single agent could
+  // therefore legally hold the entire global cap, and the previous
+  // implementation made that the norm: it selected queued agent ids with no
+  // ORDER BY and let each agent greedily claim every free slot in arbitrary
+  // table-scan order. Observed live: CTO+CEO held 4/4 running while three
+  // engineers sat on 74 queued runs aging 14h+, each computing
+  // availableSlots = min(20 - 0, 4 - 4) = 0 and returning empty forever.
+  //
+  // Fix: drive agents starvation-first (oldest queued run wins, deterministic)
+  // and hand each one a *contended ceiling* — an equal share of the global cap
+  // — so no agent can hold more than its share while another agent has queued
+  // work waiting. The ceiling is a ceiling on concurrent holdings, not on
+  // claims per pass; limiting only per-pass claims would still let a long-lived
+  // agent accumulate a monopoly one slot at a time across successive ticks.
   async function resumeQueuedRuns() {
-    const queuedRuns = await db
-      .select({ agentId: heartbeatRuns.agentId })
+    const queuedAgents = await db
+      .select({
+        agentId: heartbeatRuns.agentId,
+        oldestQueuedAt: sql<string>`min(${heartbeatRuns.createdAt})`,
+      })
       .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.status, "queued"));
+      .where(eq(heartbeatRuns.status, "queued"))
+      .groupBy(heartbeatRuns.agentId)
+      .orderBy(asc(sql`min(${heartbeatRuns.createdAt})`));
 
-    const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
-    for (const agentId of agentIds) {
-      await startNextQueuedRunForAgent(agentId);
+    if (queuedAgents.length === 0) return;
+
+    // With a single contending agent this is the full cap, so an uncontended
+    // agent still gets to use the whole host budget.
+    const contendedCeiling = Math.max(
+      1,
+      Math.floor(resolveGlobalRunCap() / queuedAgents.length),
+    );
+
+    for (const { agentId } of queuedAgents) {
+      await startNextQueuedRunForAgent(agentId, { contendedCeiling });
     }
   }
 
@@ -7177,7 +7206,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
-  async function startNextQueuedRunForAgent(agentId: string) {
+  async function startNextQueuedRunForAgent(
+    agentId: string,
+    opts?: {
+      // AUR-4143: max concurrent runs this agent may *hold* while other agents
+      // have queued work waiting. Omitted (direct wake paths) means uncontended.
+      contendedCeiling?: number;
+    },
+  ) {
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
       if (!agent) return [];
@@ -7213,9 +7249,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // advisory lock; this pre-check only avoids pointless claim attempts.
       const globalCap = resolveGlobalRunCap();
       const globalRunningCount = await countRunningRunsGlobal();
+      // AUR-4143: fair-share ceiling. When other agents also have queued work,
+      // this agent may not hold more than its equal share of the global cap, so
+      // a chatty agent cannot starve the rest of the fleet indefinitely.
+      const contendedSlots = opts?.contendedCeiling == null
+        ? Number.POSITIVE_INFINITY
+        : Math.max(0, opts.contendedCeiling - runningCount);
       const availableSlots = Math.max(
         0,
-        Math.min(policy.maxConcurrentRuns - runningCount, globalCap - globalRunningCount),
+        Math.min(
+          policy.maxConcurrentRuns - runningCount,
+          globalCap - globalRunningCount,
+          contendedSlots,
+        ),
       );
       if (availableSlots <= 0) return [];
 

@@ -7,6 +7,11 @@ export const SANDBOX_INSTALL_COMMAND = "npm install -g @anthropic-ai/claude-code
 
 export const models = [
   { id: "claude-fable-5", label: "Claude Fable 5" },
+  // AUR-4689: opus-5/sonnet-5 are live-proven on this fleet (CEO/CTO/Fast run
+  // them today); omitting them here would make config validation and the
+  // model-config sweep false-flag healthy agents.
+  { id: "claude-opus-5", label: "Claude Opus 5" },
+  { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
   { id: "claude-opus-4-8", label: "Claude Opus 4.8" },
   { id: "claude-opus-4-7", label: "Claude Opus 4.7" },
   { id: "claude-opus-4-6", label: "Claude Opus 4.6" },

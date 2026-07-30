@@ -301,7 +301,7 @@ describe("agent instructions bundle routes", () => {
       .send({
         adapterType: "claude_local",
         adapterConfig: {
-          model: "claude-sonnet-4",
+          model: "claude-sonnet-4-6",
         },
       }));
 
@@ -311,7 +311,7 @@ describe("agent instructions bundle routes", () => {
       expect.objectContaining({
         adapterType: "claude_local",
         adapterConfig: expect.objectContaining({
-          model: "claude-sonnet-4",
+          model: "claude-sonnet-4-6",
           instructionsBundleMode: "managed",
           instructionsRootPath: "/tmp/agent-1",
           instructionsEntryFile: "AGENTS.md",

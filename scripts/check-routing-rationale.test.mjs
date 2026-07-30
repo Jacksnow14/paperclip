@@ -19,6 +19,8 @@ import {
   todayDateKey,
   matchesRoutingKey,
   pickNewestRoutingRecord,
+  hasRoutingDoctrineBlock,
+  main,
 } from "./check-routing-rationale.mjs";
 
 // A stub apiGet that records every query string it receives and returns a
@@ -798,4 +800,207 @@ test("isExempt: genuinely delegated + non-exempt issue is NOT exempt under eithe
   const issue = { title: "Build the widget", createdByAgentId: "a1", assigneeAgentId: "b2" };
   assert.equal(isExempt(issue), false);
   assert.equal(isExemptForResolvedFlag(issue), false);
+});
+
+// ── AUR-4095 Phase C: hasRoutingDoctrineBlock ────────────────────────────────
+
+const CANON_BLOCK =
+  "<!-- BEGIN:routing-rationale-doctrine v1 -->\n" +
+  "Some canonical body text for the routing rationale doctrine, repeated so the ".repeat(4) +
+  "block is long enough that a short pointer stub clearly falls under the 0.5 tier ratio.\n" +
+  "<!-- END:routing-rationale-doctrine -->";
+
+test("hasRoutingDoctrineBlock: true when AGENTS.md carries the block byte-identical to canon", () => {
+  const agentsMd = `You are an agent.\n\n${CANON_BLOCK}\n`;
+  assert.equal(hasRoutingDoctrineBlock(agentsMd, CANON_BLOCK), true);
+});
+
+test("hasRoutingDoctrineBlock: true for a deliberate short pointer stub (not drift)", () => {
+  const stub =
+    "<!-- BEGIN:routing-rationale-doctrine v1 -->\nSee canonical doctrine.\n<!-- END:routing-rationale-doctrine -->";
+  const agentsMd = `You are an agent.\n\n${stub}\n`;
+  assert.equal(hasRoutingDoctrineBlock(agentsMd, CANON_BLOCK), true);
+});
+
+test("hasRoutingDoctrineBlock: false when the block is missing entirely", () => {
+  assert.equal(hasRoutingDoctrineBlock("You are an agent. No doctrine here.", CANON_BLOCK), false);
+});
+
+test("hasRoutingDoctrineBlock: false when a full-length block is present but stale", () => {
+  // Same length class as CANON_BLOCK (well above the 0.5 stub-tier ratio) so
+  // this exercises 'drifted', not 'stub'.
+  const stale =
+    "<!-- BEGIN:routing-rationale-doctrine v1 -->\n" +
+    "HAND-EDITED AND NOW STALE body text for the routing rationale doctrine, repeated so the ".repeat(4) +
+    "block is long enough to be judged full-tier, not a pointer stub.\n" +
+    "<!-- END:routing-rationale-doctrine -->";
+  const agentsMd = `You are an agent.\n\n${stale}\n`;
+  assert.equal(hasRoutingDoctrineBlock(agentsMd, CANON_BLOCK), false);
+});
+
+test("hasRoutingDoctrineBlock: false on empty/undefined AGENTS.md", () => {
+  assert.equal(hasRoutingDoctrineBlock("", CANON_BLOCK), false);
+  assert.equal(hasRoutingDoctrineBlock(undefined, CANON_BLOCK), false);
+});
+
+// ── AUR-4095 Phase C: main() integration — doctrine-currency audit ─────────
+
+const API_URL = "http://test.local";
+const COMPANY_ID = "c1";
+
+/**
+ * Minimal fetch stub keyed by `${method} ${path}` (path relative to API_URL).
+ * An unmatched route responds 404 so an unexpected call fails loudly rather
+ * than silently returning undefined-shaped data.
+ */
+function makeFetchStub(routes) {
+  const calls = [];
+  return {
+    calls,
+    fetchStub: async (url, init = {}) => {
+      const method = init.method ?? "GET";
+      const path = url.replace(API_URL, "");
+      calls.push({ method, path, body: init.body ? JSON.parse(init.body) : undefined });
+      const key = `${method} ${path}`;
+      if (!Object.prototype.hasOwnProperty.call(routes, key)) {
+        return { ok: false, status: 404, statusText: "Not Found", json: async () => ({}) };
+      }
+      const value = routes[key];
+      return { ok: true, status: 200, statusText: "OK", json: async () => value };
+    },
+  };
+}
+
+// Fixed clock so the rolling gap issue's date-keyed title (and hence the
+// findRollingIssue query URL) is deterministic.
+const PHASE_C_NOW = new Date("2026-07-25T12:00:00Z");
+const ROLLING_ISSUE_QUERY =
+  `GET /api/companies/${COMPANY_ID}/issues?q=${encodeURIComponent(rollingIssueTitle("2026-07-25"))}` +
+  `&status=backlog,todo,in_progress,in_review,blocked,done,cancelled&limit=20`;
+
+const BASE_ROUTES = {
+  [`GET /api/companies/${COMPANY_ID}/memory/records?limit=1`]: [],
+  [`GET /api/companies/${COMPANY_ID}/memory/records?titlePrefix=routing/AUR-9001&limit=${ROUTING_RECORD_LOOKUP_LIMIT}`]:
+    [{ id: "r1", title: "routing/AUR-9001" }],
+  [ROLLING_ISSUE_QUERY]: [],
+};
+
+const ROUTING_ISSUE = {
+  id: "i1",
+  identifier: "AUR-9001",
+  title: "Ship the widget",
+  priority: "high",
+  status: "in_progress",
+  assigneeAgentId: "agentB",
+  createdByAgentId: "agentA",
+};
+
+let originalFetch;
+test.beforeEach(() => {
+  originalFetch = global.fetch;
+});
+test.afterEach(() => {
+  global.fetch = originalFetch;
+});
+
+test("Phase C: flags an agent whose AGENTS.md is missing the doctrine block and files one consolidated CEO issue", async () => {
+  const { fetchStub, calls } = makeFetchStub({
+    ...BASE_ROUTES,
+    [`GET /api/companies/${COMPANY_ID}/issues?limit=500&status=backlog,todo,in_progress,in_review,blocked&offset=0`]:
+      [ROUTING_ISSUE],
+    [`GET /api/companies/${COMPANY_ID}/issues?limit=500&offset=0`]:
+      [ROUTING_ISSUE],
+    "GET /api/agents/agentA/instructions-bundle": { entryFile: "AGENTS.md" },
+    "GET /api/agents/agentA/instructions-bundle/file?path=AGENTS.md": {
+      content: "You are Agent A. No doctrine block here at all.",
+    },
+    [`POST /api/companies/${COMPANY_ID}/issues`]: { id: "newflag1" },
+  });
+  global.fetch = fetchStub;
+
+  const code = await main({
+    windowMinutes: 1440,
+    apply: true,
+    apiUrl: API_URL,
+    apiKey: "key",
+    companyId: COMPANY_ID,
+    now: PHASE_C_NOW,
+    fsImpl: { readFile: async () => `# doc\n\n${CANON_BLOCK}\n` },
+  });
+
+  assert.equal(code, 0);
+  const filed = calls.find(c => c.method === "POST" && c.path === `/api/companies/${COMPANY_ID}/issues`);
+  assert.ok(filed, "expected exactly one consolidated issue to be filed");
+  assert.equal(filed.body.assigneeAgentId, "3823a155-b4d4-4b06-b7d3-b3a55c6cbc1b");
+  assert.match(filed.body.title, /routing-rationale doctrine drift: 1 agent/);
+  assert.match(filed.body.description, /agentA/);
+});
+
+test("Phase C: stays silent when every assigning agent carries a current doctrine block", async () => {
+  const { fetchStub, calls } = makeFetchStub({
+    ...BASE_ROUTES,
+    [`GET /api/companies/${COMPANY_ID}/issues?limit=500&status=backlog,todo,in_progress,in_review,blocked&offset=0`]:
+      [ROUTING_ISSUE],
+    [`GET /api/companies/${COMPANY_ID}/issues?limit=500&offset=0`]:
+      [ROUTING_ISSUE],
+    "GET /api/agents/agentA/instructions-bundle": { entryFile: "AGENTS.md" },
+    "GET /api/agents/agentA/instructions-bundle/file?path=AGENTS.md": {
+      content: `You are Agent A.\n\n${CANON_BLOCK}\n`,
+    },
+  });
+  global.fetch = fetchStub;
+
+  const code = await main({
+    windowMinutes: 1440,
+    apply: true,
+    apiUrl: API_URL,
+    apiKey: "key",
+    companyId: COMPANY_ID,
+    now: PHASE_C_NOW,
+    fsImpl: { readFile: async () => `# doc\n\n${CANON_BLOCK}\n` },
+  });
+
+  assert.equal(code, 0);
+  const filedAnyIssue = calls.some(c => c.method === "POST" && c.path === `/api/companies/${COMPANY_ID}/issues`);
+  assert.equal(filedAnyIssue, false, "no doctrine-drift issue should be filed when every agent is current");
+});
+
+test("Phase C: auto-resolves an existing doctrine-drift flag once the fleet is repaired", async () => {
+  const existingFlag = {
+    id: "flag1",
+    identifier: "AUR-9500",
+    title: "routing-rationale doctrine drift: 1 agent(s) missing/stale block",
+    status: "todo",
+  };
+  const { fetchStub, calls } = makeFetchStub({
+    ...BASE_ROUTES,
+    [`GET /api/companies/${COMPANY_ID}/issues?limit=500&status=backlog,todo,in_progress,in_review,blocked&offset=0`]:
+      [ROUTING_ISSUE, existingFlag],
+    [`GET /api/companies/${COMPANY_ID}/issues?limit=500&offset=0`]:
+      [ROUTING_ISSUE, existingFlag],
+    "GET /api/agents/agentA/instructions-bundle": { entryFile: "AGENTS.md" },
+    "GET /api/agents/agentA/instructions-bundle/file?path=AGENTS.md": {
+      content: `You are Agent A.\n\n${CANON_BLOCK}\n`,
+    },
+    "PATCH /api/issues/flag1": { id: "flag1", status: "cancelled" },
+    "POST /api/issues/flag1/comments": { id: "comment1" },
+  });
+  global.fetch = fetchStub;
+
+  const code = await main({
+    windowMinutes: 1440,
+    apply: true,
+    apiUrl: API_URL,
+    apiKey: "key",
+    companyId: COMPANY_ID,
+    now: PHASE_C_NOW,
+    fsImpl: { readFile: async () => `# doc\n\n${CANON_BLOCK}\n` },
+  });
+
+  assert.equal(code, 0);
+  const cancelled = calls.find(c => c.method === "PATCH" && c.path === "/api/issues/flag1");
+  assert.ok(cancelled, "expected the stale doctrine-drift flag to be cancelled");
+  assert.equal(cancelled.body.status, "cancelled");
+  const commented = calls.some(c => c.method === "POST" && c.path === "/api/issues/flag1/comments");
+  assert.ok(commented, "expected an explanatory comment on the auto-resolved flag");
 });

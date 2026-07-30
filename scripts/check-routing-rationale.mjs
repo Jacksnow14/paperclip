@@ -33,6 +33,17 @@
  *     unrecoverable, and filing on them would just manufacture retro-
  *     fabricated records (the AUR-3956 pattern).
  *
+ *   Phase C — Doctrine-currency audit (AUR-4095):
+ *     The measurement pass checks whether a routing DECISION was recorded;
+ *     Phase C checks whether the agents making those decisions still carry
+ *     the RULE that obligates them to record one. For every agent that owes
+ *     (per resolveGapOwner) a post-rule eligible issue, fetches its resolved
+ *     AGENTS.md via the read-only instructions-bundle routes and diffs its
+ *     routing-rationale-doctrine block against the canonical source
+ *     (--doctrine-path). Files ONE consolidated issue to the CEO naming
+ *     every drifted/missing agent (never one per agent), auto-resolves it
+ *     once `sync-agent-doctrine.mjs --apply` repairs the fleet.
+ *
  *   Phase B — Sync rolling gap-aggregate issue (open gaps only):
  *     Find-or-create a single issue titled `routing-rationale gaps —
  *     YYYY-MM-DD` for today, rewrite its body with the current outstanding
@@ -88,6 +99,7 @@
 
 import { parseArgs } from 'node:util';
 import { resolveApiBase } from './lib/paperclip-api-base.mjs';
+import { extractCanonicalBlock, diffDoctrineBlock } from './lib/doctrine-blocks.mjs';
 
 // ── Exported core utilities (used in tests) ──────────────────────────────────
 
@@ -211,6 +223,34 @@ export function isExemptForResolvedFlag(issue) {
   if (issue.originKind && issue.originKind !== 'manual') return true;
   return isStaticallyExempt(issue);
 }
+
+/** Slug of the routing-rationale doctrine block as mirrored into agent AGENTS.md files. */
+export const ROUTING_DOCTRINE_SLUG = 'routing-rationale-doctrine';
+
+/**
+ * True if `agentsMd` carries a current mirror of the routing-rationale
+ * doctrine (AUR-4095, Phase C). Delegates to `diffDoctrineBlock` (the same
+ * tiering-aware diff `scripts/sync-agent-doctrine.mjs` uses) so this check
+ * and the sync tool always agree on what counts as "present": a byte-exact
+ * mirror ('unchanged') or a deliberate short pointer stub ('stub' — see
+ * `doctrine/propagate.py`'s POINTER_TIER_RATIO) both count. A block that is
+ * present but stale ('drifted') or absent entirely ('missing') does not.
+ *
+ * @param {string} agentsMd the agent's resolved AGENTS.md content
+ * @param {string} canonicalBlock the current `<!-- BEGIN:routing-rationale-doctrine ... -->` block, from the canonical doctrine file
+ */
+export function hasRoutingDoctrineBlock(agentsMd, canonicalBlock) {
+  const { verdict } = diffDoctrineBlock(agentsMd ?? '', canonicalBlock, ROUTING_DOCTRINE_SLUG);
+  return verdict === 'unchanged' || verdict === 'stub';
+}
+
+/**
+ * Canonical source for the routing-rationale doctrine block Phase C audits
+ * agents against (see scripts/sync-agent-doctrine.mjs for the general
+ * mirroring tool this reuses `doctrine-blocks.mjs` from).
+ */
+export const DEFAULT_ROUTING_DOCTRINE_PATH =
+  '/home/ievgen/paperclip-data/instances/default/companies/b26d3647-3e6c-4a28-9c25-e9315696484d/doctrine/routing-rationale-capture.md';
 
 /**
  * Returns a cancel reason string if the flag should be resolved, or null if
@@ -691,7 +731,11 @@ async function syncRollingGapIssue({
   return { action: 'file', issue: null };
 }
 
-export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, maxNewFlags = 20, now = new Date(), ruleEffectiveDate = RULE_EFFECTIVE_DATE }) {
+export async function main({
+  windowMinutes, apply, apiUrl, apiKey, companyId, maxNewFlags = 20,
+  now = new Date(), ruleEffectiveDate = RULE_EFFECTIVE_DATE,
+  fsImpl, canonicalDoctrinePath = DEFAULT_ROUTING_DOCTRINE_PATH,
+}) {
   // windowMinutes is accepted for CLI back-compat with the existing routine
   // invocation but is no longer used to filter anything — the full-
   // population measurement pass below scans every status every run instead
@@ -930,6 +974,127 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
   });
   console.log();
 
+  // ── Phase C: Doctrine-currency audit (AUR-4095) ────────────────────────────
+  // The routing-rationale convention itself has no include/transclusion
+  // mechanism (AUR-4089), so it's mirrored by copy into every routing agent's
+  // AGENTS.md and drifts unless re-synced (scripts/sync-agent-doctrine.mjs).
+  // The measurement pass above checks whether a routing DECISION was recorded;
+  // Phase C checks whether the agents making those decisions still carry the
+  // RULE that obligates them to record one in the first place.
+  console.log('── Phase C: Doctrine-currency audit ──');
+
+  const DOCTRINE_DRIFT_TITLE_RE = /^routing-rationale doctrine drift:/i;
+  const existingDriftFlag = rawIssues.find(
+    issue => DOCTRINE_DRIFT_TITLE_RE.test(issue.title ?? '') && !['done', 'cancelled'].includes(issue.status)
+  );
+
+  let canonicalRoutingBlock = null;
+  const driftedDoctrineAgents = [];
+  let phaseCFiled = false;
+  let phaseCResolved = false;
+
+  try {
+    const readFile = fsImpl?.readFile ?? (await import('node:fs/promises')).readFile;
+    const raw = await readFile(canonicalDoctrinePath, 'utf8');
+    canonicalRoutingBlock = extractCanonicalBlock(raw).block;
+  } catch (err) {
+    console.log(`  WARN: could not load canonical routing-rationale-doctrine block (${err.message}) — skipping Phase C.\n`);
+  }
+
+  if (canonicalRoutingBlock) {
+    // Every agent that owes a rationale for a post-rule eligible issue also
+    // owes the current doctrine text — reuse the measurement pass's
+    // `eligible` pool (already exemption- and prerule-filtered) and
+    // `resolveGapOwner` (same "who owes this" resolution used for gap
+    // ownership) so the phases agree on who is in scope.
+    const assigningAgents = new Map();
+    for (const issue of eligible) {
+      const owner = resolveGapOwner(issue);
+      const id = issue.identifier ?? issue.id;
+      if (!assigningAgents.has(owner.agentId)) assigningAgents.set(owner.agentId, []);
+      assigningAgents.get(owner.agentId).push(id);
+    }
+
+    for (const [agentId, issueIds] of assigningAgents) {
+      try {
+        const bundle = await apiGet(`/api/agents/${agentId}/instructions-bundle`);
+        const entryFile = bundle.entryFile ?? 'AGENTS.md';
+        const file = await apiGet(`/api/agents/${agentId}/instructions-bundle/file?path=${encodeURIComponent(entryFile)}`);
+        if (!hasRoutingDoctrineBlock(file.content, canonicalRoutingBlock)) {
+          driftedDoctrineAgents.push({ agentId, issueIds });
+        }
+      } catch (err) {
+        console.log(`  WARN: could not audit agent ${agentId}'s AGENTS.md: ${err.message}`);
+      }
+    }
+
+    if (driftedDoctrineAgents.length === 0) {
+      console.log('  All assigning agents carry a current routing-rationale-doctrine block.\n');
+      if (existingDriftFlag) {
+        const flagId = existingDriftFlag.id ?? existingDriftFlag.identifier;
+        const flagLabel = existingDriftFlag.identifier ?? flagId;
+        const reason = 'Auto-resolved by routing-rationale-watchdog Phase C: all assigning agents now carry a current doctrine block.';
+        console.log(`  CANCEL ${flagLabel}: ${reason}`);
+        phaseCResolved = true;
+        if (apply) {
+          const ok = await runMutation(
+            `cancel ${flagLabel} (doctrine-drift)`,
+            async () => {
+              await apiPatch(`/api/issues/${flagId}`, { status: 'cancelled' });
+              await apiPost(`/api/issues/${flagId}/comments`, { body: reason });
+            },
+            failedMutations,
+          );
+          if (ok) console.log(`    → cancelled + commented.`);
+        }
+      }
+    } else {
+      console.log(`  DRIFT — ${driftedDoctrineAgents.length} assigning agent(s) missing/stale routing-rationale-doctrine block:`);
+      for (const d of driftedDoctrineAgents) {
+        console.log(`    - ${d.agentId} (routed: ${d.issueIds.join(', ')})`);
+      }
+      console.log();
+
+      if (existingDriftFlag) {
+        console.log(`  SKIPPED-DEDUP — open doctrine-drift flag exists: ${existingDriftFlag.identifier ?? existingDriftFlag.id}\n`);
+      } else {
+        // One consolidated issue for the whole drifted set, not one per
+        // agent — a fleet-wide re-sync is a single action (`sync-agent-
+        // doctrine.mjs --apply`), so N per-agent issues would just be noise.
+        const title = `routing-rationale doctrine drift: ${driftedDoctrineAgents.length} agent(s) missing/stale block`;
+        const description = [
+          '## Routing-rationale doctrine drift detected',
+          '',
+          'The following agents owe a routing rationale for a post-rule eligible high/critical issue, but their AGENTS.md is missing or has a stale `routing-rationale-doctrine` block compared to the canonical source:',
+          '',
+          ...driftedDoctrineAgents.map(d => `- \`${d.agentId}\` — routed: ${d.issueIds.join(', ')}`),
+          '',
+          'Repair with: `node scripts/sync-agent-doctrine.mjs --apply` (AUR-4095).',
+          '',
+          'exec.routing-rationale: skip',
+        ].join('\n');
+        console.log(`  FILE: "${title}" → owner ${CEO_AGENT_ID}`);
+        phaseCFiled = true;
+        if (apply) {
+          const ok = await runMutation(
+            'file doctrine-drift issue',
+            async () => {
+              await apiPost(`/api/companies/${companyId}/issues`, {
+                title,
+                description,
+                status: 'todo',
+                assigneeAgentId: CEO_AGENT_ID,
+              });
+            },
+            failedMutations,
+          );
+          if (ok) console.log(`    → filed (assignee ${CEO_AGENT_ID}).`);
+        }
+      }
+    }
+  }
+  console.log();
+
   // ── Summary ────────────────────────────────────────────────────────────────
   console.log('── Summary ──');
   console.log(`  Legacy flags resolved: ${toCancel.length}`);
@@ -939,6 +1104,7 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
   console.log(`  Missing closed (unrecoverable, report-only): ${missingClosed.length}`);
   console.log(`  Rolling issue action: ${rollingResult.action}`);
   console.log(`  Project-scoped hits (hidden from org reads): ${projectScopedHits.length}`);
+  console.log(`  Doctrine-drift agents: ${driftedDoctrineAgents.length}`);
   console.log(`  Failed:        ${failedMutations.length}`);
   if (failedMutations.length > 0) {
     for (const { label, status } of failedMutations) {
@@ -947,7 +1113,8 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
     console.log(`  Re-run the watchdog to retry the above (idempotent).`);
   }
 
-  const hasPendingActions = toCancel.length > 0 || rollingResult.action !== 'none';
+  const phaseCPendingActions = (phaseCFiled ? 1 : 0) + (phaseCResolved ? 1 : 0);
+  const hasPendingActions = toCancel.length > 0 || rollingResult.action !== 'none' || phaseCPendingActions > 0;
   if (!apply && hasPendingActions) {
     console.log('\n[DRY-RUN] Pass --apply to execute the above actions.');
     return 1;
@@ -956,7 +1123,9 @@ export async function main({ windowMinutes, apply, apiUrl, apiKey, companyId, ma
   // Every intended mutation failed this run — nothing was accomplished, so
   // surface it distinctly from the normal "some things failed, rest went
   // through" case (which still exits 0; see Failed count above) (AUR-3855).
-  const attemptedMutations = apply ? toCancel.length + (rollingResult.action !== 'none' ? 1 : 0) : 0;
+  const attemptedMutations = apply
+    ? toCancel.length + (rollingResult.action !== 'none' ? 1 : 0) + phaseCPendingActions
+    : 0;
   if (attemptedMutations > 0 && failedMutations.length === attemptedMutations) {
     console.log('\nERROR: every intended mutation failed this run — see Failed list above.');
     return 4;
@@ -978,6 +1147,7 @@ if (isMain) {
       'window-minutes': { type: 'string', default: '1440' },
       'max-new-flags': { type: 'string', default: '20' },
       'rule-effective-date': { type: 'string' },
+      'doctrine-path': { type: 'string', default: DEFAULT_ROUTING_DOCTRINE_PATH },
       apply: { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
@@ -995,6 +1165,7 @@ if (isMain) {
     console.log('                           commit b78456e6/AUR-2301, AUR-4006). The boundary is inclusive of');
     console.log('                           the date itself: an issue created exactly at this instant IS owed a');
     console.log('                           rationale.');
+    console.log('  --doctrine-path P        Canonical routing-rationale-capture.md path for Phase C (default: company doctrine dir)');
     console.log('  --apply                  Execute changes (default: dry-run, exit 1 if actions pending)');
     process.exit(0);
   }
@@ -1015,14 +1186,18 @@ if (isMain) {
     process.exit(2);
   }
 
+  const fs = await import('node:fs/promises');
+
   resolveApiBase().then(API_URL => main({
     windowMinutes: parseInt(args['window-minutes'], 10),
     maxNewFlags: parseInt(args['max-new-flags'], 10),
+    canonicalDoctrinePath: args['doctrine-path'],
     apply: args.apply,
     apiUrl: API_URL,
     apiKey: API_KEY,
     companyId: COMPANY_ID,
     ruleEffectiveDate,
+    fsImpl: fs,
   })).then(code => process.exit(code)).catch(err => {
     console.error('FATAL:', err.message);
     process.exit(2);

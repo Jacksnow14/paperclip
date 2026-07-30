@@ -69,19 +69,27 @@ export const NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES = [
 // were mis-coded `claude_transient_upstream` and swallowed by the exclusion above.
 //
 // Adding a code to BOTH lists would reproduce that bug under a new name, so the
-// invariant is enforced at module load rather than left to a comment.
+// invariant is enforced mechanically rather than left to a comment.
 export const DETERMINISTIC_ATTRIBUTABLE_ERROR_CODES = [
   CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
 ] as const;
 
-for (const code of DETERMINISTIC_ATTRIBUTABLE_ERROR_CODES) {
-  if ((NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES as readonly string[]).includes(code)) {
-    throw new Error(
-      `productivity-review misconfigured: "${code}" is both deterministic-attributable and ` +
-        `non-attributable. A deterministic error must escalate (AUR-4513/AUR-4212).`,
-    );
-  }
-}
+// AUR-4557: this invariant used to be a module-scope `for` loop with a `throw`. The
+// module is imported at startup (services/index.ts, heartbeat.ts), so an edit adding
+// a code to both sets would not fail a test — it would crash the API on boot, taking
+// down the shared multi-tenant control plane. Fail-closed is right, but the failure
+// belongs at compile time, where it costs a red typecheck instead of an outage.
+// `AssertNever` resolves only while the two sets are disjoint: overlap turns
+// `Extract<…>` into a real union, which does not satisfy `extends never`, and this
+// file stops compiling. Zero runtime cost and unreachable at boot. The runtime
+// companion assertion lives in productivity-review-service.test.ts.
+type AssertNever<T extends never> = T;
+export type DeterministicCodesAreNotProviderCodes = AssertNever<
+  Extract<
+    (typeof DETERMINISTIC_ATTRIBUTABLE_ERROR_CODES)[number],
+    (typeof NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES)[number]
+  >
+>;
 
 function isInfraKilledRun(run: Pick<HeartbeatRunRow, "errorCode" | "error">) {
   // A deterministic failure is never an infra kill, even if a future edit adds its

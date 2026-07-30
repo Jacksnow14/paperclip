@@ -46,6 +46,8 @@ export {
   ADAPTER_SESSION_MANAGEMENT,
   LEGACY_SESSIONED_ADAPTER_TYPES,
   CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
+  CLAUDE_CONTEXT_OVERFLOW_RE,
+  isClaudeContextOverflowMessage,
   getAdapterSessionManagement,
   readSessionCompactionOverride,
   resolveSessionCompactionPolicy,

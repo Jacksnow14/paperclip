@@ -232,3 +232,113 @@ describe("isClaudeContextOverflowError (AUR-4513)", () => {
     expect(isClaudeTransientUpstreamError(input)).toBe(true);
   });
 });
+
+// AUR-4557. The AUR-4513 regression test above puts its contaminating text in
+// `stdout`, which this classifier never reads -- so it is tautological with respect
+// to the live failure mode. The real contamination vector is `parsed.result`, which
+// IS the model's final assistant message, and `errorMessage`, into which
+// describeClaudeFailure folds `parsed.result`. These are the cases that were missing.
+describe("isClaudeContextOverflowError prose contamination (AUR-4557)", () => {
+  // The exact failure the ticket describes: an agent working this very issue ends a
+  // turn summarising it, then the run fails for an unrelated reason. Pre-fix this
+  // returned true -> no errorFamily, no retry ladder, forced session rotation.
+  it("does NOT fire when the phrase appears in model prose in parsed.result", () => {
+    const prose =
+      "I fixed the classifier so a run that fails because the prompt is too long " +
+      "is no longer retried as transient.";
+    const input = {
+      parsed: { is_error: true, subtype: "success", result: prose },
+      stdout: "",
+      stderr: "",
+      errorMessage: `Claude run failed: subtype=success: ${prose}`,
+    };
+    expect(isClaudeContextOverflowError(input)).toBe(false);
+  });
+
+  // A genuine 529 that happens to follow prose about overflow must stay retryable.
+  it("leaves a real transient failure retryable when the prose mentions overflow", () => {
+    const prose =
+      "Notes on the prompt is too long defect. API Error 529 overloaded_error";
+    const input = {
+      parsed: { is_error: true, subtype: "success", result: prose },
+      stdout: "",
+      stderr: "",
+      errorMessage: `Claude run failed: subtype=success: ${prose}`,
+    };
+    expect(isClaudeContextOverflowError(input)).toBe(false);
+    expect(isClaudeTransientUpstreamError(input)).toBe(true);
+  });
+
+  // Self-seeding: the rotation handoff this feature generates embeds the reason
+  // string, so an agent that restates it must not re-trigger the classification.
+  it("does NOT fire when an agent restates its own rotation-reason handoff", () => {
+    expect(
+      isClaudeContextOverflowError({
+        parsed: {
+          is_error: true,
+          result:
+            "- Rotation reason: latest run failed with a context overflow (prompt is too long)",
+        },
+      }),
+    ).toBe(false);
+  });
+
+  // Length is not the discriminator -- a short prose reply must fail too.
+  it("does NOT fire on a short prose reply containing the phrase", () => {
+    expect(
+      isClaudeContextOverflowError({
+        parsed: { is_error: true, result: "Done - the prompt is too long fix landed." },
+      }),
+    ).toBe(false);
+  });
+
+  // The other half of the guard: it must still catch the real thing, or it is just a
+  // blanket suppressor. One passing and one failing case, per AUR-4185.
+  it("still fires on the genuine live wording", () => {
+    expect(
+      isClaudeContextOverflowError({
+        parsed: { is_error: true, subtype: "success", result: "Prompt is too long" },
+        errorMessage: "Claude run failed: subtype=success: Prompt is too long",
+      }),
+    ).toBe(true);
+    expect(
+      isClaudeContextOverflowError({
+        parsed: { is_error: true, result: "Prompt is too long." },
+      }),
+    ).toBe(true);
+    // API detail form: phrase opens the payload, colon-delimited detail follows.
+    expect(
+      isClaudeContextOverflowError({
+        parsed: {
+          is_error: true,
+          result:
+            "input length and `max_tokens` exceed context limit: 203000 + 8192 > 200000",
+        },
+      }),
+    ).toBe(true);
+  });
+
+  // parsed.errors[] is adapter/API structured output the model cannot author, so it
+  // stays substring-matched -- prose anchoring must not cost us that detection.
+  it("still fires on a structured errors[] message the model cannot author", () => {
+    expect(
+      isClaudeContextOverflowError({
+        parsed: {
+          is_error: true,
+          result: "",
+          errors: [{ message: "API error: prompt is too long: 250000 > 200000" }],
+        },
+      }),
+    ).toBe(true);
+  });
+
+  // The no-parse path passes process stderr as trustedText, also substring-matched.
+  it("still fires on the no-parse stderr path via trustedText", () => {
+    expect(
+      isClaudeContextOverflowError({
+        parsed: null,
+        trustedText: "Claude exited with code 1: API Error: 400 prompt is too long",
+      }),
+    ).toBe(true);
+  });
+});

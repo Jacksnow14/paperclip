@@ -863,7 +863,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const contextOverflow =
         !loginMeta.requiresLogin &&
         (proc.exitCode ?? 0) !== 0 &&
-        isClaudeContextOverflowError({ parsed: null, errorMessage: fallbackErrorMessage });
+        // AUR-4557: this is the no-parse path, so `fallbackErrorMessage` is built from
+        // process stderr, which the model cannot author. Pass it as trusted text
+        // (substring-matched) rather than as `errorMessage` (anchored), because the
+        // CLI prints the API rejection mid-line rather than as the whole payload.
+        isClaudeContextOverflowError({ parsed: null, trustedText: fallbackErrorMessage });
       const errorCode = loginMeta.requiresLogin
         ? "claude_auth_required"
         : contextOverflow

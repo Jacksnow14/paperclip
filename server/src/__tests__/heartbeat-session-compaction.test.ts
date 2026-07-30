@@ -209,4 +209,96 @@ describeEmbeddedPostgres("evaluateSessionCompaction forced rotation on overflow 
     expect(decision.rotate).toBe(true);
     expect(decision.reason).toMatch(/exceeded 12 runs/);
   });
+
+  // AUR-4557. The overflow branch used to sit BELOW an early
+  // `if (!policy.enabled || !hasSessionCompactionThresholds(policy)) return {rotate:false}`,
+  // so an agent that opted out of threshold compaction got no overflow rotation at
+  // all -- and an overflow is exactly the case that cannot recover on its own. A
+  // deterministic-failure rotation must not be subordinate to threshold config.
+  async function seedAgentWithCompactionOverride(override: Record<string, unknown>) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Overflow Config Gate",
+      issuePrefix: `C${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      status: "active",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Claude Coder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_local",
+      runtimeConfig: { heartbeat: { sessionCompaction: override } },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    return { companyId, agentId };
+  }
+
+  async function overflowDecisionForOverride(override: Record<string, unknown>) {
+    const { companyId, agentId } = await seedAgentWithCompactionOverride(override);
+    const sessionId = `session-${randomUUID()}`;
+    await seedSessionRuns({
+      companyId,
+      agentId,
+      sessionId,
+      count: 3,
+      minutesApart: 10,
+      latest: {
+        errorCode: CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
+        error: "Claude run failed: subtype=success: Prompt is too long",
+        usageJson: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+      },
+    });
+    const agent = await loadAgent(agentId);
+    return heartbeatService(db).evaluateSessionCompaction({ agent, sessionId, issueId: null });
+  }
+
+  it("rotates on overflow even when sessionCompaction is disabled", async () => {
+    const decision = await overflowDecisionForOverride({ enabled: false });
+    expect(decision.rotate).toBe(true);
+    expect(decision.reason).toMatch(/context overflow/i);
+    expect(decision.handoffMarkdown).toBeTruthy();
+  });
+
+  it("rotates on overflow even when every threshold is zero", async () => {
+    const decision = await overflowDecisionForOverride({
+      enabled: true,
+      maxSessionRuns: 0,
+      maxRawInputTokens: 0,
+      maxSessionAgeHours: 0,
+    });
+    expect(decision.rotate).toBe(true);
+    expect(decision.reason).toMatch(/context overflow/i);
+  });
+
+  // Control: lifting the overflow branch above the config gate must NOT turn the gate
+  // into a no-op. A disabled agent with no overflow must still never rotate, however
+  // many runs it has accumulated.
+  it("still honours the config gate for threshold rotation when disabled", async () => {
+    const { companyId, agentId } = await seedAgentWithCompactionOverride({ enabled: false });
+    const sessionId = `session-${randomUUID()}`;
+    await seedSessionRuns({
+      companyId,
+      agentId,
+      sessionId,
+      count: 13,
+      minutesApart: 1,
+      latest: { errorCode: null, error: null },
+    });
+    const agent = await loadAgent(agentId);
+    const decision = await heartbeatService(db).evaluateSessionCompaction({
+      agent,
+      sessionId,
+      issueId: null,
+    });
+
+    expect(decision.rotate).toBe(false);
+    expect(decision.reason).toBeNull();
+  });
 });

@@ -28,6 +28,7 @@ import {
   heartbeatService,
   isTransientAdapterLaunchFailureMessage,
   readHeartbeatRunErrorFamily,
+  readTransientRecoveryContractFromRun,
   resolveAdapterRunOutcome,
 } from "../services/heartbeat.ts";
 import { CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE } from "@paperclipai/adapter-utils";
@@ -2009,5 +2010,159 @@ describe("context overflow is never transient-retryable (AUR-4513)", () => {
     expect(
       readHeartbeatRunErrorFamily({ errorCode: null, resultJson: { errorFamily: "provider_quota" } }),
     ).toBe("provider_quota");
+  });
+});
+
+// AUR-4557. Everything above tests the PURE HELPER. None of it proves the actual retry
+// DECISION behaves, and none of it would catch a projection that drops `error` and
+// silently kills the message fallback. This suite drives the real gate
+// (`outcome === "failed" && readTransientRecoveryContractFromRun(run)` -> schedule)
+// against rows read back out of Postgres, and asserts on the scheduled_retry rows that
+// do or do not appear.
+describeEmbeddedPostgres("context overflow retry decision against real rows (AUR-4557)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let heartbeat!: ReturnType<typeof heartbeatService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-overflow-decision-");
+    db = createDb(tempDb.connectionString);
+    heartbeat = heartbeatService(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(heartbeatRunEvents);
+    await db.delete(environmentLeases);
+    await db.delete(issueRelations);
+    await db.delete(issueComments);
+    await db.delete(issues);
+    await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
+    await db.delete(agentRuntimeState);
+    await db.delete(budgetPolicies);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  const now = new Date("2026-07-30T05:00:00.000Z");
+  let companySeq = 0;
+
+  async function seedFailedRun(input: { errorCode: string; error: string }) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+
+    // issue_prefix is UNIQUE and defaults to "PAP", so each company needs its own.
+    companySeq += 1;
+    await db
+      .insert(companies)
+      .values({ id: companyId, name: "Auranode", issuePrefix: `O${companySeq}` });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "ClaudeCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "failed",
+      error: input.error,
+      errorCode: input.errorCode,
+      finishedAt: now,
+      contextSnapshot: { issueId: randomUUID(), wakeReason: "issue_assigned" },
+      updatedAt: now,
+      createdAt: now,
+    });
+    return { companyId, agentId, runId };
+  }
+
+  /**
+   * Mirrors the production failed-run gate. The row is re-read from Postgres first, so
+   * a projection that omits `error` fails these tests rather than passing them.
+   */
+  async function applyRetryGate(runId: string) {
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run).not.toBeNull();
+    const contract = readTransientRecoveryContractFromRun(run!);
+    if (run!.status === "failed" && contract) {
+      await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+    }
+    return contract;
+  }
+
+  async function scheduledRetryCount(sourceRunId: string) {
+    return db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.retryOfRunId, sourceRunId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+        ),
+      )
+      .then((rows) => rows[0]?.count ?? 0);
+  }
+
+  it("creates no scheduled_retry row for a run carrying the overflow error code", async () => {
+    const { runId } = await seedFailedRun({
+      errorCode: CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
+      error: "Claude run failed: subtype=success: Prompt is too long",
+    });
+    expect(await applyRetryGate(runId)).toBeNull();
+    expect(await scheduledRetryCount(runId)).toBe(0);
+  });
+
+  // The pre-fix shape. A live sweep of 1,843 claude_local runs found 107/107 rows whose
+  // error contains "too long" carrying `claude_transient_upstream` and NOT the new code,
+  // because the code did not exist when they were written. Without the message fallback
+  // every wedged session burns another failed run before force-rotate can see it.
+  it("creates no scheduled_retry row for a pre-fix row matched only by message text", async () => {
+    const { runId } = await seedFailedRun({
+      errorCode: "claude_transient_upstream",
+      error: "Claude run failed: subtype=success: Prompt is too long",
+    });
+    expect(await applyRetryGate(runId)).toBeNull();
+    expect(await scheduledRetryCount(runId)).toBe(0);
+  });
+
+  // THE control for AUR-4557. Model prose that merely mentions the phrase must stay
+  // retryable; otherwise the fallback above is the same contamination bug rewritten at
+  // the server layer, and a genuinely transient failure silently loses its ladder.
+  it("still schedules a retry when the phrase appears only in model prose", async () => {
+    const { runId } = await seedFailedRun({
+      errorCode: "claude_transient_upstream",
+      error:
+        "Claude run failed: subtype=success: I fixed the classifier so a run that " +
+        "fails because the prompt is too long is no longer retried. API Error 529",
+    });
+    expect(await applyRetryGate(runId)).toMatchObject({ errorFamily: "transient_upstream" });
+    expect(await scheduledRetryCount(runId)).toBe(1);
+  });
+
+  // Second control: an ordinary transient failure keeps its ladder, proving these tests
+  // are not passing simply because nothing ever schedules.
+  it("still schedules a retry for an ordinary transient failure", async () => {
+    const { runId } = await seedFailedRun({
+      errorCode: "claude_transient_upstream",
+      error: "API Error 529 overloaded_error",
+    });
+    expect(await applyRetryGate(runId)).toMatchObject({ errorFamily: "transient_upstream" });
+    expect(await scheduledRetryCount(runId)).toBe(1);
   });
 });

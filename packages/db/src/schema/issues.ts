@@ -63,6 +63,10 @@ export const issues = pgTable(
     executionWorkspaceSettings: jsonb("execution_workspace_settings").$type<Record<string, unknown>>(),
     startedAt: timestamp("started_at", { withTimezone: true }),
     completedAt: timestamp("completed_at", { withTimezone: true }),
+    // Which run held the issue's checkout when it entered `done` (null = no
+    // work run was attached to the closing write, or the row predates the
+    // column — readers must treat null as "unknown", never as "completed").
+    completedByRunId: uuid("completed_by_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
     hiddenAt: timestamp("hidden_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),

@@ -1059,6 +1059,22 @@ export function memoryService(
     return "pending";
   }
 
+  // AUR-4145: the auto-accept allowlist must hold at every path that writes
+  // review_state, not just the resolver's default. Callers routinely pass an
+  // explicit reviewState (the capture HTTP schema accepts one, hook policies and
+  // the refresh job hardcode "pending"), and 33 live router-read records were
+  // stranded invisible that way. An allowlisted category therefore always wins
+  // over the caller's request; the request is honored only for categories that
+  // genuinely need board review. Board review (service.review) is the one
+  // deliberate exception and does not go through this helper.
+  function finalizeReviewState(
+    metadata: Record<string, unknown> | null | undefined,
+    requested?: MemoryRecord["reviewState"] | null,
+  ): MemoryRecord["reviewState"] {
+    if (resolveReviewState(metadata ?? undefined) === "accepted") return "accepted";
+    return requested ?? "pending";
+  }
+
   async function captureLocalBasic(
     binding: BindingRow,
     scope: MemoryScope,
@@ -1166,6 +1182,15 @@ export function memoryService(
             content: input.content,
             summary: input.summary ?? existing[0].summary,
             metadata: mergedMetadata,
+            // A pending row re-captured under an allowlisted category self-heals
+            // to accepted (pending-only: a board rejection is never resurrected).
+            // Without this, upsert:true — which routing/scorecard doctrine mandates —
+            // pinned rows to pending forever even after their category joined the
+            // allowlist.
+            ...(existing[0].reviewState === "pending"
+              && finalizeReviewState(mergedMetadata) === "accepted"
+              ? { reviewState: "accepted" as const }
+              : {}),
             updatedAt,
           })
           .where(eq(memoryLocalRecords.id, existing[0].id))
@@ -1235,7 +1260,7 @@ export function memoryService(
         retentionPolicy: input.retentionPolicy ?? null,
         expiresAt: input.expiresAt ? new Date(input.expiresAt) : null,
         retentionState: "active",
-        reviewState: input.reviewState ?? resolveReviewState(input.metadata),
+        reviewState: finalizeReviewState(input.metadata, input.reviewState),
         citationJson: normalizeCitation(input.citation),
         createdByOperationId: operationId,
         idempotencyKey: input.idempotencyKey ?? null,
@@ -1315,7 +1340,7 @@ export function memoryService(
           retentionPolicy: record.retentionPolicy,
           expiresAt: record.expiresAt,
           retentionState: record.retentionState,
-          reviewState: record.reviewState ?? "pending",
+          reviewState: finalizeReviewState(record.metadata, record.reviewState),
           reviewedAt: record.reviewedAt ?? null,
           reviewedByActorType: record.reviewedBy?.type ?? null,
           reviewedByActorId: record.reviewedBy?.id ?? null,
@@ -1365,7 +1390,7 @@ export function memoryService(
             retentionPolicy: record.retentionPolicy,
             expiresAt: record.expiresAt,
             retentionState: record.retentionState,
-            reviewState: record.reviewState ?? "pending",
+            reviewState: finalizeReviewState(record.metadata, record.reviewState),
             reviewedAt: record.reviewedAt ?? null,
             reviewedByActorType: record.reviewedBy?.type ?? null,
             reviewedByActorId: record.reviewedBy?.id ?? null,
@@ -2980,6 +3005,14 @@ export function memoryService(
           ...(parsed.content !== undefined ? { content: parsed.content } : {}),
           ...("title" in parsed ? { title: parsed.title ?? null } : {}),
           ...("summary" in parsed ? { summary: parsed.summary ?? null } : {}),
+          // Re-categorizing a pending row into an allowlisted category accepts it
+          // (pending-only; rejections stick). This was the live stranding path:
+          // agents following the durability doctrine PATCHed category
+          // "retrospective" → "lesson" and the row stayed invisible-pending.
+          ...(existingRow.reviewState === "pending"
+            && finalizeReviewState(mergedMetadata) === "accepted"
+            ? { reviewState: "accepted" as const }
+            : {}),
           updatedAt,
         })
         .where(and(eq(memoryLocalRecords.companyId, companyId), eq(memoryLocalRecords.id, recordId)))

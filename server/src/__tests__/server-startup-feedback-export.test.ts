@@ -109,6 +109,8 @@ vi.mock("@paperclipai/db", () => ({
   reconcilePendingMigrationHistory: vi.fn(async () => ({ repairedMigrations: [] })),
   formatDatabaseBackupResult: vi.fn(() => "ok"),
   runDatabaseBackup: vi.fn(),
+  emergencyPruneBackups: vi.fn(() => ({ prunedCount: 0, prunedBytes: 0, keptCount: 0, keptBytes: 0 })),
+  BackupProducerConflictError: class BackupProducerConflictError extends Error {},
   authUsers: {},
   companies: {},
   companyMemberships: {},

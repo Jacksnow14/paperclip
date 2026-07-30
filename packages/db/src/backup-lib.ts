@@ -1,4 +1,4 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
@@ -11,9 +11,13 @@ export type BackupRetentionPolicy = {
   dailyDays: number;
   weeklyWeeks: number;
   monthlyMonths: number;
-  /** Max backups kept in the hourly/short tier; older ones fall into daily-per-day bucketing. Default 48. */
+  /** Max backups kept in the hourly/short tier; older ones fall into daily-per-day bucketing. Default 6. */
   hourlyCount?: number;
-  /** Hard footprint cap in bytes; 0 = unlimited. Oldest kept dumps removed first when exceeded. Default 8 GiB. */
+  /**
+   * Hard footprint cap in bytes; 0 = unlimited. Default 8 GiB. A backstop, not
+   * the primary bound: when exceeded, eviction is tier-aware (hourly bulk goes
+   * first) so daily/weekly/monthly restore points survive cap pressure.
+   */
   maxBytes?: number;
 };
 
@@ -32,13 +36,46 @@ export type RunDatabaseBackupOptions = {
   excludeTables?: string[];
   nullifyColumns?: Record<string, string[]>;
   backupEngine?: "auto" | "pg_dump" | "javascript";
+  /**
+   * Duplicate-producer spacing guard: refuse to dump (throwing
+   * BackupProducerConflictError with reason "recent_backup") when the newest
+   * existing backup is younger than this. Scheduled producers should pass
+   * slightly less than their interval; manual/CLI callers should omit it.
+   */
+  minIntervalMs?: number;
 };
 
 export type RunDatabaseBackupResult = {
   backupFile: string;
   sizeBytes: number;
   prunedCount: number;
+  prunedBytes: number;
 };
+
+export type PruneBackupsResult = {
+  prunedCount: number;
+  prunedBytes: number;
+  keptCount: number;
+  keptBytes: number;
+};
+
+export type BackupProducerConflictReason = "lock_held" | "recent_backup";
+
+/**
+ * Thrown when a backup is refused because another producer appears active:
+ * either a live cross-process lock is held, or a fresh dump already exists
+ * inside the caller's minimum spacing window (AUR-4035: two schedulers were
+ * silently doubling backup volume).
+ */
+export class BackupProducerConflictError extends Error {
+  readonly reason: BackupProducerConflictReason;
+
+  constructor(reason: BackupProducerConflictReason, message: string) {
+    super(message);
+    this.name = "BackupProducerConflictError";
+    this.reason = reason;
+  }
+}
 
 export type RunDatabaseRestoreOptions = {
   connectionString: string;
@@ -123,32 +160,49 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)}GiB`;
 }
 
-const PRUNE_DEFAULT_HOURLY_COUNT = 48;
+const PRUNE_DEFAULT_HOURLY_COUNT = 6;
 const PRUNE_DEFAULT_MAX_BYTES = 8 * 1024 * 1024 * 1024; // 8 GiB
+// Emergency (disk-pressure) overlay: hourly bulk collapses to the newest few,
+// byte backstop halves. Daily/weekly/monthly anchors are preserved by the
+// tier-aware cap eviction, so DR coverage survives an emergency prune.
+const EMERGENCY_PRUNE_HOURLY_COUNT = 2;
+const EMERGENCY_PRUNE_MAX_BYTES = 4 * 1024 * 1024 * 1024; // 4 GiB
 
-/**
- * @internal exported for unit testing
- * Tiered backup pruning:
- * 1. Hourly/short tier: keep the newest `hourlyCount` backups unconditionally (default 48)
- * 2. Daily tier: for backups within `dailyDays` not in hourly tier, keep newest per calendar day
- * 3. Weekly tier: keep the NEWEST backup per calendar week for `weeklyWeeks` weeks
- * 4. Monthly tier: keep the NEWEST backup per calendar month for `monthlyMonths` months
- * 5. Hard byte cap: if total kept footprint > `maxBytes`, delete oldest kept dumps until under cap
- * 6. Everything else is deleted
- *
- * Under hourly cadence the directory self-bounds to roughly hourlyCount + dailyDays +
- * weeklyWeeks + monthlyMonths instead of 24×dailyDays.
- */
-export function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, filenamePrefix: string): number {
-  if (!existsSync(backupDir)) return 0;
+const EMPTY_PRUNE_RESULT: PruneBackupsResult = { prunedCount: 0, prunedBytes: 0, keptCount: 0, keptBytes: 0 };
 
+function resolveEffectiveRetention(retention: BackupRetentionPolicy): { hourlyCount: number; maxBytes: number } {
   const rawHourlyCount = retention.hourlyCount ?? PRUNE_DEFAULT_HOURLY_COUNT;
   const rawMaxBytes = retention.maxBytes ?? PRUNE_DEFAULT_MAX_BYTES;
   // Env overrides win over stored settings
   const envMaxBytes = process.env.PAPERCLIP_DB_BACKUP_MAX_BYTES ? parseInt(process.env.PAPERCLIP_DB_BACKUP_MAX_BYTES, 10) : NaN;
   const envHourlyCount = process.env.PAPERCLIP_DB_BACKUP_HOURLY_COUNT ? parseInt(process.env.PAPERCLIP_DB_BACKUP_HOURLY_COUNT, 10) : NaN;
-  const effectiveMaxBytes = !isNaN(envMaxBytes) && envMaxBytes >= 0 ? envMaxBytes : rawMaxBytes;
-  const effectiveHourlyCount = Math.max(1, !isNaN(envHourlyCount) && envHourlyCount > 0 ? envHourlyCount : rawHourlyCount);
+  return {
+    maxBytes: !isNaN(envMaxBytes) && envMaxBytes >= 0 ? envMaxBytes : rawMaxBytes,
+    hourlyCount: Math.max(1, !isNaN(envHourlyCount) && envHourlyCount > 0 ? envHourlyCount : rawHourlyCount),
+  };
+}
+
+/**
+ * @internal exported for unit testing
+ * Tiered backup pruning:
+ * 1. Hourly/short tier: keep the newest `hourlyCount` backups unconditionally (default 6)
+ * 2. Daily tier: for backups within `dailyDays` not in hourly tier, keep newest per calendar day
+ * 3. Weekly tier: keep the NEWEST backup per calendar week for `weeklyWeeks` weeks
+ * 4. Monthly tier: keep the NEWEST backup per calendar month for `monthlyMonths` months
+ * 5. Hard byte cap: if total kept footprint > `maxBytes`, evict in ascending
+ *    DR-value order — hourly oldest-first, then daily/weekly/monthly newest-first —
+ *    so the oldest restore point per tier survives cap pressure. (AUR-4035: the
+ *    previous oldest-first eviction deleted exactly the daily/weekly/monthly
+ *    anchors, silently collapsing DR coverage to the hourly window.)
+ * 6. Everything else is deleted
+ *
+ * Under hourly cadence the directory self-bounds to roughly hourlyCount + dailyDays +
+ * weeklyWeeks + monthlyMonths instead of 24×dailyDays.
+ */
+export function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, filenamePrefix: string): PruneBackupsResult {
+  if (!existsSync(backupDir)) return { ...EMPTY_PRUNE_RESULT };
+
+  const { hourlyCount: effectiveHourlyCount, maxBytes: effectiveMaxBytes } = resolveEffectiveRetention(retention);
 
   const now = Date.now();
   const dailyCutoff = now - Math.max(1, retention.dailyDays) * 24 * 60 * 60 * 1000;
@@ -170,10 +224,13 @@ export function pruneOldBackups(backupDir: string, retention: BackupRetentionPol
   entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
   const kept = new Set<string>();
+  type Tier = "hourly" | "daily" | "weekly" | "monthly";
+  const tierOf = new Map<string, Tier>();
 
   // Tier 1: hourly — newest effectiveHourlyCount dumps unconditionally kept
   for (let i = 0; i < Math.min(effectiveHourlyCount, entries.length); i++) {
     kept.add(entries[i]!.fullPath);
+    tierOf.set(entries[i]!.fullPath, "hourly");
   }
 
   // Tier 2: daily — within dailyDays, keep one per calendar day
@@ -185,6 +242,7 @@ export function pruneOldBackups(backupDir: string, retention: BackupRetentionPol
     if (!dayBuckets.has(key)) {
       dayBuckets.add(key);
       kept.add(entry.fullPath);
+      tierOf.set(entry.fullPath, "daily");
     }
   }
 
@@ -198,6 +256,7 @@ export function pruneOldBackups(backupDir: string, retention: BackupRetentionPol
     if (!weekBuckets.has(key)) {
       weekBuckets.add(key);
       kept.add(entry.fullPath);
+      tierOf.set(entry.fullPath, "weekly");
     }
   }
 
@@ -211,20 +270,35 @@ export function pruneOldBackups(backupDir: string, retention: BackupRetentionPol
     if (!monthBuckets.has(key)) {
       monthBuckets.add(key);
       kept.add(entry.fullPath);
+      tierOf.set(entry.fullPath, "monthly");
     }
   }
 
-  // Tier 5: hard byte cap — evict oldest kept until under cap (always keep at least 1)
+  // Tier 5: hard byte cap — evict in ascending DR value until under cap.
+  // Hourly dumps are near-duplicates of their neighbors, so the hourly tier is
+  // drained first (oldest-first: the oldest hourly is closest to daily
+  // coverage). Within daily/weekly/monthly the NEWEST is evicted first: it is
+  // the one closest to the coverage of the tier above it, while the oldest
+  // carries the tier's unique reach-back. The newest dump overall always
+  // survives (restore-latest floor).
   if (effectiveMaxBytes > 0) {
     const keptEntries = entries.filter((e) => kept.has(e.fullPath)); // newest first
     let totalBytes = keptEntries.reduce((sum, e) => sum + e.sizeBytes, 0);
     if (totalBytes > effectiveMaxBytes) {
       const beforeBytes = totalBytes;
-      const oldestFirst = [...keptEntries].reverse();
+      const newestPath = keptEntries[0]?.fullPath;
+      const inTier = (tier: Tier) => keptEntries.filter((e) => tierOf.get(e.fullPath) === tier);
+      const evictionOrder = [
+        ...inTier("hourly").reverse(),
+        ...inTier("daily"),
+        ...inTier("weekly"),
+        ...inTier("monthly"),
+      ];
       const evicted: string[] = [];
-      for (const entry of oldestFirst) {
+      for (const entry of evictionOrder) {
         if (kept.size <= 1) break;
         if (totalBytes <= effectiveMaxBytes) break;
+        if (entry.fullPath === newestPath) continue;
         kept.delete(entry.fullPath);
         evicted.push(entry.name);
         totalBytes -= entry.sizeBytes;
@@ -237,12 +311,136 @@ export function pruneOldBackups(backupDir: string, retention: BackupRetentionPol
     }
   }
 
-  const toDelete = entries.filter((e) => !kept.has(e.fullPath)).map((e) => e.fullPath);
-  for (const filePath of toDelete) {
-    unlinkSync(filePath);
+  const toDelete = entries.filter((e) => !kept.has(e.fullPath));
+  for (const entry of toDelete) {
+    unlinkSync(entry.fullPath);
   }
 
-  return toDelete.length;
+  const keptFinal = entries.filter((e) => kept.has(e.fullPath));
+  return {
+    prunedCount: toDelete.length,
+    prunedBytes: toDelete.reduce((sum, e) => sum + e.sizeBytes, 0),
+    keptCount: keptFinal.length,
+    keptBytes: keptFinal.reduce((sum, e) => sum + e.sizeBytes, 0),
+  };
+}
+
+/**
+ * Disk-pressure prune: applies the normal retention ladder with an emergency
+ * overlay (hourly tier collapsed to the newest {@link EMERGENCY_PRUNE_HOURLY_COUNT},
+ * byte backstop tightened to {@link EMERGENCY_PRUNE_MAX_BYTES}). Because cap
+ * eviction is tier-aware, daily/weekly/monthly restore points survive; only the
+ * hourly bulk — the near-duplicate mass that actually drives footprint — is
+ * released. Returns measured bytes freed so callers can report truthfully
+ * (AUR-4035 defect 3: the old "emergency pruning triggered" alert did nothing).
+ */
+export function emergencyPruneBackups(
+  backupDir: string,
+  retention: BackupRetentionPolicy,
+  filenamePrefix = "paperclip",
+): PruneBackupsResult {
+  const base = resolveEffectiveRetention(retention);
+  return pruneOldBackups(
+    backupDir,
+    {
+      ...retention,
+      hourlyCount: Math.min(base.hourlyCount, EMERGENCY_PRUNE_HOURLY_COUNT),
+      maxBytes: base.maxBytes > 0 ? Math.min(base.maxBytes, EMERGENCY_PRUNE_MAX_BYTES) : EMERGENCY_PRUNE_MAX_BYTES,
+    },
+    filenamePrefix,
+  );
+}
+
+/**
+ * Age in ms of the newest backup file in `backupDir` matching the prefix, or
+ * null when none exists. Used as a cross-producer spacing guard: a scheduled
+ * backup is redundant when any producer has already dumped recently.
+ */
+export function getNewestBackupAgeMs(backupDir: string, filenamePrefix = "paperclip", nowMs = Date.now()): number | null {
+  if (!existsSync(backupDir)) return null;
+  let newestMtimeMs: number | null = null;
+  for (const name of readdirSync(backupDir)) {
+    if (!name.startsWith(`${filenamePrefix}-`)) continue;
+    if (!name.endsWith(".sql") && !name.endsWith(".sql.gz")) continue;
+    try {
+      const stat = statSync(resolve(backupDir, name));
+      if (newestMtimeMs === null || stat.mtimeMs > newestMtimeMs) newestMtimeMs = stat.mtimeMs;
+    } catch {
+      // raced deletion — skip
+    }
+  }
+  return newestMtimeMs === null ? null : Math.max(0, nowMs - newestMtimeMs);
+}
+
+// A dump takes ~1 minute; a lock this old belongs to a crashed producer.
+const BACKUP_LOCK_STALE_MS = 60 * 60 * 1000;
+
+function backupProducerLockPath(backupDir: string, filenamePrefix: string): string {
+  return resolve(backupDir, `.${filenamePrefix}-backup.lock`);
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Cross-process producer lock. The server's in-flight boolean only guards one
+ * process; AUR-4035 defect 2 was a second server process doubling backup
+ * volume for months. Returns a release function. A held lock from a live pid
+ * throws BackupProducerConflictError; stale locks (dead pid, or older than
+ * BACKUP_LOCK_STALE_MS when unreadable) are broken.
+ */
+function acquireBackupProducerLock(backupDir: string, filenamePrefix: string): () => void {
+  const lockPath = backupProducerLockPath(backupDir, filenamePrefix);
+  const payload = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() });
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      writeFileSync(lockPath, payload, { flag: "wx" });
+      return () => {
+        try {
+          unlinkSync(lockPath);
+        } catch {
+          // already gone — nothing to release
+        }
+      };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+
+      let holderPid: number | null = null;
+      let lockAgeMs = 0;
+      try {
+        const stat = statSync(lockPath);
+        lockAgeMs = Date.now() - stat.mtimeMs;
+        const parsed = JSON.parse(readFileSync(lockPath, "utf8")) as { pid?: unknown };
+        if (typeof parsed?.pid === "number") holderPid = parsed.pid;
+      } catch {
+        // unreadable or raced away — stale determination falls back to age only
+      }
+
+      const stale =
+        lockAgeMs > BACKUP_LOCK_STALE_MS ||
+        (holderPid !== null && holderPid !== process.pid && !isPidAlive(holderPid));
+      if (!stale) {
+        throw new BackupProducerConflictError(
+          "lock_held",
+          `another backup producer holds ${lockPath}${holderPid !== null ? ` (pid ${holderPid})` : ""}`,
+        );
+      }
+      try {
+        unlinkSync(lockPath);
+      } catch {
+        // raced with the holder's own release — retry loop handles it
+      }
+    }
+  }
+
+  throw new BackupProducerConflictError("lock_held", `could not acquire ${lockPath} after breaking a stale lock`);
 }
 
 function formatBackupSize(sizeBytes: number): string {
@@ -436,7 +634,18 @@ async function hasStatementBreakpoints(backupFile: string): Promise<boolean> {
   }
 }
 
-async function* readRestoreStatements(backupFile: string): AsyncGenerator<string> {
+const COPY_FROM_STDIN_RE = /^COPY\s.+FROM\s+stdin;\s*$/i;
+const COPY_END_SENTINEL = "\\.";
+
+/**
+ * Statement-by-statement restore of a breakpoint-delimited Paperclip dump.
+ * COPY blocks are streamed through the driver's copy-in channel: production
+ * dumps carry table data as `COPY ... FROM stdin;` + inline rows, which cannot
+ * be executed as a plain SQL statement (AUR-4035 DoD 4 exposed this — the JS
+ * fallback previously errored on the first data row, leaving hosts without a
+ * psql binary unable to restore their own backups).
+ */
+async function runJavascriptRestore(sql: postgres.Sql, backupFile: string): Promise<void> {
   const raw = createReadStream(backupFile);
   const stream = backupFile.endsWith(".gz") ? raw.pipe(createGunzip()) : raw;
   stream.setEncoding("utf8");
@@ -444,7 +653,10 @@ async function* readRestoreStatements(backupFile: string): AsyncGenerator<string
     input: stream,
     crlfDelay: Infinity,
   });
+
   let statementLines: string[] = [];
+  let copyWritable: (NodeJS.WritableStream & { destroyed?: boolean }) | null = null;
+  let copyError: unknown = null;
 
   const flushStatement = () => {
     const statement = statementLines.join("\n").trim();
@@ -452,21 +664,76 @@ async function* readRestoreStatements(backupFile: string): AsyncGenerator<string
     return statement;
   };
 
+  const writeCopyLine = async (line: string) => {
+    if (copyError) throw copyError;
+    const target = copyWritable!;
+    if (!target.write(`${line}\n`)) {
+      await new Promise<void>((resolveDrain, rejectDrain) => {
+        const onDrain = () => {
+          target.off("error", onError);
+          resolveDrain();
+        };
+        const onError = (err: unknown) => {
+          target.off("drain", onDrain);
+          rejectDrain(err as Error);
+        };
+        target.once("drain", onDrain);
+        target.once("error", onError);
+      });
+    }
+  };
+
+  const finishCopy = async () => {
+    const target = copyWritable!;
+    copyWritable = null;
+    if (copyError) throw copyError;
+    await new Promise<void>((resolveEnd, rejectEnd) => {
+      target.once("error", (err: unknown) => rejectEnd(err as Error));
+      target.end(() => resolveEnd());
+    });
+  };
+
   try {
     for await (const line of reader) {
-      if (line === STATEMENT_BREAKPOINT) {
-        const statement = flushStatement();
-        if (statement.length > 0) {
-          yield statement;
+      if (copyWritable) {
+        if (line === COPY_END_SENTINEL) {
+          await finishCopy();
+        } else {
+          await writeCopyLine(line);
         }
         continue;
       }
+
+      if (line === STATEMENT_BREAKPOINT) {
+        const statement = flushStatement();
+        if (statement.length > 0) {
+          await sql.unsafe(statement).execute();
+        }
+        continue;
+      }
+
       statementLines.push(line);
+
+      if (COPY_FROM_STDIN_RE.test(line)) {
+        const copyCommand = flushStatement();
+        const writable = await sql.unsafe(copyCommand).writable();
+        copyError = null;
+        writable.once("error", (err: unknown) => {
+          copyError = err;
+        });
+        copyWritable = writable;
+      }
+    }
+
+    if (copyWritable) {
+      // Truncated dump: COPY block never terminated
+      await finishCopy();
+      throw new Error("backup file ended inside an unterminated COPY block");
     }
 
     const trailingStatement = flushStatement();
     if (trailingStatement.length > 0) {
-      yield trailingStatement;
+      await sql.unsafe(trailingStatement).execute();
     }
   } finally {
     reader.close();
@@ -565,6 +832,20 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   const canUsePgDump = !hasBackupTransforms(opts);
   const excludedTableNames = normalizeTableNameSet(opts.excludeTables);
   const nullifiedColumnsByTable = normalizeNullifyColumnMap(opts.nullifyColumns);
+  mkdirSync(opts.backupDir, { recursive: true });
+
+  // Producer guards run before any client or file is created.
+  if (opts.minIntervalMs !== undefined && opts.minIntervalMs > 0) {
+    const newestAgeMs = getNewestBackupAgeMs(opts.backupDir, filenamePrefix);
+    if (newestAgeMs !== null && newestAgeMs < opts.minIntervalMs) {
+      throw new BackupProducerConflictError(
+        "recent_backup",
+        `newest backup is ${Math.round(newestAgeMs / 1000)}s old (< min spacing ${Math.round(opts.minIntervalMs / 1000)}s) — another producer likely dumped already`,
+      );
+    }
+  }
+  const releaseProducerLock = acquireBackupProducerLock(opts.backupDir, filenamePrefix);
+
   let sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
   let sqlClosed = false;
   const closeSql = async () => {
@@ -572,7 +853,6 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     sqlClosed = true;
     await sql.end();
   };
-  mkdirSync(opts.backupDir, { recursive: true });
   const sqlFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
   const backupFile = `${sqlFile}.gz`;
   const writer = createBufferedTextFileWriter(sqlFile);
@@ -589,11 +869,12 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         });
         await writer.abort();
         const sizeBytes = statSync(backupFile).size;
-        const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
+        const pruneResult = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
         return {
           backupFile,
           sizeBytes,
-          prunedCount,
+          prunedCount: pruneResult.prunedCount,
+          prunedBytes: pruneResult.prunedBytes,
         };
       } catch (error) {
         if (existsSync(backupFile)) {
@@ -1000,12 +1281,13 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     unlinkSync(sqlFile);
 
     const sizeBytes = statSync(backupFile).size;
-    const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
+    const pruneResult = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
 
     return {
       backupFile,
       sizeBytes,
-      prunedCount,
+      prunedCount: pruneResult.prunedCount,
+      prunedBytes: pruneResult.prunedBytes,
     };
   } catch (error) {
     await writer.abort();
@@ -1017,6 +1299,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     }
     throw error;
   } finally {
+    releaseProducerLock();
     await closeSql();
   }
 }
@@ -1038,9 +1321,7 @@ export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promi
 
   try {
     await sql`SELECT 1`;
-    for await (const statement of readRestoreStatements(opts.backupFile)) {
-      await sql.unsafe(statement).execute();
-    }
+    await runJavascriptRestore(sql, opts.backupFile);
   } catch (error) {
     const statementPreview = typeof error === "object" && error !== null && typeof (error as Record<string, unknown>).query === "string"
       ? String((error as Record<string, unknown>).query)
@@ -1058,6 +1339,8 @@ export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promi
 
 export function formatDatabaseBackupResult(result: RunDatabaseBackupResult): string {
   const size = formatBackupSize(result.sizeBytes);
-  const pruned = result.prunedCount > 0 ? `; pruned ${result.prunedCount} old backup(s)` : "";
+  const pruned = result.prunedCount > 0
+    ? `; pruned ${result.prunedCount} old backup(s), freed ${formatBytes(result.prunedBytes)}`
+    : "";
   return `${result.backupFile} (${size}${pruned})`;
 }

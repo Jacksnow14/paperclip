@@ -1,5 +1,4 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
@@ -162,7 +161,12 @@ import {
 import {
   readPaperclipSkillSyncPreference,
   writePaperclipSkillSyncPreference,
+  GLOBAL_MAX_CONCURRENT_RUNS_ENV_VAR,
+  resolveGlobalMaxConcurrentRuns,
 } from "@paperclipai/adapter-utils/server-utils";
+// Re-exported for existing importers of these two names from this module
+// (moved to adapter-utils under AUR-4536; see comment near PROCESS_LOST_RETRY_WAKE_REASON).
+export { GLOBAL_MAX_CONCURRENT_RUNS_ENV_VAR, resolveGlobalMaxConcurrentRuns };
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
 import { environmentService } from "./environments.js";
 import { environmentRuntimeService } from "./environment-runtime.js";
@@ -243,23 +247,11 @@ const PROCESS_LOST_RETRY_JITTER_RATIO = 0.5;
 export const PROCESS_LOST_RETRY_MAX_ATTEMPTS = PROCESS_LOST_RETRY_DELAYS_MS.length;
 export const PROCESS_LOST_RETRY_REASON = "process_lost";
 export const PROCESS_LOST_RETRY_WAKE_REASON = "process_lost_retry";
-// AUR-3929: host-wide ceiling on simultaneously-running agent runs. The
-// per-agent cap (heartbeat.maxConcurrentRuns, default 20) never bounded the
-// fleet: 18 agents × 20 slots is unbounded in practice, and each local
-// `claude` child holds ~200–300 MB RSS at rest with peaks approaching 1 GB
-// (session compaction, git operations, MCP children). Derived default:
-// reserve 3 GB for OS + Postgres + control plane(s), budget 1 GB per
-// concurrent run, floor the remainder. On the 7.7 GB incident host that is
-// floor((7900 MB − 3072 MB) / 1024 MB) = 4 concurrent runs. Every
-// control-plane instance sharing one database shares this ceiling, because
-// admission counts `running` rows in heartbeat_runs under an advisory lock.
-export const GLOBAL_MAX_CONCURRENT_RUNS_ENV_VAR = "PAPERCLIP_GLOBAL_MAX_CONCURRENT_RUNS";
-const GLOBAL_MAX_CONCURRENT_RUNS_OVERRIDE_MIN = 1;
-const GLOBAL_MAX_CONCURRENT_RUNS_OVERRIDE_MAX = 64;
-const GLOBAL_MAX_CONCURRENT_RUNS_DERIVED_MIN = 2;
-const GLOBAL_MAX_CONCURRENT_RUNS_DERIVED_MAX = 12;
-const GLOBAL_RUN_RESERVED_SYSTEM_MEMORY_MB = 3 * 1024;
-const GLOBAL_RUN_MEMORY_BUDGET_MB = 1024;
+// AUR-3929 concurrency cap (GLOBAL_MAX_CONCURRENT_RUNS_ENV_VAR /
+// resolveGlobalMaxConcurrentRuns) now lives in
+// @paperclipai/adapter-utils/server-utils (imported above) — AUR-4536's
+// per-run memory ceiling needs the same cap + reserve arithmetic at the
+// child-process spawn boundary, which sits in that package, not this one.
 // Arbitrary-but-fixed advisory lock id serializing run admission across every
 // control-plane instance connected to the same database.
 const GLOBAL_RUN_ADMISSION_LOCK_ID = 739_241_101;
@@ -555,30 +547,6 @@ export function computeProcessLostRetrySchedule(
     dueAt: new Date(now.getTime() + delayMs),
     maxAttempts: PROCESS_LOST_RETRY_MAX_ATTEMPTS,
   };
-}
-
-export function resolveGlobalMaxConcurrentRuns(
-  env: Record<string, string | undefined> = process.env,
-  totalMemoryBytes: number = os.totalmem(),
-): number {
-  const raw = env[GLOBAL_MAX_CONCURRENT_RUNS_ENV_VAR];
-  if (raw != null && raw.trim() !== "") {
-    const parsed = Math.floor(Number(raw));
-    if (Number.isFinite(parsed)) {
-      return Math.max(
-        GLOBAL_MAX_CONCURRENT_RUNS_OVERRIDE_MIN,
-        Math.min(GLOBAL_MAX_CONCURRENT_RUNS_OVERRIDE_MAX, parsed),
-      );
-    }
-  }
-  const totalMemoryMb = totalMemoryBytes / (1024 * 1024);
-  const derived = Math.floor(
-    (totalMemoryMb - GLOBAL_RUN_RESERVED_SYSTEM_MEMORY_MB) / GLOBAL_RUN_MEMORY_BUDGET_MB,
-  );
-  return Math.max(
-    GLOBAL_MAX_CONCURRENT_RUNS_DERIVED_MIN,
-    Math.min(GLOBAL_MAX_CONCURRENT_RUNS_DERIVED_MAX, derived),
-  );
 }
 
 async function resolveRunScopedMentionedSkillKeys(input: {

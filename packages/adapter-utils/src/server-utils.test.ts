@@ -1,9 +1,15 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  GLOBAL_MAX_CONCURRENT_RUNS_ENV_VAR,
+  RUN_MEMORY_CEILING_DISABLED_ENV_VAR,
+  RUN_MEMORY_CEILING_ENV_VAR,
+  resolveGlobalMaxConcurrentRuns,
+  resolveRunMemoryCeilingMb,
   applyPaperclipWorkspaceEnv,
   appendWithByteCap,
   buildChildProcessEnv,
@@ -1336,4 +1342,147 @@ describe("runChildProcess secret env scrub (AUR-4003)", () => {
       delete process.env[sentinelKey];
     }
   });
+});
+
+// AUR-4536: the per-run memory ceiling. Two distinct claims are proven here and
+// they need different kinds of test:
+//   1. the SIZING arithmetic is right (pure, host-independent)
+//   2. the ceiling is actually WIRED to the real child-process spawn boundary —
+//      i.e. the process runChildProcess starts really does land inside a cgroup
+//      whose memory.max is the ceiling. Claim 2 cannot be proven by asserting on
+//      a config value; it is asserted against /proc and /sys/fs/cgroup for the
+//      live child, and it is paired with a mutation control (memoryCeilingMb:
+//      null) that must NOT land in a scope — otherwise the check would pass on
+//      a host where everything happens to be in a scope for unrelated reasons.
+describe("resolveRunMemoryCeilingMb (AUR-4536)", () => {
+  const HOST_TOTAL_BYTES = 7747 * 1024 * 1024;
+
+  it("derives floor((total - reserve) / cap) — 7747 MB host, cap 4 => 1168 MB", () => {
+    // cap  = floor((7747 - 3072) / 1024) = floor(4.565) = 4
+    // ceil = floor((7747 - 3072) / 4)    = floor(1168.75) = 1168
+    expect(resolveGlobalMaxConcurrentRuns({}, HOST_TOTAL_BYTES)).toBe(4);
+    expect(resolveRunMemoryCeilingMb({}, HOST_TOTAL_BYTES)).toBe(1168);
+  });
+
+  it("tightens when the operator raises the concurrency cap, so the two never drift", () => {
+    const env = { [GLOBAL_MAX_CONCURRENT_RUNS_ENV_VAR]: "8" };
+    expect(resolveGlobalMaxConcurrentRuns(env, HOST_TOTAL_BYTES)).toBe(8);
+    // floor(4675 / 8) = 584 — same total budget, split 8 ways instead of 4.
+    expect(resolveRunMemoryCeilingMb(env, HOST_TOTAL_BYTES)).toBe(584);
+  });
+
+  it("honours an explicit per-run override", () => {
+    expect(resolveRunMemoryCeilingMb({ [RUN_MEMORY_CEILING_ENV_VAR]: "512" }, HOST_TOTAL_BYTES)).toBe(512);
+  });
+
+  it("returns null when explicitly disabled (the mutation-control switch)", () => {
+    expect(resolveRunMemoryCeilingMb({ [RUN_MEMORY_CEILING_DISABLED_ENV_VAR]: "1" }, HOST_TOTAL_BYTES)).toBeNull();
+    // Disabled wins over an explicit override — a disabled ceiling is disabled.
+    expect(
+      resolveRunMemoryCeilingMb(
+        { [RUN_MEMORY_CEILING_DISABLED_ENV_VAR]: "1", [RUN_MEMORY_CEILING_ENV_VAR]: "512" },
+        HOST_TOTAL_BYTES,
+      ),
+    ).toBeNull();
+  });
+
+  it("never returns a non-positive ceiling on a host smaller than the reserve", () => {
+    expect(resolveRunMemoryCeilingMb({}, 1024 * 1024 * 1024)).toBeNull();
+  });
+});
+
+const hasUserSystemdScopes = (() => {
+  if (process.platform !== "linux") return false;
+  try {
+    fsSync.accessSync("/run/systemd/system");
+  } catch {
+    return false;
+  }
+  try {
+    return fsSync
+      .readFileSync(`/sys/fs/cgroup/user.slice/user-${process.getuid?.()}.slice/user@${process.getuid?.()}.service/cgroup.controllers`, "utf8")
+      .includes("memory");
+  } catch {
+    return false;
+  }
+})();
+
+describe.skipIf(!hasUserSystemdScopes)("runChildProcess memory ceiling wiring (AUR-4536)", () => {
+  // Prints the child's OWN cgroup path, and the kernel limits on that cgroup as
+  // read BY THE CHILD ITSELF. Reading them from the test process instead would
+  // race `--collect`, which tears the transient scope down the instant the child
+  // exits (observed: ENOENT on memory.max). If the ceiling is wired at the spawn
+  // boundary the path is a transient systemd scope; if it is not wired the child
+  // simply inherits this test runner's cgroup.
+  const PRINT_CGROUP = [
+    "-e",
+    [
+      "const fs=require('node:fs');",
+      "const p=fs.readFileSync('/proc/self/cgroup','utf8').trim().replace(/^0::/,'');",
+      "const read=(f)=>{try{return fs.readFileSync('/sys/fs/cgroup'+p+'/'+f,'utf8').trim()}catch(e){return 'ENOENT'}};",
+      "process.stdout.write(JSON.stringify({path:p,memoryMax:read('memory.max'),swapMax:read('memory.swap.max')}));",
+    ].join(""),
+  ];
+
+  async function runPrintingCgroup(memoryCeilingMb: number | null) {
+    const result = await runChildProcess(randomUUID(), process.execPath, PRINT_CGROUP, {
+      cwd: process.cwd(),
+      env: {},
+      timeoutSec: 20,
+      graceSec: 1,
+      onLog: async () => {},
+      memoryCeilingMb,
+    });
+    expect(result.exitCode).toBe(0);
+    return JSON.parse(result.stdout.trim()) as { path: string; memoryMax: string; swapMax: string };
+  }
+
+  it("places the real child in a transient scope whose memory.max IS the ceiling", async () => {
+    const ceilingMb = 128;
+    const seen = await runPrintingCgroup(ceilingMb);
+
+    // The child is in its own transient run-*.scope, not the runner's cgroup.
+    expect(seen.path).toMatch(/\/run-[ur]?\d+\.scope$/);
+    // The ceiling is a real kernel limit on that cgroup, not just an argv string.
+    expect(seen.memoryMax).toBe(String(ceilingMb * 1024 * 1024));
+    // MemorySwapMax=0 makes the ceiling a hard kill instead of swap thrashing.
+    expect(seen.swapMax).toBe("0");
+  }, 30_000);
+
+  it("mutation control: memoryCeilingMb null leaves the child unceilinged", async () => {
+    const seen = await runPrintingCgroup(null);
+    expect(seen.path).not.toMatch(/\/run-[ur]?\d+\.scope$/);
+    // ...and inherits no 128 MB limit from anywhere else — proving the assertion
+    // above is measuring the ceiling and not some ambient host configuration.
+    expect(seen.memoryMax).not.toBe(String(128 * 1024 * 1024));
+  }, 30_000);
+
+  it("a child exceeding the ceiling is killed; the same child under a higher ceiling is not", async () => {
+    // Allocate ~180 MB of non-collectable buffer, then exit 0.
+    const BALLOON = [
+      "-e",
+      "const b=[];for(let i=0;i<180;i++){b.push(Buffer.alloc(1024*1024,i%251))}process.stdout.write('ALLOCATED '+b.length)",
+    ];
+    const run = (memoryCeilingMb: number | null) =>
+      runChildProcess(randomUUID(), process.execPath, BALLOON, {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 30,
+        graceSec: 1,
+        onLog: async () => {},
+        memoryCeilingMb,
+      });
+
+    // 96 MB ceiling < ~180 MB balloon + node baseline => cgroup OOM-kills it.
+    const killed = await run(96);
+    expect(killed.exitCode).not.toBe(0);
+    expect(killed.stdout).not.toContain("ALLOCATED");
+
+    // Mutation control: identical child, ceiling disabled => completes normally.
+    // This is what proves the KILL above came from the ceiling and not from the
+    // balloon simply being unable to run in this environment.
+    const survived = await run(null);
+    expect(survived.exitCode).toBe(0);
+    expect(survived.stdout).toContain("ALLOCATED 180");
+  }, 60_000);
 });

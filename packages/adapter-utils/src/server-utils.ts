@@ -91,6 +91,155 @@ const MATERIALIZED_SKILL_SENTINEL = ".paperclip-materialized-skill.json";
 const MATERIALIZED_SKILL_LOCK_OWNER = "owner.json";
 const MATERIALIZED_SKILL_LOCK_STALE_MS = 30_000;
 
+// AUR-3929: host-wide ceiling on simultaneously-running agent runs. The
+// per-agent cap (heartbeat.maxConcurrentRuns, default 20) never bounded the
+// fleet: 18 agents × 20 slots is unbounded in practice, and each local
+// `claude` child holds ~200–300 MB RSS at rest with peaks approaching 1 GB
+// (session compaction, git operations, MCP children). Derived default:
+// reserve 3 GB for OS + Postgres + control plane(s), budget 1 GB per
+// concurrent run, floor the remainder. On the 7.7 GB incident host that is
+// floor((7900 MB − 3072 MB) / 1024 MB) = 4 concurrent runs. Every
+// control-plane instance sharing one database shares this ceiling, because
+// admission counts `running` rows in heartbeat_runs under an advisory lock.
+//
+// Lives here (not in server/src/services/heartbeat.ts, the original home)
+// because AUR-4536's per-run memory ceiling needs the same cap + reserve
+// arithmetic at the child-process spawn boundary in this file, and the
+// server package depends on adapter-utils, not the reverse — heartbeat.ts
+// re-exports these two names so its existing imports/tests are unaffected.
+export const GLOBAL_MAX_CONCURRENT_RUNS_ENV_VAR = "PAPERCLIP_GLOBAL_MAX_CONCURRENT_RUNS";
+const GLOBAL_MAX_CONCURRENT_RUNS_OVERRIDE_MIN = 1;
+const GLOBAL_MAX_CONCURRENT_RUNS_OVERRIDE_MAX = 64;
+const GLOBAL_MAX_CONCURRENT_RUNS_DERIVED_MIN = 2;
+const GLOBAL_MAX_CONCURRENT_RUNS_DERIVED_MAX = 12;
+const GLOBAL_RUN_RESERVED_SYSTEM_MEMORY_MB = 3 * 1024;
+const GLOBAL_RUN_MEMORY_BUDGET_MB = 1024;
+
+export function resolveGlobalMaxConcurrentRuns(
+  env: Record<string, string | undefined> = process.env,
+  totalMemoryBytes: number = os.totalmem(),
+): number {
+  const raw = env[GLOBAL_MAX_CONCURRENT_RUNS_ENV_VAR];
+  if (raw != null && raw.trim() !== "") {
+    const parsed = Math.floor(Number(raw));
+    if (Number.isFinite(parsed)) {
+      return Math.max(
+        GLOBAL_MAX_CONCURRENT_RUNS_OVERRIDE_MIN,
+        Math.min(GLOBAL_MAX_CONCURRENT_RUNS_OVERRIDE_MAX, parsed),
+      );
+    }
+  }
+  const totalMemoryMb = totalMemoryBytes / (1024 * 1024);
+  const derived = Math.floor(
+    (totalMemoryMb - GLOBAL_RUN_RESERVED_SYSTEM_MEMORY_MB) / GLOBAL_RUN_MEMORY_BUDGET_MB,
+  );
+  return Math.max(
+    GLOBAL_MAX_CONCURRENT_RUNS_DERIVED_MIN,
+    Math.min(GLOBAL_MAX_CONCURRENT_RUNS_DERIVED_MAX, derived),
+  );
+}
+
+// AUR-4536: per-run RSS ceiling enforced at the real child-process spawn
+// boundary (see wrapWithMemoryCeiling / runChildProcess below), because the
+// AUR-3929 admission cap above only bounds *how many* runs execute
+// concurrently — it cannot stop a single run from growing without limit and
+// taking the whole host down (observed OOM kills at 4.79 GB and 5.95 GB RSS
+// for a single adapter child). Sized off the SAME reserve budget and the
+// SAME resolved concurrency cap resolveGlobalMaxConcurrentRuns uses above,
+// so the two never drift apart: ceiling = floor((total − reserve) / cap).
+// On the 7747 MB host with cap=4 (the default derivation) that is
+// floor((7747 − 3072) / 4) = 1168 MB per run. If an operator overrides the
+// concurrency cap via PAPERCLIP_GLOBAL_MAX_CONCURRENT_RUNS, the per-run
+// ceiling automatically tightens or loosens to keep `cap` runs within the
+// same total budget, instead of a fixed number silently under- or
+// over-committing host memory.
+export const RUN_MEMORY_CEILING_ENV_VAR = "PAPERCLIP_RUN_MEMORY_CEILING_MB";
+export const RUN_MEMORY_CEILING_DISABLED_ENV_VAR = "PAPERCLIP_RUN_MEMORY_CEILING_DISABLED";
+
+function isRunMemoryCeilingDisabled(env: Record<string, string | undefined>): boolean {
+  const raw = env[RUN_MEMORY_CEILING_DISABLED_ENV_VAR];
+  return raw === "1" || (raw?.trim().toLowerCase() ?? "") === "true";
+}
+
+export function resolveRunMemoryCeilingMb(
+  env: Record<string, string | undefined> = process.env,
+  totalMemoryBytes: number = os.totalmem(),
+): number | null {
+  if (isRunMemoryCeilingDisabled(env)) return null;
+
+  const overrideRaw = env[RUN_MEMORY_CEILING_ENV_VAR];
+  if (overrideRaw != null && overrideRaw.trim() !== "") {
+    const parsed = Math.floor(Number(overrideRaw));
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+
+  const cap = resolveGlobalMaxConcurrentRuns(env, totalMemoryBytes);
+  const totalMemoryMb = totalMemoryBytes / (1024 * 1024);
+  const ceilingMb = Math.floor((totalMemoryMb - GLOBAL_RUN_RESERVED_SYSTEM_MEMORY_MB) / cap);
+  return ceilingMb > 0 ? ceilingMb : null;
+}
+
+// Cached per-process: whether this host can enforce the ceiling via a
+// transient systemd --user scope (cgroup MemoryMax). Checked once because it
+// requires a filesystem stat plus a PATH scan, and the answer cannot change
+// mid-process for a given host. Environments without systemd as PID 1
+// (containers, CI, macOS dev) resolve to null and simply run unceilinged —
+// this is a capability gate, not a config the caller can force on.
+let systemdRunPathPromise: Promise<string | null> | null = null;
+// Logged at most once per process so a systemd-less host (CI, macOS dev,
+// non-systemd container) doesn't spam a warning on every single run.
+let warnedMemoryCeilingUnavailable = false;
+
+async function resolveSystemdRunPath(env: NodeJS.ProcessEnv): Promise<string | null> {
+  if (process.platform !== "linux") return null;
+  if (!systemdRunPathPromise) {
+    systemdRunPathPromise = (async () => {
+      const isSystemdInit = await pathExists("/run/systemd/system");
+      if (!isSystemdInit) return null;
+      return resolveCommandPath("systemd-run", process.cwd(), env);
+    })();
+  }
+  return systemdRunPathPromise;
+}
+
+// Wraps the resolved spawn target in a transient, auto-collected systemd
+// --user scope with a hard cgroup memory ceiling. `systemd-run --scope`
+// execs directly into the target command (verified: the pid systemd-run
+// reports IS the target's pid, not a wrapper pid), so this is transparent to
+// every downstream pid/process-group assumption in runChildProcess —
+// detached:true's setsid() still makes the final process its own group
+// leader, and the existing SIGTERM/SIGKILL-to-process-group cancellation
+// path kills it exactly as before. MemorySwapMax=0 makes the ceiling a hard,
+// immediate kill rather than slow swap thrashing that degrades every other
+// process on the host. --collect prevents killed/failed scopes from piling
+// up in `systemctl --user list-units`.
+async function wrapWithMemoryCeiling(
+  executable: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  memoryCeilingMb: number,
+): Promise<SpawnTarget | null> {
+  const systemdRunPath = await resolveSystemdRunPath(env);
+  if (!systemdRunPath) return null;
+  const ceilingMb = Math.max(1, Math.floor(memoryCeilingMb));
+  return {
+    command: systemdRunPath,
+    args: [
+      "--user",
+      "--scope",
+      "--quiet",
+      "--collect",
+      "-p",
+      `MemoryMax=${ceilingMb}M`,
+      "-p",
+      "MemorySwapMax=0",
+      "--",
+      executable,
+      ...args,
+    ],
+  };
+}
+
 function expandHomePrefix(value: string): string {
   if (value === "~") return os.homedir();
   if (value.startsWith("~/")) return path.resolve(os.homedir(), value.slice(2));
@@ -1393,6 +1542,8 @@ async function resolveSpawnTarget(
   options: {
     remoteExecution?: RemoteExecutionSpec | null;
     remoteEnv?: Record<string, string> | null;
+    memoryCeilingMb?: number | null;
+    onMemoryCeilingUnavailable?: (reason: string) => void;
   } = {},
 ): Promise<SpawnTarget> {
   const remote = options.remoteExecution ?? null;
@@ -1421,6 +1572,17 @@ async function resolveSpawnTarget(
   const executable = resolved ?? command;
 
   if (process.platform !== "win32") {
+    const memoryCeilingMb = options.memoryCeilingMb;
+    if (typeof memoryCeilingMb === "number" && memoryCeilingMb > 0) {
+      const wrapped = await wrapWithMemoryCeiling(executable, args, env, memoryCeilingMb);
+      if (wrapped) return wrapped;
+      if (!warnedMemoryCeilingUnavailable) {
+        warnedMemoryCeilingUnavailable = true;
+        options.onMemoryCeilingUnavailable?.(
+          "systemd-run unavailable on this host; runs will start without a per-run memory ceiling",
+        );
+      }
+    }
     return { command: executable, args };
   }
 
@@ -2161,6 +2323,12 @@ export async function runChildProcess(
     terminalResultCleanup?: TerminalResultCleanupOptions;
     stdin?: string;
     remoteExecution?: RemoteExecutionSpec | null;
+    // AUR-4536: per-run memory ceiling (MB) enforced at this spawn boundary
+    // via a transient systemd --user scope. Omit to use the host-derived
+    // default (resolveRunMemoryCeilingMb); pass `null` to explicitly disable
+    // enforcement for this call (e.g. a mutation-control test proving the
+    // ceiling — not something else — is what stops a runaway process).
+    memoryCeilingMb?: number | null;
   },
 ): Promise<RunProcessResult> {
   const onLogError = opts.onLogError ?? ((err, id, msg) => console.warn({ err, runId: id }, msg));
@@ -2183,9 +2351,19 @@ export async function runChildProcess(
     }
 
     const mergedEnv = ensureUserLocalBinInPath(ensurePathInEnv(rawMerged));
+    const remoteExecution = opts.remoteExecution ?? null;
+    // Local-only: remote (ssh/sandbox) execution never reaches this pid, and
+    // resolveSpawnTarget's remote branch ignores memoryCeilingMb regardless —
+    // this just avoids the unnecessary systemd-run capability probe for it.
+    const memoryCeilingMb =
+      opts.memoryCeilingMb === null
+        ? null
+        : opts.memoryCeilingMb ?? (remoteExecution ? null : resolveRunMemoryCeilingMb());
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
-      remoteExecution: opts.remoteExecution ?? null,
-      remoteEnv: opts.remoteExecution ? opts.env : null,
+      remoteExecution,
+      remoteEnv: remoteExecution ? opts.env : null,
+      memoryCeilingMb,
+      onMemoryCeilingUnavailable: (reason) => onLogError(new Error(reason), runId, reason),
     })
       .then((target) => {
         const child = spawn(target.command, target.args, {

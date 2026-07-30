@@ -27,8 +27,10 @@ import {
   SUPERSEDED_BY_SOURCE_SUCCESS_ERROR_CODE,
   heartbeatService,
   isTransientAdapterLaunchFailureMessage,
+  readHeartbeatRunErrorFamily,
   resolveAdapterRunOutcome,
 } from "../services/heartbeat.ts";
+import { CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE } from "@paperclipai/adapter-utils";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -1964,5 +1966,48 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         .then((rows) => rows[0]?.count ?? 0);
       expect(ladderRuns).toBe(0);
     });
+  });
+});
+
+// AUR-4513: a prompt-size rejection is deterministic. Re-sending the same over-long
+// prompt can never succeed, so it must not enter the transient retry ladder. Live
+// scale before the fix: 2,120 overflow runs in 48h against 2,140 retries scheduled off
+// an overflow parent -- a >1:1 ratio, i.e. the loop fed itself.
+describe("context overflow is never transient-retryable (AUR-4513)", () => {
+  it("assigns no error family to an overflow run, so no transient retry is scheduled", () => {
+    expect(
+      readHeartbeatRunErrorFamily({
+        errorCode: CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
+        resultJson: null,
+      }),
+    ).toBeNull();
+  });
+
+  it("ignores a stale persisted transient family on an overflow run", () => {
+    // Exactly the shape of the 2,394 pre-fix rows, and of anything a mixed-version
+    // deploy can still emit: overflow code paired with a transient errorFamily.
+    expect(
+      readHeartbeatRunErrorFamily({
+        errorCode: CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
+        resultJson: {
+          errorFamily: "transient_upstream",
+          retryNotBefore: "2026-07-30T04:00:00.000Z",
+        },
+      }),
+    ).toBeNull();
+  });
+
+  // Controls: the genuinely transient codes must keep their retry ladder, otherwise
+  // this change would be a blanket retry kill rather than a targeted one.
+  it("still marks the transient upstream codes retryable", () => {
+    expect(
+      readHeartbeatRunErrorFamily({ errorCode: "claude_transient_upstream", resultJson: null }),
+    ).toBe("transient_upstream");
+    expect(
+      readHeartbeatRunErrorFamily({ errorCode: "codex_transient_upstream", resultJson: null }),
+    ).toBe("transient_upstream");
+    expect(
+      readHeartbeatRunErrorFamily({ errorCode: null, resultJson: { errorFamily: "provider_quota" } }),
+    ).toBe("provider_quota");
   });
 });

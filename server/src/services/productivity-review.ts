@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, gt, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { clampIssueRequestDepth } from "@paperclipai/shared";
+import { CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE } from "@paperclipai/adapter-utils";
 import {
   agents,
   companies,
@@ -60,7 +61,37 @@ export const NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES = [
   "claude_auth_required",
 ] as const;
 
+// AUR-4513: codes for failures that are DETERMINISTIC -- re-running the same work
+// unchanged reproduces them. Unlike the provider-capacity codes above, nothing
+// external will ever clear these, so a run carrying one is real evidence that the
+// agent is wedged and must stay attributable and escalate. AUR-4212 reported a
+// permanently-wedged agent as "0 attributable" precisely because its overflow runs
+// were mis-coded `claude_transient_upstream` and swallowed by the exclusion above.
+//
+// Adding a code to BOTH lists would reproduce that bug under a new name, so the
+// invariant is enforced at module load rather than left to a comment.
+export const DETERMINISTIC_ATTRIBUTABLE_ERROR_CODES = [
+  CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
+] as const;
+
+for (const code of DETERMINISTIC_ATTRIBUTABLE_ERROR_CODES) {
+  if ((NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES as readonly string[]).includes(code)) {
+    throw new Error(
+      `productivity-review misconfigured: "${code}" is both deterministic-attributable and ` +
+        `non-attributable. A deterministic error must escalate (AUR-4513/AUR-4212).`,
+    );
+  }
+}
+
 function isInfraKilledRun(run: Pick<HeartbeatRunRow, "errorCode" | "error">) {
+  // A deterministic failure is never an infra kill, even if a future edit adds its
+  // code to the non-attributable list.
+  if (
+    run.errorCode != null &&
+    (DETERMINISTIC_ATTRIBUTABLE_ERROR_CODES as readonly string[]).includes(run.errorCode)
+  ) {
+    return false;
+  }
   return (
     (run.errorCode != null &&
       (NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES as readonly string[]).includes(run.errorCode)) ||

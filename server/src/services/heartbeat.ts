@@ -155,6 +155,7 @@ import { redactEventPayload, redactSensitiveText } from "../redaction.js";
 import {
   hasSessionCompactionThresholds,
   resolveSessionCompactionPolicy,
+  CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
 import {
@@ -287,9 +288,19 @@ function resolveCodexTransientFallbackMode(attempt: number): CodexTransientFallb
   return "fresh_session_safer_invocation";
 }
 
-function readHeartbeatRunErrorFamily(
+export function readHeartbeatRunErrorFamily(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ) {
+  // AUR-4513: a context overflow is deterministic and must never inherit a
+  // retryable family. This is checked BEFORE the persisted `errorFamily` on
+  // purpose: the 2,394 pre-fix overflow rows were written with
+  // `errorFamily: "transient_upstream"` in resultJson, and during a mixed-version
+  // deploy an older adapter can still emit that pairing. Trusting the persisted
+  // value first would keep those runs on the retry ladder forever.
+  if (run.errorCode === CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE) {
+    return null;
+  }
+
   const resultJson = parseObject(run.resultJson);
   const persistedFamily = readNonEmptyString(resultJson.errorFamily);
   if (persistedFamily) return persistedFamily;
@@ -3431,6 +3442,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         createdAt: heartbeatRuns.createdAt,
         usageJson: heartbeatRuns.usageJson,
         error: heartbeatRuns.error,
+        // AUR-4513: the forced-rotation branch below is keyed on errorCode. Without
+        // projecting it here the field reads `undefined` on every persisted row and
+        // the guard silently never fires.
+        errorCode: heartbeatRuns.errorCode,
         ...heartbeatRunListResultColumns,
       })
       .from(heartbeatRuns)
@@ -3462,7 +3477,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : 0;
 
     let reason: string | null = null;
-    if (policy.maxSessionRuns > 0 && runs.length > policy.maxSessionRuns) {
+    // AUR-4513: a prompt-size rejection is deterministic -- resuming the same session
+    // re-sends the same over-long prompt, so it can never clear on its own. Force
+    // rotation regardless of the run/age/token thresholds, which are all calibrated
+    // for gradual accumulation and by definition have not tripped yet.
+    if (latestRun?.errorCode === CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE) {
+      reason = "latest run failed with a context overflow (prompt too long)";
+    } else if (policy.maxSessionRuns > 0 && runs.length > policy.maxSessionRuns) {
       reason = `session exceeded ${policy.maxSessionRuns} runs`;
     } else if (
       policy.maxRawInputTokens > 0 &&
@@ -10392,6 +10413,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   return {
+    // AUR-4513: exposed so the forced-rotation guard can be exercised against real
+    // persisted rows. A pure-logic test cannot catch the failure mode that shipped
+    // here before -- the guard is keyed on heartbeatRuns.errorCode, and when the
+    // .select() above omitted that column the field read `undefined` on every
+    // production row while hand-built fixtures still passed.
+    evaluateSessionCompaction,
     listWakeupRequests: async (agentId: string, limit = 50) => {
       const clamped = Math.max(1, Math.min(500, Math.floor(limit) || 50));
       return db

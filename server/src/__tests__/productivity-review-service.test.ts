@@ -15,6 +15,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { MAX_ISSUE_REQUEST_DEPTH } from "@paperclipai/shared";
+import { CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE } from "@paperclipai/adapter-utils";
 import {
   DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS,
   DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
@@ -22,6 +23,8 @@ import {
   PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX,
   PRODUCTIVITY_REVIEW_ORIGIN_KIND,
   PROCESS_LOST_ERROR_CODE,
+  NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES,
+  DETERMINISTIC_ATTRIBUTABLE_ERROR_CODES,
   productivityReviewService,
 } from "../services/productivity-review.ts";
 
@@ -980,6 +983,51 @@ describeEmbeddedPostgres("productivity review service", () => {
       expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
       expect(review?.description).toContain("No-comment completed-run streak: 10");
       expect(review?.description).toContain("Excluded-run breakdown by errorCode: none");
+    });
+  });
+
+  // AUR-4513 / AUR-4212: a DETERMINISTIC repeated failure must stay attributable.
+  // AUR-4212 reported a permanently-wedged agent as "0 attributable" because its
+  // overflow runs were mis-coded `claude_transient_upstream` and swallowed by the
+  // AUR-4016 provider-capacity exclusion above. Nothing external ever clears an
+  // over-long prompt, so this streak has to escalate.
+  describe("AUR-4513 deterministic-error attributability", () => {
+    it("fires a no_comment_streak review for a repeated claude_context_overflow streak", async () => {
+      const now = new Date("2026-07-30T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+        status: "failed",
+        errorCode: CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
+        error: "Claude run failed: subtype=success: Prompt is too long",
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      expect(result.suppressedForInfraOutage).toBe(0);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+      expect(review?.description).toContain("Excluded-run breakdown by errorCode: none");
+    });
+
+    it("keeps the overflow code out of the non-attributable exclusion set", () => {
+      // Guards the AUR-4513 instruction "do not simply add the new code to the
+      // exclusion set -- that reproduces the bug under a new name".
+      expect(NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES as readonly string[]).not.toContain(
+        CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
+      );
+      expect(DETERMINISTIC_ATTRIBUTABLE_ERROR_CODES as readonly string[]).toContain(
+        CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
+      );
     });
   });
 });

@@ -7,6 +7,8 @@ export {
   describeClaudeFailure,
   isClaudeMaxTurnsResult,
   isClaudeUnknownSessionError,
+  isClaudeContextOverflowError,
+  CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
 } from "./parse.js";
 export {
   getQuotaWindows,

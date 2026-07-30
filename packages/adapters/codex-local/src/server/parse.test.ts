@@ -121,6 +121,28 @@ describe("isCodexTransientUpstreamError", () => {
     );
   });
 
+  it("classifies the account-level usage-limit wording and extracts the dated retry time (AUR-4139)", () => {
+    const errorMessage =
+      "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Jun 18th, 2026 2:13 AM.";
+    const now = new Date(2026, 5, 17, 10, 0, 0);
+
+    expect(isCodexTransientUpstreamError({ errorMessage })).toBe(true);
+    expect(extractCodexRetryNotBefore({ errorMessage }, now)?.getTime()).toBe(
+      new Date(2026, 5, 18, 2, 13, 0, 0).getTime(),
+    );
+  });
+
+  it("classifies the account-level usage-limit wording with a bare (undated) retry time", () => {
+    const errorMessage =
+      "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 11:31 PM.";
+    const now = new Date(2026, 3, 22, 22, 29, 2);
+
+    expect(isCodexTransientUpstreamError({ errorMessage })).toBe(true);
+    expect(extractCodexRetryNotBefore({ errorMessage }, now)?.getTime()).toBe(
+      new Date(2026, 3, 22, 23, 31, 0, 0).getTime(),
+    );
+  });
+
   it("does not classify deterministic compaction errors as transient", () => {
     expect(
       isCodexTransientUpstreamError({

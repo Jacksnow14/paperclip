@@ -19,6 +19,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
+import { findActiveAdapterQuotaPause } from "./quota-pause.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
 export const DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS = 10;
@@ -132,6 +133,8 @@ type ProductivityReviewEvidence = {
   commentCountLastSixHours: number;
   elapsedMs: number | null;
   zeroRecentActivity: boolean;
+  quotaPaused: boolean;
+  quotaPausedUntil: Date | null;
   latestRuns: HeartbeatRunRow[];
   latestComments: Array<typeof issueComments.$inferSelect>;
   costCents: number;
@@ -589,7 +592,18 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       : null;
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
-    const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
+    const longActiveRaw = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
+    // AUR-4139: a wall-clock "long active" episode can be entirely explained by a
+    // provider quota pause shared across every agent on this adapter's credential
+    // (AUR-4055/quota-pause.ts) -- the issue isn't dark, admission is correctly
+    // refusing to burn zero-token runs against a wall that hasn't cleared yet. Gate
+    // longActive on the absence of an active pause so the stall watchdog doesn't
+    // mistake a suppressed run queue for agent inactivity.
+    const activeQuotaPause = longActiveRaw
+      ? await findActiveAdapterQuotaPause(db, sourceIssue.companyId, sourceAgent.adapterType, now)
+      : null;
+    const quotaPaused = activeQuotaPause !== null;
+    const longActive = longActiveRaw && !quotaPaused;
     // AUR-4014: episode age and activity rate are orthogonal. A long-active episode with zero
     // runs, zero assignee comments, and zero active runs in the last hour is a stall (the issue
     // went dark) -- a completely different failure from a long episode that is still producing
@@ -606,6 +620,11 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     if (!trigger) return null;
 
     const triggerReasons: string[] = [];
+    if (quotaPaused && activeQuotaPause) {
+      triggerReasons.push(
+        `adapter quota pause active for ${sourceAgent.adapterType} until ${activeQuotaPause.scheduledRetryAt.toISOString()} (via agent ${activeQuotaPause.agentId}) -- this suppressed the long-active/stalled trigger for this episode`,
+      );
+    }
     if (noComment) triggerReasons.push(`${noCommentStreak} consecutive completed issue-linked runs had no run-created issue comment (${infraKilledTerminalRuns.length} infra-killed runs in the sampled window were excluded from this streak)`);
     if (trigger === "stalled_active_episode") {
       // Gated on the resolved `trigger`, not the raw `stalled` boolean: if a different trigger
@@ -652,6 +671,8 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       commentCountLastSixHours: assigneeRunCommentCountLastSixHours,
       elapsedMs,
       zeroRecentActivity,
+      quotaPaused,
+      quotaPausedUntil: activeQuotaPause?.scheduledRetryAt ?? null,
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
       costCents: costRow.costCents,

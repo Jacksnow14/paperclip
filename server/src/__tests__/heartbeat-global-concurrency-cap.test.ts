@@ -56,6 +56,8 @@ import {
   PROCESS_LOST_RETRY_DELAYS_MS,
   PROCESS_LOST_RETRY_MAX_ATTEMPTS,
 } from "../services/heartbeat.ts";
+import { findActiveAdapterQuotaPause, MAX_ADAPTER_QUOTA_PAUSE_MS } from "../services/quota-pause.ts";
+import { logger } from "../middleware/logger.js";
 
 const GiB = 1024 * 1024 * 1024;
 
@@ -241,7 +243,7 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
     return companyId;
   }
 
-  async function seedAgent(companyId: string, opts?: { maxConcurrentRuns?: number }) {
+  async function seedAgent(companyId: string, opts?: { maxConcurrentRuns?: number; adapterType?: string }) {
     const agentId = randomUUID();
     await db.insert(agents).values({
       id: agentId,
@@ -249,7 +251,7 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
       name: `Coder-${agentId.slice(0, 8)}`,
       role: "engineer",
       status: "idle",
-      adapterType: "codex_local",
+      adapterType: opts?.adapterType ?? "codex_local",
       adapterConfig: {},
       runtimeConfig: {
         heartbeat: { wakeOnDemand: true, maxConcurrentRuns: opts?.maxConcurrentRuns ?? 5 },
@@ -289,10 +291,18 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
     return runId;
   }
 
-  async function seedActiveQuotaPause(companyId: string, agentId: string, scheduledRetryAt: Date) {
+  // `pauseRecordedAt` is the row's createdAt -- the fixed point MAX_ADAPTER_QUOTA_PAUSE_MS
+  // is anchored to. Tests must control it explicitly, otherwise "clamped" is
+  // indistinguishable from "recomputed relative to now" (AUR-4139).
+  async function seedActiveQuotaPause(
+    companyId: string,
+    agentId: string,
+    scheduledRetryAt: Date,
+    pauseRecordedAt?: Date,
+  ) {
     const runId = randomUUID();
     const wakeupRequestId = randomUUID();
-    const now = new Date();
+    const now = pauseRecordedAt ?? new Date();
     await db.insert(agentWakeupRequests).values({
       id: wakeupRequestId,
       companyId,
@@ -315,6 +325,78 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
       scheduledRetryAt,
       scheduledRetryReason: "transient_failure",
       contextSnapshot: { transientRetryNotBefore: scheduledRetryAt.toISOString() },
+      updatedAt: now,
+      createdAt: now,
+    });
+    return runId;
+  }
+
+  async function seedQuotaPauseMarkerWithoutScheduledRetryAt(
+    companyId: string,
+    agentId: string,
+    pauseRecordedAt?: Date,
+  ) {
+    const runId = randomUUID();
+    const wakeupRequestId = randomUUID();
+    const now = pauseRecordedAt ?? new Date();
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "transient_failure_retry",
+      payload: {},
+      status: "queued",
+      updatedAt: now,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "scheduled_retry",
+      wakeupRequestId,
+      scheduledRetryAt: null,
+      scheduledRetryReason: "transient_failure",
+      contextSnapshot: { transientRetryNotBefore: new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString() },
+      updatedAt: now,
+      createdAt: now,
+    });
+    return runId;
+  }
+
+  // AUR-4139: a scheduled_retry row with a future scheduledRetryAt but no
+  // transientRetryNotBefore marker is an ordinary bounded retry (e.g. a
+  // process-lost backoff), not a parsed provider quota reset -- it must not
+  // suppress admission the way seedActiveQuotaPause's row does.
+  async function seedScheduledRetryWithoutQuotaMarker(companyId: string, agentId: string, scheduledRetryAt: Date) {
+    const runId = randomUUID();
+    const wakeupRequestId = randomUUID();
+    const now = new Date();
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "process_lost_retry",
+      payload: {},
+      status: "queued",
+      updatedAt: now,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "scheduled_retry",
+      wakeupRequestId,
+      scheduledRetryAt,
+      scheduledRetryReason: "process_lost",
+      contextSnapshot: {},
       updatedAt: now,
       createdAt: now,
     });
@@ -434,6 +516,205 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
     hangAdapterUntilReleased();
     expect(await heartbeat.startNextQueuedRunForAgent(agentId)).toHaveLength(1);
     expect((await heartbeat.getRun(otherIssueRun))?.status).toBe("running");
+  });
+
+  it("does not suppress admission for a scheduled_retry row lacking a parsed quota reset marker (AUR-4139)", async () => {
+    const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4 });
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId);
+    const futureRetryAt = new Date(Date.now() + 60 * 60 * 1000);
+    await seedScheduledRetryWithoutQuotaMarker(companyId, agentId, futureRetryAt);
+    const queuedRun = await seedQueuedRun(companyId, agentId);
+
+    // A future scheduledRetryAt alone (no transientRetryNotBefore) must not be
+    // mistaken for an active quota pause -- otherwise every ordinary bounded
+    // retry (e.g. process-lost backoff) would also freeze admission.
+    hangAdapterUntilReleased();
+    expect(await heartbeat.startNextQueuedRunForAgent(agentId)).toHaveLength(1);
+    expect((await heartbeat.getRun(queuedRun))?.status).toBe("running");
+  });
+
+  it("suppresses admission for a sibling agent sharing the same adapter's quota pause (AUR-4139)", async () => {
+    const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4 });
+    const companyId = await seedCompany();
+    const pausedAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const siblingAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const resetAt = new Date(Date.now() + 60 * 60 * 1000);
+    await seedActiveQuotaPause(companyId, pausedAgentId, resetAt);
+    const siblingQueuedRun = await seedQueuedRun(companyId, siblingAgentId);
+
+    // Session limits are scoped to the credential/account behind the adapter, not
+    // to the individual agent whose run happened to hit the limit -- a sibling
+    // agent sharing the same adapterType shares the same wall.
+    expect(await heartbeat.startNextQueuedRunForAgent(siblingAgentId)).toHaveLength(0);
+    expect((await heartbeat.getRun(siblingQueuedRun))?.status).toBe("queued");
+  });
+
+  it("does not suppress admission for an agent on a different adapterType than the paused one (AUR-4139)", async () => {
+    const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4 });
+    const companyId = await seedCompany();
+    const pausedAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const unrelatedAgentId = await seedAgent(companyId, { adapterType: "codex_local" });
+    const resetAt = new Date(Date.now() + 60 * 60 * 1000);
+    await seedActiveQuotaPause(companyId, pausedAgentId, resetAt);
+    const unrelatedQueuedRun = await seedQueuedRun(companyId, unrelatedAgentId);
+
+    // A different adapterType means a different credential/account -- it must
+    // not inherit another adapter's quota pause.
+    hangAdapterUntilReleased();
+    expect(await heartbeat.startNextQueuedRunForAgent(unrelatedAgentId)).toHaveLength(1);
+    expect((await heartbeat.getRun(unrelatedQueuedRun))?.status).toBe("running");
+  });
+
+  it("clamps an adapter-wide quota pause to the maximum horizon measured from when it was recorded (AUR-4139)", async () => {
+    const companyId = await seedCompany();
+    const pausedAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    // A ~24h reset recorded 1h ago: still inside the 6h max horizon, so still paused,
+    // but reported as expiring at anchor+6h rather than at the parsed 24h reset.
+    const recordedAt = new Date(Date.now() - 60 * 60 * 1000);
+    const parsedResetAt = new Date(recordedAt.getTime() + 24 * 60 * 60 * 1000);
+    await seedActiveQuotaPause(companyId, pausedAgentId, parsedResetAt, recordedAt);
+
+    const activePause = await findActiveAdapterQuotaPause(db, companyId, "claude_local", new Date());
+
+    expect(activePause).not.toBeNull();
+    expect(activePause?.agentId).toBe(pausedAgentId);
+    expect(activePause?.scheduledRetryAt.toISOString()).toBe(
+      new Date(recordedAt.getTime() + MAX_ADAPTER_QUOTA_PAUSE_MS).toISOString(),
+    );
+    // the unclamped provider value stays available for logging
+    expect(activePause?.parsedResetAt.toISOString()).toBe(parsedResetAt.toISOString());
+  });
+
+  // The load-bearing test for the clamp. Asserting the horizon at a single instant cannot
+  // fail on a clamp anchored to `now` -- at t=0 "bounded to 6h" and "returns now+6h
+  // forever" are the same value. This asserts PAST the horizon, the one axis a sliding
+  // window cannot survive (AUR-4139).
+  it("stops suppressing admission once the maximum horizon has elapsed, even if the parsed reset is far out (AUR-4139)", async () => {
+    const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4 });
+    const companyId = await seedCompany();
+    const pausedAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const siblingAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    // A ~24h reset recorded 7h ago: the parsed reset is still 17h in the future, but the
+    // 6h max horizon lapsed an hour ago, so the fleet must be released to probe the wall.
+    const recordedAt = new Date(Date.now() - 7 * 60 * 60 * 1000);
+    const parsedResetAt = new Date(recordedAt.getTime() + 24 * 60 * 60 * 1000);
+    expect(parsedResetAt.getTime()).toBeGreaterThan(Date.now());
+    await seedActiveQuotaPause(companyId, pausedAgentId, parsedResetAt, recordedAt);
+
+    expect(await findActiveAdapterQuotaPause(db, companyId, "claude_local", new Date())).toBeNull();
+
+    const siblingQueuedRun = await seedQueuedRun(companyId, siblingAgentId);
+    hangAdapterUntilReleased();
+    expect(await heartbeat.startNextQueuedRunForAgent(siblingAgentId)).toHaveLength(1);
+    expect((await heartbeat.getRun(siblingQueuedRun))?.status).toBe("running");
+  });
+
+  it("anchors the maximum horizon to createdAt even if updatedAt changes later (AUR-4139)", async () => {
+    const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4 });
+    const companyId = await seedCompany();
+    const pausedAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const siblingAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const recordedAt = new Date(Date.now() - 7 * 60 * 60 * 1000);
+    const parsedResetAt = new Date(recordedAt.getTime() + 24 * 60 * 60 * 1000);
+    const pauseRunId = await seedActiveQuotaPause(companyId, pausedAgentId, parsedResetAt, recordedAt);
+
+    await db
+      .update(heartbeatRuns)
+      .set({ updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, pauseRunId));
+
+    expect(await findActiveAdapterQuotaPause(db, companyId, "claude_local", new Date())).toBeNull();
+
+    const siblingQueuedRun = await seedQueuedRun(companyId, siblingAgentId);
+    hangAdapterUntilReleased();
+    expect(await heartbeat.startNextQueuedRunForAgent(siblingAgentId)).toHaveLength(1);
+    expect((await heartbeat.getRun(siblingQueuedRun))?.status).toBe("running");
+  });
+
+  it("ignores scheduled_retry rows with a quota marker but NULL scheduledRetryAt (AUR-4139)", async () => {
+    const companyId = await seedCompany();
+    const pausedAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const nullPauseAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const now = new Date();
+    const realPauseRecordedAt = new Date(now.getTime() - 60 * 60 * 1000);
+    const realPauseResetAt = new Date(now.getTime() + 60 * 60 * 1000);
+    await seedActiveQuotaPause(companyId, pausedAgentId, realPauseResetAt, realPauseRecordedAt);
+    await seedQuotaPauseMarkerWithoutScheduledRetryAt(
+      companyId,
+      nullPauseAgentId,
+      new Date(now.getTime() - 10 * 60 * 1000),
+    );
+
+    const activePause = await findActiveAdapterQuotaPause(db, companyId, "claude_local", now);
+
+    expect(activePause).not.toBeNull();
+    expect(activePause?.agentId).toBe(pausedAgentId);
+    expect(activePause?.scheduledRetryAt.toISOString()).toBe(realPauseResetAt.toISOString());
+  });
+
+  it("logs the suppression payload when an adapter-wide quota pause blocks admission (AUR-4139 AC1)", async () => {
+    const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4 });
+    const companyId = await seedCompany();
+    const pausedAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const siblingAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const recordedAt = new Date(Date.now() - 60 * 60 * 1000);
+    const parsedResetAt = new Date(recordedAt.getTime() + 24 * 60 * 60 * 1000);
+    await seedActiveQuotaPause(companyId, pausedAgentId, parsedResetAt, recordedAt);
+    const siblingQueuedRun = await seedQueuedRun(companyId, siblingAgentId);
+    const loggerInfoSpy = vi.spyOn(logger, "info").mockImplementation(() => undefined);
+
+    expect(await heartbeat.startNextQueuedRunForAgent(siblingAgentId)).toHaveLength(0);
+    expect((await heartbeat.getRun(siblingQueuedRun))?.status).toBe("queued");
+    expect(loggerInfoSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: siblingAgentId,
+        pausedByAgentId: pausedAgentId,
+        adapterType: "claude_local",
+        quotaPausedUntil: new Date(recordedAt.getTime() + MAX_ADAPTER_QUOTA_PAUSE_MS).toISOString(),
+        parsedResetAt: parsedResetAt.toISOString(),
+        clampedToMaxHorizon: true,
+      }),
+      "startNextQueuedRunForAgent: adapter quota pause active; run admission suppressed",
+    );
+  });
+
+  it.each(["paused", "pending_approval"])(
+    "ignores %s agents when resolving an adapter-wide quota pause (AUR-4139)",
+    async (ineligibleStatus) => {
+      const companyId = await seedCompany();
+      const ineligibleAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+      const recordedAt = new Date(Date.now() - 60 * 1000);
+      await seedActiveQuotaPause(
+        companyId,
+        ineligibleAgentId,
+        new Date(recordedAt.getTime() + 60 * 60 * 1000),
+        recordedAt,
+      );
+      await db.update(agents).set({ status: ineligibleStatus }).where(eq(agents.id, ineligibleAgentId));
+
+      // An agent admission already refuses cannot clear the wall, so its retry row carries
+      // no live signal about the shared credential and must not gate live siblings.
+      expect(await findActiveAdapterQuotaPause(db, companyId, "claude_local", new Date())).toBeNull();
+    },
+  );
+
+  it("ignores terminated agents when resolving an adapter-wide quota pause (AUR-4139)", async () => {
+    const companyId = await seedCompany();
+    const terminatedAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const liveAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const now = new Date("2026-07-26T00:00:00.000Z");
+    await seedActiveQuotaPause(companyId, terminatedAgentId, new Date(now.getTime() + 5 * 60 * 60 * 1000));
+    await seedActiveQuotaPause(companyId, liveAgentId, new Date(now.getTime() + 60 * 60 * 1000));
+    await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, terminatedAgentId));
+
+    const activePause = await findActiveAdapterQuotaPause(db, companyId, "claude_local", now);
+
+    expect(activePause).not.toBeNull();
+    expect(activePause?.agentId).toBe(liveAgentId);
+    expect(activePause?.scheduledRetryAt.toISOString()).toBe(
+      new Date(now.getTime() + 60 * 60 * 1000).toISOString(),
+    );
   });
 
   it("schedules process-lost retries with backoff and jitter instead of re-queueing them", async () => {

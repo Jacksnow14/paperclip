@@ -29,6 +29,7 @@ function createRoutine(overrides: Partial<RoutineListItem> = {}): RoutineListIte
     updatedByUserId: null,
     lastTriggeredAt: null,
     lastEnqueuedAt: null,
+    consecutiveCoalesceCount: 0,
     createdAt: new Date("2026-04-30T00:00:00.000Z"),
     updatedAt: new Date("2026-04-30T00:00:00.000Z"),
     triggers: [],

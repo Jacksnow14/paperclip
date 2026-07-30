@@ -2046,4 +2046,122 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(blockers.some((row) => row.blockerIssueId === closedEscalationId)).toBe(false);
     expect(blockers.some((row) => row.blockerIssueId === freshEscalation?.id)).toBe(true);
   });
+
+  async function seedMissingEdgeIssue(staleTimestamp: Date) {
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const coderId = randomUUID();
+    const blockedIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: managerId,
+        companyId,
+        name: "CTO",
+        role: "cto",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: false } },
+        permissions: {},
+      },
+      {
+        id: coderId,
+        companyId,
+        name: "Coder",
+        role: "engineer",
+        status: "idle",
+        reportsTo: managerId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: false } },
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: blockedIssueId,
+      companyId,
+      title: "Blocked without a recorded blocker",
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      createdAt: staleTimestamp,
+      updatedAt: staleTimestamp,
+    });
+
+    return { companyId, managerId, coderId, blockedIssueId };
+  }
+
+  it("attributes each classA/classB success to the specific issue id, not just the counters", async () => {
+    await enableAutoRecovery();
+
+    const classA = await seedBlockedChain({
+      blockerStatus: "cancelled",
+      blockerAssigneeAgentId: "coder",
+    });
+    const classBNudge = await seedMissingEdgeIssue(new Date(Date.now() - 8 * 24 * 60 * 60 * 1000));
+    const classBEscalate = await seedMissingEdgeIssue(new Date(Date.now() - 31 * 24 * 60 * 60 * 1000));
+
+    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+
+    expect(result).toMatchObject({
+      classAAutoRecovered: 1,
+      classBNudged: 1,
+      classBEscalated: 1,
+    });
+
+    expect(result.classAIssueIds).toEqual([classA.blockedIssueId]);
+    expect(result.classBNudgedIssueIds).toEqual([classBNudge.blockedIssueId]);
+    expect(result.classBEscalatedIssueIds).toEqual([classBEscalate.blockedIssueId]);
+
+    // The arrays must match the counters exactly, not just be non-empty.
+    expect(result.classAIssueIds).toHaveLength(result.classAAutoRecovered);
+    expect(result.classBNudgedIssueIds).toHaveLength(result.classBNudged);
+    expect(result.classBEscalatedIssueIds).toHaveLength(result.classBEscalated);
+
+    const [recoveredSourceIssue] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, classA.blockedIssueId));
+    expect(recoveredSourceIssue?.status).toBe("todo");
+
+    const [nudgedSourceIssue] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, classBNudge.blockedIssueId));
+    expect(nudgedSourceIssue?.status).toBe("blocked");
+
+    const [escalatedSourceIssue] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, classBEscalate.blockedIssueId));
+    expect(escalatedSourceIssue?.status).toBe("blocked");
+
+    const nudgeRecoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, classBNudge.blockedIssueId));
+    expect(nudgeRecoveryActions[0]).toMatchObject({
+      kind: "issue_graph_liveness",
+      ownerAgentId: classBNudge.coderId,
+    });
+
+    const escalateRecoveryActions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, classBEscalate.blockedIssueId));
+    expect(escalateRecoveryActions[0]).toMatchObject({
+      kind: "issue_graph_liveness",
+      ownerAgentId: classBEscalate.managerId,
+    });
+  });
 });

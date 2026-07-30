@@ -58,6 +58,11 @@ export const PROCESS_LOST_ERROR_CODE = "process_lost";
 export const NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES = [
   PROCESS_LOST_ERROR_CODE,
   "claude_transient_upstream",
+  // AUR-4144: quota walls split out of claude_transient_upstream into their own code.
+  // Same provider-capacity nature — the run dies at the provider wall before the agent
+  // does any work, so it carries no signal about the assigned agent's behavior. Without
+  // this entry the split would silently make quota-walled runs attributable again.
+  "claude_quota_exhausted",
   "claude_auth_required",
 ] as const;
 

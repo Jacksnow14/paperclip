@@ -57,7 +57,9 @@ import {
   isClaudeTransientUpstreamError,
   isClaudeUnknownSessionError,
   isClaudeContextOverflowError,
-  CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
+  detectClaudeQuotaExhaustion,
+  claudeQuotaExhaustionResultJson,
+  resolveClaudeFailureErrorCode,
 } from "./parse.js";
 import { prepareClaudeConfigSeed } from "./claude-config.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
@@ -841,23 +843,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     if (!parsed) {
       const fallbackErrorMessage = parseFallbackErrorMessage(proc);
-      const transientUpstream =
-        !loginMeta.requiresLogin &&
-        (proc.exitCode ?? 0) !== 0 &&
-        isClaudeTransientUpstreamError({
-          parsed: null,
-          stdout: proc.stdout,
-          stderr: proc.stderr,
-          errorMessage: fallbackErrorMessage,
-        });
-      const transientRetryNotBefore = transientUpstream
-        ? extractClaudeRetryNotBefore({
-            parsed: null,
-            stdout: proc.stdout,
-            stderr: proc.stderr,
-            errorMessage: fallbackErrorMessage,
-          })
-        : null;
+      const failureFields = {
+        parsed: null,
+        stdout: proc.stdout,
+        stderr: proc.stderr,
+        errorMessage: fallbackErrorMessage,
+      };
       // AUR-4513: deterministic prompt-size rejection wins over the transient
       // classifier, which false-positives on quota wording inside the transcript.
       const contextOverflow =
@@ -868,32 +859,55 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // (substring-matched) rather than as `errorMessage` (anchored), because the
         // CLI prints the API rejection mid-line rather than as the whole payload.
         isClaudeContextOverflowError({ parsed: null, trustedText: fallbackErrorMessage });
-      const errorCode = loginMeta.requiresLogin
-        ? "claude_auth_required"
-        : contextOverflow
-        ? CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE
-        : transientUpstream
-        ? "claude_transient_upstream"
+      // AUR-4144: quota is determined BEFORE the transient classifier -- it is the more
+      // specific class, and this run log path (no terminal `result` event at all) is
+      // exactly where the structured `rate_limit_event` is the only evidence available.
+      const quotaExhaustion =
+        !loginMeta.requiresLogin && !contextOverflow && (proc.exitCode ?? 0) !== 0
+          ? detectClaudeQuotaExhaustion(failureFields)
+          : null;
+      const transientUpstream =
+        !loginMeta.requiresLogin &&
+        (proc.exitCode ?? 0) !== 0 &&
+        isClaudeTransientUpstreamError(failureFields);
+      // AUR-4144: a quota wall KEEPS `errorFamily: "transient_upstream"` on purpose.
+      // `server/src/services/quota-pause.ts` and the park-at-reset scheduling in
+      // `server/src/services/heartbeat.ts` both key off
+      // `errorFamily === "transient_upstream"` plus the presence of
+      // `transientRetryNotBefore`. Minting a new family here would silently disable the
+      // admission gate AND the reset-time parking -- i.e. it would reintroduce the outage
+      // this ticket exists to end. The distinct errorCode + structured metadata is what
+      // makes the class observable without touching scheduling.
+      const retryableUpstream = transientUpstream || quotaExhaustion != null;
+      const transientRetryNotBefore = retryableUpstream
+        ? quotaExhaustion?.resetAt ?? extractClaudeRetryNotBefore(failureFields)
         : null;
+      const errorCode = resolveClaudeFailureErrorCode({
+        requiresLogin: loginMeta.requiresLogin,
+        contextOverflow,
+        quotaExhausted: quotaExhaustion != null,
+        transientUpstream,
+      });
       return {
         exitCode: proc.exitCode,
         signal: proc.signal,
         timedOut: false,
         errorMessage: fallbackErrorMessage,
         errorCode,
-        errorFamily: transientUpstream ? "transient_upstream" : null,
+        errorFamily: retryableUpstream ? "transient_upstream" : null,
         retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
         errorMeta,
         resultJson: {
           stdout: proc.stdout,
           stderr: proc.stderr,
-          ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
+          ...(retryableUpstream ? { errorFamily: "transient_upstream" } : {}),
           ...(transientRetryNotBefore
             ? { retryNotBefore: transientRetryNotBefore.toISOString() }
             : {}),
           ...(transientRetryNotBefore
             ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() }
             : {}),
+          ...claudeQuotaExhaustionResultJson(quotaExhaustion),
         },
         clearSession: Boolean(opts.clearSessionOnMissingSession),
       };
@@ -934,24 +948,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const errorMessage = failed
       ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
       : null;
-    const transientUpstream =
-      failed &&
-      !loginMeta.requiresLogin &&
-      !clearSessionForMaxTurns &&
-      isClaudeTransientUpstreamError({
-        parsed,
-        stdout: proc.stdout,
-        stderr: proc.stderr,
-        errorMessage,
-      });
-    const transientRetryNotBefore = transientUpstream
-      ? extractClaudeRetryNotBefore({
-          parsed,
-          stdout: proc.stdout,
-          stderr: proc.stderr,
-          errorMessage,
-        })
-      : null;
+    const failureFields = {
+      parsed,
+      stdout: proc.stdout,
+      stderr: proc.stderr,
+      errorMessage,
+    };
     // AUR-4513: this is the path the 2,394 live overflow rows took. `Prompt is too
     // long` matches no transient pattern itself -- it was tagged transient because
     // the haystack folds in the resumed transcript. Classify it deterministically.
@@ -960,21 +962,40 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       !loginMeta.requiresLogin &&
       !clearSessionForMaxTurns &&
       isClaudeContextOverflowError({ parsed, errorMessage });
-    const resolvedErrorCode = loginMeta.requiresLogin
-      ? "claude_auth_required"
-      : failed && clearSessionForMaxTurns
-      ? "max_turns_exhausted"
-      : contextOverflow
-      ? CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE
-      : transientUpstream
-      ? "claude_transient_upstream"
+    // AUR-4144: quota is resolved after the login / max-turns / overflow determinations
+    // (all of which are more specific) but BEFORE the transient one, which it subsumes.
+    const quotaExhaustion =
+      failed && !loginMeta.requiresLogin && !clearSessionForMaxTurns && !contextOverflow
+        ? detectClaudeQuotaExhaustion(failureFields)
+        : null;
+    const transientUpstream =
+      failed &&
+      !loginMeta.requiresLogin &&
+      !clearSessionForMaxTurns &&
+      isClaudeTransientUpstreamError(failureFields);
+    // AUR-4144: the quota wall deliberately keeps `errorFamily: "transient_upstream"`.
+    // `server/src/services/quota-pause.ts` and the park-at-reset scheduling in
+    // `server/src/services/heartbeat.ts` both gate on that family plus the presence of
+    // `transientRetryNotBefore`; a new family would silently switch both off. Only the
+    // errorCode and the structured metadata differ.
+    const retryableUpstream = transientUpstream || quotaExhaustion != null;
+    const transientRetryNotBefore = retryableUpstream
+      ? quotaExhaustion?.resetAt ?? extractClaudeRetryNotBefore(failureFields)
       : null;
+    const resolvedErrorCode = resolveClaudeFailureErrorCode({
+      requiresLogin: loginMeta.requiresLogin,
+      maxTurnsExhausted: failed && clearSessionForMaxTurns,
+      contextOverflow,
+      quotaExhausted: quotaExhaustion != null,
+      transientUpstream,
+    });
     const mergedResultJson: Record<string, unknown> = {
       ...parsed,
       ...(failed && clearSessionForMaxTurns ? { stopReason: "max_turns_exhausted" } : {}),
-      ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
+      ...(retryableUpstream ? { errorFamily: "transient_upstream" } : {}),
       ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
+      ...claudeQuotaExhaustionResultJson(quotaExhaustion),
     };
 
     return {
@@ -983,7 +1004,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       timedOut: false,
       errorMessage,
       errorCode: resolvedErrorCode,
-      errorFamily: transientUpstream ? "transient_upstream" : null,
+      errorFamily: retryableUpstream ? "transient_upstream" : null,
       retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
       errorMeta,
       usage,

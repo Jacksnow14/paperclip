@@ -83,7 +83,35 @@ for (const code of DETERMINISTIC_ATTRIBUTABLE_ERROR_CODES) {
   }
 }
 
-function isInfraKilledRun(run: Pick<HeartbeatRunRow, "errorCode" | "error">) {
+// AUR-4062: adapter-agnostic backstop for the *next* provider failure mode that isn't in
+// NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES yet. AUR-3943 forensics found a clean, bimodal split
+// independent of errorCode: runs that never reached the model logged ~6.0-6.2 KB and recorded
+// zero tokens/cost, vs. 257-311 KB for runs that actually invoked it. Gate on logBytes (not just
+// zero usage) so a genuine $0 agent failure that already reached the model -- a real transcript,
+// just no billed usage -- is not swept in; that risk is exactly why AUR-4062 asked for this to be
+// its own change with its own test coverage instead of folding into AUR-4016's errorCode list.
+const ZERO_TOKEN_BACKSTOP_LOG_BYTES_CEILING = 32 * 1024;
+
+function hasZeroUsage(usageJson: HeartbeatRunRow["usageJson"]) {
+  const usage = usageJson as { inputTokens?: unknown; outputTokens?: unknown; costUsd?: unknown } | null;
+  const inputTokens = typeof usage?.inputTokens === "number" ? usage.inputTokens : 0;
+  const outputTokens = typeof usage?.outputTokens === "number" ? usage.outputTokens : 0;
+  const costUsd = typeof usage?.costUsd === "number" ? usage.costUsd : 0;
+  return inputTokens === 0 && outputTokens === 0 && costUsd === 0;
+}
+
+function isZeroTokenBackstopRun(run: Pick<HeartbeatRunRow, "usageJson" | "logBytes">) {
+  return (
+    hasZeroUsage(run.usageJson) &&
+    typeof run.logBytes === "number" &&
+    run.logBytes > 0 &&
+    run.logBytes <= ZERO_TOKEN_BACKSTOP_LOG_BYTES_CEILING
+  );
+}
+
+function isInfraKilledRun(
+  run: Pick<HeartbeatRunRow, "errorCode" | "error" | "usageJson" | "logBytes">,
+) {
   // A deterministic failure is never an infra kill, even if a future edit adds its
   // code to the non-attributable list.
   if (
@@ -95,7 +123,8 @@ function isInfraKilledRun(run: Pick<HeartbeatRunRow, "errorCode" | "error">) {
   return (
     (run.errorCode != null &&
       (NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES as readonly string[]).includes(run.errorCode)) ||
-    Boolean(run.error?.startsWith("Process lost"))
+    Boolean(run.error?.startsWith("Process lost")) ||
+    isZeroTokenBackstopRun(run)
   );
 }
 
@@ -106,10 +135,22 @@ function nonAttributableErrorCodeSqlList() {
   );
 }
 
+function zeroTokenBackstopSqlPredicate() {
+  return sql`(
+    coalesce((${heartbeatRuns.usageJson} ->> 'inputTokens')::numeric, 0) = 0
+    and coalesce((${heartbeatRuns.usageJson} ->> 'outputTokens')::numeric, 0) = 0
+    and coalesce((${heartbeatRuns.usageJson} ->> 'costUsd')::numeric, 0) = 0
+    and ${heartbeatRuns.logBytes} is not null
+    and ${heartbeatRuns.logBytes} > 0
+    and ${heartbeatRuns.logBytes} <= ${ZERO_TOKEN_BACKSTOP_LOG_BYTES_CEILING}
+  )`;
+}
+
 function infraKilledRunSqlExclusion() {
   return sql`(
     coalesce(${heartbeatRuns.errorCode}, '') not in (${nonAttributableErrorCodeSqlList()})
     and (${heartbeatRuns.error} is null or ${heartbeatRuns.error} not like ${"Process lost%"})
+    and not ${zeroTokenBackstopSqlPredicate()}
   )`;
 }
 
@@ -117,6 +158,7 @@ function infraKilledRunSqlPredicate() {
   return sql`(
     coalesce(${heartbeatRuns.errorCode}, '') in (${nonAttributableErrorCodeSqlList()})
     or ${heartbeatRuns.error} like ${"Process lost%"}
+    or ${zeroTokenBackstopSqlPredicate()}
   )`;
 }
 
@@ -563,7 +605,9 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     const attributableTerminalRuns = terminalRuns.filter((run) => !isInfraKilledRun(run));
     const infraKilledTerminalRunBreakdownMap = new Map<string, number>();
     for (const run of infraKilledTerminalRuns) {
-      const key = run.errorCode ?? "(unlabeled Process lost)";
+      const key =
+        run.errorCode ??
+        (isZeroTokenBackstopRun(run) ? "(zero-token/logBytes backstop)" : "(unlabeled Process lost)");
       infraKilledTerminalRunBreakdownMap.set(key, (infraKilledTerminalRunBreakdownMap.get(key) ?? 0) + 1);
     }
     const infraKilledTerminalRunBreakdown = Array.from(

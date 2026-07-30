@@ -128,6 +128,8 @@ describeEmbeddedPostgres("productivity review service", () => {
     status?: string;
     errorCode?: string | null;
     error?: string | null;
+    usageJson?: Record<string, unknown> | null;
+    logBytes?: number | null;
   }) {
     const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
     const startIndex = input.startIndex ?? 0;
@@ -148,6 +150,8 @@ describeEmbeddedPostgres("productivity review service", () => {
         livenessState: input.status && input.status !== "succeeded" ? "failed" : "advanced",
         errorCode: input.errorCode ?? null,
         error: input.error ?? null,
+        usageJson: input.usageJson ?? null,
+        logBytes: input.logBytes ?? null,
         nextAction: "Continue processing the next batch.",
         createdAt,
         updatedAt: createdAt,
@@ -982,6 +986,131 @@ describeEmbeddedPostgres("productivity review service", () => {
       const [review] = await listProductivityReviews(seeded.companyId);
       expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
       expect(review?.description).toContain("No-comment completed-run streak: 10");
+      expect(review?.description).toContain("Excluded-run breakdown by errorCode: none");
+    });
+  });
+
+  describe("AUR-4062 zero-token/logBytes backstop classification", () => {
+    const ZERO_USAGE = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
+    const STARVED_LOG_BYTES = 6_100; // AUR-3943 forensics: starved runs logged ~6.0-6.2 KB.
+    const REAL_WORK_LOG_BYTES = 280_000; // vs. 257-311 KB for runs that actually invoked the model.
+
+    it("excludes a terminal run carrying the zero-token/tiny-log signature even under an errorCode not yet in the allowlist", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+
+      // 9 runs shaped like AUR-4201's quota-starved streak, but tagged with a fictional
+      // errorCode that has never been added to NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES --
+      // this is exactly the "next provider failure mode" gap the backstop exists to close.
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 9,
+        now,
+        status: "failed",
+        errorCode: "some_future_provider_code",
+        error: "Provider rejected the request before invoking the model",
+        usageJson: ZERO_USAGE,
+        logBytes: STARVED_LOG_BYTES,
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+        startIndex: 9,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+      expect(review?.description).toContain("No-comment completed-run streak: 10");
+      expect(review?.description).toContain(
+        "Terminal sampled runs: 19 (9 infra-killed/non-attributable, 10 attributable to the agent)",
+      );
+      expect(review?.description).toContain(
+        "Excluded-run breakdown by errorCode: `some_future_provider_code`: 9",
+      );
+    });
+
+    it("labels an errorCode-less zero-token/tiny-log run distinctly from the process_lost fallback", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 3,
+        now,
+        status: "failed",
+        errorCode: null,
+        error: "connection reset before the model responded",
+        usageJson: ZERO_USAGE,
+        logBytes: STARVED_LOG_BYTES,
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+        startIndex: 3,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain(
+        "Excluded-run breakdown by errorCode: `(zero-token/logBytes backstop)`: 3",
+      );
+    });
+
+    it("does NOT exclude a genuine $0 failure that already reached the model (large logBytes)", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+
+      // Same zero-usage shape as a starved run, but logBytes is in the "actually invoked
+      // the model" range -- e.g. the agent ran, produced a real transcript, and errored
+      // before any billable usage was recorded. This must stay attributable so a genuine
+      // $0 agent failure can't be swept under the backstop (the exact risk the issue
+      // description called out for keeping this separate from AUR-4016).
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+        status: "failed",
+        errorCode: null,
+        error: "the agent's own code threw an unhandled exception after a full run",
+        usageJson: ZERO_USAGE,
+        logBytes: REAL_WORK_LOG_BYTES,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+      expect(review?.description).toContain("No-comment completed-run streak: 10");
+      expect(review?.description).toContain(
+        "Terminal sampled runs: 10 (0 infra-killed/non-attributable, 10 attributable to the agent)",
+      );
       expect(review?.description).toContain("Excluded-run breakdown by errorCode: none");
     });
   });

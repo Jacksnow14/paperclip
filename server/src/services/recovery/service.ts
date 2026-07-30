@@ -148,7 +148,7 @@ type DurableBlockedIssueClassificationKind =
   | "terminal_only"
   | "open_non_terminal";
 
-type DurableBlockedEnteredAtSource = "activity_log" | "fallback_updated_at";
+type DurableBlockedEnteredAtSource = "activity_log" | "fallback_created_at";
 
 type DurableBlockedIssueClassification = {
   issue: DurableBlockedIssueRow;
@@ -2799,29 +2799,32 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           eq(activityLog.entityType, "issue"),
           inArray(activityLog.entityId, blockedIssueIds),
           inArray(activityLog.action, ["issue.created", "issue.updated"]),
-          sql`${activityLog.details} ->> 'status' = 'blocked'`,
+          // Two write shapes carry a blocked transition. Direct issue writes
+          // put the new status at `details.status`; the plugin host's
+          // `issues.update` logs `issue.updated` with
+          // `details: { identifier, patch, _previous }`, so a plugin-driven
+          // block only shows up at `details.patch.status`. `_previous.status`
+          // is deliberately NOT matched — that is the status the issue left,
+          // so matching it would read the wrong transition.
+          sql`(${activityLog.details} ->> 'status' = 'blocked' OR ${activityLog.details} -> 'patch' ->> 'status' = 'blocked')`,
         ),
       )
       .groupBy(activityLog.entityId);
 
     // No activity_log row carries the blocked transition for this issue (some
-    // svc.update() paths omit `status` from the details). Falling back to
-    // issues.createdAt would make a freshly re-blocked but old issue look
-    // 60+ days stale and escalate on a guess, so fall back to the newest
-    // timestamp we can actually observe while the issue is blocked. The
-    // fallback is tracked so it shows up in the reconciler counters instead of
-    // silently shaping an escalation decision.
+    // svc.update() paths omit `status` from the details entirely). Fall back to
+    // issues.createdAt: it is monotone and, unlike issues.updatedAt, immune to
+    // comment recency (issues.addComment deliberately bumps updatedAt, which
+    // made blocked-staleness a function of how chatty the issue was and could
+    // cancel a live escalation). A createdAt-derived timestamp over-estimates
+    // staleness, so it is allowed to escalate but never to cancel — see the
+    // stage === "none" branch. The fallback is counted so it shows up in the
+    // reconciler counters instead of silently shaping a decision.
     const blockedEnteredAtByIssueId = new Map<string, BlockedEnteredAtEntry>(
-      blockedIssues.map((issue) => {
-        const createdAt = issue.createdAt;
-        const updatedAt = issue.updatedAt;
-        const newest =
-          updatedAt instanceof Date && !Number.isNaN(updatedAt.getTime()) &&
-          updatedAt.getTime() > createdAt.getTime()
-            ? updatedAt
-            : createdAt;
-        return [issue.id, { at: newest, source: "fallback_updated_at" as const }];
-      }),
+      blockedIssues.map((issue) => [
+        issue.id,
+        { at: issue.createdAt, source: "fallback_created_at" as const },
+      ]),
     );
     for (const row of rows) {
       if (!row.blockedEnteredAt) continue;
@@ -2923,8 +2926,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         [...(directBlockersByIssueId.get(issue.id)?.values() ?? [])],
       );
       const hasFirstClassBlockerEdge = (explicitBlockerIdsByIssueId.get(issue.id)?.size ?? 0) > 0;
+      // The loader seeds an entry for every issue it is handed, so this default
+      // is unreachable; it is kept only so the lookup stays total, and it
+      // matches the loader's own fallback exactly rather than reporting a
+      // different (updatedAt-derived) source.
       const blockedEnteredAtEntry = blockedEnteredAtByIssueId.get(issue.id)
-        ?? { at: issue.createdAt, source: "fallback_updated_at" as const };
+        ?? { at: issue.createdAt, source: "fallback_created_at" as const };
       const blockedEnteredAt = blockedEnteredAtEntry.at;
       const kind: DurableBlockedIssueClassificationKind =
         directBlockers.length === 0
@@ -3077,10 +3084,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   /**
-   * Prior Class A auto-recoveries inside the rolling window, keyed by issue.
-   * Derived from `activity_log` rows the Class A path already writes, so this
-   * needs no new table. Rows written before the fingerprint was recorded fall
-   * back to deriving it from the logged blocker summaries.
+   * Prior Class A *decisions* inside the rolling window, keyed by issue: either
+   * an actual auto-recovery (`issue.updated` blocked -> todo) or a capped
+   * decision (`issue.recovery_class_a_capped`). Derived from `activity_log` rows
+   * the Class A path already writes, so this needs no new table. Rows written
+   * before the fingerprint was recorded fall back to deriving it from the logged
+   * blocker summaries.
+   *
+   * Matching the capped marker too is what makes the window self-refreshing: a
+   * persistently re-blocked issue keeps extending it and stays capped, instead
+   * of ageing out of a recovery-only window and re-flipping every 7 days.
    */
   async function loadRecentClassAAutoRecoveryFingerprints(
     issueIds: string[],
@@ -3099,11 +3112,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         and(
           eq(activityLog.entityType, "issue"),
           inArray(activityLog.entityId, [...new Set(issueIds)]),
-          eq(activityLog.action, "issue.updated"),
+          inArray(activityLog.action, ["issue.updated", "issue.recovery_class_a_capped"]),
           gte(activityLog.createdAt, since),
           sql`${activityLog.details} ->> 'source' = 'recovery.reconcile_issue_graph_liveness'`,
-          sql`${activityLog.details} ->> 'previousStatus' = 'blocked'`,
-          sql`${activityLog.details} ->> 'status' = 'todo'`,
+          sql`(
+            (${activityLog.action} = 'issue.updated'
+              AND ${activityLog.details} ->> 'previousStatus' = 'blocked'
+              AND ${activityLog.details} ->> 'status' = 'todo')
+            OR ${activityLog.action} = 'issue.recovery_class_a_capped'
+          )`,
         ),
       );
 
@@ -3171,22 +3188,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }) {
     const classifications = await collectDurableBlockedIssueClassifications(input.now);
     const sourceIssueIds = classifications.map((classification) => classification.issue.id);
-    const [graphLivenessActions, anyActiveActions] = await Promise.all([
-      loadActiveIssueGraphLivenessRecoveryActions(sourceIssueIds),
-      loadAnyActiveRecoveryActions(sourceIssueIds),
-    ]);
-    // Owner resolution is needed for every issue that can end up needing an
-    // owner: 30-day escalations, capped Class A downgrades, and the
-    // wake_assignee stage when the issue is assigned to a user (no agent).
-    const ownerMaps = await loadDurableMissingBlockerEscalationOwners(
-      classifications.map((classification) => classification.issue),
-    );
-    const recentClassAFingerprintsByIssueId = await loadRecentClassAAutoRecoveryFingerprints(
-      classifications
-        .filter((classification) => classification.kind === "terminal_only")
-        .map((classification) => classification.issue.id),
-      new Date(input.now.getTime() - CLASS_A_OSCILLATION_WINDOW_MS),
-    );
 
     const result = {
       blockedIssuesScanned: classifications.length,
@@ -3205,6 +3206,58 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       actionErrors: 0,
       errorIssueIds: [] as string[],
     };
+
+    // These pre-loop loaders used to sit outside every try/catch. A throw here
+    // (a transient DB error, say) aborted the whole reconciler while reporting
+    // actionErrors: 0, and because reconcileIssueGraphLiveness sits mid-chain in
+    // the periodic heartbeat it also skipped the scans that run after it. Degrade
+    // instead: record one action error so the tick still logs (actionErrors is in
+    // the log gate) and let the caller's chain continue.
+    const prescan = await (async () => {
+      try {
+        const [graphLivenessActions, anyActiveActions] = await Promise.all([
+          loadActiveIssueGraphLivenessRecoveryActions(sourceIssueIds),
+          loadAnyActiveRecoveryActions(sourceIssueIds),
+        ]);
+        // Owner resolution is needed for every issue that can end up needing an
+        // owner: 30-day escalations, capped Class A downgrades, and the
+        // wake_assignee stage when the issue is assigned to a user (no agent).
+        const ownerMaps = await loadDurableMissingBlockerEscalationOwners(
+          classifications.map((classification) => classification.issue),
+        );
+        const recentClassAFingerprintsByIssueId = await loadRecentClassAAutoRecoveryFingerprints(
+          classifications
+            .filter((classification) => classification.kind === "terminal_only")
+            .map((classification) => classification.issue.id),
+          new Date(input.now.getTime() - CLASS_A_OSCILLATION_WINDOW_MS),
+        );
+        return {
+          ok: true as const,
+          graphLivenessActions,
+          anyActiveActions,
+          ownerMaps,
+          recentClassAFingerprintsByIssueId,
+        };
+      } catch (error) {
+        return { ok: false as const, error };
+      }
+    })();
+
+    if (!prescan.ok) {
+      result.actionErrors += 1;
+      logger.error({
+        err: prescan.error,
+        blockedIssuesScanned: classifications.length,
+      }, "durable blocked-issue prescan failed; skipping actuation for this tick");
+      return result;
+    }
+
+    const {
+      graphLivenessActions,
+      anyActiveActions,
+      ownerMaps,
+      recentClassAFingerprintsByIssueId,
+    } = prescan;
 
     const resolveFallbackOwnerAgentId = (issue: DurableBlockedIssueRow) => (
       issue.projectId
@@ -3311,7 +3364,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       else if (classification.kind === "missing_edge") result.missingEdgeIssues += 1;
       else result.openNonTerminalIssues += 1;
 
-      if (classification.blockedEnteredAtSource === "fallback_updated_at") {
+      if (classification.blockedEnteredAtSource === "fallback_created_at") {
         result.blockedEnteredAtFallbacks += 1;
       }
 
@@ -3323,9 +3376,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           const blockerSetFingerprint = buildClassABlockerSetFingerprint(
             classification.directBlockers.map((blocker) => blocker.blockerIssueId),
           );
-          const alreadyAutoRecovered = recentClassAFingerprintsByIssueId
-            .get(classification.issue.id)
-            ?.has(blockerSetFingerprint) ?? false;
+          const alreadyAutoRecovered =
+            recentClassAFingerprintsByIssueId
+              .get(classification.issue.id)
+              ?.has(blockerSetFingerprint) ?? false;
 
           if (alreadyAutoRecovered) {
             // The issue was already auto-recovered off this exact blocker set
@@ -3335,6 +3389,35 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             // silent path would reintroduce the inert-detector failure this
             // line of work exists to kill.
             result.classAOscillationCapped += 1;
+
+            // Refresh the window. Without this marker the window measured
+            // "time since the last Class A *recovery*", so 7 days after the last
+            // genuine recovery alreadyAutoRecovered flipped back to false and
+            // Class A force-flipped the issue again — oscillation throttled to
+            // weekly rather than ended. The marker makes the window measure
+            // "time since the last Class A *decision*", so every capped tick
+            // extends it. It is a distinct action, NOT an `issue.updated` with a
+            // fabricated `status: "todo"`: no status change happened here, and
+            // faking one would corrupt the blocked-transition history that
+            // loadDurableBlockedEnteredAtByIssue reads.
+            await logActivity(db, {
+              companyId: classification.issue.companyId,
+              actorType: "system",
+              actorId: "system",
+              agentId: null,
+              runId: input.runId ?? null,
+              action: "issue.recovery_class_a_capped",
+              entityType: "issue",
+              entityId: classification.issue.id,
+              details: {
+                identifier: classification.issue.identifier,
+                source: "recovery.reconcile_issue_graph_liveness",
+                durableBlockerClassification: classification.kind,
+                stage: "class_a_oscillation_capped",
+                classABlockerSetFingerprint: blockerSetFingerprint,
+                classAOscillationWindowMs: CLASS_A_OSCILLATION_WINDOW_MS,
+              },
+            });
 
             if (anyActiveAction && anyActiveAction.kind !== "issue_graph_liveness") {
               result.classBSkippedOtherRecoveryAction += 1;
@@ -3465,6 +3548,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
         const stage = missingBlockerEdgeStageForAge(classification.staleAgeMs);
         if (stage === "none") {
+          // A fallback-derived blockedEnteredAt may escalate but must NEVER
+          // cancel. The fallback (issues.createdAt) is only a bound on when the
+          // issue entered blocked, so "entered blocked recently" is a guess —
+          // and acting on that guess here would silently retire a live
+          // escalation action. The asymmetry is deliberate: a false positive
+          // costs one wake, a false negative disables the detector.
+          if (graphLivenessAction && classification.blockedEnteredAtSource !== "activity_log") {
+            result.classBNoop += 1;
+            continue;
+          }
           if (graphLivenessAction) {
             const resolved = await resolveDurableIssueGraphLivenessAction({
               action: graphLivenessAction,

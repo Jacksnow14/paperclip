@@ -94,8 +94,16 @@ type IssueGraphLivenessReconciliationSummary = {
   obsoleteRecoveriesRetired?: number;
   obsoleteRecoveryBlockerRelationsRemoved?: number;
   classAAutoRecovered?: number;
+  classAOscillationCapped?: number;
   classBNudged?: number;
   classBEscalated?: number;
+  classBBoardOnly?: number;
+  /**
+   * Present in the payload (so the number is visible whenever the line is
+   * logged) but deliberately NOT a gate trigger — see the gate below.
+   */
+  classBNoop?: number;
+  blockedEnteredAtFallbacks?: number;
   issueGraphRecoveryActionsResolved?: number;
   actionErrors?: number;
 };
@@ -103,13 +111,22 @@ type IssueGraphLivenessReconciliationSummary = {
 export function shouldLogIssueGraphLivenessReconciliation(
   reconciled: IssueGraphLivenessReconciliationSummary,
 ): boolean {
+  // Gate on *events* only: something was written, retired, or an agent was
+  // woken. `classBNoop` and `blockedEnteredAtFallbacks` are recurring *state*,
+  // not events — noop scales with the blocked backlog and the fallback counter
+  // is >= 1 on every tick as long as a single blocked issue has no readable
+  // blocked-transition row. Adding either would make this return true
+  // unconditionally forever and drown the real events, so they stay in the
+  // summary payload (visible when the line does fire) and out of the gate.
   return (
     (reconciled.escalationsCreated ?? 0) > 0 ||
     (reconciled.obsoleteRecoveriesRetired ?? 0) > 0 ||
     (reconciled.obsoleteRecoveryBlockerRelationsRemoved ?? 0) > 0 ||
     (reconciled.classAAutoRecovered ?? 0) > 0 ||
+    (reconciled.classAOscillationCapped ?? 0) > 0 ||
     (reconciled.classBNudged ?? 0) > 0 ||
     (reconciled.classBEscalated ?? 0) > 0 ||
+    (reconciled.classBBoardOnly ?? 0) > 0 ||
     (reconciled.issueGraphRecoveryActionsResolved ?? 0) > 0 ||
     (reconciled.actionErrors ?? 0) > 0
   );

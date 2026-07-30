@@ -16,10 +16,13 @@
  *   `lesson` is agent-mutable (AUR-3865) so agents can correct or retract their own
  *   distilled retrospective lessons instead of leaving a wrong lesson live forever.
  *
- * Capture visibility warnings (POST /memory/capture):
- *   The response includes a non-breaking `warnings: string[]` field when the captured
- *   record(s) won't appear in the default GET /memory/records or memory/query response
- *   (e.g. reviewState=pending, project-scoped, or agent-scoped to a different agent).
+ * Capture visibility (POST /memory/capture, AUR-4140):
+ *   The response carries a top-level `visibility: "visible" | "pending_review"` —
+ *   "pending_review" means the record is hidden from every other agent until reviewed
+ *   (the author can always read back their own record by id or with ?reviewState=pending).
+ *   The non-breaking `warnings: string[]` field additionally flags cases where the
+ *   record won't appear in default reads (pending review, project-scoped, or
+ *   agent-scoped to a different agent).
  *
  * Scorecard integrity guard (POST /memory/capture, AUR-3993/AUR-3996):
  *   A capture with metadata.category `performance_scorecard` or `scorecard_adjusted` is
@@ -414,12 +417,19 @@ export function memoryRoutes(
     }
     const result = await memory.capture(companyId, payload, actorInfoFromReq(req));
     const warnings: string[] = [];
+    // AUR-4140: `warnings[]` is free text and was missed by callers even when the
+    // record was invisible to them — `visibility` is the machine-readable signal.
+    const visibility: "visible" | "pending_review" = result.records.some(
+      (record) => record.reviewState === "pending",
+    )
+      ? "pending_review"
+      : "visible";
     const firstRecord = result.records[0];
     if (firstRecord) {
       if (firstRecord.reviewState === "pending") {
         warnings.push(
-          "Record is pending review; it won't appear in the default GET /memory/records or memory/query response. " +
-          "Read it back with ?reviewState=pending.",
+          `Record ${firstRecord.id} is pending review: hidden from every other agent's reads (including memory/query) until accepted. ` +
+          `As the author you can verify it with GET /memory/records/${firstRecord.id} or GET /memory/records?reviewState=pending.`,
         );
       }
       if (firstRecord.scopeType === "project") {
@@ -455,7 +465,7 @@ export function memoryRoutes(
         sourceKind: result.operation.source?.kind ?? null,
       },
     });
-    res.status(201).json({ ...result, warnings });
+    res.status(201).json({ ...result, visibility, warnings });
   });
 
   router.post("/companies/:companyId/memory/forget", validate(memoryForgetSchema), async (req, res) => {

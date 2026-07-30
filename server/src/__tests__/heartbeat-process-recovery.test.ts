@@ -2060,6 +2060,92 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  // AUR-4647: before this fix, reconcileStrandedAssignedIssues had no
+  // dependency-readiness check, so it re-called enqueueWakeup for the same
+  // dependency-blocked issue on every scheduler tick forever -- the storm of
+  // skipped/issue_dependencies_blocked wakes (AUR-4149 alone produced 481 of
+  // them in ~2h). FIRE case: the blocker is still open, so recovery must not
+  // redispatch at all this tick.
+  it("suppresses stranded-todo recovery redispatch while the issue is dependency-blocked (AUR-4647 FIRE)", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "failed",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Open blocker",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 900,
+      identifier: `${issuePrefix}-900`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+    const wakesBefore = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.dispatchRequeued).toBe(0);
+    expect(result.assignmentDispatched).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.dependencyBlockedSkipped).toBe(1);
+    expect(result.issueIds).toEqual([]);
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.id).toBe(runId);
+
+    const wakesAfter = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakesAfter).toHaveLength(wakesBefore.length);
+  });
+
+  // PASS case: the same shape, but the blocker has resolved. Recovery must
+  // still dispatch normally -- suppression must not become a permanent block.
+  it("still dispatches stranded-todo recovery once the blocker resolves (AUR-4647 PASS)", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "failed",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Resolved blocker",
+      status: "done",
+      priority: "medium",
+      issueNumber: 900,
+      identifier: `${issuePrefix}-900`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.dependencyBlockedSkipped).toBe(0);
+    expect(result.dispatchRequeued).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(2);
+    const retryRun = runs.find((row) => row.id !== runId);
+    expect(retryRun).toBeTruthy();
+    if (retryRun) {
+      await waitForRunToSettle(heartbeat, retryRun.id);
+    }
+  });
+
   it("blocks assigned todo work after the one automatic dispatch recovery was already used", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "todo",

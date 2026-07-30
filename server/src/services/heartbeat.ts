@@ -10701,8 +10701,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // .select() above omitted that column the field read `undefined` on every
     // production row while hand-built fixtures still passed.
     evaluateSessionCompaction,
-    listWakeupRequests: async (agentId: string, limit = 50) => {
+    // AUR-4647: `before`/`offset` are real pagination params, not decoration --
+    // a caller reaching for them is trying to page past the newest 500 rows.
+    // Silently ignoring them (the pre-fix behavior) makes a bounded read look
+    // like a complete one: a caller can ask for `before: <8h ago>` expecting
+    // an older window and instead get today's newest 500 back, misread a real
+    // wake as "never happened", and act on that false zero (see AUR-4647).
+    listWakeupRequests: async (
+      agentId: string,
+      limit = 50,
+      opts?: { before?: Date; offset?: number },
+    ) => {
       const clamped = Math.max(1, Math.min(500, Math.floor(limit) || 50));
+      const clampedOffset = Math.max(0, Math.floor(opts?.offset ?? 0) || 0);
+      const conditions = [eq(agentWakeupRequests.agentId, agentId)];
+      if (opts?.before) {
+        conditions.push(lt(agentWakeupRequests.requestedAt, opts.before));
+      }
       return db
         .select({
           id: agentWakeupRequests.id,
@@ -10727,9 +10742,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           error: agentWakeupRequests.error,
         })
         .from(agentWakeupRequests)
-        .where(eq(agentWakeupRequests.agentId, agentId))
+        .where(and(...conditions))
         .orderBy(desc(agentWakeupRequests.requestedAt))
-        .limit(clamped);
+        .limit(clamped)
+        .offset(clampedOffset);
     },
 
     list: async (companyId: string, agentId?: string, limit?: number) => {

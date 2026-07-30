@@ -1,4 +1,4 @@
-import { and, eq, notInArray, sql } from "drizzle-orm";
+import { and, eq, isNotNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns } from "@paperclipai/db";
 
@@ -8,7 +8,7 @@ export interface ActiveAdapterQuotaPause {
   scheduledRetryAt: Date;
   /** The provider's parsed reset time, unclamped — for logging when the two differ. */
   parsedResetAt: Date;
-  /** Row timestamp the max horizon is anchored to. */
+  /** Row creation timestamp the max horizon is anchored to. */
   pauseRecordedAt: Date;
 }
 
@@ -37,11 +37,11 @@ const QUOTA_PAUSE_INELIGIBLE_AGENT_STATUSES = ["paused", "terminated", "pending_
 //
 // Deliberately NOT `scheduledRetryAt <= now + MAX`, which would fail *open* — a long
 // reset would stop matching entirely and restore the AUR-4055 zero-token burn loop.
-// Bounding the horizon means that once it lapses one run is admitted to probe the wall:
-// if the wall is real that run re-fails and re-arms a fresh anchored horizon; if the
-// reset was misparsed it succeeds. That bounded probe is the intended behaviour — a
-// handful of probe runs per day instead of either a continuous burn or a silent
-// multi-day fleet outage.
+// Bounding the horizon means that once it lapses queued runs sharing that adapterType
+// are admitted again to probe the wall: if the wall is real, one or more of those runs
+// re-fail and re-arm a fresh anchored horizon; if the reset was misparsed they succeed.
+// That bounded re-admission is the intended behaviour — a handful of probe runs per day
+// instead of either a continuous burn or a silent multi-day fleet outage.
 export async function findActiveAdapterQuotaPause(
   db: Db,
   companyId: string,
@@ -51,13 +51,13 @@ export async function findActiveAdapterQuotaPause(
   // Interval and comparison operand are rendered as literals/casts rather than bound
   // Date/number params: the postgres driver will not bind a raw Date inside a sql`` tag.
   const maxPauseInterval = sql.raw(`interval '${MAX_ADAPTER_QUOTA_PAUSE_MS / 1000} seconds'`);
-  const effectiveHorizon = sql<Date>`least(${heartbeatRuns.scheduledRetryAt}, ${heartbeatRuns.updatedAt} + ${maxPauseInterval})`;
+  const effectiveHorizon = sql<Date>`least(${heartbeatRuns.scheduledRetryAt}, ${heartbeatRuns.createdAt} + ${maxPauseInterval})`;
   const nowParam = sql`${now.toISOString()}::timestamptz`;
   const row = await db
     .select({
       agentId: heartbeatRuns.agentId,
       scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
-      pauseRecordedAt: heartbeatRuns.updatedAt,
+      pauseRecordedAt: heartbeatRuns.createdAt,
     })
     .from(heartbeatRuns)
     .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
@@ -67,6 +67,7 @@ export async function findActiveAdapterQuotaPause(
         eq(agents.adapterType, adapterType),
         notInArray(agents.status, QUOTA_PAUSE_INELIGIBLE_AGENT_STATUSES),
         eq(heartbeatRuns.status, "scheduled_retry"),
+        isNotNull(heartbeatRuns.scheduledRetryAt),
         sql`${heartbeatRuns.contextSnapshot} ->> 'transientRetryNotBefore' is not null`,
         sql`${effectiveHorizon} > ${nowParam}`,
       ),

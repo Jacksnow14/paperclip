@@ -57,6 +57,7 @@ import {
   PROCESS_LOST_RETRY_MAX_ATTEMPTS,
 } from "../services/heartbeat.ts";
 import { findActiveAdapterQuotaPause, MAX_ADAPTER_QUOTA_PAUSE_MS } from "../services/quota-pause.ts";
+import { logger } from "../middleware/logger.js";
 
 const GiB = 1024 * 1024 * 1024;
 
@@ -290,7 +291,7 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
     return runId;
   }
 
-  // `pauseRecordedAt` is the row's updatedAt -- the fixed point MAX_ADAPTER_QUOTA_PAUSE_MS
+  // `pauseRecordedAt` is the row's createdAt -- the fixed point MAX_ADAPTER_QUOTA_PAUSE_MS
   // is anchored to. Tests must control it explicitly, otherwise "clamped" is
   // indistinguishable from "recomputed relative to now" (AUR-4139).
   async function seedActiveQuotaPause(
@@ -324,6 +325,42 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
       scheduledRetryAt,
       scheduledRetryReason: "transient_failure",
       contextSnapshot: { transientRetryNotBefore: scheduledRetryAt.toISOString() },
+      updatedAt: now,
+      createdAt: now,
+    });
+    return runId;
+  }
+
+  async function seedQuotaPauseMarkerWithoutScheduledRetryAt(
+    companyId: string,
+    agentId: string,
+    pauseRecordedAt?: Date,
+  ) {
+    const runId = randomUUID();
+    const wakeupRequestId = randomUUID();
+    const now = pauseRecordedAt ?? new Date();
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "transient_failure_retry",
+      payload: {},
+      status: "queued",
+      updatedAt: now,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "scheduled_retry",
+      wakeupRequestId,
+      scheduledRetryAt: null,
+      scheduledRetryReason: "transient_failure",
+      contextSnapshot: { transientRetryNotBefore: new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString() },
       updatedAt: now,
       createdAt: now,
     });
@@ -571,6 +608,75 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
     hangAdapterUntilReleased();
     expect(await heartbeat.startNextQueuedRunForAgent(siblingAgentId)).toHaveLength(1);
     expect((await heartbeat.getRun(siblingQueuedRun))?.status).toBe("running");
+  });
+
+  it("anchors the maximum horizon to createdAt even if updatedAt changes later (AUR-4139)", async () => {
+    const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4 });
+    const companyId = await seedCompany();
+    const pausedAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const siblingAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const recordedAt = new Date(Date.now() - 7 * 60 * 60 * 1000);
+    const parsedResetAt = new Date(recordedAt.getTime() + 24 * 60 * 60 * 1000);
+    const pauseRunId = await seedActiveQuotaPause(companyId, pausedAgentId, parsedResetAt, recordedAt);
+
+    await db
+      .update(heartbeatRuns)
+      .set({ updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, pauseRunId));
+
+    expect(await findActiveAdapterQuotaPause(db, companyId, "claude_local", new Date())).toBeNull();
+
+    const siblingQueuedRun = await seedQueuedRun(companyId, siblingAgentId);
+    hangAdapterUntilReleased();
+    expect(await heartbeat.startNextQueuedRunForAgent(siblingAgentId)).toHaveLength(1);
+    expect((await heartbeat.getRun(siblingQueuedRun))?.status).toBe("running");
+  });
+
+  it("ignores scheduled_retry rows with a quota marker but NULL scheduledRetryAt (AUR-4139)", async () => {
+    const companyId = await seedCompany();
+    const pausedAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const nullPauseAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const now = new Date();
+    const realPauseRecordedAt = new Date(now.getTime() - 60 * 60 * 1000);
+    const realPauseResetAt = new Date(now.getTime() + 60 * 60 * 1000);
+    await seedActiveQuotaPause(companyId, pausedAgentId, realPauseResetAt, realPauseRecordedAt);
+    await seedQuotaPauseMarkerWithoutScheduledRetryAt(
+      companyId,
+      nullPauseAgentId,
+      new Date(now.getTime() - 10 * 60 * 1000),
+    );
+
+    const activePause = await findActiveAdapterQuotaPause(db, companyId, "claude_local", now);
+
+    expect(activePause).not.toBeNull();
+    expect(activePause?.agentId).toBe(pausedAgentId);
+    expect(activePause?.scheduledRetryAt.toISOString()).toBe(realPauseResetAt.toISOString());
+  });
+
+  it("logs the suppression payload when an adapter-wide quota pause blocks admission (AUR-4139 AC1)", async () => {
+    const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4 });
+    const companyId = await seedCompany();
+    const pausedAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const siblingAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
+    const recordedAt = new Date(Date.now() - 60 * 60 * 1000);
+    const parsedResetAt = new Date(recordedAt.getTime() + 24 * 60 * 60 * 1000);
+    await seedActiveQuotaPause(companyId, pausedAgentId, parsedResetAt, recordedAt);
+    const siblingQueuedRun = await seedQueuedRun(companyId, siblingAgentId);
+    const loggerInfoSpy = vi.spyOn(logger, "info").mockImplementation(() => undefined);
+
+    expect(await heartbeat.startNextQueuedRunForAgent(siblingAgentId)).toHaveLength(0);
+    expect((await heartbeat.getRun(siblingQueuedRun))?.status).toBe("queued");
+    expect(loggerInfoSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: siblingAgentId,
+        pausedByAgentId: pausedAgentId,
+        adapterType: "claude_local",
+        quotaPausedUntil: new Date(recordedAt.getTime() + MAX_ADAPTER_QUOTA_PAUSE_MS).toISOString(),
+        parsedResetAt: parsedResetAt.toISOString(),
+        clampedToMaxHorizon: true,
+      }),
+      "startNextQueuedRunForAgent: adapter quota pause active; run admission suppressed",
+    );
   });
 
   it.each(["paused", "pending_approval"])(

@@ -1437,12 +1437,17 @@ describe.skipIf(!hasUserSystemdScopes)("runChildProcess memory ceiling wiring (A
     return JSON.parse(result.stdout.trim()) as { path: string; memoryMax: string; swapMax: string };
   }
 
+  // systemd names transient scopes run-u<decimal>.scope (sequential bus id),
+  // run-r<hex>.scope (random id — what GitHub Actions' systemd produces), or
+  // run-<pid>.scope, depending on how the unit name was allocated.
+  const TRANSIENT_RUN_SCOPE = /\/run-[ur]?[0-9a-f]+\.scope$/;
+
   it("places the real child in a transient scope whose memory.max IS the ceiling", async () => {
     const ceilingMb = 128;
     const seen = await runPrintingCgroup(ceilingMb);
 
     // The child is in its own transient run-*.scope, not the runner's cgroup.
-    expect(seen.path).toMatch(/\/run-[ur]?\d+\.scope$/);
+    expect(seen.path).toMatch(TRANSIENT_RUN_SCOPE);
     // The ceiling is a real kernel limit on that cgroup, not just an argv string.
     expect(seen.memoryMax).toBe(String(ceilingMb * 1024 * 1024));
     // MemorySwapMax=0 makes the ceiling a hard kill instead of swap thrashing.
@@ -1451,7 +1456,7 @@ describe.skipIf(!hasUserSystemdScopes)("runChildProcess memory ceiling wiring (A
 
   it("mutation control: memoryCeilingMb null leaves the child unceilinged", async () => {
     const seen = await runPrintingCgroup(null);
-    expect(seen.path).not.toMatch(/\/run-[ur]?\d+\.scope$/);
+    expect(seen.path).not.toMatch(TRANSIENT_RUN_SCOPE);
     // ...and inherits no 128 MB limit from anywhere else — proving the assertion
     // above is measuring the ceiling and not some ambient host configuration.
     expect(seen.memoryMax).not.toBe(String(128 * 1024 * 1024));

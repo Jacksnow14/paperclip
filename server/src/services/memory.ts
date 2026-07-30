@@ -481,7 +481,17 @@ function canReadRecord(companyId: string, record: MemoryRecord, actor: ActorInfo
   const maxSensitivity = maxSensitivityForActor(actor, scope);
   if (SENSITIVITY_RANK[record.sensitivityLabel] > SENSITIVITY_RANK[maxSensitivity]) return false;
   if (actor.actorType !== "agent") return true;
-  if (record.reviewState !== "accepted") return false;
+  if (record.reviewState !== "accepted") {
+    // Agents may always read back a record they own, even before it clears
+    // review — otherwise a pending capture (any category not on the
+    // auto-accept allowlist) is a 201 with a real recordId that then 404s
+    // for everyone, including its own creator, with no way to ever observe
+    // it (AUR-4060). Board/human review of pending records for other
+    // purposes is unaffected; this only restores read access to the owner.
+    const isOwnRecord =
+      record.owner?.type === "agent" && actor.agentId != null && record.owner.id === actor.agentId;
+    if (!isOwnRecord) return false;
+  }
   return scopeMatches(record, deriveAllowedScopes(companyId, scope, actor));
 }
 
@@ -747,6 +757,15 @@ function buildRecordVisibilityConditions(
     includeExpired?: boolean;
     includeSuperseded?: boolean;
     includeDeleted?: boolean;
+    // Callers that already filter on an explicit reviewState (e.g. the caller
+    // asked for ?reviewState=pending to read back their own not-yet-reviewed
+    // capture) must be able to opt out of the default accepted-only gate below.
+    // Without this, an agent-actor condition list ends up with both
+    // reviewState = 'pending' (their filter) AND reviewState = 'accepted'
+    // (this default) ANDed together, which is never satisfiable and made
+    // pending records permanently unreadable regardless of any filter passed
+    // (AUR-4060).
+    skipReviewStateGate?: boolean;
   },
 ) {
   const conditions = [
@@ -763,7 +782,9 @@ function buildRecordVisibilityConditions(
   if (!options?.includeSuperseded) {
     conditions.push(isNull(memoryLocalRecords.supersededByRecordId));
   }
-  conditions.push(eq(memoryLocalRecords.reviewState, "accepted"));
+  if (!options?.skipReviewStateGate) {
+    conditions.push(eq(memoryLocalRecords.reviewState, "accepted"));
+  }
 
   const maxSensitivity = maxSensitivityForActor(actor, scope);
   conditions.push(inArray(memoryLocalRecords.sensitivityLabel, allowedSensitivityLabels(maxSensitivity)));
@@ -1457,8 +1478,23 @@ export function memoryService(
           includeExpired: filters.includeExpired,
           includeRevoked: filters.includeRevoked,
           includeSuperseded: filters.includeSuperseded,
+          // filters.reviewState (pushed above) already constrains this query;
+          // don't additionally force reviewState = 'accepted' or the two
+          // conditions become unsatisfiable whenever a caller asks for
+          // pending/rejected records explicitly.
+          skipReviewStateGate: Boolean(filters.reviewState),
         }).filter((condition, index) => index > 1),
       );
+      // An explicit non-accepted reviewState filter only unlocks the agent's
+      // own not-yet-reviewed records (mirrors canReadRecord's owner check) —
+      // it must not become a way to browse other agents' unreviewed captures
+      // company-wide.
+      if (filters.reviewState && filters.reviewState !== "accepted" && actor.agentId) {
+        conditions.push(
+          eq(memoryLocalRecords.ownerType, "agent"),
+          eq(memoryLocalRecords.ownerId, actor.agentId),
+        );
+      }
     }
 
     return conditions;

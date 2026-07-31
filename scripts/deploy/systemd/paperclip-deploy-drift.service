@@ -1,0 +1,18 @@
+# AUR-3937: compares what production is running against origin/master.
+# Installed by scripts/deploy/install-drift-timer.sh. Runs system-level (not as
+# a paperclip.service child) so it survives control-plane restarts and reports
+# on them.
+[Unit]
+Description=Paperclip deploy drift check (deployed SHA vs origin/master)
+Documentation=https://paperclip/AUR/issues/AUR-3937
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ievgen
+Group=ievgen
+ExecStart=/opt/paperclip/app/current/scripts/deploy/check-deploy-drift.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=paperclip-deploy-drift

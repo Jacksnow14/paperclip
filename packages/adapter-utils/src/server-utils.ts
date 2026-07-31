@@ -908,8 +908,35 @@ function rewriteUrlHostToLoopback(rawUrl: string): string {
   return `${parsed.protocol}//127.0.0.1${port}${path}${parsed.search}${parsed.hash}`;
 }
 
+function slugifyAgentName(name: string): string {
+  const slug = name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || "agent";
+}
+
+/**
+ * Derives a per-agent git identity so commits are attributable per-run instead
+ * of all landing under the repo's shared `[user] name` config (AUR-4030).
+ * `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env beats repo/global git config, so this
+ * covers every worktree with no per-checkout setup.
+ */
+function buildAgentGitIdentityEnv(agent: { id: string; name: string }): Record<string, string> {
+  const shortId = agent.id.replace(/-/g, "").slice(0, 8) || agent.id;
+  const gitName = `${agent.name} (agent ${shortId})`;
+  const gitEmail = `${slugifyAgentName(agent.name)}-${shortId}@agents.paperclip.local`;
+  return {
+    GIT_AUTHOR_NAME: gitName,
+    GIT_AUTHOR_EMAIL: gitEmail,
+    GIT_COMMITTER_NAME: gitName,
+    GIT_COMMITTER_EMAIL: gitEmail,
+  };
+}
+
 export function buildPaperclipEnv(
-  agent: { id: string; companyId: string },
+  agent: { id: string; companyId: string; name?: string },
   opts: { preferLoopback?: boolean } = {},
 ): Record<string, string> {
   const resolveHostForUrl = (rawHost: string): string => {
@@ -921,6 +948,7 @@ export function buildPaperclipEnv(
   const vars: Record<string, string> = {
     PAPERCLIP_AGENT_ID: agent.id,
     PAPERCLIP_COMPANY_ID: agent.companyId,
+    ...(agent.name ? buildAgentGitIdentityEnv({ id: agent.id, name: agent.name }) : {}),
   };
   const runtimeHost = resolveHostForUrl(
     process.env.PAPERCLIP_LISTEN_HOST ?? process.env.HOST ?? "localhost",
@@ -1161,6 +1189,119 @@ export function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJ
     delete env[key];
   }
   return env;
+}
+
+// AUR-4003: default-deny inheritance of secret-shaped host env vars into agent
+// child processes. Company-scoped vault bindings (resolveEnvBindings -> config.env
+// -> opts.env) are the only supported way an agent receives a credential, so this
+// filter must only ever be applied to the inherited process.env side of a spawn
+// merge — never to opts.env / config.env.
+const INHERITED_SECRET_ENV_EXPLICIT_DENYLIST = new Set([
+  // Secret-bearing names SENSITIVE_ENV_KEY does not match.
+  "SUPABASE_DB_URL",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "GOOGLE_WORKSPACE_SA_KEY",
+]);
+
+// Runtime-auth vars the spawned agent CLI itself consumes. Every entry here is
+// ambient credential surface shared with all tenants — keep it minimal and
+// justify additions in review.
+const INHERITED_SECRET_ENV_KEEPLIST = new Set([
+  "ANTHROPIC_API_KEY",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+]);
+
+export type InheritedSecretEnvScrubMode = "enforce" | "report";
+
+export function resolveInheritedSecretEnvScrubMode(
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): InheritedSecretEnvScrubMode {
+  return baseEnv.PAPERCLIP_ENV_SCRUB_MODE === "report" ? "report" : "enforce";
+}
+
+export function sanitizeInheritedSecretEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  opts: {
+    runId?: string;
+    mode?: InheritedSecretEnvScrubMode;
+    log?: (message: string) => void;
+  } = {},
+): NodeJS.ProcessEnv {
+  const mode = opts.mode ?? resolveInheritedSecretEnvScrubMode();
+  const env: NodeJS.ProcessEnv = { ...baseEnv };
+  const stripped: string[] = [];
+  for (const key of Object.keys(env)) {
+    if (INHERITED_SECRET_ENV_KEEPLIST.has(key)) continue;
+    if (!SENSITIVE_ENV_KEY.test(key) && !INHERITED_SECRET_ENV_EXPLICIT_DENYLIST.has(key)) continue;
+    stripped.push(key);
+    if (mode === "enforce") delete env[key];
+  }
+  if (stripped.length > 0) {
+    const log = opts.log ?? ((message: string) => console.info(message));
+    const runSuffix = opts.runId ? ` run=${opts.runId}` : "";
+    log(
+      `[paperclip] env-scrub mode=${mode}${runSuffix} ${
+        mode === "enforce" ? "stripped" : "would strip"
+      } inherited env keys: ${stripped.sort().join(", ")}`,
+    );
+  }
+  return env;
+}
+
+// AUR-4046: Paperclip's OWN host-owned infrastructure credentials (server-side
+// Gmail SA, object-storage keys). Unlike ordinary tenant secret_ref vault
+// bindings, no agent child process is entitled to hold these ambiently — the
+// server process reads them directly from its own process.env. A vault
+// binding can still legitimately resolve one of these names into runEnv (e.g.
+// a project- or agent-scoped config.env entry), so this is a narrow,
+// name-based denylist — NOT a blanket runEnv filter — and it is escapable
+// per call via opts.allowRunEnvKeys for a reviewed, intentional exception.
+const RUN_ENV_HOST_CREDENTIAL_DENYLIST = new Set([
+  "GOOGLE_WORKSPACE_SA_KEY",
+  "INTEROP_R2_ACCESS_KEY_ID",
+  "INTEROP_R2_SECRET_ACCESS_KEY",
+]);
+
+// The one supported way to build a child-process env from the host env plus the
+// per-run env. Scrubs identity and secret-shaped vars from the inherited side,
+// and separately default-denies the small set of host-owned credential names
+// above from the per-run side (opt-in only, see RUN_ENV_HOST_CREDENTIAL_DENYLIST).
+// All other per-run values (tenant-scoped vault bindings) always win and are
+// never filtered here.
+export function buildChildProcessEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  runEnv: Record<string, string | undefined>,
+  opts: {
+    runId?: string;
+    mode?: InheritedSecretEnvScrubMode;
+    log?: (message: string) => void;
+    allowRunEnvKeys?: Iterable<string>;
+  } = {},
+): NodeJS.ProcessEnv {
+  const mode = opts.mode ?? resolveInheritedSecretEnvScrubMode();
+  const allowed = new Set(opts.allowRunEnvKeys ?? []);
+  const scrubbedRunEnv: Record<string, string | undefined> = {};
+  const blocked: string[] = [];
+  for (const [key, value] of Object.entries(runEnv)) {
+    if (RUN_ENV_HOST_CREDENTIAL_DENYLIST.has(key) && !allowed.has(key)) {
+      blocked.push(key);
+      if (mode === "enforce") continue;
+    }
+    scrubbedRunEnv[key] = value;
+  }
+  if (blocked.length > 0) {
+    const log = opts.log ?? ((message: string) => console.info(message));
+    const runSuffix = opts.runId ? ` run=${opts.runId}` : "";
+    log(
+      `[paperclip] env-scrub mode=${mode}${runSuffix} ${
+        mode === "enforce" ? "blocked" : "would block"
+      } host-credential keys from runEnv (not opted in): ${blocked.sort().join(", ")}`,
+    );
+  }
+  return {
+    ...sanitizeInheritedSecretEnv(sanitizeInheritedPaperclipEnv(baseEnv), opts),
+    ...scrubbedRunEnv,
+  };
 }
 
 export function defaultPathForPlatform() {
@@ -2024,10 +2165,7 @@ export async function runChildProcess(
 ): Promise<RunProcessResult> {
   const onLogError = opts.onLogError ?? ((err, id, msg) => console.warn({ err, runId: id }, msg));
   return new Promise<RunProcessResult>((resolve, reject) => {
-    const rawMerged: NodeJS.ProcessEnv = {
-      ...sanitizeInheritedPaperclipEnv(process.env),
-      ...opts.env,
-    };
+    const rawMerged: NodeJS.ProcessEnv = buildChildProcessEnv(process.env, opts.env, { runId });
 
     // Strip Claude Code nesting-guard env vars so spawned `claude` processes
     // don't refuse to start with "cannot be launched inside another session".

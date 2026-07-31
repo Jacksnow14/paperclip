@@ -8,7 +8,8 @@
  * Agent self-service revoke (POST /memory/records/:id/revoke-own):
  *   Agents may revoke their own records when the record's metadata.category is in
  *   AGENT_MUTABLE_CATEGORIES (experiment, experiment_conclusion, hypothesis, observation,
- *   performance_scorecard, scorecard_adjusted, tool_gap, routing, synthesis, lesson).
+ *   performance_scorecard, scorecard_adjusted, tool_gap, routing, routing_rationale, synthesis,
+ *   lesson).
  *   Returns 403 for non-owner or off-allowlist categories.
  *   `synthesis` is agent-mutable (AUR-3072) so SGI loops that author synthesis records
  *   (Loop E nightly, Loop H quarterly) can PATCH-upsert / revoke-own their own duplicates.
@@ -19,6 +20,13 @@
  *   The response includes a non-breaking `warnings: string[]` field when the captured
  *   record(s) won't appear in the default GET /memory/records or memory/query response
  *   (e.g. reviewState=pending, project-scoped, or agent-scoped to a different agent).
+ *
+ * Scorecard integrity guard (POST /memory/capture, AUR-3993/AUR-3996):
+ *   A capture with metadata.category `performance_scorecard` or `scorecard_adjusted` is
+ *   rejected with 422 unless metadata.issue_id/quality_signal/token_cost/agent_id/task_type
+ *   are all present, metadata.issue_id resolves to a real issue in this company, and
+ *   metadata.test_data is not `true`. All violations are returned together in
+ *   `details.errors[]`. `outcome` and `value_signal` stay optional.
  */
 import { Router } from "express";
 import type { Db } from "@paperclipai/db";
@@ -46,7 +54,6 @@ import {
 import { validate } from "../middleware/validate.js";
 import { forbidden, notFound, unprocessable } from "../errors.js";
 import { agentService, issueService, logActivity, memoryService, projectService } from "../services/index.js";
-import { isUuidLike, normalizeIssueIdentifier } from "@paperclipai/shared";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 
 /**
@@ -89,6 +96,63 @@ export function checkRouterReadScopeViolation(payload: {
   );
 }
 
+/**
+ * Categories subject to the scorecard integrity guard (AUR-3993 found 218
+ * synthetic performance_scorecard/scorecard_adjusted records polluting the
+ * routing registry's quartile math; AUR-3996 closes the write path that let
+ * them in). A capture in one of these categories must carry the fields the
+ * router groups and scores on, and must resolve to a real issue — otherwise
+ * it is unusable by construction and should never have been written.
+ */
+export const SCORECARD_INTEGRITY_CATEGORIES = new Set(["performance_scorecard", "scorecard_adjusted"]);
+
+/**
+ * `outcome` and `value_signal` are deliberately NOT required here: a sweep of
+ * the live registry (AUR-3993 thread, CTO, 2026-07-25) found `outcome` absent
+ * on 1,872 of 3,896 scorecards — 48% of the entire registry — so requiring it
+ * would 422 roughly every other honest capture. `issue_id` is checked
+ * separately below because it also needs DB-backed resolution, not just
+ * presence.
+ */
+const SCORECARD_REQUIRED_METADATA_FIELDS = ["issue_id", "quality_signal", "token_cost", "agent_id", "task_type"] as const;
+
+function isBlankMetadataValue(value: unknown): boolean {
+  return value === undefined || value === null || (typeof value === "string" && value.trim().length === 0);
+}
+
+/**
+ * Synchronous half of the scorecard integrity guard: checks the metadata
+ * fields the router groups/scores on are present, that `issue_id` is a
+ * string (so the caller-facing message can tell them to fix it before the
+ * DB-backed resolution check runs), and rejects a capture self-declared as
+ * test data (AUR-3993 thread: 46 live fixtures self-declared
+ * `metadata.test_data: true`, all traced to the same synthetic burst this
+ * guard exists to stop recurring). Returns an empty array when
+ * `metadata.category` isn't a scorecard category, or when every check passes.
+ */
+export function checkScorecardMetadataViolations(metadata: Record<string, unknown> | undefined): string[] {
+  const category = metadata?.category;
+  if (typeof category !== "string" || !SCORECARD_INTEGRITY_CATEGORIES.has(category)) return [];
+
+  const errors: string[] = [];
+  for (const field of SCORECARD_REQUIRED_METADATA_FIELDS) {
+    const value = metadata?.[field];
+    if (isBlankMetadataValue(value)) {
+      errors.push(
+        `metadata.${field} is required for category '${category}' — the router groups and scores on it.`,
+      );
+    } else if (field === "issue_id" && typeof value !== "string") {
+      errors.push("metadata.issue_id must be a string identifier (AUR-NNNN or UUID)");
+    }
+  }
+  if (metadata?.test_data === true) {
+    errors.push(
+      `metadata.test_data: true is not permitted on a '${category}' capture; use a scoped test company, not production.`,
+    );
+  }
+  return errors;
+}
+
 function actorInfoFromReq(req: any) {
   if (req.actor.type === "agent") {
     return {
@@ -123,13 +187,26 @@ export function memoryRoutes(
   const projectsSvc = projectService(db);
   const issuesSvc = issueService(db);
 
+  /**
+   * Resolves an `AUR-NNNN` identifier or a UUID to a real issue id in this
+   * company. Always DB-backed: a UUID-shaped string is never trusted on
+   * shape alone (CTO review, AUR-3996) — `issuesSvc.getById` looks it up by
+   * primary key the same way it looks up an identifier, so a fabricated
+   * UUID with no matching row is rejected just like a fabricated `AUR-NNNN`.
+   *
+   * Falls back to the issue_tombstones table (AUR-4091) when the identifier
+   * doesn't resolve to a live issue: a hard-deleted issue leaves a tombstone
+   * behind, so a capture referencing "this issue existed when the work
+   * happened and was deleted afterwards" still resolves, while a fabricated
+   * identifier that never existed still returns null.
+   */
   async function resolveSourceIssueId(companyId: string, issueId: string): Promise<string | null> {
-    if (isUuidLike(issueId)) return issueId;
-    const normalized = normalizeIssueIdentifier(issueId);
-    if (!normalized) return null;
-    const issue = await issuesSvc.getByIdentifier(normalized);
-    if (!issue || issue.companyId !== companyId) return null;
-    return issue.id;
+    const trimmed = issueId.trim();
+    if (!trimmed) return null;
+    const issue = await issuesSvc.getById(trimmed);
+    if (issue) return issue.companyId === companyId ? issue.id : null;
+    const tombstone = await issuesSvc.getTombstoneByIdentifierOrUuid(companyId, trimmed);
+    return tombstone ? tombstone.issueId : null;
   }
 
   router.get("/companies/:companyId/memory/providers", async (req, res) => {
@@ -304,6 +381,28 @@ export function memoryRoutes(
     if (routerReadScopeViolation) {
       throw unprocessable(routerReadScopeViolation);
     }
+    const scorecardErrors = checkScorecardMetadataViolations(payload.metadata);
+    const scorecardIssueId = payload.metadata?.issue_id;
+    if (
+      typeof payload.metadata?.category === "string" &&
+      SCORECARD_INTEGRITY_CATEGORIES.has(payload.metadata.category) &&
+      typeof scorecardIssueId === "string" &&
+      scorecardIssueId.trim().length > 0
+    ) {
+      const resolved = await resolveSourceIssueId(companyId, scorecardIssueId);
+      if (!resolved) {
+        scorecardErrors.push(
+          `metadata.issue_id '${scorecardIssueId}' does not resolve to a real issue in this company; ` +
+          "use a scoped test company, not production.",
+        );
+      }
+    }
+    if (scorecardErrors.length > 0) {
+      throw unprocessable(
+        `Invalid '${payload.metadata?.category}' capture: ${scorecardErrors.length} validation error(s)`,
+        { errors: scorecardErrors },
+      );
+    }
     if (payload.source?.issueId) {
       const resolvedId = await resolveSourceIssueId(companyId, payload.source.issueId);
       if (!resolvedId) {
@@ -400,7 +499,10 @@ export function memoryRoutes(
   });
 
   // Categories that agents are permitted to update (PATCH) or revoke-own on their own records.
-  // "routing" is included so agents can deduplicate stale routing/* records via revoke-own.
+  // "routing_rationale" is included so agents can deduplicate stale routing/* records via
+  // revoke-own — every routing/* record is captured with metadata.category = "routing_rationale"
+  // (see AUTO_ACCEPT_CATEGORIES in services/memory.ts and backfill-router-read-scope.mjs). The
+  // plain "routing" entry is kept for back-compat in case any legacy record used that string.
   const AGENT_MUTABLE_CATEGORIES = new Set([
     "experiment",
     "experiment_conclusion",
@@ -410,6 +512,7 @@ export function memoryRoutes(
     "scorecard_adjusted",
     "tool_gap",
     "routing",
+    "routing_rationale",
     // synthesis: agent-authored + auto-accepted; owning SGI loops must be able to
     // PATCH-upsert / revoke-own their own duplicate synthesis records (AUR-3072).
     "synthesis",
@@ -439,7 +542,15 @@ export function memoryRoutes(
         const category = typeof record.metadata?.category === "string" ? record.metadata.category : null;
         if (!category || !AGENT_MUTABLE_CATEGORIES.has(category)) {
           throw forbidden(
-            `Agent cannot update records with category '${category ?? "(none)"}'. Allowed: ${[...AGENT_MUTABLE_CATEGORIES].join(", ")}`,
+            `Category '${category ?? "(none)"}' is immutable — agents cannot PATCH records in this category. ` +
+              `Supported alternative: capture a new record via POST /memory/capture instead of editing this one. ` +
+              `Agent-mutable categories: ${[...AGENT_MUTABLE_CATEGORIES].join(", ")}.`,
+            {
+              category: category ?? null,
+              immutable: true,
+              supportedAlternative: "capture_new_record",
+              agentMutableCategories: [...AGENT_MUTABLE_CATEGORIES],
+            },
           );
         }
       } else {
@@ -488,7 +599,16 @@ export function memoryRoutes(
       const category = typeof record.metadata?.category === "string" ? record.metadata.category : null;
       if (!category || !AGENT_MUTABLE_CATEGORIES.has(category)) {
         throw forbidden(
-          `Agent cannot revoke records with category '${category ?? "(none)"}'. Allowed: ${[...AGENT_MUTABLE_CATEGORIES].join(", ")}`,
+          `Category '${category ?? "(none)"}' is immutable — agents cannot revoke records in this category. ` +
+            `Supported alternative: capture a new record via POST /memory/capture instead; ask a board user to ` +
+            `use POST /memory/revoke if this record must be removed. ` +
+            `Agent-mutable categories: ${[...AGENT_MUTABLE_CATEGORIES].join(", ")}.`,
+          {
+            category: category ?? null,
+            immutable: true,
+            supportedAlternative: "capture_new_record",
+            agentMutableCategories: [...AGENT_MUTABLE_CATEGORIES],
+          },
         );
       }
 

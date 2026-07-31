@@ -23,6 +23,7 @@ import {
   issueDocuments,
   issueReadStates,
   issueThreadInteractions,
+  issueTombstones,
   issues,
   labels,
   projectWorkspaces,
@@ -63,6 +64,7 @@ import {
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
@@ -75,6 +77,7 @@ import {
 } from "./issue-tree-control.js";
 import { parseIssueGraphLivenessIncidentKey } from "./recovery/origins.js";
 import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
+import { recoveryActionDormancyCutoff } from "./issue-recovery-actions.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -836,8 +839,15 @@ const PRODUCTIVITY_REVIEW_TRIGGERS: readonly IssueProductivityReviewTrigger[] = 
   "no_comment_streak",
   "long_active_duration",
   "high_churn",
+  "stalled_active_episode",
 ];
 const BLOCKER_ATTENTION_OPEN_RECOVERY_TERMINAL_STATUSES = ["done", "cancelled"];
+// Statuses that resolve a *child* blocker-attention edge outright (see
+// isBlockerAttentionEdgeResolved) — a cancelled child is as complete as a done one,
+// matching getWakeableParentAfterChildCompletion. Explicit `blocks` edges only resolve
+// on "done": a cancelled explicit blocker stays unresolved until an operator removes or
+// replaces the relationship (AUR-3956 Defect 2).
+const BLOCKER_ATTENTION_RESOLVED_STATUSES = ["done", "cancelled"];
 const BLOCKER_ATTENTION_MAX_DEPTH = 8;
 const BLOCKER_ATTENTION_MAX_NODES = 2000;
 const BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES = new Set(["active", "idle", "running", "error"]);
@@ -929,6 +939,25 @@ function createIssueBlockerAttention(input: Partial<IssueBlockerAttention> = {})
 
 function blockerSampleIdentifier(node: IssueBlockerAttentionNode | null | undefined) {
   return node?.identifier ?? node?.id ?? null;
+}
+
+// A cancelled node resolves a *structural* child edge (blockerIssueId's parentId ===
+// issueId — matches getWakeableParentAfterChildCompletion) but does NOT resolve an
+// explicit `blocks` edge (AUR-3956 Defect 2) — those stay unresolved until an operator
+// removes or replaces the blocker relationship. Whether an edge is a "child" edge is
+// computed structurally rather than tagged at query time: a redundant explicit `blocks`
+// relation can coexist with a structural parent-child relationship for the same pair, and
+// appendBlockerAttentionEdges' dedup (keeps whichever edge was appended first) would
+// otherwise make the classification depend on query ordering.
+function isBlockerAttentionEdgeResolved(
+  edge: IssueBlockerAttentionEdge,
+  nodesById: Map<string, IssueBlockerAttentionNode>,
+): boolean {
+  const blocker = nodesById.get(edge.blockerIssueId);
+  if (blocker == null) return false;
+  const isChildEdge = blocker.parentId === edge.issueId;
+  if (isChildEdge) return BLOCKER_ATTENTION_RESOLVED_STATUSES.includes(blocker.status);
+  return blocker.status === "done";
 }
 
 function appendBlockerAttentionEdges(
@@ -1319,7 +1348,13 @@ async function listIssueBlockerAttentionMap(
   const explicitWaitCandidateIds = [...nodesById.values()]
     .filter((node) => node.status !== "done")
     .map((node) => node.id);
-  const explicitWaitingIssueIds = new Set<string>();
+  // Split into two sets rather than one: a pending interaction/approval on a *cancelled*
+  // issue is never going to be answered (AUR-3927/AUR-3928 stale-interaction class) and
+  // must not cover it, but an active recovery/liveness-escalation path is genuinely doing
+  // work against the cancelled blocker right now and must still cover it (CTO review on
+  // PR #112, AUR-3959 — collapsing these into one set broke the liveness-escalation test).
+  const pendingInteractionApprovalIssueIds = new Set<string>();
+  const activeRecoveryWaitIssueIds = new Set<string>();
   if (explicitWaitCandidateIds.length > 0) {
     for (const chunk of chunkList(explicitWaitCandidateIds, ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
       const interactionRows: Array<{ issueId: string }> = await dbOrTx
@@ -1332,7 +1367,7 @@ async function listIssueBlockerAttentionMap(
             inArray(issueThreadInteractions.issueId, chunk),
           ),
         );
-      for (const row of interactionRows) explicitWaitingIssueIds.add(row.issueId);
+      for (const row of interactionRows) pendingInteractionApprovalIssueIds.add(row.issueId);
 
       const approvalRows: Array<{ issueId: string }> = await dbOrTx
         .select({ issueId: issueApprovals.issueId })
@@ -1345,7 +1380,7 @@ async function listIssueBlockerAttentionMap(
             inArray(issueApprovals.issueId, chunk),
           ),
         );
-      for (const row of approvalRows) explicitWaitingIssueIds.add(row.issueId);
+      for (const row of approvalRows) pendingInteractionApprovalIssueIds.add(row.issueId);
     }
 
     // Recovery rows are intentionally company-wide: a liveness escalation for
@@ -1365,9 +1400,9 @@ async function listIssueBlockerAttentionMap(
     for (const row of recoveryRows) {
       const parsed = parseIssueGraphLivenessIncidentKey(row.originId);
       if (!parsed || parsed.companyId !== companyId) continue;
-      explicitWaitingIssueIds.add(row.id);
-      explicitWaitingIssueIds.add(parsed.issueId);
-      explicitWaitingIssueIds.add(parsed.leafIssueId);
+      activeRecoveryWaitIssueIds.add(row.id);
+      activeRecoveryWaitIssueIds.add(parsed.issueId);
+      activeRecoveryWaitIssueIds.add(parsed.leafIssueId);
     }
 
     const recoveryActionRows: Array<{ sourceIssueId: string }> = await dbOrTx
@@ -1378,9 +1413,10 @@ async function listIssueBlockerAttentionMap(
           eq(issueRecoveryActions.companyId, companyId),
           inArray(issueRecoveryActions.status, ["active", "escalated"]),
           inArray(issueRecoveryActions.sourceIssueId, explicitWaitCandidateIds),
+          gt(issueRecoveryActions.lastAttemptAt, recoveryActionDormancyCutoff()),
         ),
       );
-    for (const row of recoveryActionRows) explicitWaitingIssueIds.add(row.sourceIssueId);
+    for (const row of recoveryActionRows) activeRecoveryWaitIssueIds.add(row.sourceIssueId);
   }
 
   const agentRows: IssueBlockerAttentionAgentRow[] = agentIds.size > 0
@@ -1400,6 +1436,7 @@ async function listIssueBlockerAttentionMap(
     stalled: boolean;
     sampleBlockerIdentifier: string | null;
     sampleStalledBlockerIdentifier: string | null;
+    sampleBlockerCancelled: boolean;
   };
   const classifyPath = (
     nodeId: string,
@@ -1407,40 +1444,50 @@ async function listIssueBlockerAttentionMap(
   ): PathClassification => {
     const sample = blockerSampleIdentifier(nodesById.get(nodeId));
     if (truncated || seen.has(nodeId)) {
-      return { covered: false, stalled: false, sampleBlockerIdentifier: sample, sampleStalledBlockerIdentifier: null };
+      return { covered: false, stalled: false, sampleBlockerIdentifier: sample, sampleStalledBlockerIdentifier: null, sampleBlockerCancelled: false };
     }
     const node = nodesById.get(nodeId);
     if (!node || node.companyId !== companyId) {
-      return { covered: false, stalled: false, sampleBlockerIdentifier: nodeId, sampleStalledBlockerIdentifier: null };
+      return { covered: false, stalled: false, sampleBlockerIdentifier: nodeId, sampleStalledBlockerIdentifier: null, sampleBlockerCancelled: false };
     }
     const nodeSample = blockerSampleIdentifier(node);
     if (node.status === "done") {
-      return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+      return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null, sampleBlockerCancelled: false };
     }
-    if (explicitWaitingIssueIds.has(node.id)) {
-      return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+    // An active recovery/liveness-escalation path is real work happening against this
+    // blocker right now, so it covers even a cancelled node. A pending interaction or
+    // approval on a cancelled issue, by contrast, is never going to be answered
+    // (AUR-3927/AUR-3928 stale-interaction class) — exclude cancelled there so it falls
+    // through to the explicit cancelled_blocker branch below (CTO review nit on PR #112,
+    // AUR-3959).
+    if (activeRecoveryWaitIssueIds.has(node.id) || (node.status !== "cancelled" && pendingInteractionApprovalIssueIds.has(node.id))) {
+      return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null, sampleBlockerCancelled: false };
     }
     if (node.assigneeUserId && node.status !== "cancelled") {
-      return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+      return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null, sampleBlockerCancelled: false };
     }
     if (node.status === "in_review") {
       const hasWaitingPath = activeIssueIds.has(node.id) || Boolean(node.assigneeUserId);
       if (hasWaitingPath) {
-        return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+        return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null, sampleBlockerCancelled: false };
       }
-      return { covered: false, stalled: true, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: nodeSample };
+      return { covered: false, stalled: true, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: nodeSample, sampleBlockerCancelled: false };
     }
     if (activeIssueIds.has(node.id)) {
-      return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+      return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null, sampleBlockerCancelled: false };
     }
     if (node.status === "cancelled") {
-      return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+      // Only reachable via explicit `blocks` edges now: isBlockerAttentionEdgeResolved
+      // filters out cancelled *child* edges before classifyPath is ever called on them, so
+      // a cancelled node surviving to this point is always someone's cancelled explicit
+      // blocker, which stays unresolved until an operator intervenes (AUR-3956 Defect 2).
+      return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null, sampleBlockerCancelled: true };
     }
     if (node.status === "backlog" && node.assigneeAgentId) {
-      return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+      return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null, sampleBlockerCancelled: false };
     }
 
-    const downstream = (edgesByIssueId.get(node.id) ?? []).filter((edge) => nodesById.get(edge.blockerIssueId)?.status !== "done");
+    const downstream = (edgesByIssueId.get(node.id) ?? []).filter((edge) => !isBlockerAttentionEdgeResolved(edge, nodesById));
     if (downstream.length > 0) {
       const nextSeen = new Set(seen);
       nextSeen.add(nodeId);
@@ -1454,6 +1501,7 @@ async function listIssueBlockerAttentionMap(
           stalled: false,
           sampleBlockerIdentifier: hardAttention.sampleBlockerIdentifier,
           sampleStalledBlockerIdentifier: sampleStalled,
+          sampleBlockerCancelled: hardAttention.sampleBlockerCancelled,
         };
       }
       const stalledEntry = classified.find((result) => result.stalled);
@@ -1463,6 +1511,7 @@ async function listIssueBlockerAttentionMap(
           stalled: true,
           sampleBlockerIdentifier: stalledEntry.sampleBlockerIdentifier,
           sampleStalledBlockerIdentifier: sampleStalled,
+          sampleBlockerCancelled: false,
         };
       }
       return {
@@ -1470,26 +1519,32 @@ async function listIssueBlockerAttentionMap(
         stalled: false,
         sampleBlockerIdentifier: classified[0]?.sampleBlockerIdentifier ?? nodeSample,
         sampleStalledBlockerIdentifier: null,
+        sampleBlockerCancelled: false,
       };
     }
 
     if (node.assigneeAgentId) {
       const assignee = agentsById.get(node.assigneeAgentId);
       if (!assignee || assignee.companyId !== companyId || !BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES.has(assignee.status)) {
-        return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+        return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null, sampleBlockerCancelled: false };
       }
     }
 
-    return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+    return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null, sampleBlockerCancelled: false };
   };
 
   for (const root of roots) {
-    const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) => nodesById.get(edge.blockerIssueId)?.status !== "done");
+    const allTopLevelEdges = edgesByIssueId.get(root.id) ?? [];
+    const topLevelEdges = allTopLevelEdges.filter((edge) => !isBlockerAttentionEdgeResolved(edge, nodesById));
     if (topLevelEdges.length === 0) {
-      attentionMap.set(root.id, createIssueBlockerAttention({
-        state: "needs_attention",
-        reason: "attention_required",
-      }));
+      // A "blocked" root with no live blocker edge needs attention regardless of how it
+      // got there: no recorded blocker at all (the pre-existing anomalous case), all
+      // blockers went "done", or all blockers were "cancelled". Done blockers never reach
+      // this graph (both frontier queries exclude "done" status), so we cannot distinguish
+      // "had a done blocker" from "never had one" without spending the node budget on
+      // resolved rows — and we must not treat cancelled as more resolving than done
+      // (CTO review on PR #112, AUR-3959): same operator signal either way, one state.
+      attentionMap.set(root.id, createIssueBlockerAttention({ state: "needs_attention", reason: "attention_required" }));
       continue;
     }
 
@@ -1512,7 +1567,7 @@ async function listIssueBlockerAttentionMap(
     let reason: IssueBlockerAttention["reason"];
     if (attentionBlockerCount > 0) {
       state = "needs_attention";
-      reason = "attention_required";
+      reason = hardAttentionEntry?.result.sampleBlockerCancelled ? "cancelled_blocker" : "attention_required";
     } else if (stalledBlockerCount > 0) {
       state = "stalled";
       reason = "stalled_review";
@@ -2712,6 +2767,7 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
+  const recoveryActionsSvc = issueRecoveryActionService(db);
 
   async function getIssueByUuid(id: string) {
     const row = await db
@@ -3783,6 +3839,28 @@ export function issueService(db: Db) {
       return getIssueByIdentifier(identifier);
     },
 
+    /**
+     * Looks up a tombstone (issue-was-deleted record) by `AUR-NNNN`
+     * identifier or UUID, scoped to `companyId`. Used to distinguish "this
+     * identifier referred to a real, since-deleted issue" from "this
+     * identifier never existed" (AUR-4091).
+     */
+    getTombstoneByIdentifierOrUuid: async (companyId: string, raw: string) => {
+      const id = raw.trim();
+      const identifier = normalizeIssueReferenceIdentifier(id);
+      const condition = identifier
+        ? and(eq(issueTombstones.companyId, companyId), eq(issueTombstones.identifier, identifier))
+        : isUuidLike(id)
+          ? and(eq(issueTombstones.companyId, companyId), eq(issueTombstones.issueId, id))
+          : null;
+      if (!condition) return null;
+      return db
+        .select()
+        .from(issueTombstones)
+        .where(condition)
+        .then((rows) => rows[0] ?? null);
+    },
+
     getCurrentScheduledRetry: async (issueId: string) => {
       const issue = await db
         .select({ id: issues.id, companyId: issues.companyId })
@@ -4489,6 +4567,20 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+        if (issueData.status !== undefined) {
+          // An active recovery action tracks a stranded issue. Once the issue reaches a terminal
+          // status the tracker is obsolete, so close it out in the same transaction as the status
+          // write — otherwise `activeRecoveryAction` accumulates orphans and stops being a usable
+          // signal (AUR-4299). No-ops for non-terminal statuses.
+          await recoveryActionsSvc.resolveActiveForTerminalIssues(
+            {
+              companyId: existing.companyId,
+              sourceIssueIds: [updated.id],
+              issueStatus: updated.status,
+            },
+            tx,
+          );
+        }
         if (nextLabelIds !== undefined) {
           await syncIssueLabels(updated.id, existing.companyId, nextLabelIds, tx);
         }
@@ -4588,6 +4680,18 @@ export function issueService(db: Db) {
           .where(eq(issues.id, id))
           .returning()
           .then((rows) => rows[0] ?? null);
+
+        if (removedIssue) {
+          await tx
+            .insert(issueTombstones)
+            .values({
+              companyId: removedIssue.companyId,
+              issueId: removedIssue.id,
+              identifier: removedIssue.identifier,
+              title: removedIssue.title,
+            })
+            .onConflictDoNothing();
+        }
 
         if (removedIssue && attachmentAssetIds.length > 0) {
           await tx

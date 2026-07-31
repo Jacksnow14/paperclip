@@ -1,0 +1,15 @@
+[Unit]
+Description=AUR-3993 guarded deploy — re-arm every 60s until the activated release is serving
+Documentation=https://paperclip/AUR/issues/AUR-3993
+
+[Timer]
+OnBootSec=90
+OnUnitInactiveSec=60
+AccuracySec=5s
+# Survive host reboots and missed windows: this is the re-arm the one-shot
+# watcher never had (CEO review, AUR-3993).
+Persistent=true
+Unit=aur3993-deploy.service
+
+[Install]
+WantedBy=timers.target

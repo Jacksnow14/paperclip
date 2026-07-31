@@ -22,6 +22,7 @@ import {
   type IssueTreePreviewWarning,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 
 type IssueRow = typeof issues.$inferSelect;
 type HoldRow = typeof issueTreeHolds.$inferSelect;
@@ -409,6 +410,8 @@ function restoreStatusFromCancelSnapshot(status: IssueStatus): IssueStatus | nul
 }
 
 export function issueTreeControlService(db: Db) {
+  const recoveryActionsSvc = issueRecoveryActionService(db);
+
   async function listTreeIssues(companyId: string, rootIssueId: string): Promise<TreeIssue[]> {
     const root = await db
       .select()
@@ -893,6 +896,15 @@ export function issueTreeControlService(db: Db) {
         status: issues.status,
         assigneeAgentId: issues.assigneeAgentId,
       });
+
+    // This bulk cancel writes `issues` directly instead of going through `issueService.update`,
+    // so it has to close out recovery actions itself or tree cancellations strand them (AUR-4299).
+    await recoveryActionsSvc.resolveActiveForTerminalIssues({
+      companyId,
+      sourceIssueIds: updated.map((issue) => issue.id),
+      issueStatus: "cancelled",
+      resolutionNote: "Source issue cancelled by issue tree hold.",
+    });
 
     return {
       updatedIssueIds: updated.map((issue) => issue.id),

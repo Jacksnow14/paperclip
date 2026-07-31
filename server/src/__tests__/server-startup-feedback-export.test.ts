@@ -109,6 +109,8 @@ vi.mock("@paperclipai/db", () => ({
   reconcilePendingMigrationHistory: vi.fn(async () => ({ repairedMigrations: [] })),
   formatDatabaseBackupResult: vi.fn(() => "ok"),
   runDatabaseBackup: vi.fn(),
+  emergencyPruneBackups: vi.fn(() => ({ prunedCount: 0, prunedBytes: 0, keptCount: 0, keptBytes: 0 })),
+  BackupProducerConflictError: class BackupProducerConflictError extends Error {},
   authUsers: {},
   companies: {},
   companyMemberships: {},
@@ -177,6 +179,10 @@ vi.mock("../services/feedback-share-client.js", () => ({
   createFeedbackTraceShareClientFromConfig: vi.fn(() => ({ id: "feedback-share-client" })),
 }));
 
+vi.mock("../services/plugin-worker-manager.js", () => ({
+  createPluginWorkerManager: vi.fn(() => ({ id: "plugin-worker-manager" })),
+}));
+
 vi.mock("../startup-banner.js", () => ({
   printStartupBanner: vi.fn(),
 }));
@@ -194,7 +200,7 @@ vi.mock("../auth/better-auth.js", () => ({
   resolveBetterAuthSessionFromHeaders: vi.fn(async () => null),
 }));
 
-import { startServer } from "../index.ts";
+import { startServer, shouldLogIssueGraphLivenessReconciliation } from "../index.ts";
 
 describe("startServer feedback export wiring", () => {
   beforeEach(() => {
@@ -216,6 +222,94 @@ describe("startServer feedback export wiring", () => {
       storageService: { id: "storage-service" },
       serverPort: 3210,
     });
+  });
+
+  it("treats durable blocker-actuation and action errors as log-worthy even when legacy escalations stay at zero", () => {
+    expect(shouldLogIssueGraphLivenessReconciliation({
+      escalationsCreated: 0,
+      classAAutoRecovered: 3,
+      classBNudged: 14,
+      classBEscalated: 0,
+      issueGraphRecoveryActionsResolved: 2,
+      actionErrors: 1,
+    })).toBe(true);
+
+    expect(shouldLogIssueGraphLivenessReconciliation({
+      escalationsCreated: 0,
+      classAAutoRecovered: 0,
+      classBNudged: 0,
+      classBEscalated: 0,
+      issueGraphRecoveryActionsResolved: 0,
+      actionErrors: 0,
+      obsoleteRecoveriesRetired: 0,
+      obsoleteRecoveryBlockerRelationsRemoved: 0,
+    })).toBe(false);
+  });
+
+  it("logs a tick whose only event is a capped class A downgrade or a board-only class B action", () => {
+    // Each of these wrote a recovery action and/or woke an owner, so a tick that
+    // contains nothing else must still log. One assertion per counter, all other
+    // fields zero, so each is proven to flip the gate on its own.
+    expect(shouldLogIssueGraphLivenessReconciliation({
+      escalationsCreated: 0,
+      obsoleteRecoveriesRetired: 0,
+      obsoleteRecoveryBlockerRelationsRemoved: 0,
+      classAAutoRecovered: 0,
+      classAOscillationCapped: 1,
+      classBNudged: 0,
+      classBEscalated: 0,
+      classBBoardOnly: 0,
+      issueGraphRecoveryActionsResolved: 0,
+      actionErrors: 0,
+    })).toBe(true);
+
+    expect(shouldLogIssueGraphLivenessReconciliation({
+      escalationsCreated: 0,
+      obsoleteRecoveriesRetired: 0,
+      obsoleteRecoveryBlockerRelationsRemoved: 0,
+      classAAutoRecovered: 0,
+      classAOscillationCapped: 0,
+      classBNudged: 0,
+      classBEscalated: 0,
+      classBBoardOnly: 1,
+      issueGraphRecoveryActionsResolved: 0,
+      actionErrors: 0,
+    })).toBe(true);
+  });
+
+  it("keeps recurring per-tick state out of the gate so the reconciler log is not a firehose", () => {
+    // `blockedEnteredAtFallbacks` is >= 1 on every tick for as long as a single
+    // blocked issue has no readable blocked-transition activity row, and
+    // `classBNoop` scales with the blocked backlog. Gating on either would make
+    // this return true unconditionally and drown the real events. They belong in
+    // the payload, not the gate — these two negatives pin that decision down.
+    expect(shouldLogIssueGraphLivenessReconciliation({
+      escalationsCreated: 0,
+      obsoleteRecoveriesRetired: 0,
+      obsoleteRecoveryBlockerRelationsRemoved: 0,
+      classAAutoRecovered: 0,
+      classAOscillationCapped: 0,
+      classBNudged: 0,
+      classBEscalated: 0,
+      classBBoardOnly: 0,
+      issueGraphRecoveryActionsResolved: 0,
+      actionErrors: 0,
+      blockedEnteredAtFallbacks: 5,
+    })).toBe(false);
+
+    expect(shouldLogIssueGraphLivenessReconciliation({
+      escalationsCreated: 0,
+      obsoleteRecoveriesRetired: 0,
+      obsoleteRecoveryBlockerRelationsRemoved: 0,
+      classAAutoRecovered: 0,
+      classAOscillationCapped: 0,
+      classBNudged: 0,
+      classBEscalated: 0,
+      classBBoardOnly: 0,
+      issueGraphRecoveryActionsResolved: 0,
+      actionErrors: 0,
+      classBNoop: 5,
+    })).toBe(false);
   });
 });
 

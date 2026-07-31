@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFile } from 'node:fs/promises';
 import {
   hasRetro,
   isExempt,
   hasPerformanceScorecard,
   hasScorecardAdjusted,
   fetchMergedMemRecords,
+  GAP_CATEGORY,
+  COMPLIANCE_CATEGORY,
 } from './retro-compliance-audit.mjs';
 
 // ── hasRetro ─────────────────────────────────────────────────────────────────
@@ -311,4 +314,27 @@ test('scope policy: completedAt is required; cancelledAt-only issues are skipped
   const inScope = issues.filter(i => i.completedAt != null);
   assert.equal(inScope.length, 1);
   assert.equal(inScope[0].id, '1');
+});
+
+// ── gap-record category (AUR-4151, AUR-4334) ─────────────────────────────────
+
+test('GAP_CATEGORY is present in memory.ts AUTO_ACCEPT_CATEGORIES', async () => {
+  // Couples this script's wire category to the server allowlist that decides
+  // reviewState. If `lesson` is ever dropped from AUTO_ACCEPT_CATEGORIES, gap
+  // records silently revert to `pending` — invisible to the recall path, which
+  // hard-filters reviewState='accepted'. This test is the tripwire for that.
+  const src = await readFile(new URL('../server/src/services/memory.ts', import.meta.url), 'utf8');
+  const m = src.match(/AUTO_ACCEPT_CATEGORIES\s*=\s*new Set\(\[([^\]]*)\]\)/);
+  assert.ok(m, 'could not locate AUTO_ACCEPT_CATEGORIES in server/src/services/memory.ts');
+  const allowlist = [...m[1].matchAll(/"([^"]+)"|'([^']+)'/g)].map(x => x[1] ?? x[2]);
+  assert.ok(
+    allowlist.includes(GAP_CATEGORY),
+    `GAP_CATEGORY '${GAP_CATEGORY}' is not auto-accepted; allowlist=[${allowlist.join(', ')}]`,
+  );
+});
+
+test('the semantic compliance category is NOT auto-accepted (why it moved off metadata.category)', () => {
+  // Documents the defect: the old wire value would land `pending`.
+  assert.equal(COMPLIANCE_CATEGORY, 'retrospective_compliance_gap');
+  assert.notEqual(COMPLIANCE_CATEGORY, GAP_CATEGORY);
 });

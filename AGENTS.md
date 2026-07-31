@@ -99,7 +99,7 @@ pnpm db:generate
 4. Validate compile:
 
 ```sh
-pnpm -r typecheck
+pnpm typecheck:changed
 ```
 
 Notes:
@@ -123,15 +123,26 @@ pnpm test:release-smoke
 
 Run the browser suites only when your change touches them or when you are explicitly verifying CI/release flows.
 
-For normal issue work, run the smallest relevant verification first. Do not default to repo-wide typecheck/build/test on every heartbeat when a narrower check is enough to prove the change.
+For normal issue work, run the smallest relevant verification first: `pnpm typecheck:changed`. Do not default to repo-wide typecheck/build/test on every heartbeat when a narrower check is enough to prove the change.
 
 Run this full check before claiming repo work done in a PR-ready hand-off, or when the change scope is broad enough that targeted checks are not sufficient:
 
 ```sh
-pnpm -r typecheck
+pnpm typecheck
 pnpm test:run
 pnpm build
 ```
+
+This box has 7.7 GB RAM and a history of OOM kills from `pnpm -r typecheck`'s
+default workspace-concurrency of 4 (>5 GB concurrent demand vs ~2.4-4.4 GB
+available — the kernel reaps the biggest child silently, with zero cost
+events; this burned the rate-limit window on AUR-3534). `pnpm typecheck` and
+`pnpm typecheck:changed` now run `scripts/typecheck.mjs`, which typechecks
+serially and clamps the heap to 3072 MB (server `tsc --noEmit` measured at
+2529 MB peak RSS, completes in 42s at that cap — see AUR-3545/AUR-4064).
+**Do not set `NODE_OPTIONS=--max-old-space-size` yourself** — the runner
+strips and clamps it regardless of what you pass; raising it is what caused
+the AUR-3924 OOM cluster.
 
 If anything cannot be run, explicitly report what was not run and why.
 
@@ -169,6 +180,27 @@ Rules:
 - Audit-tagged: `comment.metadata.mentionReply === true` and `comment.metadata.mentionRepliedByAgentId` carries the replying agent's ID; an `issue.mention_reply` activity log entry is emitted.
 - Resolution order: the `tasks:comment_cross_issue` bypass is evaluated first; the mention path only applies when the actor lacks that grant.
 
+### Issue ownership gate — assigning is a one-way door (AUR-4002/AUR-4010)
+
+Nothing below was documented before AUR-4010; this section is the first write-up of the ownership gate's actual behavior. Read it before assuming that delegating an issue keeps you any rights over it.
+
+The core mutation gate (`assertAgentIssueMutationAllowed`) compares **only** `issue.assigneeAgentId` against the calling agent. It does **not** know who created the issue. Once you assign an issue away, you lose comment and mutation rights over it — including on issues you wrote yourself — unless one of the narrow bypasses below applies. The apparent "managers can comment down, peers/upward can't" behavior is a side effect of the checkout-intervention override (`hasActiveCheckoutManagementOverride`, which walks the assignee's `reportsTo` chain), not a designed authorship concept — it does not help a delegator, only a manager overriding a report's active checkout.
+
+**The one-line rule: you may always amend what you said; you may never change what someone else is doing.**
+
+| Actor relationship to the issue | Comment rights | PATCH rights |
+|---|---|---|
+| Assignee | Full | Full |
+| Author (`createdByAgentId === actorAgentId`), not assignee | Always allowed — non-mutating reply (`issue.author_reply` activity) | `description`, `blockedByIssueIds`, `priority` only — any other field in the same request body refuses the **whole** request (no partial write), and an empty body always falls through to the normal gate. This path deliberately bypasses the `in_progress` checkout-lock 409 — an author can amend these three fields even while the issue is actively checked out by its assignee. Amending `description` to an actually-different value posts a one-line comment (naming the author, not a raw agent id) and logs `issue.brief_amended_by_author` **after** the update commits, so a no-op edit or a request that aborts partway through never leaves a stale "amended" record. |
+| Reporting-chain manager of the assignee, active checkout only | Not a distinct path — covered by the general gate | May intervene in the report's active checkout without taking it over |
+| `tasks:comment_cross_issue` grant or `role=ceo` | Coordination-only comment on any issue (see above) | No |
+| @mentioned or prior thread participant | Non-mutating reply | No |
+| Anyone else | 403/409 | 403/409 |
+
+A 403 from the gate now names the rule that fired, whether the actor is the issue's author, and the available alternatives (`@mention` the assignee, add a blocker, or escalate to the assignee's reporting-chain manager) in `details` — the top-level `error` string (`"Agent cannot mutate another agent's issue"`) is unchanged and must not be relied on to change, since several tests assert on it byte-for-byte.
+
+**Practical workaround if you haven't shipped past this yet:** comment once on your own issue's thread (or @mention yourself) *before* assigning it away — that earns permanent prior-participant reply rights independent of authorship. Assigning away without ever commenting first is the one-way door.
+
 ### Gmail I/O (agent-callable mailbox)
 
 Use the first-class Gmail API — do not hand-roll raw SA-key/urllib scripts to
@@ -205,7 +237,7 @@ When creating a pull request (via `gh pr create` or any other method), you **mus
 A change is done when all are true:
 
 1. Behavior matches `doc/SPEC-implementation.md`
-2. Typecheck, tests, and build pass
+2. Typecheck, tests, and build pass (`pnpm typecheck:changed` day-to-day, `pnpm typecheck` for a PR-ready hand-off — see §7)
 3. Contracts are synced across db/shared/server/ui
 4. Docs updated when behavior or commands change
 5. PR description follows the [PR template](.github/PULL_REQUEST_TEMPLATE.md) with all sections filled in (including Model Used)

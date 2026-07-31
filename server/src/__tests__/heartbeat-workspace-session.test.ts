@@ -1,7 +1,25 @@
-import { describe, expect, it } from "vitest";
-import type { agents } from "@paperclipai/db";
+import { randomUUID } from "node:crypto";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { eq } from "drizzle-orm";
+import {
+  agents,
+  companies,
+  createDb,
+  executionWorkspaces,
+  issues,
+  projects,
+  projectWorkspaces,
+} from "@paperclipai/db";
 import { sessionCodec as codexSessionCodec } from "@paperclipai/adapter-codex-local/server";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
+import {
+  buildWorkspaceRealizationRequest,
+  readWorkspaceRealizationRequest,
+} from "../services/workspace-realization.js";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
 import {
   applyPersistedExecutionWorkspaceConfig,
   buildRealizedExecutionWorkspaceFromPersisted,
@@ -16,8 +34,33 @@ import {
   resolveRuntimeSessionParamsForWorkspace,
   stripWorkspaceRuntimeFromExecutionRunConfig,
   shouldResetTaskSessionForWake,
+  heartbeatService,
   type ResolvedWorkspaceForRun,
 } from "../services/heartbeat.ts";
+
+const mockAdapterExecute = vi.hoisted(() =>
+  vi.fn(async () => ({
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    sessionParams: { sessionId: "session-1" },
+    sessionDisplayId: "session-1",
+    provider: "test",
+    model: "test-model",
+  })),
+);
+
+vi.mock("../adapters/index.ts", async () => {
+  const actual = await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts");
+  return {
+    ...actual,
+    getServerAdapter: vi.fn(() => ({
+      type: "codex_local",
+      execute: mockAdapterExecute,
+      supportsLocalAgentJwt: false,
+    })),
+  };
+});
 
 function buildResolvedWorkspace(overrides: Partial<ResolvedWorkspaceForRun> = {}): ResolvedWorkspaceForRun {
   return {
@@ -253,6 +296,84 @@ describe("buildRealizedExecutionWorkspaceFromPersisted", () => {
     expect(result.worktreePath).toBe("/tmp/reused-worktree");
     expect(result.branchName).toBe("PAP-880-thumbs-capture-for-evals-feature");
     expect(result.source).toBe("task_session");
+  });
+
+  it("preserves project_workspace source on the shared_workspace reuse path (AUR-4104)", () => {
+    const result = buildRealizedExecutionWorkspaceFromPersisted({
+      base: buildResolvedWorkspace({
+        cwd: "/tmp/project-primary",
+        source: "project_workspace",
+        repoRef: "main",
+      }),
+      workspace: {
+        id: "execution-workspace-2",
+        companyId: "company-1",
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        sourceIssueId: "issue-2",
+        mode: "shared_workspace",
+        strategyType: "project_primary",
+        name: "PAP-4104-pinned-workspace-reuse",
+        status: "active",
+        cwd: "/tmp/pinned-project-workspace",
+        repoUrl: "https://example.com/paperclip.git",
+        baseRef: "main",
+        branchName: null,
+        providerType: "project_primary",
+        providerRef: "/tmp/pinned-project-workspace",
+        derivedFromExecutionWorkspaceId: null,
+        lastUsedAt: new Date(),
+        openedAt: new Date(),
+        closedAt: null,
+        cleanupEligibleAt: null,
+        cleanupReason: null,
+        config: null,
+        metadata: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    });
+
+    expect(result?.source).toBe("project_workspace");
+  });
+
+  it("still labels an unpinned shared_workspace reuse as project_primary (AUR-4104 regression guard)", () => {
+    const result = buildRealizedExecutionWorkspaceFromPersisted({
+      base: buildResolvedWorkspace({
+        cwd: "/tmp/project-primary",
+        source: "project_primary",
+        repoRef: "main",
+      }),
+      workspace: {
+        id: "execution-workspace-3",
+        companyId: "company-1",
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        sourceIssueId: "issue-3",
+        mode: "shared_workspace",
+        strategyType: "project_primary",
+        name: "PAP-4104-unpinned-workspace-reuse",
+        status: "active",
+        cwd: "/tmp/project-primary",
+        repoUrl: "https://example.com/paperclip.git",
+        baseRef: "main",
+        branchName: null,
+        providerType: "project_primary",
+        providerRef: "/tmp/project-primary",
+        derivedFromExecutionWorkspaceId: null,
+        lastUsedAt: new Date(),
+        openedAt: new Date(),
+        closedAt: null,
+        cleanupEligibleAt: null,
+        cleanupReason: null,
+        config: null,
+        metadata: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    });
+
+    expect(result?.source).toBe("project_primary");
   });
 });
 
@@ -522,12 +643,29 @@ describe("parseSessionCompactionPolicy", () => {
     // claude_local pins the standard 200K window (the CLI is blocked from
     // auto-upgrading to the paid 1M beta), so Paperclip must rotate the session
     // before raw input crosses ~200K instead of relying on unbounded growth.
+    //
+    // AUR-4513 recalibrated the run/age pair. The previous 200 runs / 72 hours could
+    // not fire before the wall: measured over the 39 sessions that ever overflowed,
+    // the MINIMUM onset was 16 runs / 13.0h and the MAXIMUM was 129 runs / 70.8h, so
+    // 200 was unreachable and 72h missed the worst case by 1.2h. These values sit
+    // below the observed minimum (25% and 38% headroom) rather than the median,
+    // because only the minimum protects every session instead of half of them.
     expect(parseSessionCompactionPolicy(buildAgent("claude_local"))).toEqual({
       enabled: true,
-      maxSessionRuns: 200,
+      maxSessionRuns: 12,
       maxRawInputTokens: 150_000,
-      maxSessionAgeHours: 72,
+      maxSessionAgeHours: 8,
     });
+  });
+
+  it("keeps the claude local thresholds strictly under the measured overflow onset (AUR-4513)", () => {
+    // Guard against a future "just raise it a bit" edit silently re-crossing the
+    // empirical floor. 16 runs / 13.0h are the minimum observed onsets.
+    const policy = parseSessionCompactionPolicy(buildAgent("claude_local"));
+    expect(policy.maxSessionRuns).toBeGreaterThan(0);
+    expect(policy.maxSessionRuns).toBeLessThan(16);
+    expect(policy.maxSessionAgeHours).toBeGreaterThan(0);
+    expect(policy.maxSessionAgeHours).toBeLessThan(13);
   });
 
   it("keeps conservative defaults for adapters without confirmed native compaction", () => {
@@ -563,5 +701,216 @@ describe("parseSessionCompactionPolicy", () => {
       maxRawInputTokens: 500_000,
       maxSessionAgeHours: 0,
     });
+  });
+});
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+if (!embeddedPostgresSupport.supported) {
+  console.warn(
+    `Skipping embedded Postgres workspace primary-order regression tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
+  );
+}
+
+// Regression coverage for AUR-3915: resolveWorkspaceForRun's run-path query ordered
+// project workspace candidates by createdAt only, so an unpinned issue landed in
+// whichever workspace was inserted first instead of the flagged primary — and the
+// selection was then mislabeled "project_primary" regardless of which one won.
+describeEmbeddedPostgres("resolveWorkspaceForRun primary-first ordering (AUR-3915)", () => {
+  let stopDb: (() => Promise<void>) | null = null;
+  let db!: ReturnType<typeof createDb>;
+
+  beforeAll(async () => {
+    const started = await startEmbeddedPostgresTestDatabase("heartbeat-workspace-primary-order");
+    stopDb = started.stop;
+    db = createDb(started.connectionString);
+  }, 20_000);
+
+  afterEach(() => {
+    mockAdapterExecute.mockClear();
+  });
+
+  afterAll(async () => {
+    await db.$client.end();
+    await stopDb?.();
+  });
+
+  it("selects the primary workspace over an older non-primary workspace for an unpinned issue and reports an accurate source", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const olderNonPrimaryWorkspaceId = randomUUID();
+    const primaryWorkspaceId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const olderNonPrimaryCwd = `/tmp/paperclip-aur3915-nonprimary-${randomUUID()}`;
+    const primaryCwd = `/tmp/paperclip-aur3915-primary-${randomUUID()}`;
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(olderNonPrimaryCwd, { recursive: true });
+    await mkdir(primaryCwd, { recursive: true });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Acme",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      status: "active",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace Primary Ordering Regression",
+      status: "active",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    // Non-primary workspace is inserted first (older createdAt) to reproduce the bug:
+    // an unpinned run must not fall back to insertion order once isPrimary is set elsewhere.
+    await db.insert(projectWorkspaces).values({
+      id: olderNonPrimaryWorkspaceId,
+      companyId,
+      projectId,
+      name: "Non-primary (older)",
+      cwd: olderNonPrimaryCwd,
+      isPrimary: false,
+      createdAt: new Date(Date.now() - 60_000),
+      updatedAt: new Date(Date.now() - 60_000),
+    });
+    await db.insert(projectWorkspaces).values({
+      id: primaryWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary (newer)",
+      cwd: primaryCwd,
+      isPrimary: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      title: "Unpinned issue",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const run = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      contextSnapshot: { issueId },
+    });
+
+    expect(run).not.toBeNull();
+    await vi.waitFor(async () => {
+      const latest = await heartbeat.getRun(run!.id);
+      expect(latest?.status).toBe("succeeded");
+    }, { timeout: 5_000 });
+
+    const executionWorkspace = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.sourceIssueId, issueId))
+      .then((rows) => rows[0] ?? null);
+
+    expect(executionWorkspace?.projectWorkspaceId).toBe(primaryWorkspaceId);
+    expect(executionWorkspace?.cwd).toBe(primaryCwd);
+    expect((executionWorkspace?.metadata as Record<string, unknown> | null)?.source).toBe(
+      "project_primary",
+    );
+  }, 15_000);
+});
+
+// Regression coverage for the "project_workspace" mislabel-on-round-trip blocker
+// raised in CTO review of PR #93: readWorkspaceRealizationRequest's deserialize
+// allowlist did not include "project_workspace", so a non-primary selection that
+// persisted this request to workspace metadata and was later read back would
+// silently re-emerge labelled "project_primary" — reintroducing the exact defect
+// this issue exists to eliminate, just one hop downstream of the original fix.
+describe("buildWorkspaceRealizationRequest / readWorkspaceRealizationRequest round-trip (AUR-3915)", () => {
+  it("preserves a non-primary project_workspace source label across a JSON persistence round-trip", () => {
+    const request = buildWorkspaceRealizationRequest({
+      adapterType: "claude_local",
+      companyId: randomUUID(),
+      environmentId: randomUUID(),
+      executionWorkspaceId: randomUUID(),
+      issueId: randomUUID(),
+      heartbeatRunId: randomUUID(),
+      requestedMode: null,
+      workspace: {
+        baseCwd: "/tmp/paperclip-aur3915-roundtrip",
+        source: "project_workspace",
+        projectId: randomUUID(),
+        workspaceId: randomUUID(),
+        repoUrl: null,
+        repoRef: null,
+        strategy: "project_primary",
+        cwd: "/tmp/paperclip-aur3915-roundtrip",
+        branchName: null,
+        worktreePath: null,
+        warnings: [],
+        created: false,
+      },
+      workspaceConfig: null,
+    });
+
+    expect(request.source.kind).toBe("project_workspace");
+
+    // Simulate persisting to (and reading back from) workspace metadata storage.
+    const persisted = JSON.parse(JSON.stringify(request));
+    const rehydrated = readWorkspaceRealizationRequest(persisted);
+
+    expect(rehydrated?.source.kind).toBe("project_workspace");
+  });
+
+  it("still coerces an unrecognized source kind to project_primary", () => {
+    const request = buildWorkspaceRealizationRequest({
+      adapterType: "claude_local",
+      companyId: randomUUID(),
+      environmentId: randomUUID(),
+      executionWorkspaceId: null,
+      issueId: null,
+      heartbeatRunId: randomUUID(),
+      requestedMode: null,
+      workspace: {
+        baseCwd: "/tmp/paperclip-aur3915-roundtrip-legacy",
+        source: "project_primary",
+        projectId: null,
+        workspaceId: null,
+        repoUrl: null,
+        repoRef: null,
+        strategy: "project_primary",
+        cwd: "/tmp/paperclip-aur3915-roundtrip-legacy",
+        branchName: null,
+        worktreePath: null,
+        warnings: [],
+        created: false,
+      },
+      workspaceConfig: null,
+    });
+
+    const legacyPersisted = { ...JSON.parse(JSON.stringify(request)) };
+    legacyPersisted.source = { ...legacyPersisted.source, kind: "some_future_value" };
+    const rehydrated = readWorkspaceRealizationRequest(legacyPersisted);
+
+    expect(rehydrated?.source.kind).toBe("project_primary");
   });
 });

@@ -152,7 +152,30 @@ async function createApp() {
   return app;
 }
 
-function makeIssue() {
+async function createAppAsAgent(actorAgentId: string) {
+  const [{ issueRoutes }, { errorHandler }] = await Promise.all([
+    import("../routes/issues.js"),
+    import("../middleware/index.js"),
+  ]);
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    (req as any).actor = {
+      type: "agent",
+      agentId: actorAgentId,
+      companyId: "company-1",
+      runId: "run-1",
+    };
+    next();
+  });
+  app.use("/api", issueRoutes({} as any, {} as any));
+  app.use(errorHandler);
+  return app;
+}
+
+const authorAgentId = "55555555-5555-4555-8555-555555555555";
+
+function makeIssue(overrides: Record<string, unknown> = {}) {
   return {
     id: issueId,
     companyId: "company-1",
@@ -161,12 +184,15 @@ function makeIssue() {
     assigneeAgentId: agentId,
     assigneeUserId: null,
     createdByUserId: "local-board",
+    createdByAgentId: null,
     identifier: "PAP-1085",
     title: "Closed worktree issue",
+    description: "Original description",
     projectId: null,
     executionRunId: null,
     checkoutRunId: null,
     executionWorkspaceId: closedWorkspaceId,
+    ...overrides,
   };
 }
 
@@ -247,5 +273,24 @@ describe.sequential("closed isolated workspace issue routes", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.executionWorkspaceId).toBe(nextWorkspaceId);
+  });
+
+  it("does not leave a phantom brief-amended activity/comment when an author's description amendment is aborted by a closed workspace", async () => {
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ assigneeAgentId: agentId, createdByAgentId: authorAgentId }),
+    );
+
+    const res = await request(await createAppAsAgent(authorAgentId))
+      .patch(`/api/issues/${issueId}`)
+      .send({ description: "Revised by author" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain("closed workspace");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "issue.brief_amended_by_author" }),
+    );
   });
 });

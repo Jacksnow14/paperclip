@@ -1,5 +1,9 @@
 import type { UsageSummary } from "@paperclipai/adapter-utils";
 import {
+  CLAUDE_CONTEXT_OVERFLOW_RE,
+  isClaudeContextOverflowMessage,
+} from "@paperclipai/adapter-utils";
+import {
   asString,
   asNumber,
   parseObject,
@@ -10,9 +14,24 @@ const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s
 const URL_RE = /(https?:\/\/[^\s'"`<>()[\]{};,!?]+[^\s'"`<>()[\]{};,!.?:]+)/gi;
 
 const CLAUDE_TRANSIENT_UPSTREAM_RE =
-  /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached)/i;
+  /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached|session\s+limit)/i;
+// Prefixes recognized ahead of a "resets <time>" hint. Must stay in sync with
+// the quota-exhaustion wording covered by CLAUDE_TRANSIENT_UPSTREAM_RE above
+// (AUR-4055: "You've hit your session limit" carries a live reset timestamp
+// but was falling outside this list, so the retry scheduler never learned
+// when it was safe to try again and fell back to the generic bounded-backoff
+// ladder instead).
 const CLAUDE_EXTRA_USAGE_RESET_RE =
-  /(?:out\s+of\s+extra\s+usage|extra\s+usage|usage\s+limit\s+reached|usage\s+cap\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|claude\s+usage\s+limit\s+reached)[\s\S]{0,80}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;
+  /(?:out\s+of\s+extra\s+usage|extra\s+usage|usage\s+limit\s+reached|usage\s+cap\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|claude\s+usage\s+limit\s+reached|session\s+limit)[\s\S]{0,80}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;
+
+// AUR-4513: a prompt-size rejection is DETERMINISTIC -- the same prompt re-sent
+// unchanged can never succeed, so it must never share the transient/retryable
+// family. Live wording (2,394 rows, 2026-07-26..29) is exactly
+// `Claude run failed: subtype=success: Prompt is too long`.
+// AUR-4557: both forms of the wording test now live in adapter-utils, shared with the
+// heartbeat service. The substring form is only ever applied to text the model cannot
+// author; anything that can carry model prose goes through the anchored form.
+export { CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE } from "@paperclipai/adapter-utils";
 
 export function parseClaudeStreamJson(stdout: string) {
   let sessionId: string | null = null;
@@ -367,6 +386,53 @@ export function extractClaudeRetryNotBefore(
   return parseClaudeResetClockTime(match[1] ?? "", now, match[2]);
 }
 
+/**
+ * AUR-4513: detect a prompt-size rejection.
+ *
+ * Deliberately does NOT look at `stdout`/`stderr`. `buildClaudeTransientHaystack`
+ * folds the whole stream-JSON transcript into its haystack, which is why every one
+ * of the 2,394 overflow runs was mis-tagged `claude_transient_upstream`: our agents
+ * routinely *discuss* quota wording ("session limit", "usage limit reached") in the
+ * conversation being resumed, so the transient regex matched the transcript content
+ * rather than the actual failure.
+ *
+ * AUR-4557: excluding `stdout`/`stderr` was NOT sufficient, and the original fix
+ * reproduced the bug class it was written to close. `parsed.result` IS the model's
+ * final assistant message on a stream-JSON result event, and `describeClaudeFailure`
+ * folds `parsed.result` into `errorMessage` — so a substring test over either one is
+ * still reading free-form model prose. An agent that ends a turn summarising "…the
+ * prompt is too long…" and then fails for an unrelated reason (or on a genuine 529)
+ * was classified as a deterministic overflow: no `errorFamily`, no retry ladder for a
+ * transient failure, and a forced session rotation. The rotation handoff itself
+ * embeds the reason string, so the mistake could re-seed itself on the next run.
+ *
+ * Fields are therefore split by who can author them:
+ *
+ *   TRUSTED      `parsed.errors[].message`, adapter/CLI stderr — the model cannot
+ *                write these, so a substring match is safe.
+ *   CONTAMINABLE `parsed.result`, `errorMessage` — may be model prose, so the wording
+ *                must OPEN the payload (see `isClaudeContextOverflowMessage`) rather
+ *                than merely appear somewhere inside it.
+ */
+export function isClaudeContextOverflowError(input: {
+  parsed?: Record<string, unknown> | null;
+  /** Adapter-derived failure summary; may embed the model's final message. Anchored. */
+  errorMessage?: string | null;
+  /** Text the model cannot author (process stderr). Substring-matched. */
+  trustedText?: string | null;
+}): boolean {
+  const parsed = input.parsed ?? null;
+
+  const trusted = [
+    input.trustedText ?? "",
+    ...(parsed ? extractClaudeErrorMessages(parsed) : []),
+  ].filter(Boolean);
+  if (trusted.some((text) => CLAUDE_CONTEXT_OVERFLOW_RE.test(text))) return true;
+
+  const contaminable = [parsed ? asString(parsed.result, "") : "", input.errorMessage ?? ""];
+  return contaminable.some((text) => isClaudeContextOverflowMessage(text));
+}
+
 export function isClaudeTransientUpstreamError(input: {
   parsed?: Record<string, unknown> | null;
   stdout?: string | null;
@@ -376,6 +442,12 @@ export function isClaudeTransientUpstreamError(input: {
   const parsed = input.parsed ?? null;
   // Deterministic failures are handled by their own classifiers.
   if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeUnknownSessionError(parsed))) {
+    return false;
+  }
+  // AUR-4513: prompt-size rejection is deterministic; it must never be retried as
+  // transient. Checked before the haystack test because the haystack includes the
+  // resumed transcript and false-positives on quota wording inside it.
+  if (isClaudeContextOverflowError({ parsed, errorMessage: input.errorMessage })) {
     return false;
   }
   const loginMeta = detectClaudeLoginRequired({

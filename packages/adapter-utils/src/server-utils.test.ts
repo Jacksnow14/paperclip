@@ -6,7 +6,9 @@ import { describe, expect, it } from "vitest";
 import {
   applyPaperclipWorkspaceEnv,
   appendWithByteCap,
+  buildChildProcessEnv,
   buildInvocationEnvForLogs,
+  sanitizeInheritedSecretEnv,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   ensureCommandResolvable,
   ensurePathInEnv,
@@ -1099,5 +1101,239 @@ describe.skipIf(process.platform === "win32")("ensureUserLocalBinInPath", () => 
       const result = ensureUserLocalBinInPath(env);
       expect(result).toBe(env);
     });
+  });
+});
+
+describe("sanitizeInheritedSecretEnv (AUR-4003)", () => {
+  const base = {
+    PATH: "/usr/bin",
+    HOME: "/home/user",
+    LANG: "en_US.UTF-8",
+    GOOGLE_WORKSPACE_SA_KEY: "fixture-not-a-secret",
+    SUPABASE_SERVICE_ROLE_KEY: "fixture-not-a-secret",
+    SUPABASE_DB_URL: "postgres://fixture",
+    GOOGLE_APPLICATION_CREDENTIALS: "/tmp/fixture.json",
+    BETTER_AUTH_SECRET: "fixture-not-a-secret",
+    CLOUDFLARE_API_TOKEN: "fixture-not-a-secret",
+    SOME_DB_PASSWORD: "fixture-not-a-secret",
+    ANTHROPIC_API_KEY: "fixture-not-a-secret",
+    CLAUDE_CODE_OAUTH_TOKEN: "fixture-not-a-secret",
+  };
+
+  it("strips secret-shaped vars matched by the sensitive-key regex", () => {
+    const result = sanitizeInheritedSecretEnv(base, { mode: "enforce", log: () => {} });
+    expect(result).not.toHaveProperty("GOOGLE_WORKSPACE_SA_KEY");
+    expect(result).not.toHaveProperty("SUPABASE_SERVICE_ROLE_KEY");
+    expect(result).not.toHaveProperty("BETTER_AUTH_SECRET");
+    expect(result).not.toHaveProperty("CLOUDFLARE_API_TOKEN");
+    expect(result).not.toHaveProperty("SOME_DB_PASSWORD");
+  });
+
+  it("strips explicit-denylist vars the regex misses", () => {
+    const result = sanitizeInheritedSecretEnv(base, { mode: "enforce", log: () => {} });
+    expect(result).not.toHaveProperty("SUPABASE_DB_URL");
+    expect(result).not.toHaveProperty("GOOGLE_APPLICATION_CREDENTIALS");
+  });
+
+  it("keeps runtime-auth keep-list vars and non-secret vars", () => {
+    const result = sanitizeInheritedSecretEnv(base, { mode: "enforce", log: () => {} });
+    expect(result.ANTHROPIC_API_KEY).toBe("fixture-not-a-secret");
+    expect(result.CLAUDE_CODE_OAUTH_TOKEN).toBe("fixture-not-a-secret");
+    expect(result.PATH).toBe("/usr/bin");
+    expect(result.HOME).toBe("/home/user");
+    expect(result.LANG).toBe("en_US.UTF-8");
+  });
+
+  it("report mode strips nothing but logs what would be stripped", () => {
+    const messages: string[] = [];
+    const result = sanitizeInheritedSecretEnv(base, {
+      mode: "report",
+      runId: "run-report",
+      log: (message) => messages.push(message),
+    });
+    expect(result.GOOGLE_WORKSPACE_SA_KEY).toBe("fixture-not-a-secret");
+    expect(result.SUPABASE_DB_URL).toBe("postgres://fixture");
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain("would strip");
+    expect(messages[0]).toContain("run=run-report");
+    expect(messages[0]).toContain("GOOGLE_WORKSPACE_SA_KEY");
+  });
+
+  it("logs stripped key names but never values", () => {
+    const messages: string[] = [];
+    sanitizeInheritedSecretEnv(base, {
+      mode: "enforce",
+      runId: "run-enforce",
+      log: (message) => messages.push(message),
+    });
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain("stripped");
+    expect(messages[0]).toContain("SUPABASE_SERVICE_ROLE_KEY");
+    expect(messages[0]).not.toContain("fixture-not-a-secret");
+    expect(messages[0]).not.toContain("postgres://fixture");
+  });
+
+  it("does not log when nothing is stripped", () => {
+    const messages: string[] = [];
+    sanitizeInheritedSecretEnv(
+      { PATH: "/usr/bin" },
+      { mode: "enforce", log: (message) => messages.push(message) },
+    );
+    expect(messages).toHaveLength(0);
+  });
+});
+
+describe("buildChildProcessEnv (AUR-4003)", () => {
+  it("run-env (vault-bound) values with secret-shaped names are never stripped", () => {
+    const result = buildChildProcessEnv(
+      { PATH: "/usr/bin", GOOGLE_WORKSPACE_SA_KEY: "host-fixture" },
+      { TENANT_SCOPED_API_KEY: "tenant-fixture", PAPERCLIP_API_KEY: "run-fixture" },
+      { mode: "enforce", log: () => {} },
+    );
+    expect(result.TENANT_SCOPED_API_KEY).toBe("tenant-fixture");
+    expect(result.PAPERCLIP_API_KEY).toBe("run-fixture");
+    expect(result).not.toHaveProperty("GOOGLE_WORKSPACE_SA_KEY");
+  });
+
+  it("a per-run binding wins over a stripped host var of the same name", () => {
+    const result = buildChildProcessEnv(
+      { TENANT_SCOPED_API_TOKEN: "host-fixture" },
+      { TENANT_SCOPED_API_TOKEN: "vault-bound-fixture" },
+      { mode: "enforce", log: () => {} },
+    );
+    expect(result.TENANT_SCOPED_API_TOKEN).toBe("vault-bound-fixture");
+  });
+
+  it("still applies paperclip identity sanitization to the inherited side", () => {
+    const result = buildChildProcessEnv(
+      { PAPERCLIP_HOME: "/host", PAPERCLIP_RUNTIME_API_URL: "http://runtime" },
+      {},
+      { mode: "enforce", log: () => {} },
+    );
+    expect(result).not.toHaveProperty("PAPERCLIP_HOME");
+    expect(result.PAPERCLIP_RUNTIME_API_URL).toBe("http://runtime");
+  });
+});
+
+describe("buildChildProcessEnv host-credential runEnv denylist (AUR-4046)", () => {
+  const hostCredentialKeys = [
+    "GOOGLE_WORKSPACE_SA_KEY",
+    "INTEROP_R2_ACCESS_KEY_ID",
+    "INTEROP_R2_SECRET_ACCESS_KEY",
+  ] as const;
+
+  it("blocks all three host-credential keys from a composed (inherited + runEnv) child env by default, even when only runEnv carries them", () => {
+    const runEnv = Object.fromEntries(hostCredentialKeys.map((key) => [key, "vault-bound-fixture"]));
+    const result = buildChildProcessEnv(
+      { PATH: "/usr/bin", HOME: "/home/user" },
+      runEnv,
+      { mode: "enforce", log: () => {} },
+    );
+    for (const key of hostCredentialKeys) {
+      expect(result).not.toHaveProperty(key);
+    }
+    expect(result.PATH).toBe("/usr/bin");
+    expect(result.HOME).toBe("/home/user");
+  });
+
+  it("does not affect other, non-denylisted vault-bound runEnv secrets (no blanket runEnv filter)", () => {
+    const result = buildChildProcessEnv(
+      {},
+      {
+        GOOGLE_WORKSPACE_SA_KEY: "vault-bound-fixture",
+        STRIPE_API_KEY: "tenant-vault-fixture",
+        CUSTOMER_SECRET_TOKEN: "tenant-vault-fixture",
+      },
+      { mode: "enforce", log: () => {} },
+    );
+    expect(result).not.toHaveProperty("GOOGLE_WORKSPACE_SA_KEY");
+    expect(result.STRIPE_API_KEY).toBe("tenant-vault-fixture");
+    expect(result.CUSTOMER_SECRET_TOKEN).toBe("tenant-vault-fixture");
+  });
+
+  it("allows an explicitly opted-in key through", () => {
+    const result = buildChildProcessEnv(
+      {},
+      { GOOGLE_WORKSPACE_SA_KEY: "vault-bound-fixture" },
+      { mode: "enforce", log: () => {}, allowRunEnvKeys: ["GOOGLE_WORKSPACE_SA_KEY"] },
+    );
+    expect(result.GOOGLE_WORKSPACE_SA_KEY).toBe("vault-bound-fixture");
+  });
+
+  it("opting in to one key does not allow the others through", () => {
+    const result = buildChildProcessEnv(
+      {},
+      {
+        GOOGLE_WORKSPACE_SA_KEY: "vault-bound-fixture",
+        INTEROP_R2_ACCESS_KEY_ID: "vault-bound-fixture",
+      },
+      { mode: "enforce", log: () => {}, allowRunEnvKeys: ["GOOGLE_WORKSPACE_SA_KEY"] },
+    );
+    expect(result.GOOGLE_WORKSPACE_SA_KEY).toBe("vault-bound-fixture");
+    expect(result).not.toHaveProperty("INTEROP_R2_ACCESS_KEY_ID");
+  });
+
+  it("report mode logs what would be blocked but does not block it", () => {
+    const messages: string[] = [];
+    const result = buildChildProcessEnv(
+      {},
+      { GOOGLE_WORKSPACE_SA_KEY: "vault-bound-fixture" },
+      { mode: "report", runId: "run-report", log: (message) => messages.push(message) },
+    );
+    expect(result.GOOGLE_WORKSPACE_SA_KEY).toBe("vault-bound-fixture");
+    expect(messages.some((m) => m.includes("would block"))).toBe(true);
+    expect(messages.some((m) => m.includes("GOOGLE_WORKSPACE_SA_KEY"))).toBe(true);
+    expect(messages.some((m) => m.includes("run=run-report"))).toBe(true);
+  });
+
+  it("logs blocked key names but never values", () => {
+    const messages: string[] = [];
+    buildChildProcessEnv(
+      {},
+      { GOOGLE_WORKSPACE_SA_KEY: "super-secret-value-should-not-be-logged" },
+      { mode: "enforce", log: (message) => messages.push(message) },
+    );
+    expect(messages.some((m) => m.includes("GOOGLE_WORKSPACE_SA_KEY"))).toBe(true);
+    expect(messages.some((m) => m.includes("super-secret-value-should-not-be-logged"))).toBe(false);
+  });
+
+  it("does not log when no host-credential keys are present", () => {
+    const messages: string[] = [];
+    buildChildProcessEnv(
+      {},
+      { TENANT_SCOPED_API_KEY: "tenant-fixture" },
+      { mode: "enforce", log: (message) => messages.push(message) },
+    );
+    expect(messages).toHaveLength(0);
+  });
+});
+
+describe("runChildProcess secret env scrub (AUR-4003)", () => {
+  it("a secret-shaped host env var never reaches the child; run-env secrets do", async () => {
+    const sentinelKey = "AUR4003_E2E_FAKE_TOKEN";
+    process.env[sentinelKey] = "host-fixture-not-a-secret";
+    try {
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        [
+          "-e",
+          "process.stdout.write(JSON.stringify({inherited: process.env.AUR4003_E2E_FAKE_TOKEN ?? null, bound: process.env.AUR4003_RUN_BOUND_KEY ?? null}))",
+        ],
+        {
+          cwd: process.cwd(),
+          env: { AUR4003_RUN_BOUND_KEY: "vault-fixture-not-a-secret" },
+          timeoutSec: 10,
+          graceSec: 1,
+          onLog: async () => {},
+        },
+      );
+      expect(result.exitCode).toBe(0);
+      const observed = JSON.parse(result.stdout) as { inherited: string | null; bound: string | null };
+      expect(observed.inherited).toBeNull();
+      expect(observed.bound).toBe("vault-fixture-not-a-secret");
+    } finally {
+      delete process.env[sentinelKey];
+    }
   });
 });

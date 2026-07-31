@@ -78,6 +78,7 @@ import {
   PROCESS_LOST_RETRY_MAX_ATTEMPTS,
 } from "../services/heartbeat.ts";
 import {
+  recoveryService,
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
@@ -2370,6 +2371,116 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
     expect(issue?.status).toBe("todo");
     await waitForHeartbeatIdle(db);
+  });
+
+  // AUR-4250 convergence guard.
+  //
+  // Escalation used to write `status: "blocked"`, which removed the issue from the
+  // `["todo","in_progress"]` candidate filter of `reconcileStrandedAssignedIssues` permanently.
+  // It no longer does: a dispatchable stranded issue stays a candidate on every 30s scheduler
+  // tick for ~3 days. That means the sweep's *other* wake-minting exits, which never had to be
+  // loop-safe before, now run against the same issue repeatedly.
+  //
+  // They converge, and the bound is two wakes per escalation cycle:
+  //
+  //   tick 1 — `escalateStrandedAssignedIssue` mints the `source_scoped_recovery_action` wake.
+  //   tick 2 — that wake's run carries no `retryReason`, so `didAutomaticRecoveryFail` is false
+  //            and the sweep falls through to `enqueueStrandedIssueRecovery`, which mints one
+  //            wake whose contextSnapshot carries `retryReason: "assignment_recovery"`.
+  //   tick 3+ — that reason makes `didAutomaticRecoveryFail(latestRun, "assignment_recovery")`
+  //            true, so the sweep re-enters `escalateStrandedAssignedIssue`, which short-circuits
+  //            on the 24h recovery-action cooldown and returns null. Steady state until the
+  //            action goes dormant a day later.
+  //
+  // The entire bound therefore rests on one string matching across two functions:
+  // `enqueueStrandedIssueRecovery`'s `retryReason: "assignment_recovery"` and the literal
+  // `didAutomaticRecoveryFail` keys on. Break that match and the handoff into the cooldown is
+  // gone, the sweep never re-enters escalation, and every tick mints another wake forever. This
+  // test is here so that regression fails loudly instead of shipping to the fleet.
+  const MAX_WAKES_PER_ESCALATION_CYCLE = 2;
+
+  it("converges to a bounded number of wakes when a dispatchable stranded issue stays a candidate", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "failed",
+      retryReason: "assignment_recovery",
+    });
+
+    // Count at the mint boundary and model the worst case explicitly: every wake we mint is
+    // claimed and its run dies, leaving the issue stranded again with that wake's contextSnapshot
+    // as its new latest run. Driving the real heartbeat executor instead would fold in wakes this
+    // sweep did not mint (process-loss retries, the same-name execution guard) and make the count
+    // jitter, which would defeat the point of asserting a tight bound.
+    const mintedWakes: { reason: string; retryReason: string | null }[] = [];
+    let mintedRunSequence = 0;
+    const recovery = recoveryService(db, {
+      enqueueWakeup: (async (wakeAgentId: string, wake: any) => {
+        const contextSnapshot = (wake?.contextSnapshot ?? {}) as Record<string, unknown>;
+        mintedWakes.push({
+          reason: String(wake?.reason),
+          retryReason: (contextSnapshot.retryReason as string | undefined) ?? null,
+        });
+        mintedRunSequence += 1;
+        // Fixed, strictly increasing timestamps: `getLatestIssueRun` orders by
+        // `createdAt desc, id desc`, and random UUIDs would make a same-millisecond tie
+        // non-deterministic.
+        const mintedAt = new Date(Date.UTC(2030, 2, 19) + mintedRunSequence * 60_000);
+        const runId = randomUUID();
+        await db.insert(heartbeatRuns).values({
+          id: runId,
+          companyId,
+          agentId: wakeAgentId,
+          invocationSource: "automation",
+          triggerDetail: "system",
+          status: "failed",
+          contextSnapshot,
+          startedAt: mintedAt,
+          finishedAt: mintedAt,
+          createdAt: mintedAt,
+          updatedAt: mintedAt,
+          errorCode: "process_lost",
+          error: "recovery wake run died again",
+        });
+        return { id: runId };
+      }) as never,
+    });
+
+    const TICKS = 5;
+    const statusPerTick: (string | undefined)[] = [];
+    const wakeCountPerTick: number[] = [];
+    for (let tick = 0; tick < TICKS; tick += 1) {
+      await recovery.reconcileStrandedAssignedIssues();
+      const issue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      statusPerTick.push(issue?.status);
+      wakeCountPerTick.push(mintedWakes.length);
+    }
+
+    // The bound, across all five ticks — not per tick.
+    expect(mintedWakes.length).toBeLessThanOrEqual(MAX_WAKES_PER_ESCALATION_CYCLE);
+    // ...and it is tight: the two wakes are exactly the escalation wake and the single
+    // `assignment_recovery` requeue that hands the next tick into the cooldown.
+    expect(mintedWakes).toEqual([
+      { reason: "source_scoped_recovery_action", retryReason: null },
+      { reason: "issue_assignment_recovery", retryReason: "assignment_recovery" },
+    ]);
+    // Minting stops rather than merely slowing down: nothing new after tick 2.
+    expect(wakeCountPerTick).toEqual([1, 2, 2, 2, 2]);
+
+    // No oscillation: escalation leaves the issue dispatchable and every later tick is a no-op,
+    // so the status never flips (in particular it never falls back to a zero-edge `blocked`).
+    expect(statusPerTick).toEqual(Array(TICKS).fill("todo"));
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
+
+    // One escalation, one attempt, one comment — the repeats were absorbed by the cooldown and
+    // did not rotate the wake idempotency key or refresh the AUR-4168 sweep suppression.
+    const action = await strandedRecoveryActionFor(companyId, issueId);
+    expect(action).toMatchObject({ status: "active", attemptCount: 1, ownerAgentId: agentId });
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
   });
 
   it("still blocks stranded work that has a real unresolved blocker", async () => {

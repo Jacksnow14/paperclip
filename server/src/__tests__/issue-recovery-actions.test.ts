@@ -193,6 +193,18 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     return { companyId, managerId, coderId, sourceIssueId, prefix, sourceIssue: sourceIssue! };
   }
 
+  // AUR-4250: `escalateStrandedAssignedIssue` refuses to re-escalate while the source-scoped
+  // recovery action is still warm (`lastAttemptAt` newer than the 24h dormancy cutoff), because
+  // the cooldown — not the old `status: "blocked"` write — is now the loop-breaker. Tests that
+  // exercise escalation *twice* have to push the action past that window in between, exactly the
+  // way the scheduler would after a day.
+  async function backdateRecoveryActionPastDormancy(sourceIssueId: string) {
+    await db
+      .update(issueRecoveryActions)
+      .set({ lastAttemptAt: new Date(Date.now() - 25 * 60 * 60 * 1000) })
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+  }
+
   function createApp(actor: any = { type: "board", source: "local_implicit" }) {
     const app = express();
     app.use(express.json());
@@ -261,6 +273,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       latestRun,
       comment: "Automatic continuation recovery failed.",
     });
+    // AUR-4250: re-escalation is gated on the 24h recovery-action dormancy window. Without this
+    // backdate the second call short-circuits to null and this test stops proving action reuse —
+    // do not delete it. It mirrors "re-escalates stranded recovery once the recovery action has
+    // gone dormant" in heartbeat-process-recovery.test.ts.
+    await backdateRecoveryActionPastDormancy(sourceIssue.id);
     await recovery.escalateStrandedAssignedIssue({
       issue: sourceIssue,
       previousStatus: "in_progress",
@@ -284,8 +301,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
 
     const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    // AUR-4250: escalation only mints `blocked` when real unresolved blockers exist. This fixture
+    // has none and the recovery action has an invokable owner, so the issue is left dispatchable
+    // (`todo`) instead of being dropped out of the execution candidate filter with zero blocker
+    // edges. See "still blocks stranded work that has a real unresolved blocker" for the other arm.
     expect(updatedIssue).toMatchObject({
-      status: "blocked",
+      status: "todo",
     });
     const recoveryIssues = await db
       .select()
@@ -324,6 +345,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       latestRun: firstLatestRun,
       comment: "Automatic continuation recovery failed.",
     });
+    // AUR-4250: the 24h cooldown would otherwise make the second escalation a no-op, and this
+    // test would silently stop covering source-scoped action reuse. Keep the backdate.
+    await backdateRecoveryActionPastDormancy(sourceIssue.id);
     await recovery.escalateStrandedAssignedIssue({
       issue: sourceIssue,
       previousStatus: "in_progress",
@@ -355,7 +379,15 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
-  it("keeps the source issue blocked when source-scoped wakeup is claimed synchronously", async () => {
+  // The invariant here is the tail re-assert, not any particular constant: `enqueueWakeup` flips
+  // the issue to `in_progress` mid-escalation (a wake claimed before escalation finished writing),
+  // and escalation's own status decision must win that race rather than silently losing it.
+  //
+  // AUR-4250 decision: the target of that re-assert is `todo`, not `blocked`. Nothing is blocking
+  // this issue and it has an invokable recovery owner, so it must stay dispatchable. The old
+  // behaviour clobbered a racing `in_progress` all the way to a zero-edge `blocked`, which was
+  // strictly worse — it won the race and then removed the issue from execution entirely.
+  it("re-asserts the escalation status over a synchronously-claimed wakeup", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, managerId));
     const enqueueWakeup = vi.fn(async () => {
@@ -383,14 +415,19 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       comment: "Automatic continuation recovery failed.",
     });
 
+    // The wake already wrote `in_progress`; escalation re-asserts over it. Discriminating: if the
+    // tail re-assert were a no-op this would read `in_progress`.
     const [afterFirst] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
-    expect(afterFirst?.status).toBe("blocked");
+    expect(afterFirst?.status).toBe("todo");
     expect(afterFirst?.assigneeAgentId).toBe(coderId);
 
     const secondLatestRun = {
       ...firstLatestRun,
       id: randomUUID(),
     };
+    // AUR-4250: without pushing the action past the 24h dormancy window the second escalation
+    // short-circuits and `attemptCount` never reaches 2.
+    await backdateRecoveryActionPastDormancy(sourceIssue.id);
     await recovery.escalateStrandedAssignedIssue({
       issue: sourceIssue,
       previousStatus: "in_progress",
@@ -413,7 +450,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       attemptCount: 2,
     });
     const [afterSecond] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
-    expect(afterSecond?.status).toBe("blocked");
+    expect(afterSecond?.status).toBe("todo");
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssue.id));
     expect(comments).toHaveLength(1);

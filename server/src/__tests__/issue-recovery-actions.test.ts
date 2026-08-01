@@ -562,7 +562,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issues)
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
     expect(recoveryIssues).toHaveLength(1);
-    expect(recoveryIssues[0]?.status).toBe("blocked");
+    expect(recoveryIssues[0]?.status).toBe("todo");
   });
 
   it("exposes active recovery actions on the issue read API", async () => {
@@ -1084,6 +1084,45 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(eq(issueRecoveryActions.sourceIssueId, blockedIssueId));
     expect(actionRows).toHaveLength(1);
     expect(actionRows[0]).toMatchObject({ kind: "stranded_assigned_issue", status: "active" });
+  });
+
+  it("Class B durable-blocker sweep nudges a missing-edge issue after 25 hours (AUR-4712)", async () => {
+    const { companyId, coderId, prefix } = await seedCompany();
+    const blockedIssueId = randomUUID();
+    const twentyFiveHoursAgo = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    await db.insert(issues).values({
+      id: blockedIssueId,
+      companyId,
+      title: "Blocked with no blocker edge",
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      issueNumber: 3,
+      identifier: `${prefix}-3`,
+      createdAt: twentyFiveHoursAgo,
+      updatedAt: twentyFiveHoursAgo,
+    });
+
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const result = await recovery.reconcileIssueGraphLiveness({ force: true });
+
+    expect(result.classBNudged).toBe(1);
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.sourceIssueId, blockedIssueId),
+          eq(issueRecoveryActions.kind, "issue_graph_liveness"),
+          eq(issueRecoveryActions.status, "active"),
+        ),
+      );
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({
+      ownerType: "agent",
+      ownerAgentId: coderId,
+      evidence: expect.objectContaining({ stage: "wake_assignee" }),
+    });
   });
 
   it("Class B durable-blocker sweep proceeds once the guarding recovery action's one-shot wake goes dormant (AUR-4300)", async () => {

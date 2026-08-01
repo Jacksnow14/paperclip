@@ -2712,6 +2712,54 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     expect(row.assigneeAgentId).toBeNull();
   });
 
+  it("rejects creating a blocked issue without a blocker edge or explicit wait path", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await expect(
+      svc.create(companyId, {
+        title: "Blocked black hole",
+        status: "blocked",
+        priority: "medium",
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({
+        code: "invalid_issue_disposition",
+        missing: "blocker_or_wait_path",
+      }),
+    });
+  });
+
+  it("allows transitioning into blocked when an unresolved blocker edge is attached", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const blockerId = randomUUID();
+    const blockedId = randomUUID();
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Blocker", status: "todo", priority: "medium" },
+      { id: blockedId, companyId, title: "Blocked", status: "todo", priority: "medium" },
+    ]);
+
+    await expect(
+      svc.update(blockedId, { status: "blocked", blockedByIssueIds: [blockerId] }),
+    ).resolves.toMatchObject({
+      id: blockedId,
+      status: "blocked",
+    });
+  });
+
   it("wakes parents only when all direct children are terminal", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();

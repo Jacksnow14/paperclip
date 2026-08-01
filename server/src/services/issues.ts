@@ -91,6 +91,9 @@ const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_LOG_BYTES = 2_000_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_CHUNK_BYTES = 256_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_END_SLACK_MS = 60_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_PARALLEL_READS = 8;
+const INVALID_BLOCKED_DISPOSITION_MESSAGE =
+  "blocked issues require a first-class blocker or explicit waiting path";
+
 function assertTransition(from: string, to: string) {
   if (from === to) return;
   if (!ALL_ISSUE_STATUSES.includes(to)) {
@@ -114,6 +117,108 @@ function applyStatusSideEffects(
     patch.cancelledAt = new Date();
   }
   return patch;
+}
+
+async function hasExplicitBlockedWaitingPath(
+  input: {
+    companyId: string;
+    issueId?: string | null;
+    assigneeUserId?: string | null;
+    description?: string | null;
+    executionPolicy?: Record<string, unknown> | null;
+    monitorNextCheckAt?: Date | string | null;
+  },
+  dbOrTx: any = db,
+) {
+  if (typeof input.assigneeUserId === "string" && input.assigneeUserId.trim().length > 0) {
+    return true;
+  }
+
+  const policyMonitorNextCheckAt = normalizeIssueExecutionPolicy(input.executionPolicy ?? null)?.monitor?.nextCheckAt ?? null;
+  const nextMonitorCheckAtMs = toTimestampMs(input.monitorNextCheckAt) ?? toTimestampMs(policyMonitorNextCheckAt);
+  if (nextMonitorCheckAtMs !== null && nextMonitorCheckAtMs > Date.now()) {
+    return true;
+  }
+
+  if (externalWaitFromDescription(input.description ?? null)) {
+    return true;
+  }
+
+  if (!input.issueId) {
+    return false;
+  }
+
+  const [interactionRows, approvalRows, recoveryActionRows] = await Promise.all([
+    dbOrTx
+      .select({ id: issueThreadInteractions.id })
+      .from(issueThreadInteractions)
+      .where(and(
+        eq(issueThreadInteractions.companyId, input.companyId),
+        eq(issueThreadInteractions.issueId, input.issueId),
+        eq(issueThreadInteractions.status, "pending"),
+      ))
+      .limit(1),
+    dbOrTx
+      .select({ issueId: issueApprovals.issueId })
+      .from(issueApprovals)
+      .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+      .where(and(
+        eq(issueApprovals.companyId, input.companyId),
+        eq(issueApprovals.issueId, input.issueId),
+        inArray(approvals.status, ["pending", "revision_requested"]),
+      ))
+      .limit(1),
+    dbOrTx
+      .select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions)
+      .where(and(
+        eq(issueRecoveryActions.companyId, input.companyId),
+        eq(issueRecoveryActions.sourceIssueId, input.issueId),
+        inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        gt(issueRecoveryActions.lastAttemptAt, recoveryActionDormancyCutoff()),
+      ))
+      .limit(1),
+  ]);
+
+  return interactionRows.length > 0 || approvalRows.length > 0 || recoveryActionRows.length > 0;
+}
+
+async function assertBlockedDispositionHasPath(
+  input: {
+    companyId: string;
+    issueId?: string | null;
+    status?: string | null;
+    unresolvedBlockerIssueIds: string[];
+    assigneeUserId?: string | null;
+    description?: string | null;
+    executionPolicy?: Record<string, unknown> | null;
+    monitorNextCheckAt?: Date | string | null;
+  },
+  dbOrTx: any = db,
+) {
+  if (input.status !== "blocked") {
+    return;
+  }
+  if (input.unresolvedBlockerIssueIds.length > 0) {
+    return;
+  }
+  if (await hasExplicitBlockedWaitingPath(input, dbOrTx)) {
+    return;
+  }
+
+  throw unprocessable(INVALID_BLOCKED_DISPOSITION_MESSAGE, {
+    code: "invalid_issue_disposition",
+    missing: "blocker_or_wait_path",
+    validBlockedPaths: [
+      "unresolved_blocked_by_issue",
+      "human_assignee_user_id",
+      "pending_issue_thread_interaction",
+      "linked_pending_approval",
+      "scheduled_issue_monitor",
+      "active_issue_recovery_action",
+      "external_owner_action",
+    ],
+  });
 }
 
 function readStringFromRecord(record: unknown, key: string) {
@@ -4317,6 +4422,19 @@ export function issueService(db: Db) {
           }),
         );
 
+        const unresolvedBlockerIssueIds = values.status === "blocked" && blockedByIssueIds !== undefined
+          ? await listUnresolvedBlockerIssueIds(tx, companyId, blockedByIssueIds)
+          : [];
+        await assertBlockedDispositionHasPath({
+          companyId,
+          status: values.status ?? "backlog",
+          unresolvedBlockerIssueIds,
+          assigneeUserId: values.assigneeUserId ?? null,
+          description: values.description ?? null,
+          executionPolicy: values.executionPolicy as Record<string, unknown> | null | undefined,
+          monitorNextCheckAt: values.monitorNextCheckAt ?? null,
+        }, tx);
+
         const [issue] = await tx.insert(issues).values(values).returning();
         if (inputLabelIds) {
           await syncIssueLabels(issue.id, companyId, inputLabelIds, tx);
@@ -4392,12 +4510,26 @@ export function issueService(db: Db) {
       if (patch.status === "in_progress" && !nextAssigneeAgentId && !nextAssigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
       }
-      if (patch.status === "in_progress") {
-        const unresolvedBlockerIssueIds = blockedByIssueIds !== undefined
+      const nextStatus = patch.status ?? existing.status;
+      const blockedDispositionTouched =
+        nextStatus === "blocked" &&
+        (
+          issueData.status === "blocked" ||
+          blockedByIssueIds !== undefined ||
+          issueData.assigneeUserId !== undefined ||
+          issueData.description !== undefined ||
+          issueData.executionPolicy !== undefined ||
+          issueData.monitorNextCheckAt !== undefined
+        );
+      let unresolvedBlockerIssueIds: string[] | null = null;
+      if (patch.status === "in_progress" || blockedDispositionTouched) {
+        unresolvedBlockerIssueIds = blockedByIssueIds !== undefined
           ? await listUnresolvedBlockerIssueIds(dbOrTx, existing.companyId, blockedByIssueIds)
           : (
               await listIssueDependencyReadinessMap(dbOrTx, existing.companyId, [id])
             ).get(id)?.unresolvedBlockerIssueIds ?? [];
+      }
+      if (patch.status === "in_progress") {
         if (unresolvedBlockerIssueIds.length > 0) {
           throw unprocessable("Issue is blocked by unresolved blockers", { unresolvedBlockerIssueIds });
         }
@@ -4429,6 +4561,22 @@ export function issueService(db: Db) {
       }
 
       applyStatusSideEffects(issueData.status, patch);
+      if (blockedDispositionTouched) {
+        await assertBlockedDispositionHasPath({
+          companyId: existing.companyId,
+          issueId: existing.id,
+          status: nextStatus,
+          unresolvedBlockerIssueIds: unresolvedBlockerIssueIds ?? [],
+          assigneeUserId: nextAssigneeUserId,
+          description: issueData.description !== undefined ? issueData.description : existing.description,
+          executionPolicy: issueData.executionPolicy !== undefined
+            ? issueData.executionPolicy as Record<string, unknown> | null
+            : existing.executionPolicy as Record<string, unknown> | null,
+          monitorNextCheckAt: issueData.monitorNextCheckAt !== undefined
+            ? issueData.monitorNextCheckAt
+            : existing.monitorNextCheckAt,
+        }, dbOrTx);
+      }
       if (issueData.status && issueData.status !== "done") {
         patch.completedAt = null;
       }

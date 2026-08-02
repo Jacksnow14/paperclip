@@ -941,6 +941,52 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
+  it("agrees with the scheduler's dependency readiness for a todo issue with a genuine open blocker (AUR-4710 FIRE case)", async () => {
+    const { companyId } = await createCompany("PDR");
+    const dependentId = await insertIssue({ companyId, identifier: "PDR-1", title: "Dependent", status: "todo" });
+    const blockerId = await insertIssue({ companyId, identifier: "PDR-2", title: "Open blocker", status: "todo" });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: dependentId });
+
+    const readiness = await svc.getDependencyReadiness(dependentId);
+    expect(readiness.isDependencyReady).toBe(false);
+
+    const dependent = (await svc.list(companyId, { status: "todo" })).find((issue) => issue.id === dependentId);
+    expect(dependent?.blockerAttention?.state).not.toBe("none");
+    expect(dependent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      unresolvedBlockerCount: 1,
+      sampleBlockerIdentifier: "PDR-2",
+    });
+  });
+
+  it("clears blockerAttention once the blocker resolves, matching dependency readiness (AUR-4710 PASS case)", async () => {
+    const { companyId } = await createCompany("PDP");
+    const dependentId = await insertIssue({ companyId, identifier: "PDP-1", title: "Dependent", status: "in_progress" });
+    const blockerId = await insertIssue({ companyId, identifier: "PDP-2", title: "Blocker", status: "todo" });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: dependentId });
+
+    const before = (await svc.list(companyId, { status: "in_progress" })).find((issue) => issue.id === dependentId);
+    expect(before?.blockerAttention?.state).toBe("needs_attention");
+
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerId));
+
+    const readiness = await svc.getDependencyReadiness(dependentId);
+    expect(readiness.isDependencyReady).toBe(true);
+
+    const after = (await svc.list(companyId, { status: "in_progress" })).find((issue) => issue.id === dependentId);
+    expect(after?.blockerAttention).toMatchObject({ state: "none", unresolvedBlockerCount: 0 });
+  });
+
+  it("does not disagree with readiness for a done issue's stale explicit blocker", async () => {
+    const { companyId } = await createCompany("PDD");
+    const dependentId = await insertIssue({ companyId, identifier: "PDD-1", title: "Done dependent", status: "done" });
+    const blockerId = await insertIssue({ companyId, identifier: "PDD-2", title: "Open blocker", status: "todo" });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: dependentId });
+
+    const dependent = (await svc.list(companyId, { status: "done" })).find((issue) => issue.id === dependentId);
+    expect(dependent?.blockerAttention).toMatchObject({ state: "none", unresolvedBlockerCount: 0 });
+  });
+
   it("classifies recovery issues and missing successful-run dispositions", async () => {
     const { companyId, agentId } = await createCompany("BID");
     const sourceId = await insertIssue({ companyId, identifier: "BID-1", title: "Stopped source", status: "blocked" });

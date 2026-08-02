@@ -1191,10 +1191,40 @@ async function listIssueBlockerAttentionMap(
   companyId: string,
   issueRows: IssueBlockerAttentionInputNode[],
 ): Promise<Map<string, IssueBlockerAttention>> {
-  const roots = issueRows.filter((row) => row.companyId === companyId && row.status === "blocked");
+  // A root is any issue whose stored status is literally "blocked", OR any issue with a
+  // live (non-done) explicit `blocks` edge -- matching listIssueDependencyReadinessMap's
+  // own admission check, which never looks at the dependent's own status field. Without
+  // this, a todo/in_progress issue with a genuine open blocker read as "none" here while
+  // the scheduler correctly skipped its wake as issue_dependencies_blocked (AUR-4710).
+  // Terminal issues (done/cancelled) are excluded: the scheduler never admits them, so
+  // there is no readiness check to stay in parity with.
+  const candidateRows = issueRows.filter(
+    (row) => row.companyId === companyId && !BLOCKER_ATTENTION_RESOLVED_STATUSES.includes(row.status),
+  );
+  const explicitlyBlockedIds = new Set<string>();
+  const candidateIds = [...new Set(candidateRows.map((row) => row.id))];
+  for (const chunk of chunkList(candidateIds, ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
+    const rows: Array<{ issueId: string }> = await dbOrTx
+      .select({ issueId: issueRelations.relatedIssueId })
+      .from(issueRelations)
+      .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+      .where(
+        and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.type, "blocks"),
+          inArray(issueRelations.relatedIssueId, chunk),
+          eq(issues.companyId, companyId),
+          ne(issues.status, "done"),
+        ),
+      );
+    for (const row of rows) explicitlyBlockedIds.add(row.issueId);
+  }
+
+  const roots = candidateRows.filter((row) => row.status === "blocked" || explicitlyBlockedIds.has(row.id));
+  const rootIds = new Set(roots.map((row) => row.id));
   const attentionMap = new Map<string, IssueBlockerAttention>();
   for (const row of issueRows) {
-    if (row.status !== "blocked") {
+    if (!rootIds.has(row.id)) {
       attentionMap.set(row.id, createIssueBlockerAttention());
     }
   }

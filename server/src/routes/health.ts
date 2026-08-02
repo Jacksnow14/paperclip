@@ -7,6 +7,7 @@ import type { DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
 import { readBuildInfo } from "../build-info.js";
 import { readPersistedDevServerStatus, toDevServerHealthStatus } from "../dev-server-status.js";
 import { logger } from "../middleware/logger.js";
+import { checkGlobalRunAdmission } from "../services/global-run-admission-monitor.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { serverVersion } from "../version.js";
 
@@ -120,6 +121,18 @@ export function healthRoutes(
       });
     }
 
+    // AUR-4059: expose current cap/queue state so "is the cap binding right
+    // now?" is answerable without a DB query or log grep. Board/agent-only —
+    // matches the gating already applied to devServer internals below.
+    let concurrency: Awaited<ReturnType<typeof checkGlobalRunAdmission>> | undefined;
+    if (exposeFullDetails) {
+      try {
+        concurrency = await checkGlobalRunAdmission(db);
+      } catch (err) {
+        logger.warn({ err }, "Health check: global-run-admission check failed");
+      }
+    }
+
     if (!exposeFullDetails) {
       res.json({
         status: "ok",
@@ -155,6 +168,7 @@ export function healthRoutes(
           process.env.GMAIL_INTAKE_POLLER_ENABLED !== "false",
       },
       ...(devServer ? { devServer } : {}),
+      ...(concurrency ? { concurrency } : {}),
     });
   });
 

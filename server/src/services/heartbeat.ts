@@ -5106,6 +5106,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           | "issue_terminal_status"
           | "issue_not_in_progress"
           | "issue_execution_lock_changed"
+          | "issue_blocked"
           | "issue_review_participant_changed"
           | "issue_paused"
           | "issue_dependencies_blocked";
@@ -5200,6 +5201,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         allowed: false,
         reason: `Scheduled retry suppressed because issue reached terminal status (${issue.status})`,
         errorCode: issue.status === "cancelled" ? "issue_cancelled" : "issue_terminal_status",
+        issueId,
+        details: { issueId, currentStatus: issue.status },
+      };
+    }
+
+    if (issue.status === "blocked") {
+      return {
+        allowed: false,
+        reason: "Scheduled retry suppressed because issue is blocked — retry will resume when the issue transitions back to an actionable status",
+        errorCode: "issue_blocked",
         issueId,
         details: { issueId, currentStatus: issue.status },
       };
@@ -5627,27 +5638,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         : baseSchedule;
 
-    if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON) {
+    {
       const gate = await evaluateScheduledRetryGate({ run, agent, contextSnapshot, retryReason });
       if (!gate.allowed) {
-        await appendRunEvent(run, await nextRunEventSeq(run.id), {
-          eventType: "lifecycle",
-          stream: "system",
-          level: "warn",
-          message: gate.reason,
-          payload: {
-            retryReason,
-            scheduledRetryAttempt: nextAttempt,
-            maxAttempts,
-            ...gate.details,
-          },
-        });
-        return {
-          outcome: "not_scheduled" as const,
-          reason: gate.reason,
-          errorCode: gate.errorCode,
-          issueId: gate.issueId,
-        };
+        // Preserve legacy transient retry behavior for runs that only carry a
+        // loose task context rather than a persisted issue row (LAR-618).
+        const isLegacyIssueNotFoundException =
+          gate.errorCode === "issue_not_found" &&
+          retryReason !== MAX_TURN_CONTINUATION_RETRY_REASON;
+        if (!isLegacyIssueNotFoundException) {
+          await appendRunEvent(run, await nextRunEventSeq(run.id), {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message: gate.reason,
+            payload: {
+              retryReason,
+              scheduledRetryAttempt: nextAttempt,
+              maxAttempts,
+              ...gate.details,
+            },
+          });
+          return {
+            outcome: "not_scheduled" as const,
+            reason: gate.reason,
+            errorCode: gate.errorCode,
+            issueId: gate.issueId,
+          };
+        }
       }
     }
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);

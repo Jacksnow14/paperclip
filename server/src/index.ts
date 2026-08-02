@@ -752,6 +752,7 @@ export async function startServer(): Promise<StartedServer> {
 
   if (config.heartbeatSchedulerEnabled) {
     const { isDiskPressureActive, updateDiskPressure, shouldFireCeoAlert, checkDisk, formatDiskReport, getArtifactDirFootprints, getBackupDirStats } = await import("./services/disk-monitor.js");
+    const { checkGlobalRunAdmission } = await import("./services/global-run-admission-monitor.js");
     const {
       runArtifactRetention,
       formatArtifactRetentionReport,
@@ -1054,7 +1055,15 @@ export async function startServer(): Promise<StartedServer> {
         .catch((err) => {
           logger.error({ err }, "routine scheduler tick failed");
         });
-  
+
+      // AUR-4059: a single refused admission is normal load-shedding; escalate
+      // to warn only once the global concurrency ceiling has been saturated
+      // continuously past the sustained threshold. /api/health reads the same
+      // checker on demand.
+      void checkGlobalRunAdmission(db as any).catch((err) => {
+        logger.error({ err }, "global-run-admission check failed");
+      });
+
       // Periodically reap orphaned runs (5-min staleness threshold) and make sure
       // persisted queued work is still being driven forward.
       void heartbeat

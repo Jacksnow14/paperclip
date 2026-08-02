@@ -22,6 +22,7 @@ import {
 import {
   ADAPTER_CLI_UNRESOLVABLE_ERROR_CODE,
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
+  MAX_TRANSIENT_RETRY_PARK_MS,
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
   SUPERSEDED_BY_SOURCE_SUCCESS_ERROR_CODE,
@@ -1306,6 +1307,89 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .then((rows) => rows[0] ?? null);
 
     expect((wakeupRequest?.payload as Record<string, unknown> | null)?.transientRetryNotBefore).toBe(
+      retryNotBefore.toISOString(),
+    );
+  });
+
+  it("parks a multi-day provider reset date unchanged while it is inside the trust horizon (AUR-4679)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date(2026, 6, 30, 5, 11, 0);
+    // Mirrors the live incident shape: codex weekly limit resetting 6 days out.
+    const retryNotBefore = new Date(2026, 7, 5, 8, 46, 0);
+    expect(retryNotBefore.getTime() - now.getTime()).toBeLessThan(MAX_TRANSIENT_RETRY_PARK_MS);
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      retryNotBefore: retryNotBefore.toISOString(),
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+    // Passthrough side: a plausible weekly reset is trusted exactly, not
+    // clamped and not probed sooner.
+    expect(scheduled.dueAt.getTime()).toBe(retryNotBefore.getTime());
+
+    const retryRun = await db
+      .select({ scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    expect(retryRun?.scheduledRetryAt?.getTime()).toBe(retryNotBefore.getTime());
+  });
+
+  it("clamps an implausibly-far provider reset date to the park horizon and keeps the raw date in the snapshot (AUR-4679)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date(2026, 6, 30, 5, 11, 0);
+    // A mis-parse shape: no codex limit cycle is 30 days, so the date cannot
+    // be a real reset horizon.
+    const retryNotBefore = new Date(2026, 7, 29, 8, 46, 0);
+    expect(retryNotBefore.getTime() - now.getTime()).toBeGreaterThan(MAX_TRANSIENT_RETRY_PARK_MS);
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      retryNotBefore: retryNotBefore.toISOString(),
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+    expect(scheduled.dueAt.getTime()).toBe(now.getTime() + MAX_TRANSIENT_RETRY_PARK_MS);
+
+    const retryRun = await db
+      .select({
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    expect(retryRun?.scheduledRetryAt?.getTime()).toBe(now.getTime() + MAX_TRANSIENT_RETRY_PARK_MS);
+    // The provider's raw claim survives for observability even when the park
+    // it implies does not.
+    expect((retryRun?.contextSnapshot as Record<string, unknown> | null)?.transientRetryNotBefore).toBe(
       retryNotBefore.toISOString(),
     );
   });

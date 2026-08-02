@@ -224,6 +224,12 @@ export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
   2 * 60 * 60 * 1000,
 ] as const;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
+// AUR-4679: ceiling on how far a provider-parsed reset date may park a run's
+// own scheduledRetryAt. Codex's longest limit cycle is weekly, so 7 days plus
+// a day of slack; anything further out is treated as a mis-parse and parked at
+// the horizon instead. See the decision comment at the clamp site in
+// scheduleBoundedRetryForRun.
+export const MAX_TRANSIENT_RETRY_PARK_MS = 8 * 24 * 60 * 60 * 1000;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
@@ -5637,14 +5643,49 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issueVisibility,
       };
     }
-    const schedule =
-      transientRetryNotBefore && transientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
-        ? {
-            ...baseSchedule,
-            dueAt: transientRetryNotBefore,
-            delayMs: Math.max(0, transientRetryNotBefore.getTime() - now.getTime()),
-          }
-        : baseSchedule;
+    // AUR-4679 decision: when the provider names a reset time, PARK the run
+    // until then rather than probing sooner — but only up to an explicit trust
+    // horizon. Reasoning, recorded here because both directions were weighed
+    // against live data:
+    //
+    // - Probe-sooner (clamp to hours and retry) interacts fatally with the
+    //   4-rung retry ladder above (2m/10m/30m/2h): every probe against a
+    //   still-closed weekly limit consumes a rung, so a genuine multi-day
+    //   reset would exhaust the ladder within ~a day and retry_exhausted
+    //   abandons automatic continuation entirely — strictly worse than a
+    //   delayed but guaranteed continuation at the reset. Exempting probes
+    //   from the budget would create an unbounded retry class needing its own
+    //   termination guard; not warranted while the parse keeps verifying
+    //   correct in production (2026-08-05T08:46Z confirmed as the real codex
+    //   weekly reset by two independent derivations, AUR-4620 AC5/AUR-4679).
+    // - Fleet impact of a long park is already bounded elsewhere: the
+    //   adapter-wide quota pause is clamped to 6h (AUR-4139), so a far date
+    //   never walls sibling agents. The residual harm — an agent whose whole
+    //   queue sits behind the park — is a visibility problem, handled by
+    //   scripts/check-parked-agents.mjs rather than by distrusting a correct
+    //   provider signal.
+    // - But the date comes from an English-text regex over provider error
+    //   output, so unbounded trust is wrong in the tail: a misread year would
+    //   park a run for ~forever with no recourse. The longest genuine codex
+    //   reset horizon is weekly, so trust the parse up to 8 days (7d + slack
+    //   for timezone/wording drift) and park at the horizon beyond that. The
+    //   clamped run still re-probes exactly once at the horizon, consuming
+    //   the same single ladder rung as an unclamped park; the raw parsed date
+    //   is preserved in transientRetryNotBefore for observability.
+    const schedule = (() => {
+      if (!transientRetryNotBefore || transientRetryNotBefore.getTime() <= baseSchedule.dueAt.getTime()) {
+        return baseSchedule;
+      }
+      const dueAtMs = Math.min(
+        transientRetryNotBefore.getTime(),
+        now.getTime() + MAX_TRANSIENT_RETRY_PARK_MS,
+      );
+      return {
+        ...baseSchedule,
+        dueAt: new Date(dueAtMs),
+        delayMs: Math.max(0, dueAtMs - now.getTime()),
+      };
+    })();
 
     {
       const gate = await evaluateScheduledRetryGate({ run, agent, contextSnapshot, retryReason });

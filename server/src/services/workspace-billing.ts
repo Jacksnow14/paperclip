@@ -64,13 +64,13 @@ async function fetchAllDirectoryUsers(auth: InstanceType<typeof google.auth.JWT>
 }
 
 // Domain-wide delegation for admin.directory.user.readonly is granted, but
-// apps.licensing.readonly is not (Tier B, pending founder grant — AUR-3290).
+// apps.licensing is not (Tier B, pending founder grant — AUR-3290).
 // A JWT requesting an ungranted scope fails at token exchange with
 // `unauthorized_client`, so licensing is fetched via a separate token request
 // and only that specific failure degrades to scope_not_granted.
 async function fetchLicenseSkus(): Promise<{ status: WorkspaceLicenseStatus; skus: string[] }> {
   try {
-    const auth = buildAuthClient(["https://www.googleapis.com/auth/apps.licensing.readonly"]);
+    const auth = buildAuthClient(["https://www.googleapis.com/auth/apps.licensing"]);
     await auth.authorize();
     const licensing = google.licensing({ version: "v1", auth });
     const skus = new Set<string>();

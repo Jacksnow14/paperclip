@@ -3,11 +3,12 @@ import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 const mockAuthorize = vi.fn().mockResolvedValue(undefined);
 const mockUsersList = vi.fn();
 const mockLicenseAssignmentsListForProduct = vi.fn();
+const mockJwt = vi.fn().mockImplementation(() => ({ authorize: mockAuthorize }));
 
 vi.mock("googleapis", () => ({
   google: {
     auth: {
-      JWT: vi.fn().mockImplementation(() => ({ authorize: mockAuthorize })),
+      JWT: mockJwt,
     },
     admin: vi.fn(() => ({ users: { list: mockUsersList } })),
     licensing: vi.fn(() => ({
@@ -68,6 +69,9 @@ describe("getWorkspaceBillingSummary", () => {
     });
     expect(typeof summary.fetchedAt).toBe("string");
     expect(mockUsersList).toHaveBeenCalledTimes(2);
+    expect(mockJwt).toHaveBeenCalledWith(expect.objectContaining({
+      scopes: ["https://www.googleapis.com/auth/apps.licensing"],
+    }));
   });
 
   it("degrades licensing to scope_not_granted when the licensing scope is not delegated", async () => {

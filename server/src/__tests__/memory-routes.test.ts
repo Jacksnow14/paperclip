@@ -47,6 +47,7 @@ const mockProjectService = vi.hoisted(() => ({
 const mockIssueService = vi.hoisted(() => ({
   getByIdentifier: vi.fn(),
   getById: vi.fn(),
+  getTombstoneByIdentifierOrUuid: vi.fn(),
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
@@ -105,6 +106,7 @@ describe("memory routes", () => {
     // Tests exercising a specific resolution outcome (miss, cross-company, etc.)
     // override with mockResolvedValueOnce.
     mockIssueService.getById.mockImplementation(async (id: string) => ({ id, companyId: companyA }));
+    mockIssueService.getTombstoneByIdentifierOrUuid.mockResolvedValue(null);
     mockLogActivity.mockResolvedValue(undefined);
   });
 
@@ -1308,6 +1310,46 @@ describe("memory routes", () => {
       expect(res.status).toBe(201);
       expect(mockIssueService.getById).toHaveBeenCalledWith(validIssueUuid);
       expect(mockMemoryService.capture).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns 201 for a scorecard whose issue_id was deleted after the work happened (AUR-4091)", async () => {
+      // The issue no longer exists (hard-deleted), but a tombstone was left behind at delete time.
+      mockIssueService.getById.mockResolvedValue(null);
+      mockIssueService.getTombstoneByIdentifierOrUuid.mockImplementation(async (companyId: string, id: string) =>
+        id === validIssueUuid || id === "AUR-2223"
+          ? { id: "tomb-1", companyId, issueId: validIssueUuid, identifier: "AUR-2223", title: "Deleted issue", deletedAt: new Date() }
+          : null,
+      );
+      mockMemoryService.capture.mockResolvedValue(scorecardCaptureResult);
+      const app = createApp(agentActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({
+          ...scorecardBaseBody,
+          source: { kind: "issue", issueId: "AUR-2223" },
+          metadata: { ...completeMetadata, issue_id: "AUR-2223" },
+        });
+
+      expect(res.status).toBe(201);
+      expect(mockIssueService.getTombstoneByIdentifierOrUuid).toHaveBeenCalledWith(companyA, "AUR-2223");
+      expect(mockMemoryService.capture).toHaveBeenCalledTimes(1);
+    });
+
+    it("still returns 422 for an identifier with neither a live issue nor a tombstone (fabricated, AUR-4091)", async () => {
+      mockIssueService.getById.mockResolvedValue(null);
+      mockIssueService.getTombstoneByIdentifierOrUuid.mockResolvedValue(null);
+      const app = createApp(agentActor);
+
+      const res = await request(app)
+        .post(`/api/companies/${companyA}/memory/capture`)
+        .set("Origin", "http://localhost:3100")
+        .send({ ...scorecardBaseBody, metadata: { ...completeMetadata, issue_id: "AUR-999999" } });
+
+      expect(res.status).toBe(422);
+      expect(res.body.details.errors.some((e: string) => e.includes("AUR-999999"))).toBe(true);
+      expect(mockMemoryService.capture).not.toHaveBeenCalled();
     });
 
     it("does not leak the guard to a non-scorecard category with no issue_id", async () => {

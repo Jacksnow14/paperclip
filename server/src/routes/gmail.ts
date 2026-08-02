@@ -45,6 +45,9 @@ const replyBodySchema = z
     replyTo: z.string().email().optional(),
     attachments: z.array(attachmentInputSchema).optional(),
     ceoApprovalId: z.string().optional(),
+    // AUR-4479: a self-addressed reply must be a deliberate act, never the
+    // accidental outcome of recipient resolution.
+    allowSelfAddressed: z.boolean().optional(),
   })
   .refine((v) => Boolean(v.replyToMessageId || v.threadId), {
     message: "replyToMessageId or threadId is required",

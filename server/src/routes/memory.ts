@@ -193,13 +193,20 @@ export function memoryRoutes(
    * shape alone (CTO review, AUR-3996) — `issuesSvc.getById` looks it up by
    * primary key the same way it looks up an identifier, so a fabricated
    * UUID with no matching row is rejected just like a fabricated `AUR-NNNN`.
+   *
+   * Falls back to the issue_tombstones table (AUR-4091) when the identifier
+   * doesn't resolve to a live issue: a hard-deleted issue leaves a tombstone
+   * behind, so a capture referencing "this issue existed when the work
+   * happened and was deleted afterwards" still resolves, while a fabricated
+   * identifier that never existed still returns null.
    */
   async function resolveSourceIssueId(companyId: string, issueId: string): Promise<string | null> {
     const trimmed = issueId.trim();
     if (!trimmed) return null;
     const issue = await issuesSvc.getById(trimmed);
-    if (!issue || issue.companyId !== companyId) return null;
-    return issue.id;
+    if (issue) return issue.companyId === companyId ? issue.id : null;
+    const tombstone = await issuesSvc.getTombstoneByIdentifierOrUuid(companyId, trimmed);
+    return tombstone ? tombstone.issueId : null;
   }
 
   router.get("/companies/:companyId/memory/providers", async (req, res) => {

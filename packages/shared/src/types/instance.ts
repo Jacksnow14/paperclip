@@ -3,7 +3,7 @@ import type { FeedbackDataSharingPreference } from "./feedback.js";
 export const DAILY_RETENTION_PRESETS = [3, 7, 14] as const;
 export const WEEKLY_RETENTION_PRESETS = [1, 2, 4] as const;
 export const MONTHLY_RETENTION_PRESETS = [1, 3, 6] as const;
-export const HOURLY_COUNT_PRESETS = [12, 24, 48, 72, 96] as const;
+export const HOURLY_COUNT_PRESETS = [6, 12, 24, 48, 72, 96] as const;
 export const MAX_BYTES_PRESETS = [
   1 * 1024 * 1024 * 1024,
   2 * 1024 * 1024 * 1024,
@@ -14,7 +14,11 @@ export const MAX_BYTES_PRESETS = [
 export const DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS = 24;
 export const MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS = 1;
 export const MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS = 24 * 30;
-export const DEFAULT_HOURLY_COUNT = 48;
+// AUR-4035: 48 hourly dumps × ~370 MiB exceeded the byte cap every cycle,
+// pinning the backup dir at the cap and evicting the daily/weekly/monthly
+// restore points. 6 hourly + 7 daily + 4 weekly + 1 monthly ≈ 18 dumps keeps
+// the ladder intact with headroom under the 8 GiB backstop.
+export const DEFAULT_HOURLY_COUNT = 6;
 export const DEFAULT_MAX_BYTES = 8 * 1024 * 1024 * 1024; // 8 GiB
 
 export interface BackupRetentionPolicy {

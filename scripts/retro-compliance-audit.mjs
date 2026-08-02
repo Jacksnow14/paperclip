@@ -28,24 +28,21 @@ const CONTENT_BOTS = new Set([
 const CTO = '371a1b08-0286-4a12-a516-f587f42df5eb';
 
 /**
- * metadata.category for captured gap records (AUR-4151, 2026-07-26).
+ * Category used when capturing gap records (AUR-4151, AUR-4334).
  *
- * Auto-accept in /memory/capture is keyed on metadata.category, and a NON-auto-accepted
- * category lands the record in `reviewState: pending` — where it is write-only. The capture
- * still returns 201, but the record is then unreadable by every path: the default records
- * list omits it, `?reviewState=pending` (which the capture's own warning tells you to use)
- * returns 0 items, and GET by id 404s.
+ * `metadata.category` is not a free-text label: memory.ts `resolveReviewState()`
+ * auto-accepts only categories in its AUTO_ACCEPT_CATEGORIES allowlist and files
+ * everything else as `reviewState: 'pending'`. Pending records are invisible to
+ * the recall/search path, which hard-filters `reviewState = 'accepted'`.
  *
- * The natural category here, `retrospective_compliance_gap`, is NOT auto-accepted, so every
- * gap record this script had ever "captured" was invisible — Step 4's durable enforcement
- * record was silently a no-op. We therefore write an auto-accepted category (`lesson`) and
- * keep the semantic one in `compliance_category`. Readers must filter on `compliance_category`
- * (or the `retrospective-compliance/` title prefix), NOT on `category`.
- *
- * Auto-accepted set as of 2026-07-26: lesson, tool_gap, performance_scorecard,
- * scorecard_adjusted, synthesis, experiment, experiment_conclusion.
+ * So the semantic name `retrospective_compliance_gap` — which is NOT in that
+ * allowlist — made every gap record unreadable, turning this audit's durable
+ * enforcement record into a silent no-op. The wire category must be an
+ * allowlisted one (`lesson`); the semantic name moves to `compliance_category`,
+ * which nothing gates on.
  */
-const GAP_CATEGORY = 'lesson';
+export const GAP_CATEGORY = 'lesson';
+export const COMPLIANCE_CATEGORY = 'retrospective_compliance_gap';
 
 /**
  * Retrospective heading detector — matches the literal `## Retrospective` heading.
@@ -267,7 +264,7 @@ export async function main({ hours, apply, apiUrl, apiKey, companyId, runIssueId
         content: `Closed issue ${m.identifier} ("${m.title}") has no '## Retrospective' comment. Assignee ${m.assigneeName ?? 'unassigned'}; manager notified: ${m.managerName}.`,
         metadata: {
           category: GAP_CATEGORY,
-          compliance_category: 'retrospective_compliance_gap',
+          compliance_category: COMPLIANCE_CATEGORY,
           gap_type: 'missing_retro',
           issue_identifier: m.identifier, issue_id: m.id, title: m.title,
           assignee_agent_id: m.assigneeAgentId, manager_agent_id: m.managerId,
@@ -288,7 +285,7 @@ export async function main({ hours, apply, apiUrl, apiKey, companyId, runIssueId
         content: `Closed issue ${m.identifier} ("${m.title}") is missing scorecard captures: [${missing}]. Assignee ${m.assigneeName ?? 'unassigned'}; manager notified: ${m.managerName}.`,
         metadata: {
           category: GAP_CATEGORY,
-          compliance_category: 'retrospective_compliance_gap',
+          compliance_category: COMPLIANCE_CATEGORY,
           gap_type: 'missing_scorecard',
           missing_records: [m.missingPerf && 'performance_scorecard', m.missingAdj && 'scorecard_adjusted'].filter(Boolean),
           issue_identifier: m.identifier, issue_id: m.id, title: m.title,

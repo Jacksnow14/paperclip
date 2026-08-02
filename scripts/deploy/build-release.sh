@@ -11,7 +11,9 @@
 #   --force     rebuild an existing release directory for the same SHA.
 #   --activate  atomically point /opt/paperclip/app/current at the new release.
 #               Takes effect on the next start of paperclip.service; this script
-#               NEVER restarts the service.
+#               NEVER restarts the service. Direct --activate is refused unless
+#               the safe-deploy wrapper marks the call gated, or break-glass is
+#               explicitly set for an emergency bypass.
 set -euo pipefail
 
 # AUR-4134: the guard that refuses to delete a release a live process is
@@ -37,6 +39,21 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+if [[ "$ACTIVATE" -eq 1 ]]; then
+  if [[ "${PAPERCLIP_DEPLOY_BREAK_GLASS:-0}" == "1" ]]; then
+    cat >&2 <<'EOF'
+WARNING: PAPERCLIP_DEPLOY_BREAK_GLASS=1 bypassing safe-deploy.sh protections for build-release.sh --activate
+WARNING: this skips the memory floor/watchdog, sampler verification, post-activation watch, and automatic rollback
+EOF
+  elif [[ "${PAPERCLIP_DEPLOY_GATED:-0}" != "1" ]]; then
+    cat >&2 <<'EOF'
+refusing direct build-release.sh --activate: use scripts/deploy/safe-deploy.sh --activate
+emergency bypass only: set PAPERCLIP_DEPLOY_BREAK_GLASS=1 and rerun to make an explicit, logged exception
+EOF
+    exit 1
+  fi
+fi
 
 git -C "$REPO" fetch --quiet origin
 SHA=$(git -C "$REPO" rev-parse --verify "${REF}^{commit}")

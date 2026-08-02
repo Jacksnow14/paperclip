@@ -76,6 +76,78 @@ run_from() {
   return 1
 }
 
+make_fake_build_tools() {
+  local root=$1 sha=$2
+  local fakebin="$root/fakebin"
+  mkdir -p "$fakebin" "$root/repo"
+
+  cat > "$fakebin/git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+sha=${FAKE_SHA:?}
+
+if [[ "${1:-}" == "-C" ]]; then
+  shift 2
+  case "${1:-}" in
+    fetch) exit 0 ;;
+    rev-parse) printf '%s\n' "$sha"; exit 0 ;;
+    branch) printf '  origin/master\n'; exit 0 ;;
+    remote) exit 0 ;;
+    checkout) exit 0 ;;
+  esac
+fi
+
+if [[ "${1:-}" == "clone" ]]; then
+  mkdir -p "${@: -1}"
+  exit 0
+fi
+
+printf 'unexpected git args: %s\n' "$*" >&2
+exit 1
+EOF
+
+  cat > "$fakebin/pnpm" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p server/dist server/node_modules/tsx/dist ui/dist
+: > server/dist/index.js
+: > server/node_modules/tsx/dist/loader.mjs
+: > ui/dist/index.html
+EOF
+
+  cat > "$fakebin/sudo" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+cmd=$1
+shift
+
+case "$cmd" in
+  install)
+    dirs=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -d) shift ;;
+        -o|-g|-m) shift 2 ;;
+        *) dirs+=("$1"); shift ;;
+      esac
+    done
+    mkdir -p "${dirs[@]}"
+    ;;
+  chown|chmod)
+    ;;
+  *)
+    exec "$cmd" "$@"
+    ;;
+esac
+EOF
+
+  chmod +x "$fakebin/git" "$fakebin/pnpm" "$fakebin/sudo"
+  printf '%s\n' "$fakebin"
+}
+
 echo "== detection =="
 APP="$TMP/detect"
 make_app "$APP" R
@@ -237,6 +309,62 @@ strict_out=$(
 check "guard completes under set -euo pipefail" "$strict_out" "survived"
 check "running release intact under strict mode" \
   "$( [[ -d "$APP/releases/R" ]] && echo present || echo GONE )" "present"
+
+echo
+echo "== build-release activation gate =="
+SHA="1234567890abcdef1234567890abcdef12345678"
+SHA12=${SHA:0:12}
+FAKE_ROOT="$TMP/fake-build-release"
+FAKE_BIN=$(make_fake_build_tools "$FAKE_ROOT" "$SHA")
+
+APP="$TMP/activate-ungated"
+make_app "$APP" OLD
+activate "$APP" OLD
+ungated_out="$TMP/activate-ungated.log"
+(
+  PATH="$FAKE_BIN:$PATH" \
+  FAKE_SHA="$SHA" \
+  PAPERCLIP_DEPLOY_SRC_REPO="$FAKE_ROOT/repo" \
+  PAPERCLIP_DEPLOY_APP_ROOT="$APP" \
+  "$SCRIPT_DIR/build-release.sh" --ref origin/master --activate
+) >"$ungated_out" 2>&1
+check "direct --activate is refused without a gate token" "$?" "1"
+check "refusal names safe-deploy.sh" \
+  "$(grep -q 'safe-deploy.sh --activate' "$ungated_out" && echo yes || echo no)" "yes"
+check "ungated refusal leaves current unchanged" "$(readlink "$APP/current")" "releases/OLD"
+
+APP="$TMP/activate-gated"
+make_app "$APP" OLD
+activate "$APP" OLD
+gated_out="$TMP/activate-gated.log"
+(
+  PATH="$FAKE_BIN:$PATH" \
+  FAKE_SHA="$SHA" \
+  PAPERCLIP_DEPLOY_GATED=1 \
+  PAPERCLIP_DEPLOY_SRC_REPO="$FAKE_ROOT/repo" \
+  PAPERCLIP_DEPLOY_APP_ROOT="$APP" \
+  "$SCRIPT_DIR/build-release.sh" --ref origin/master --activate
+) >"$gated_out" 2>&1
+check "gated --activate proceeds" "$?" "0"
+check "gated activation updates current" "$(readlink "$APP/current")" "releases/$SHA12"
+check "gated activation records previous" "$(readlink "$APP/previous")" "releases/OLD"
+
+APP="$TMP/activate-break-glass"
+make_app "$APP" OLD
+activate "$APP" OLD
+break_glass_out="$TMP/activate-break-glass.log"
+(
+  PATH="$FAKE_BIN:$PATH" \
+  FAKE_SHA="$SHA" \
+  PAPERCLIP_DEPLOY_BREAK_GLASS=1 \
+  PAPERCLIP_DEPLOY_SRC_REPO="$FAKE_ROOT/repo" \
+  PAPERCLIP_DEPLOY_APP_ROOT="$APP" \
+  "$SCRIPT_DIR/build-release.sh" --ref origin/master --activate
+) >"$break_glass_out" 2>&1
+check "break-glass --activate proceeds" "$?" "0"
+check "break-glass warns loudly" \
+  "$(grep -q 'PAPERCLIP_DEPLOY_BREAK_GLASS=1' "$break_glass_out" && echo yes || echo no)" "yes"
+check "break-glass activation updates current" "$(readlink "$APP/current")" "releases/$SHA12"
 
 echo
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"

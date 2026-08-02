@@ -1122,4 +1122,70 @@ describe("claude execute", () => {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
+
+  // AUR-4513 end-to-end: this is the adapter path that produced all 2,394 live
+  // overflow rows. The result event carries `subtype: "success"` with
+  // `is_error: true` -- the shape that made `describeClaudeFailure` emit
+  // "Claude run failed: subtype=success: Prompt is too long".
+  it("classifies a prompt-size rejection as a deterministic context overflow, not transient (AUR-4513)", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-overflow-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeFailingClaudeCommand(commandPath, {
+      resultEvent: {
+        type: "result",
+        subtype: "success",
+        is_error: true,
+        session_id: "claude-session-overflow",
+        result: "Prompt is too long",
+        usage: { input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 },
+      },
+    });
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+
+    try {
+      const result = await execute({
+        runId: "run-claude-overflow",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBe("claude_context_overflow");
+      expect(result.errorCode).not.toBe("claude_transient_upstream");
+      // No retryable family and no retry hint: the retry scheduler must find nothing
+      // to schedule off this run.
+      expect(result.errorFamily).toBeNull();
+      expect(result.retryNotBefore).toBeNull();
+      expect(result.resultJson?.errorFamily).toBeUndefined();
+      expect(result.resultJson?.retryNotBefore).toBeUndefined();
+      expect(result.errorMessage ?? "").toContain("Prompt is too long");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
 });

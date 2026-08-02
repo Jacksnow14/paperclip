@@ -53,6 +53,16 @@ export const heartbeatRuns = pgTable(
     continuationAttempt: integer("continuation_attempt").notNull().default(0),
     lastUsefulActionAt: timestamp("last_useful_action_at", { withTimezone: true }),
     nextAction: text("next_action"),
+    // Resolved execution workspace (AUR-4645) — the realized cwd/source/workspaceId this run
+    // actually executed in, plus any resolver/realization warnings. Set once the run reaches
+    // the "running" transition; null for runs that never got that far. `workspaceSource` alone
+    // is not sufficient to audit pinning (see AUR-4231) — a project-bound routine whose project
+    // has no primary workspace cwd reports source "project_primary" while cwd is an agent-home
+    // fallback, so the fleet audit must key on `workspaceCwd`.
+    workspaceCwd: text("workspace_cwd"),
+    workspaceSource: text("workspace_source"),
+    workspaceId: uuid("workspace_id"),
+    workspaceWarnings: jsonb("workspace_warnings").$type<string[]>(),
     contextSnapshot: jsonb("context_snapshot").$type<Record<string, unknown>>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

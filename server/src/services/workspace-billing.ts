@@ -24,6 +24,18 @@ interface DirectoryUser {
   suspended?: boolean;
 }
 
+function isScopeNotGrantedError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const maybeError = error as {
+    code?: unknown;
+    message?: unknown;
+    response?: { data?: { error?: unknown } };
+  };
+  return maybeError.code === "unauthorized_client"
+    || maybeError.response?.data?.error === "unauthorized_client"
+    || (typeof maybeError.message === "string" && maybeError.message.includes("unauthorized_client"));
+}
+
 function buildAuthClient(scopes: string[]) {
   const key = loadServiceAccountKey();
   return new google.auth.JWT({
@@ -55,8 +67,7 @@ async function fetchAllDirectoryUsers(auth: InstanceType<typeof google.auth.JWT>
 // apps.licensing.readonly is not (Tier B, pending founder grant — AUR-3290).
 // A JWT requesting an ungranted scope fails at token exchange with
 // `unauthorized_client`, so licensing is fetched via a separate token request
-// and any failure there degrades to scope_not_granted rather than failing the
-// whole summary.
+// and only that specific failure degrades to scope_not_granted.
 async function fetchLicenseSkus(): Promise<{ status: WorkspaceLicenseStatus; skus: string[] }> {
   try {
     const auth = buildAuthClient(["https://www.googleapis.com/auth/apps.licensing.readonly"]);
@@ -77,8 +88,11 @@ async function fetchLicenseSkus(): Promise<{ status: WorkspaceLicenseStatus; sku
       pageToken = res.data.nextPageToken ?? undefined;
     } while (pageToken);
     return { status: "granted", skus: [...skus] };
-  } catch {
-    return { status: "scope_not_granted", skus: [] };
+  } catch (error) {
+    if (isScopeNotGrantedError(error)) {
+      return { status: "scope_not_granted", skus: [] };
+    }
+    throw error;
   }
 }
 

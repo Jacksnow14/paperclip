@@ -88,4 +88,15 @@ describe("getWorkspaceBillingSummary", () => {
     expect(summary.licenseSkus).toEqual([]);
     expect(summary.seatsActive).toBe(1);
   });
+
+  it("rethrows unexpected licensing failures instead of misreporting scope_not_granted", async () => {
+    mockUsersList.mockResolvedValueOnce({
+      data: { users: [{ suspended: false }], nextPageToken: undefined },
+    });
+    mockAuthorize.mockRejectedValueOnce(new Error("socket hang up"));
+
+    const { getWorkspaceBillingSummary } = await loadService();
+
+    await expect(getWorkspaceBillingSummary()).rejects.toThrow("socket hang up");
+  });
 });

@@ -91,6 +91,10 @@ export function workspaceBillingRoutes(db: Db) {
           title: cacheTitleForToday(),
           content: JSON.stringify(summary),
           metadata: { category: "workspace_billing" },
+          // workspace_billing is not an auto-accepted memory category, so the
+          // cache must opt into accepted visibility explicitly or subsequent
+          // reads will never see it.
+          reviewState: "accepted",
           upsert: true,
         },
         actor,

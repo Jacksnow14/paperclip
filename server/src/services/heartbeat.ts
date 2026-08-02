@@ -5206,7 +5206,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
+    const getDependencyBlockedGate = async (): Promise<BlockedScheduledRetryGate | null> => {
+      const dependencyReadiness = await issuesSvc.listDependencyReadiness(run.companyId, [issueId]);
+      const readiness = dependencyReadiness.get(issueId);
+      if (!readiness || readiness.isDependencyReady) return null;
+
+      return {
+        allowed: false,
+        reason: "Scheduled retry suppressed because issue dependencies are still blocked",
+        errorCode: "issue_dependencies_blocked",
+        issueId,
+        details: {
+          issueId,
+          unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+          unresolvedBlockerCount: readiness.unresolvedBlockerCount,
+        },
+      };
+    };
+
     if (issue.status === "blocked") {
+      const dependencyBlockedGate = await getDependencyBlockedGate();
+      if (dependencyBlockedGate) return dependencyBlockedGate;
+
       return {
         allowed: false,
         reason: "Scheduled retry suppressed because issue is blocked — retry will resume when the issue transitions back to an actionable status",
@@ -5281,21 +5302,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    const dependencyReadiness = await issuesSvc.listDependencyReadiness(run.companyId, [issueId]);
-    const readiness = dependencyReadiness.get(issueId);
-    if (readiness && !readiness.isDependencyReady) {
-      return {
-        allowed: false,
-        reason: "Scheduled retry suppressed because issue dependencies are still blocked",
-        errorCode: "issue_dependencies_blocked",
-        issueId,
-        details: {
-          issueId,
-          unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
-          unresolvedBlockerCount: readiness.unresolvedBlockerCount,
-        },
-      };
-    }
+    const dependencyBlockedGate = await getDependencyBlockedGate();
+    if (dependencyBlockedGate) return dependencyBlockedGate;
 
     return { allowed: true };
   }

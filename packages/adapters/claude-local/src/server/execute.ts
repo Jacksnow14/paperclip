@@ -37,6 +37,7 @@ import {
   joinPromptSections,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
+  ensureClaudeWorkspaceTrusted,
   ensurePathInEnv,
   ensureUserLocalBinInPath,
   refreshPaperclipWorkspaceEnvForExecution,
@@ -181,6 +182,12 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     executionCwd: effectiveExecutionCwd,
   });
   await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
+  if (!executionTargetIsRemote) {
+    // Local (non-sandboxed) execution reads the host's real ~/.claude.json trust
+    // config, so a freshly provisioned workspace cwd must be trusted here or its
+    // permissions.allow entries are silently dropped on every run (AUR-4374).
+    await ensureClaudeWorkspaceTrusted(cwd, { onLog });
+  }
 
   const envConfig = parseObject(config.env);
   const hasExplicitApiKey =

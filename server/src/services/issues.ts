@@ -4771,7 +4771,7 @@ export function issueService(db: Db) {
 
     checkout: async (id: string, agentId: string, expectedStatuses: string[], checkoutRunId: string | null) => {
       const issueCompany = await db
-        .select({ companyId: issues.companyId })
+        .select({ companyId: issues.companyId, assigneeUserId: issues.assigneeUserId })
         .from(issues)
         .where(eq(issues.id, id))
         .then((rows) => rows[0] ?? null);
@@ -4801,6 +4801,13 @@ export function issueService(db: Db) {
         throw unprocessable("Issue is blocked by unresolved blockers", { unresolvedBlockerIssueIds });
       }
 
+      if (issueCompany.assigneeUserId) {
+        throw conflict("Issue is owned by a human assignee", {
+          issueId: id,
+          assigneeUserId: issueCompany.assigneeUserId,
+        });
+      }
+
       const sameRunAssigneeCondition = checkoutRunId
         ? and(
           eq(issues.assigneeAgentId, agentId),
@@ -4827,6 +4834,7 @@ export function issueService(db: Db) {
             inArray(issues.status, expectedStatuses),
             or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
             executionLockCondition,
+            isNull(issues.assigneeUserId),
           ),
         )
         .returning()

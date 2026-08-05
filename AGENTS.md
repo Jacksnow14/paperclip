@@ -201,6 +201,19 @@ A 403 from the gate now names the rule that fired, whether the actor is the issu
 
 **Practical workaround if you haven't shipped past this yet:** comment once on your own issue's thread (or @mention yourself) *before* assigning it away — that earns permanent prior-participant reply rights independent of authorship. Assigning away without ever commenting first is the one-way door.
 
+### Human-gated issues (park an issue on a human, not an agent)
+
+There is no `human_gated` flag or `awaiting_human` status — don't build one. `assigneeUserId` already is that primitive, and every scheduled-pickup path (recovery reconcilers, the issue-monitor due-tick, productivity scans, orphan-blocker auto-assign, `blockerAttention`) already treats a non-null `assigneeUserId` as "hands off, a human owns this."
+
+To park an issue on a human:
+
+- `PATCH /api/issues/{id}` with `assigneeUserId: "<user id>"` and `assigneeAgentId: null`. Keep `status: blocked`.
+- This makes the issue ineligible for every scheduled agent run while it stays visible on the board and still blocks dependents.
+- `assigneeAgentId` and `assigneeUserId` are mutually exclusive — setting one clears the other.
+- `checkout()` (`server/src/services/issues.ts`) refuses to touch an issue with `assigneeUserId` set: the WHERE clause excludes it and an explicit pre-check throws `409 Issue is owned by a human assignee`. That is enforced server-side, not just by caller convention.
+- **Do not cancel a human gate.** Cancelling loses visibility and (until `blockerAttention` is fixed for cancelled issues) can leave dependents showing green when they are not.
+- Founder user id: `qzBIwcb9ITOZ6qiHzqMYvOvxNnAaI6B4`. There is currently no agent-callable endpoint to look up user IDs (`GET /api/companies/{id}/members` is board-only); this ID is documented here until one exists.
+
 ### Gmail I/O (agent-callable mailbox)
 
 Use the first-class Gmail API — do not hand-roll raw SA-key/urllib scripts to

@@ -316,7 +316,8 @@ export async function lookupRoutingRecord({ companyId, targetId, projectId, apiG
   const orgRecords = await apiGet(
     `/api/companies/${companyId}/memory/records?titlePrefix=routing/${targetId}&limit=${ROUTING_RECORD_LOOKUP_LIMIT}`
   );
-  if (extractRecords(orgRecords).some(r => r.title === exactTitle)) {
+  const matchesTarget = (r) => r.title === exactTitle || r.title.startsWith(`${exactTitle}/`);
+  if (extractRecords(orgRecords).some(matchesTarget)) {
     return { found: true, scope: 'org' };
   }
 
@@ -324,7 +325,7 @@ export async function lookupRoutingRecord({ companyId, targetId, projectId, apiG
     const projectRecords = await apiGet(
       `/api/companies/${companyId}/memory/records?titlePrefix=routing/${targetId}&limit=${ROUTING_RECORD_LOOKUP_LIMIT}&projectId=${projectId}`
     );
-    if (extractRecords(projectRecords).some(r => r.title === exactTitle)) {
+    if (extractRecords(projectRecords).some(matchesTarget)) {
       return { found: true, scope: 'project' };
     }
   }

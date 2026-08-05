@@ -10,12 +10,13 @@
 // cap without re-measuring on this host — see the AUR-3924 OOM cluster.
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const MAX_OLD_SPACE_SIZE_MB = 3072;
 const FULL_RUN_MEMORY_FLOOR_MB = 3000;
-// Lower floor for --changed mode when the resolved package set excludes
+// Lower floor for --changed mode when the pnpm-resolved package set (the
+// filter-expanded set that will actually run, not the changed set) excludes
 // `server` (the only package measured above ~600 MB peak RSS). Still a real
 // gate, not a bypass: packages/shared peaked at 515 MB, so 1200 MB leaves
 // >2x headroom for a single serial `tsc` process.
@@ -65,6 +66,7 @@ export function resolvePackageForFile(filePath, packageDirs) {
 
 export function mapChangedFilesToPackages(changedFiles, packageDirs) {
   const packages = new Set();
+  const unmapped = [];
   let rootLevelChange = false;
   for (const file of changedFiles) {
     const pkg = resolvePackageForFile(file, packageDirs);
@@ -74,11 +76,46 @@ export function mapChangedFilesToPackages(changedFiles, packageDirs) {
       // A file living directly in the repo root (tsconfig.base.json,
       // package.json, pnpm-workspace.yaml, ...) can affect every package's
       // typecheck. Files in non-package subdirectories (docs/, scripts/)
-      // that don't map to a package are just ignored.
+      // that don't map to a package are skipped — but reported, so a
+      // no-op run is distinguishable from an empty diff.
       rootLevelChange = true;
+    } else {
+      unmapped.push(file);
     }
   }
-  return { packages: [...packages].sort(), rootLevelChange };
+  return { packages: [...packages].sort(), rootLevelChange, unmapped };
+}
+
+// pnpm filter semantics: a LEADING `...` selects the package plus its
+// DEPENDENTS; a trailing `...` selects its dependencies. Changed-mode must
+// re-check everything that depends on what changed, so leading it is.
+// (`...@paperclipai/shared` → 14 pkgs incl. server; `@paperclipai/shared...`
+// → 1 pkg. Getting this backwards false-greens cross-package breaks.)
+export function buildFilterArgs(packageDirs, nameByDir) {
+  return packageDirs.flatMap((dir) => ["--filter", `...${nameByDir.get(dir)}`]);
+}
+
+export function parseResolvedPackageDirs(pnpmLsJsonText, rootPath) {
+  const entries = JSON.parse(pnpmLsJsonText);
+  if (!Array.isArray(entries)) {
+    throw new Error("unexpected pnpm ls output: not an array");
+  }
+  return entries
+    .map((entry) => relative(rootPath, entry.path))
+    .filter((dir) => dir !== "")
+    .sort();
+}
+
+// The floor is chosen from the RESOLVED set (what pnpm will actually run
+// after filter expansion), never the changed set — a one-file edit in a
+// widely-depended-on package expands to a set containing server (2529 MB
+// peak). Empty/unknown resolution gets the conservative floor.
+export function selectMemoryFloor(resolvedDirs) {
+  const smallAndServerFree =
+    resolvedDirs.length > 0 &&
+    resolvedDirs.length <= CHANGED_MODE_SMALL_SET_LIMIT &&
+    !resolvedDirs.includes("server");
+  return smallAndServerFree ? CHANGED_MODE_MEMORY_FLOOR_MB : FULL_RUN_MEMORY_FLOOR_MB;
 }
 
 export function parseWorkspaceGlobs(yamlText) {
@@ -163,32 +200,70 @@ function git(args) {
 }
 
 function resolveBaseRef() {
-  for (const ref of ["origin/main", "origin/master"]) {
+  // origin/HEAD is the remote's actual default branch; hardcoded names are
+  // fallbacks only. This repo's default is master — a stale origin/main
+  // mirror preferred over it would silently under-scope the diff.
+  const symbolic = git(["symbolic-ref", "refs/remotes/origin/HEAD"]);
+  if (symbolic.ok) {
+    const ref = symbolic.stdout.trim().replace(/^refs\/remotes\//, "");
     if (git(["rev-parse", "--verify", "--quiet", ref]).ok) return ref;
   }
-  const symbolic = git(["symbolic-ref", "refs/remotes/origin/HEAD"]);
-  if (symbolic.ok) return symbolic.stdout.trim().replace(/^refs\/remotes\//, "");
-  return "HEAD";
+  for (const ref of ["origin/master", "origin/main"]) {
+    if (git(["rev-parse", "--verify", "--quiet", ref]).ok) return ref;
+  }
+  return null;
 }
 
+// Returns { files, failures }. Any failed git probe is recorded in
+// `failures` — the caller must NOT treat the (possibly empty) file list as
+// trustworthy when failures is non-empty. Swallowing a git error as "zero
+// changed files" turns a broken environment into a passing typecheck.
 function getChangedFiles() {
-  const baseRef = resolveBaseRef();
-  const mergeBase = git(["merge-base", "HEAD", baseRef]);
   const files = new Set();
-
-  if (mergeBase.ok) {
-    const range = `${mergeBase.stdout.trim()}...HEAD`;
-    for (const line of git(["diff", "--name-only", range]).stdout.split("\n")) {
+  const failures = [];
+  const collect = (result, label) => {
+    if (!result.ok) {
+      failures.push(label);
+      return;
+    }
+    for (const line of result.stdout.split("\n")) {
       if (line.trim()) files.add(line.trim());
     }
+  };
+
+  const baseRef = resolveBaseRef();
+  if (baseRef === null) {
+    failures.push("no usable base ref (origin/HEAD, origin/master, origin/main)");
+  } else {
+    const mergeBase = git(["merge-base", "HEAD", baseRef]);
+    if (!mergeBase.ok) {
+      failures.push(`git merge-base HEAD ${baseRef}`);
+    } else {
+      collect(
+        git(["diff", "--name-only", `${mergeBase.stdout.trim()}...HEAD`]),
+        "git diff <merge-base>...HEAD",
+      );
+    }
   }
-  for (const line of git(["diff", "--name-only", "HEAD"]).stdout.split("\n")) {
-    if (line.trim()) files.add(line.trim());
+  collect(git(["diff", "--name-only", "HEAD"]), "git diff --name-only HEAD");
+  collect(git(["ls-files", "--others", "--exclude-standard"]), "git ls-files --others");
+  return { files: [...files], failures };
+}
+
+// Resolve the set pnpm will actually run for these filter args. Returns
+// workspace-relative dirs, or null if resolution failed (caller applies the
+// conservative floor).
+function resolveEffectivePackageDirs(filterArgs) {
+  const result = spawnSync("pnpm", ["ls", "-r", "--depth", "-1", ...filterArgs, "--json"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  if (result.error || result.status !== 0) return null;
+  try {
+    return parseResolvedPackageDirs(result.stdout, repoRoot);
+  } catch {
+    return null;
   }
-  for (const line of git(["ls-files", "--others", "--exclude-standard"]).stdout.split("\n")) {
-    if (line.trim()) files.add(line.trim());
-  }
-  return [...files];
 }
 
 function currentMemAvailableMB() {
@@ -233,10 +308,24 @@ function main() {
     return;
   }
 
-  const changedFiles = getChangedFiles();
+  const { files: changedFiles, failures: gitFailures } = getChangedFiles();
+  if (gitFailures.length > 0) {
+    // A failed git probe means the changed set cannot be trusted — an empty
+    // list here is indistinguishable from "git broke". Fail safe by running
+    // everything, loudly, instead of reporting a pass on nothing.
+    runFull(`git probe failed (${gitFailures.join("; ")}); cannot trust the changed set — falling back to full serial run`);
+    return;
+  }
+
   const workspacePackages = discoverWorkspacePackages(repoRoot, readFileSync(join(repoRoot, "pnpm-workspace.yaml"), "utf8"));
   const packageDirs = workspacePackages.map((pkg) => pkg.dir);
-  const { packages, rootLevelChange } = mapChangedFilesToPackages(changedFiles, packageDirs);
+  const { packages, rootLevelChange, unmapped } = mapChangedFilesToPackages(changedFiles, packageDirs);
+
+  if (unmapped.length > 0) {
+    console.log(
+      `[typecheck] ${unmapped.length} changed path(s) do not map to a typecheck-capable workspace package (skipped): ${unmapped.join(", ")}`,
+    );
+  }
 
   if (rootLevelChange) {
     runFull("root-level file changed; falling back to full serial run");
@@ -244,21 +333,36 @@ function main() {
   }
 
   if (packages.length === 0) {
-    console.log("[typecheck] no changed files map to a workspace package; nothing to typecheck");
+    if (changedFiles.length === 0) {
+      console.log("[typecheck] working tree matches the base ref; no changed files; nothing to typecheck");
+    } else {
+      console.log("[typecheck] no changed files map to a workspace package; nothing to typecheck");
+    }
     process.exit(0);
     return;
   }
 
-  const skipStandardGate = packages.length <= CHANGED_MODE_SMALL_SET_LIMIT && !packages.includes("server");
-  const floor = skipStandardGate ? CHANGED_MODE_MEMORY_FLOOR_MB : FULL_RUN_MEMORY_FLOOR_MB;
+  const nameByDir = new Map(workspacePackages.map((pkg) => [pkg.dir, pkg.name]));
+  const filterArgs = buildFilterArgs(packages, nameByDir);
+
+  // Gate on the filter-EXPANDED set pnpm will actually run, not the changed
+  // set: one changed file in a widely-depended-on package pulls in server
+  // (2529 MB peak) via dependents. Unknown resolution → conservative floor.
+  const resolvedDirs = resolveEffectivePackageDirs(filterArgs);
+  let floor;
+  if (resolvedDirs === null) {
+    console.warn("[typecheck] could not resolve the effective package set via pnpm ls; applying the conservative full-run memory floor");
+    floor = FULL_RUN_MEMORY_FLOOR_MB;
+  } else {
+    console.log(`[typecheck] changed packages (${packages.join(", ")}) expand to ${resolvedDirs.length} package(s) incl. dependents: ${resolvedDirs.join(", ")}`);
+    floor = selectMemoryFloor(resolvedDirs);
+  }
   const gate = evaluateMemoryGate(currentMemAvailableMB(), floor);
   if (!gate.ok) {
     console.error(`[typecheck] ${gate.message}`);
     process.exit(1);
   }
 
-  const nameByDir = new Map(workspacePackages.map((pkg) => [pkg.dir, pkg.name]));
-  const filterArgs = packages.flatMap((dir) => ["--filter", `${nameByDir.get(dir)}...`]);
   runPnpm(filterArgs, `changed-package run (${packages.join(", ")})`);
 }
 

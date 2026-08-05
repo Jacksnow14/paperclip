@@ -2,12 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildFilterArgs,
   clampNodeOptions,
   evaluateMemoryGate,
+  mapChangedFilesToPackages,
+  parseResolvedPackageDirs,
+  parseWorkspaceGlobs,
   readMemAvailableMB,
   resolvePackageForFile,
-  mapChangedFilesToPackages,
-  parseWorkspaceGlobs,
+  selectMemoryFloor,
 } from "./typecheck.mjs";
 
 test("clampNodeOptions: strips an inherited --max-old-space-size and preserves other flags", () => {
@@ -87,6 +90,57 @@ test("mapChangedFilesToPackages: a non-package subdirectory file is ignored, not
   const { packages, rootLevelChange } = mapChangedFilesToPackages(["doc/plans/foo.md", "scripts/x.mjs"], packageDirs);
   assert.deepEqual(packages, []);
   assert.equal(rootLevelChange, false);
+});
+
+test("mapChangedFilesToPackages: unmappable subdirectory paths are reported, not silently dropped", () => {
+  const packageDirs = ["server", "packages/shared"];
+  const { packages, rootLevelChange, unmapped } = mapChangedFilesToPackages(
+    ["doc/plans/foo.md", "scripts/x.mjs", "packages/shared/src/y.ts"],
+    packageDirs,
+  );
+  assert.deepEqual(packages, ["packages/shared"]);
+  assert.equal(rootLevelChange, false);
+  assert.deepEqual(unmapped, ["doc/plans/foo.md", "scripts/x.mjs"]);
+});
+
+test("buildFilterArgs: uses a LEADING ... (package plus dependents), never trailing", () => {
+  const nameByDir = new Map([
+    ["packages/shared", "@paperclipai/shared"],
+    ["server", "@paperclipai/server"],
+  ]);
+  assert.deepEqual(buildFilterArgs(["packages/shared", "server"], nameByDir), [
+    "--filter",
+    "...@paperclipai/shared",
+    "--filter",
+    "...@paperclipai/server",
+  ]);
+});
+
+test("parseResolvedPackageDirs: maps pnpm ls --json absolute paths to workspace-relative dirs", () => {
+  const json = JSON.stringify([
+    { name: "@paperclipai/shared", path: "/repo/packages/shared" },
+    { name: "@paperclipai/server", path: "/repo/server" },
+  ]);
+  assert.deepEqual(parseResolvedPackageDirs(json, "/repo"), ["packages/shared", "server"]);
+});
+
+test("parseResolvedPackageDirs: rejects non-array pnpm ls output", () => {
+  assert.throws(() => parseResolvedPackageDirs('{"error": "x"}', "/repo"));
+});
+
+test("selectMemoryFloor: small server-free resolved set gets the lower floor", () => {
+  assert.equal(selectMemoryFloor(["packages/shared"]), 1200);
+  assert.equal(selectMemoryFloor(["cli", "packages/shared", "ui"]), 1200);
+});
+
+test("selectMemoryFloor: any resolved set containing server gets the full floor", () => {
+  assert.equal(selectMemoryFloor(["server"]), 3000);
+  assert.equal(selectMemoryFloor(["packages/shared", "server"]), 3000);
+});
+
+test("selectMemoryFloor: large or empty resolved sets get the full floor", () => {
+  assert.equal(selectMemoryFloor(["a", "b", "c", "d"]), 3000);
+  assert.equal(selectMemoryFloor([]), 3000);
 });
 
 test("parseWorkspaceGlobs: reads the packages: list from pnpm-workspace.yaml, ignoring comments", () => {

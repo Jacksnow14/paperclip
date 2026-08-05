@@ -1447,3 +1447,134 @@ describe("issue execution policy transitions", () => {
     });
   });
 });
+
+describe("AUR-4171: pending-stage status downgrade notice", () => {
+  const policy = twoStagePolicy();
+  const reviewStageId = policy.stages[0].id;
+  const approvalStageId = policy.stages[1].id;
+
+  function changesRequestedState(): IssueExecutionState {
+    return {
+      status: "changes_requested",
+      currentStageId: reviewStageId,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+      reviewRequest: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: "changes_requested",
+      monitor: null,
+    };
+  }
+
+  function resubmit(requestedStatus: string) {
+    return applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: changesRequestedState(),
+      },
+      policy,
+      requestedStatus,
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: "Fixed edge cases",
+    });
+  }
+
+  it("executor PATCH done downgraded to in_review emits a machine-readable notice", () => {
+    const result = resubmit("done");
+
+    // Behaviour is unchanged — only the diagnostic channel is new.
+    expect(result.patch.status).toBe("in_review");
+    expect(result.notice).toMatchObject({
+      code: "execution_stage_pending",
+      requestedStatus: "done",
+      appliedStatus: "in_review",
+      stageId: reviewStageId,
+      stageType: "review",
+      participant: { type: "agent", agentId: qaAgentId, userId: null },
+      requiredActions: ["approve", "request_changes"],
+    });
+    expect(result.notice?.message).toContain(reviewStageId);
+    expect(result.notice?.message).toContain(qaAgentId);
+  });
+
+  it("executor PATCH in_review is not a surprise → no notice", () => {
+    const result = resubmit("in_review");
+
+    expect(result.patch.status).toBe("in_review");
+    expect(result.notice ?? null).toBeNull();
+  });
+
+  it("reviewer approval that completes the policy emits no notice", () => {
+    const reviewOnly = reviewOnlyPolicy();
+    const stageId = reviewOnly.stages[0].id;
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: reviewOnly,
+        executionState: {
+          status: "pending",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: qaAgentId },
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      },
+      policy: reviewOnly,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "LGTM",
+    });
+
+    expect(result.patch.executionState).toMatchObject({ status: "completed" });
+    expect(result.notice ?? null).toBeNull();
+  });
+
+  it("reviewer approval that hands off to a further stage names that next stage", () => {
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: qaAgentId },
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "LGTM",
+    });
+
+    expect(result.patch.status).toBe("in_review");
+    expect(result.notice).toMatchObject({
+      code: "execution_stage_pending",
+      stageId: approvalStageId,
+      stageType: "approval",
+      participant: { type: "user", agentId: null, userId: ctoUserId },
+    });
+  });
+});

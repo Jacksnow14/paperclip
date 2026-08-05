@@ -588,4 +588,109 @@ describe("issue execution policy routes", () => {
       }),
     );
   });
+
+  describe("AUR-4171: pending review stage downgrades PATCH done", () => {
+    const issueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const executorAgentId = "33333333-3333-4333-8333-333333333333";
+    const reviewerAgentId = "44444444-4444-4444-8444-444444444444";
+    const stageId = "11111111-1111-4111-8111-111111111111";
+
+    function stuckIssue() {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [
+          { id: stageId, type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] },
+        ],
+      })!;
+      return {
+        id: issueId,
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: executorAgentId,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-4171",
+        title: "Stuck behind an undecided review stage",
+        executionPolicy: policy,
+        executionState: {
+          status: "changes_requested",
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+          returnAssignee: { type: "agent", agentId: executorAgentId, userId: null },
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: "changes_requested",
+          monitor: null,
+        },
+      };
+    }
+
+    async function patchStatus(status: string) {
+      const issue = stuckIssue();
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+      return request(await createApp({
+        type: "agent",
+        agentId: executorAgentId,
+        companyId: "company-1",
+        runId: "run-1",
+      }))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status });
+    }
+
+    it("responds with an explicit stage/participant notice instead of a silent in_review", async () => {
+      const res = await patchStatus("done");
+
+      expect(res.status).toBe(200);
+      // The downgrade itself is correct and unchanged...
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_review", assigneeAgentId: reviewerAgentId }),
+      );
+      // ...but it is no longer silent.
+      expect(res.body.executionStageNotice).toMatchObject({
+        code: "execution_stage_pending",
+        requestedStatus: "done",
+        appliedStatus: "in_review",
+        stageId,
+        stageType: "review",
+        participant: { type: "agent", agentId: reviewerAgentId, userId: null },
+        requiredActions: ["approve", "request_changes"],
+      });
+      expect(Array.isArray(res.body.warnings)).toBe(true);
+      expect(res.body.warnings.length).toBeGreaterThan(0);
+      expect(res.body.warnings[0]).toContain(stageId);
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.execution_stage_pending_downgrade",
+          entityId: issueId,
+          details: expect.objectContaining({ stageId, requestedStatus: "done" }),
+        }),
+      );
+    });
+
+    it("control: PATCH in_review lands as in_review and carries no notice", async () => {
+      const res = await patchStatus("in_review");
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ status: "in_review" }),
+      );
+      expect(res.body.executionStageNotice).toBeNull();
+      expect(res.body.warnings).toBeUndefined();
+      expect(mockLogActivity).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: "issue.execution_stage_pending_downgrade" }),
+      );
+    });
+  });
 });

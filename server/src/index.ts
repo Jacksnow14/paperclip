@@ -6,7 +6,7 @@ import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { pathToFileURL } from "node:url";
 import type { Request as ExpressRequest, RequestHandler } from "express";
-import { and, eq } from "drizzle-orm";
+import { and, eq, notInArray } from "drizzle-orm";
 import {
   createDb,
   ensurePostgresDatabase,
@@ -971,6 +971,108 @@ export async function startServer(): Promise<StartedServer> {
       run: runDailyHealthReport,
       onError: (err) => logger.error({ err }, "daily health scheduler: unhandled error"),
     }).start();
+
+    // AUR-4689: startup + periodic sweep flagging agents whose configured
+    // adapterConfig.model is no longer in the adapter's available-model list.
+    // Config-time PATCH validation cannot catch a model the provider retires
+    // *after* it was configured (Junior Coder burned 34 runs that way); this
+    // sweep is the half of the guard that catches post-hoc retirement.
+    {
+      const { sweepAgentConfiguredModels } = await import("./services/agent-model-validation.js");
+      const { agents: agentsTable, issues: issuesTable } = await import("@paperclipai/db");
+      const AGENT_MODEL_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+      const runAgentModelSweep = async () => {
+        const rows = await (db as any)
+          .select({
+            id: agentsTable.id,
+            name: agentsTable.name,
+            companyId: agentsTable.companyId,
+            status: agentsTable.status,
+            adapterType: agentsTable.adapterType,
+            adapterConfig: agentsTable.adapterConfig,
+          })
+          .from(agentsTable);
+        const result = await sweepAgentConfiguredModels(
+          rows.map((row: any) => ({
+            id: row.id,
+            name: row.name,
+            companyId: row.companyId,
+            status: row.status,
+            adapterType: row.adapterType,
+            model:
+              row.adapterConfig && typeof row.adapterConfig.model === "string"
+                ? row.adapterConfig.model
+                : null,
+          })),
+        );
+        if (result.unvalidatedAdapterTypes.length > 0) {
+          logger.warn(
+            { adapterTypes: result.unvalidatedAdapterTypes },
+            "agent-model-sweep: model list unavailable for some adapter types; their agents were skipped (fail-open)",
+          );
+        }
+        for (const flag of result.flagged) {
+          logger.warn(
+            {
+              agentId: flag.agentId,
+              agentName: flag.agentName,
+              adapterType: flag.adapterType,
+              model: flag.model,
+              validIds: flag.validIds,
+            },
+            `agent-model-sweep: agent "${flag.agentName}" configured model '${flag.model}' is not in the ${flag.adapterType} available-model list`,
+          );
+          // File a deduped alert issue so the flag is actionable before the
+          // agent burns runs — a log line alone would not have stopped the
+          // 34-run incident.
+          const title = `[MODEL CONFIG] ${flag.agentName}: '${flag.model}' not available on ${flag.adapterType}`;
+          try {
+            const existingAlert = await (db as any)
+              .select({ id: issuesTable.id })
+              .from(issuesTable)
+              .where(and(eq(issuesTable.title, title), notInArray(issuesTable.status, ["done", "cancelled"])))
+              .limit(1);
+            if (existingAlert.length === 0) {
+              await issuesSvc.create(flag.companyId, {
+                title,
+                description:
+                  `## Agent model-config alert (AUR-4689 sweep)\n\n`
+                  + `Agent **${flag.agentName}** (\`${flag.agentId}\`) has \`adapterConfig.model\` set to `
+                  + `\`${flag.model}\`, which is **not** in the current ${flag.adapterType} available-model list. `
+                  + `Every run it accepts will fail at the provider before any work happens.\n\n`
+                  + `**Valid model ids right now:** ${flag.validIds.join(", ")}\n\n`
+                  + `Fix: \`PATCH /api/agents/${flag.agentId}\` with a valid \`adapterConfig.model\`, `
+                  + `or pause the agent until its model is corrected.`,
+                status: "todo",
+                priority: "high",
+                assigneeAgentId: CEO_AGENT_ID,
+              });
+              logger.warn(
+                { agentId: flag.agentId, title },
+                "agent-model-sweep: filed model-config alert issue",
+              );
+            }
+          } catch (err) {
+            logger.error({ err, agentId: flag.agentId }, "agent-model-sweep: failed to file alert issue");
+          }
+        }
+        if (result.flagged.length === 0) {
+          logger.info(
+            { checkedCount: result.checkedCount },
+            "agent-model-sweep: all configured agent models present in adapter model lists",
+          );
+        }
+      };
+
+      createDailyHealthScheduler({
+        startupDelayMs: 2 * 60 * 1000,
+        intervalMs: AGENT_MODEL_SWEEP_INTERVAL_MS,
+        run: runAgentModelSweep,
+        onError: (err) => logger.error({ err }, "agent-model-sweep: unhandled error"),
+      }).start();
+      logger.info({ intervalMs: AGENT_MODEL_SWEEP_INTERVAL_MS }, "agent-model-sweep: scheduled");
+    }
 
     // AUR-1747: Gmail intake poller — automatically triage inbound emails on a
     // schedule so they become findable issues without manual API calls.

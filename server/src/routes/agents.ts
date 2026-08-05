@@ -83,6 +83,10 @@ import { redactEventPayload } from "../redaction.js";
 import { redactCurrentUserValue } from "../log-redaction.js";
 import { renderOrgChartSvg, renderOrgChartPng, type OrgNode, type OrgChartStyle, ORG_CHART_STYLES } from "./org-chart-svg.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import {
+  checkConfiguredModelAvailability,
+  formatInvalidModelMessage,
+} from "../services/agent-model-validation.js";
 import { runClaudeLogin } from "@paperclipai/adapter-claude-local/server";
 import {
   DEFAULT_ACPX_LOCAL_AGENT,
@@ -942,6 +946,7 @@ export function agentRoutes(
     adapterType: string | null | undefined;
     adapterConfig: Record<string, unknown>;
     constraintAdapterConfig?: Record<string, unknown>;
+    enforceModelAvailability?: boolean;
   }): Promise<Record<string, unknown>> {
     const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
       input.companyId,
@@ -953,6 +958,7 @@ export function agentRoutes(
       input.constraintAdapterConfig
         ? { ...input.constraintAdapterConfig, ...normalizedAdapterConfig }
         : normalizedAdapterConfig,
+      { enforceModelAvailability: input.enforceModelAvailability },
     );
     return normalizedAdapterConfig;
   }
@@ -983,6 +989,9 @@ export function agentRoutes(
           ...baseAdapterConfig,
           ...adapterDefaultConfig,
         },
+        // Only a profile that itself pins a model gets availability-enforced;
+        // profiles inheriting the base model are covered by the base check.
+        enforceModelAvailability: Object.prototype.hasOwnProperty.call(entry.adapterConfig, "model"),
       });
       normalizedModelProfiles[entry.profileKey] = {
         ...entry.profile,
@@ -1058,13 +1067,41 @@ export function agentRoutes(
   async function assertAdapterConfigConstraints(
     adapterType: string | null | undefined,
     adapterConfig: Record<string, unknown>,
+    opts?: { enforceModelAvailability?: boolean },
   ) {
-    if (adapterType !== "opencode_local") return;
-    try {
-      requireOpenCodeModelId(adapterConfig.model);
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
-      throw unprocessable(`Invalid opencode_local adapterConfig: ${reason}`);
+    if (adapterType === "opencode_local") {
+      try {
+        requireOpenCodeModelId(adapterConfig.model);
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        throw unprocessable(`Invalid opencode_local adapterConfig: ${reason}`);
+      }
+      // OpenCode models are arbitrary provider/model pairs; its static list is
+      // a UI hint, not availability ground truth. Availability is already
+      // enforced against the live CLI list at execute time by
+      // ensureOpenCodeModelConfiguredAndAvailable, so the generic check below
+      // would only add false rejections here.
+      return;
+    }
+    // AUR-4689: reject a model id the adapter cannot run, at config time.
+    // Enforced only when the write explicitly sets the model (or changes the
+    // adapter type) — merged-in pre-existing models are the periodic sweep's
+    // job, so an unrelated config PATCH is never blocked by earlier drift.
+    if (!opts?.enforceModelAvailability) return;
+    const configuredModel = asNonEmptyString(adapterConfig.model);
+    if (!configuredModel || !adapterType) return;
+    const check = await checkConfiguredModelAvailability(adapterType, configuredModel);
+    if (check.outcome === "invalid") {
+      throw unprocessable(formatInvalidModelMessage(adapterType, configuredModel, check.validIds));
+    }
+    if (check.outcome === "unvalidated" && check.reason === "model-list-unavailable") {
+      // Fail open, loudly: a validator that hard-fails on its own outage is
+      // worse than no validator. The write proceeds unvalidated.
+      console.warn(
+        `agent-model-validation: could not fetch model list for adapter '${adapterType}'; `
+        + `allowing model '${configuredModel}' unvalidated`,
+        check.error,
+      );
     }
   }
 
@@ -2265,6 +2302,7 @@ export function agentRoutes(
       companyId,
       adapterType: createInput.adapterType,
       adapterConfig: desiredSkillAssignment.adapterConfig,
+      enforceModelAvailability: true,
     });
     const normalizedRuntimeConfig = await normalizeRuntimeConfigAdapterConfigsForPersistence(
       companyId,
@@ -2741,6 +2779,12 @@ export function agentRoutes(
         companyId: existing.companyId,
         adapterType: requestedAdapterType,
         adapterConfig: effectiveAdapterConfig,
+        // Enforce when this PATCH explicitly sets a model, or moves the agent
+        // to another adapter (a carried-over model must be valid there too).
+        enforceModelAvailability:
+          (requestedAdapterConfig !== null
+            && Object.prototype.hasOwnProperty.call(requestedAdapterConfig, "model"))
+          || changingAdapterType,
       });
       patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
     }

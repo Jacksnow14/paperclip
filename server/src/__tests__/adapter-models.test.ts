@@ -1,3 +1,6 @@
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { models as codexFallbackModels } from "@paperclipai/adapter-codex-local";
 import { models as cursorFallbackModels } from "@paperclipai/adapter-cursor-local";
@@ -18,6 +21,9 @@ describe("adapter model listing", () => {
   beforeEach(() => {
     delete process.env.OPENAI_API_KEY;
     delete process.env.PAPERCLIP_OPENCODE_COMMAND;
+    // AUR-4689: pin CODEX_HOME to an empty directory so a real
+    // ~/.codex/models_cache.json on the host cannot leak into fallback tests.
+    process.env.CODEX_HOME = mkdtempSync(join(tmpdir(), "adapter-models-empty-codex-home-"));
     resetCodexModelsCacheForTests();
     resetCursorModelsCacheForTests();
     setCursorModelsRunnerForTests(null);
@@ -102,6 +108,28 @@ describe("adapter model listing", () => {
     expect(models).toEqual(codexFallbackModels);
   });
 
+  it("prefers the Codex CLI models cache over the static fallback when no API key is available (AUR-4689)", async () => {
+    const codexHome = mkdtempSync(join(tmpdir(), "adapter-models-codex-home-"));
+    writeFileSync(
+      join(codexHome, "models_cache.json"),
+      JSON.stringify({
+        models: [
+          { slug: "gpt-5.5", display_name: "GPT-5.5", visibility: "list" },
+          { slug: "gpt-5.4", display_name: "GPT-5.4", visibility: "list" },
+          { slug: "gpt-5.4-mini", display_name: "GPT-5.4 mini", visibility: "list" },
+          // Hidden internal models are not offered for selection by the CLI.
+          { slug: "codex-auto-review", display_name: "Auto Review", visibility: "hide" },
+        ],
+      }),
+    );
+    process.env.CODEX_HOME = codexHome;
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const models = await listAdapterModels("codex_local");
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(models.map((model) => model.id)).toEqual(["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]);
+  });
 
   it("returns cursor fallback models when CLI discovery is unavailable", async () => {
     setCursorModelsRunnerForTests(() => ({

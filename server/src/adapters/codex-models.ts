@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { AdapterModel } from "./types.js";
 import { models as codexFallbackModels } from "@paperclipai/adapter-codex-local";
 import { readConfigFile } from "../config-file.js";
@@ -29,6 +32,46 @@ function mergedWithFallback(models: AdapterModel[]): AdapterModel[] {
     ...models,
     ...codexFallbackModels,
   ]).sort((a, b) => a.id.localeCompare(b.id, "en", { numeric: true, sensitivity: "base" }));
+}
+
+// AUR-4689: on ChatGPT-account auth there is no OpenAI API key, so the OpenAI
+// /v1/models endpoint is unusable and the static fallback can drift from what
+// the account can actually run (gpt-5.3-codex was retired provider-side while
+// still listed here). The Codex CLI maintains its own account-scoped
+// availability cache; when present it is the best ground truth available.
+function readCodexCliModelsCache(): AdapterModel[] {
+  try {
+    const codexHome = process.env.CODEX_HOME?.trim() || join(homedir(), ".codex");
+    const raw = readFileSync(join(codexHome, "models_cache.json"), "utf8");
+    const parsed = JSON.parse(raw) as { models?: unknown };
+    const entries = Array.isArray(parsed.models) ? parsed.models : [];
+    const models: AdapterModel[] = [];
+    for (const entry of entries) {
+      if (typeof entry !== "object" || entry === null) continue;
+      const { slug, display_name: displayName, visibility } = entry as {
+        slug?: unknown;
+        display_name?: unknown;
+        visibility?: unknown;
+      };
+      if (typeof slug !== "string" || slug.trim().length === 0) continue;
+      // "hide" marks internal models the CLI does not offer for selection.
+      if (visibility === "hide") continue;
+      models.push({
+        id: slug.trim(),
+        label:
+          typeof displayName === "string" && displayName.trim().length > 0 ? displayName.trim() : slug.trim(),
+      });
+    }
+    return dedupeModels(models);
+  } catch {
+    return [];
+  }
+}
+
+function cliCacheOrStaticFallback(): AdapterModel[] {
+  const cliCacheModels = readCodexCliModelsCache();
+  if (cliCacheModels.length > 0) return cliCacheModels;
+  return dedupeModels(codexFallbackModels);
 }
 
 function resolveOpenAiApiKey(): string | null {
@@ -73,8 +116,7 @@ async function fetchOpenAiModels(apiKey: string): Promise<AdapterModel[]> {
 async function loadCodexModels(options?: { forceRefresh?: boolean }): Promise<AdapterModel[]> {
   const forceRefresh = options?.forceRefresh === true;
   const apiKey = resolveOpenAiApiKey();
-  const fallback = dedupeModels(codexFallbackModels);
-  if (!apiKey) return fallback;
+  if (!apiKey) return cliCacheOrStaticFallback();
 
   const now = Date.now();
   const keyFingerprint = fingerprint(apiKey);
@@ -97,7 +139,7 @@ async function loadCodexModels(options?: { forceRefresh?: boolean }): Promise<Ad
     return cached.models;
   }
 
-  return fallback;
+  return cliCacheOrStaticFallback();
 }
 
 export async function listCodexModels(): Promise<AdapterModel[]> {

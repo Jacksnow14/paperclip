@@ -1,4 +1,6 @@
 import { google } from "googleapis";
+import type { Db } from "@paperclipai/db";
+import { gmailOutboundRecords } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { HttpError, badRequest, notFound, tooManyRequests, badGateway, gatewayTimeout } from "../errors.js";
 import { classifyGmailOutbound, GmailOutboundBlockedError } from "./gmail-outbound-guard.js";
@@ -162,6 +164,18 @@ export interface GmailApprovalScope {
 export interface GmailSendGuardContext {
   approvalVerified?: boolean;
   approvalScope?: GmailApprovalScope;
+}
+
+/**
+ * AUR-1796: identifies the company whose outbound mail activity should be
+ * recorded. Threaded through the sendMessage() chokepoint (the same place the
+ * outbound guard classifies every send) so any code path that dispatches mail
+ * leaves a gmail_outbound_records row for the conversations dashboard's
+ * reply-state computation. Callers without a company context (or a db) simply
+ * skip tracking — the send itself is unaffected.
+ */
+export interface GmailOutboundTrackingContext {
+  companyId: string;
 }
 
 function normalizeEmailForScopeCompare(value: string | undefined): string {
@@ -441,7 +455,7 @@ export function isSupportedGmailAlias(alias: string): alias is GmailAlias {
   return (GMAIL_SUPPORTED_ALIASES as readonly string[]).includes(alias);
 }
 
-export function createGmailService() {
+export function createGmailService(db?: Db) {
   async function listMessages(alias: GmailAlias, opts?: GmailListOptions) {
     const gmail = buildGmailClient(alias);
     const res = await withRetry("messages.list", () =>
@@ -485,6 +499,7 @@ export function createGmailService() {
     alias: GmailAlias,
     opts: GmailSendOptions,
     guard?: GmailSendGuardContext,
+    tracking?: GmailOutboundTrackingContext,
   ) {
     for (const attachment of opts.attachments ?? []) {
       if (attachment.contentBase64.length > MAX_ATTACHMENT_BASE64_BYTES) {
@@ -578,6 +593,32 @@ export function createGmailService() {
       { alias, to: opts.to, cc: opts.cc, subject: opts.subject, messageId: res.data.id },
       "gmail: message sent",
     );
+    // AUR-1796: record the outbound AFTER the guard classification and the
+    // actual dispatch, so only sends that really went out are tracked.
+    // Tracking is observability — a failed write must never fail a send that
+    // already left the building, so this is strictly best-effort.
+    if (db && tracking && res.data.id) {
+      try {
+        await db
+          .insert(gmailOutboundRecords)
+          .values({
+            companyId: tracking.companyId,
+            mailbox: alias,
+            gmailThreadId: res.data.threadId ?? "",
+            gmailMessageId: res.data.id,
+            recipient: opts.to,
+            subject: opts.subject,
+            snippet: opts.body.slice(0, 200),
+            sentAt: new Date(),
+          })
+          .onConflictDoNothing();
+      } catch (err) {
+        logger.warn(
+          { err, alias, to: opts.to, messageId: res.data.id },
+          "gmail: failed to record outbound message for reply tracking (AUR-1796)",
+        );
+      }
+    }
     return res.data;
   }
 
@@ -585,6 +626,7 @@ export function createGmailService() {
     alias: GmailAlias,
     opts: GmailReplyOptions,
     guard?: GmailSendGuardContext,
+    tracking?: GmailOutboundTrackingContext,
   ) {
     if (!opts.replyToMessageId && !opts.threadId) {
       throw new Error("replyInThread requires replyToMessageId or threadId");
@@ -661,6 +703,7 @@ export function createGmailService() {
         allowSelfAddressed: opts.allowSelfAddressed,
       },
       guard,
+      tracking,
     );
     // AUR-4479: surface the resolved recipient so callers can ASSERT on who was
     // actually addressed. A returned message id proves dispatch, not delivery

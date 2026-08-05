@@ -997,6 +997,196 @@ describe.sequential("issue thread interaction routes", () => {
     );
   });
 
+  // AUR-4245: an agent-addressed ask_user_questions used to be unanswerable and
+  // uncancellable by the addressed agent, so it stranded `pending` forever.
+  it("allows the addressed assignee agent to answer another agent's ask_user_questions and wakes the asker", async () => {
+    mockInteractionService.getByIdForIssue.mockResolvedValueOnce({
+      id: "interaction-2",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      createdByAgentId: CREATED_AGENT_ID,
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:00:00.000Z",
+    });
+    mockInteractionService.answerQuestions.mockResolvedValueOnce({
+      id: "interaction-2",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "ask_user_questions",
+      status: "answered",
+      continuationPolicy: "wake_assignee",
+      idempotencyKey: null,
+      sourceCommentId: "comment-2",
+      sourceRunId: "run-2",
+      createdByAgentId: CREATED_AGENT_ID,
+      payload: { version: 1, questions: [] },
+      result: { version: 1, answers: [], summaryMarkdown: null },
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:05:00.000Z",
+      resolvedAt: "2026-04-20T12:05:00.000Z",
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: ASSIGNEE_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-assignee-1",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/respond")
+      .send({ answers: [{ questionId: "scope", optionIds: ["phase-1"] }] });
+
+    expect(res.status).toBe(200);
+    expect(mockInteractionService.answerQuestions).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      "interaction-2",
+      expect.anything(),
+      expect.objectContaining({ agentId: ASSIGNEE_AGENT_ID }),
+    );
+    // The answering assignee is woken (existing behavior) AND the asker is resumed.
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({ reason: "issue_commented" }),
+    );
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      CREATED_AGENT_ID,
+      expect.objectContaining({
+        contextSnapshot: expect.objectContaining({ isInteractionCreatorWake: true }),
+      }),
+    );
+  });
+
+  it("returns 403 when a non-assignee agent attempts to answer", async () => {
+    const NON_ASSIGNEE_AGENT_ID = "33333333-3333-4333-8333-333333333333";
+    mockInteractionService.getByIdForIssue.mockResolvedValueOnce({
+      id: "interaction-2",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      createdByAgentId: CREATED_AGENT_ID,
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:00:00.000Z",
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: NON_ASSIGNEE_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/respond")
+      .send({ answers: [] });
+
+    expect(res.status).toBe(403);
+    expect(mockInteractionService.answerQuestions).not.toHaveBeenCalled();
+  });
+
+  it("returns 403 when the creator agent tries to answer its own question", async () => {
+    mockInteractionService.getByIdForIssue.mockResolvedValueOnce({
+      id: "interaction-2",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      createdByAgentId: ASSIGNEE_AGENT_ID,
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:00:00.000Z",
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: ASSIGNEE_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/respond")
+      .send({ answers: [] });
+
+    expect(res.status).toBe(403);
+    expect(mockInteractionService.answerQuestions).not.toHaveBeenCalled();
+  });
+
+  it("allows the addressed assignee agent to cancel another agent's stranded interaction", async () => {
+    mockInteractionService.getByIdForIssue.mockResolvedValueOnce({
+      id: "interaction-rc",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      createdByAgentId: CREATED_AGENT_ID,
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:00:00.000Z",
+    });
+    mockInteractionService.cancelInteraction.mockResolvedValueOnce({
+      id: "interaction-rc",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "ask_user_questions",
+      status: "cancelled",
+      continuationPolicy: "wake_assignee",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: null,
+      createdByAgentId: CREATED_AGENT_ID,
+      payload: { version: 1, questions: [] },
+      result: { version: 1, cancellationReason: "Answered in thread" },
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:05:00.000Z",
+      resolvedAt: "2026-04-20T12:05:00.000Z",
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: ASSIGNEE_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-assignee-2",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-rc/cancel")
+      .send({ reason: "Answered in thread" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("cancelled");
+    expect(mockInteractionService.cancelInteraction).toHaveBeenCalled();
+  });
+
+  it("returns 403 when an assignee agent tries to cancel a board-authored interaction", async () => {
+    mockInteractionService.getByIdForIssue.mockResolvedValueOnce({
+      id: "interaction-board",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      createdByAgentId: null,
+      createdByUserId: "local-board",
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:00:00.000Z",
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: ASSIGNEE_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-board/cancel")
+      .send({});
+
+    expect(res.status).toBe(403);
+    expect(mockInteractionService.cancelInteraction).not.toHaveBeenCalled();
+  });
+
   it("returns 403 when a non-creator agent tries to cancel someone else's interaction", async () => {
     const NON_CREATOR_AGENT_ID = "33333333-3333-4333-8333-333333333333";
     mockInteractionService.getByIdForIssue.mockResolvedValueOnce({

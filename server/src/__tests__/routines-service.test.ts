@@ -11,6 +11,7 @@ import {
   executionWorkspaces,
   heartbeatRuns,
   instanceSettings,
+  issueComments,
   issueInboxArchives,
   issueReadStates,
   issues,
@@ -55,6 +56,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       process.env.PAPERCLIP_SECRETS_PROVIDER = originalSecretsProviderEnv;
     }
     await db.delete(activityLog);
+    await db.delete(issueComments);
     await db.delete(issueInboxArchives);
     await db.delete(issueReadStates);
     await db.delete(routineRuns);
@@ -672,6 +674,144 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
     expect(routineIssues).toHaveLength(1);
     expect(routineIssues[0]?.id).toBe(previousIssue.id);
+  });
+
+  async function seedWedgedRoutineIssue(fixture: {
+    agentId: string;
+    companyId: string;
+    issueSvc: ReturnType<typeof issueService>;
+    routine: { id: string; projectId: string | null; title: string; description: string | null; priority: string; assigneeAgentId: string | null };
+  }) {
+    const previousRunId = randomUUID();
+    const liveHeartbeatRunId = randomUUID();
+    const previousIssue = await fixture.issueSvc.create(fixture.companyId, {
+      projectId: fixture.routine.projectId,
+      title: fixture.routine.title,
+      description: fixture.routine.description,
+      status: "in_progress",
+      priority: fixture.routine.priority,
+      assigneeAgentId: fixture.routine.assigneeAgentId,
+      originKind: "routine_execution",
+      originId: fixture.routine.id,
+      originRunId: previousRunId,
+    });
+
+    await db.insert(routineRuns).values({
+      id: previousRunId,
+      companyId: fixture.companyId,
+      routineId: fixture.routine.id,
+      triggerId: null,
+      source: "manual",
+      status: "issue_created",
+      triggeredAt: new Date("2026-03-20T12:00:00.000Z"),
+      linkedIssueId: previousIssue.id,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: liveHeartbeatRunId,
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: { issueId: previousIssue.id },
+      startedAt: new Date("2026-03-20T12:01:00.000Z"),
+    });
+
+    await db
+      .update(issues)
+      .set({
+        checkoutRunId: liveHeartbeatRunId,
+        executionRunId: liveHeartbeatRunId,
+        executionLockedAt: new Date("2026-03-20T12:01:00.000Z"),
+      })
+      .where(eq(issues.id, previousIssue.id));
+
+    return { previousIssue, previousRunId, liveHeartbeatRunId };
+  }
+
+  async function readCoalesceState(routineId: string, issueId: string) {
+    const [routineRow] = await db
+      .select({ consecutiveCoalesceCount: routines.consecutiveCoalesceCount })
+      .from(routines)
+      .where(eq(routines.id, routineId));
+    const comments = await db
+      .select({ id: issueComments.id, body: issueComments.body, authorType: issueComments.authorType })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    return { count: routineRow?.consecutiveCoalesceCount, comments };
+  }
+
+  it("raises a coalesce anomaly on the second consecutive fold and stays silent on the first", async () => {
+    const fixture = await seedFixture();
+    const { previousIssue } = await seedWedgedRoutineIssue(fixture);
+    const { routine, svc } = fixture;
+
+    const first = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(first.status).toBe("coalesced");
+    let state = await readCoalesceState(routine.id, previousIssue.id);
+    expect(state.count).toBe(1);
+    expect(state.comments).toHaveLength(0);
+
+    const second = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(second.status).toBe("coalesced");
+    state = await readCoalesceState(routine.id, previousIssue.id);
+    expect(state.count).toBe(2);
+    expect(state.comments).toHaveLength(1);
+    expect(state.comments[0]?.authorType).toBe("system");
+    expect(state.comments[0]?.body).toContain("2 consecutive fires coalesced");
+    expect(state.comments[0]?.body).toContain(routine.title);
+    expect(state.comments[0]?.body).toContain("none on record");
+
+    const anomalyLogs = await db
+      .select({ action: activityLog.action, entityId: activityLog.entityId })
+      .from(activityLog)
+      .where(eq(activityLog.action, "routine.coalesce_anomaly"));
+    expect(anomalyLogs).toHaveLength(1);
+    expect(anomalyLogs[0]?.entityId).toBe(previousIssue.id);
+
+    // Third fold is not a doubling point: counter advances, no new comment.
+    const third = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(third.status).toBe("coalesced");
+    state = await readCoalesceState(routine.id, previousIssue.id);
+    expect(state.count).toBe(3);
+    expect(state.comments).toHaveLength(1);
+
+    // Fourth fold doubles: a fresh comment lands.
+    const fourth = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(fourth.status).toBe("coalesced");
+    state = await readCoalesceState(routine.id, previousIssue.id);
+    expect(state.count).toBe(4);
+    expect(state.comments).toHaveLength(2);
+  });
+
+  it("resets the consecutive coalesce counter when a fire dispatches fresh work", async () => {
+    const fixture = await seedFixture();
+    const { previousIssue } = await seedWedgedRoutineIssue(fixture);
+    const { routine, svc } = fixture;
+
+    const folded = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(folded.status).toBe("coalesced");
+    let state = await readCoalesceState(routine.id, previousIssue.id);
+    expect(state.count).toBe(1);
+    expect(state.comments).toHaveLength(0);
+
+    const completedAt = new Date("2026-03-21T09:00:00.000Z");
+    await db
+      .update(issues)
+      .set({ status: "done", completedAt, updatedAt: completedAt })
+      .where(eq(issues.id, previousIssue.id));
+
+    const dispatched = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(dispatched.status).toBe("issue_created");
+    expect(dispatched.linkedIssueId).not.toBe(previousIssue.id);
+    state = await readCoalesceState(routine.id, previousIssue.id);
+    expect(state.count).toBe(0);
+    expect(state.comments).toHaveLength(0);
+
+    const detail = await svc.getDetail(routine.id);
+    expect(detail?.consecutiveCoalesceCount).toBe(0);
+    expect(detail?.lastSuccessfulCompletionAt?.toISOString()).toBe(completedAt.toISOString());
   });
 
   it("touches a coalesced routine issue for the manual runner's inbox", async () => {

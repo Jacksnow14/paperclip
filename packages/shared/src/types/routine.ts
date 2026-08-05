@@ -69,6 +69,7 @@ export interface Routine {
   updatedByUserId: string | null;
   lastTriggeredAt: Date | null;
   lastEnqueuedAt: Date | null;
+  consecutiveCoalesceCount: number;
   createdAt: Date;
   updatedAt: Date;
   managedByPlugin?: RoutineManagedByPlugin | null;
@@ -195,6 +196,8 @@ export interface RoutineDetail extends Routine {
   triggers: RoutineTrigger[];
   recentRuns: RoutineRunSummary[];
   activeIssue: RoutineIssueSummary | null;
+  /** Completion time of the newest routine-execution issue that reached `done`. */
+  lastSuccessfulCompletionAt: Date | null;
 }
 
 export interface RoutineRunSummary extends RoutineRun {

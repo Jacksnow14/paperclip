@@ -675,6 +675,13 @@
       "breakpoints": true
     },
     {
+      "idx": 97,
+      "version": "7",
+      "when": 1785413713416,
+      "tag": "0097_routine_coalesce_visibility",
+      "breakpoints": true
+    },
+    {
       "idx": 99,
       "version": "7",
       "when": 1785931111131,

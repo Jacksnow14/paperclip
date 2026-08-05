@@ -9,6 +9,7 @@ import {
   executionWorkspaces,
   goals,
   heartbeatRuns,
+  issueComments,
   issueInboxArchives,
   issueReadStates,
   issues,
@@ -845,15 +846,22 @@ export function routineService(
     status: string;
     issueId?: string | null;
     nextRunAt?: Date | null;
-  }, executor: Db = db) {
-    await executor
+  }, executor: Db = db): Promise<{ consecutiveCoalesceCount: number }> {
+    const coalesced = input.status === "skipped" || input.status === "coalesced";
+    const [touched] = await executor
       .update(routines)
       .set({
         lastTriggeredAt: input.triggeredAt,
         lastEnqueuedAt: input.issueId ? input.triggeredAt : undefined,
+        consecutiveCoalesceCount: coalesced
+          ? sql`${routines.consecutiveCoalesceCount} + 1`
+          : input.status === "issue_created"
+            ? 0
+            : undefined,
         updatedAt: new Date(),
       })
-      .where(eq(routines.id, input.routineId));
+      .where(eq(routines.id, input.routineId))
+      .returning({ consecutiveCoalesceCount: routines.consecutiveCoalesceCount });
 
     if (input.triggerId) {
       await executor
@@ -866,6 +874,74 @@ export function routineService(
         })
         .where(eq(routineTriggers.id, input.triggerId));
     }
+    return { consecutiveCoalesceCount: touched?.consecutiveCoalesceCount ?? 0 };
+  }
+
+  async function findLastSuccessfulCompletionAt(
+    routine: Pick<RoutineRow, "id" | "companyId">,
+    executor: Db = db,
+  ): Promise<Date | null> {
+    const completedAtOrUpdatedAt = sql<Date>`coalesce(${issues.completedAt}, ${issues.updatedAt})`.mapWith(issues.completedAt);
+    const [row] = await executor
+      .select({ completedAt: completedAtOrUpdatedAt })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, routine.companyId),
+          eq(issues.originId, routine.id),
+          eq(issues.status, "done"),
+        ),
+      )
+      .orderBy(desc(completedAtOrUpdatedAt))
+      .limit(1);
+    return row?.completedAt ?? null;
+  }
+
+  // Coalescing is correct (never double-dispatch), but a wedged execution issue
+  // makes every subsequent fire fold silently — the sensor goes dark with every
+  // dashboard green (AUR-4373: deliverability routine dark for 3 days). Raise at
+  // the second consecutive fold, then at each doubling so high-frequency
+  // routines stay visible without spamming the thread.
+  function isCoalesceAnomalyRaisePoint(count: number) {
+    return count >= 2 && (count & (count - 1)) === 0;
+  }
+
+  async function maybeRaiseCoalesceAnomaly(input: {
+    routine: RoutineRow;
+    targetIssue: { id: string; identifier: string | null };
+    consecutiveCoalesceCount: number;
+    triggeredAt: Date;
+  }, executor: Db) {
+    const count = input.consecutiveCoalesceCount;
+    if (!isCoalesceAnomalyRaisePoint(count)) return;
+    const lastCompletion = await findLastSuccessfulCompletionAt(input.routine, executor);
+    const body = [
+      `⚠️ **Routine wedge suspected: ${count} consecutive fires coalesced into this issue.**`,
+      "",
+      `Routine "${input.routine.title}" (\`${input.routine.id}\`) fired at ${input.triggeredAt.toISOString()} and folded into this issue instead of dispatching new work — consecutive fold #${count}. This issue has held the routine's execution slot the whole time. Last successful completion of a run of this routine: ${lastCompletion ? lastCompletion.toISOString() : "none on record"}.`,
+      "",
+      "If this issue is wedged rather than legitimately busy, the routine's output has silently stopped: close or unblock this issue so the next fire can dispatch. (Coalesce-anomaly guard, raised at 2 consecutive folds and each doubling.)",
+    ].join("\n");
+    await executor.insert(issueComments).values({
+      companyId: input.routine.companyId,
+      issueId: input.targetIssue.id,
+      authorType: "system",
+      body,
+    });
+    await logActivity(executor, {
+      companyId: input.routine.companyId,
+      actorType: "system",
+      actorId: "routine-scheduler",
+      action: "routine.coalesce_anomaly",
+      entityType: "issue",
+      entityId: input.targetIssue.id,
+      details: {
+        routineId: input.routine.id,
+        routineTitle: input.routine.title,
+        consecutiveCoalesceCount: count,
+        lastSuccessfulCompletionAt: lastCompletion ? lastCompletion.toISOString() : null,
+      },
+    });
   }
 
   function routineExecutionFingerprintCondition(dispatchFingerprint?: string | null) {
@@ -1280,13 +1356,19 @@ export function routineService(
             coalescedIntoRunId: activeIssue.originRunId,
             completedAt: triggeredAt,
           }, txDb);
-          await updateRoutineTouchedState({
+          const touched = await updateRoutineTouchedState({
             routineId: input.routine.id,
             triggerId: input.trigger?.id ?? null,
             triggeredAt,
             status,
             issueId: activeIssue.id,
             nextRunAt,
+          }, txDb);
+          await maybeRaiseCoalesceAnomaly({
+            routine: input.routine,
+            targetIssue: activeIssue,
+            consecutiveCoalesceCount: touched.consecutiveCoalesceCount,
+            triggeredAt,
           }, txDb);
           return updated ?? createdRun;
         }
@@ -1345,13 +1427,19 @@ export function routineService(
             coalescedIntoRunId: existingIssue.originRunId,
             completedAt: triggeredAt,
           }, txDb);
-          await updateRoutineTouchedState({
+          const touched = await updateRoutineTouchedState({
             routineId: input.routine.id,
             triggerId: input.trigger?.id ?? null,
             triggeredAt,
             status,
             issueId: existingIssue.id,
             nextRunAt,
+          }, txDb);
+          await maybeRaiseCoalesceAnomaly({
+            routine: input.routine,
+            targetIssue: existingIssue,
+            consecutiveCoalesceCount: touched.consecutiveCoalesceCount,
+            triggeredAt,
           }, txDb);
           return updated ?? createdRun;
         }
@@ -1478,7 +1566,7 @@ export function routineService(
     getDetail: async (id: string): Promise<RoutineDetail | null> => {
       const row = await getRoutineById(id);
       if (!row) return null;
-      const [project, assignee, parentIssue, triggers, recentRuns, activeIssue, managedByRoutine] = await Promise.all([
+      const [project, assignee, parentIssue, triggers, recentRuns, activeIssue, managedByRoutine, lastSuccessfulCompletionAt] = await Promise.all([
         row.projectId
           ? db.select().from(projects).where(eq(projects.id, row.projectId)).then((rows) => rows[0] ?? null)
           : null,
@@ -1558,6 +1646,7 @@ export function routineService(
           ),
         findLiveExecutionIssue(row),
         listManagedRoutineMetadata([row.id]),
+        findLastSuccessfulCompletionAt(row),
       ]);
 
       return {
@@ -1569,6 +1658,7 @@ export function routineService(
         triggers: triggers as RoutineTrigger[],
         recentRuns,
         activeIssue,
+        lastSuccessfulCompletionAt,
       };
     },
 

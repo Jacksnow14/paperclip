@@ -44,6 +44,9 @@ export const routines = pgTable(
     updatedByUserId: text("updated_by_user_id"),
     lastTriggeredAt: timestamp("last_triggered_at", { withTimezone: true }),
     lastEnqueuedAt: timestamp("last_enqueued_at", { withTimezone: true }),
+    // Consecutive fires that coalesced/skipped into an already-live execution
+    // issue without dispatching new work. Reset when a fire creates an issue.
+    consecutiveCoalesceCount: integer("consecutive_coalesce_count").notNull().default(0),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

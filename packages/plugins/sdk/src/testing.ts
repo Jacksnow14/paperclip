@@ -1083,6 +1083,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
             updatedByUserId: null,
             lastTriggeredAt: null,
             lastEnqueuedAt: null,
+            consecutiveCoalesceCount: 0,
             createdAt: now,
             updatedAt: now,
             managedByPlugin: {

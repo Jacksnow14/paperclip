@@ -124,7 +124,7 @@ describeEmbeddedPostgres("environment runtime driver contract", () => {
         targetType: "environment",
         targetId: environmentId,
         configPath: "privateKeySecretRef",
-      });
+      }, { type: "board" });
       config = {
         ...config,
         privateKey: null,

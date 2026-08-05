@@ -36,7 +36,7 @@ import {
   secretProviderConfigPayloadSchema,
   updateSecretProviderConfigSchema,
 } from "@paperclipai/shared";
-import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import {
   checkSecretProviders,
@@ -234,6 +234,13 @@ function canonicalizeBinding(binding: EnvBinding): CanonicalEnvBinding {
   };
 }
 
+/**
+ * Actor context for secret-binding writes. Matches the shape of `req.actor`.
+ * Only `type: "board"` may add or change secret bindings; every other value —
+ * including a missing actor — fails closed (AUR-4093).
+ */
+export type SecretBindingWriteActor = { type?: string | null } | null | undefined;
+
 function defaultProviderConfigStatus(provider: SecretProvider): SecretProviderConfigStatus {
   return COMING_SOON_SECRET_PROVIDERS.has(provider) ? "coming_soon" : "ready";
 }
@@ -371,6 +378,74 @@ export function secretService(db: Db) {
     if (secret.status === "deleted") throw notFound("Secret not found");
     if (secret.companyId !== companyId) throw unprocessable("Secret must belong to same company");
     return secret;
+  }
+
+  /**
+   * Board gate for secret-binding writes (AUR-4093 / AUR-4090).
+   *
+   * Delta-based: compares the desired bindings against the rows that already
+   * exist for the target and refuses only *additions* (a new configPath, or a
+   * changed secretId/versionSelector at an existing configPath) for non-board
+   * actors. Removals and unchanged bindings pass, so agents keep the
+   * de-escalation path used in AUR-4066. A missing actor fails closed.
+   */
+  async function assertBindingAdditionsAllowed(input: {
+    actor: SecretBindingWriteActor;
+    companyId: string;
+    targetType: SecretBindingTargetType;
+    targetId: string | null;
+    desired: Array<{ secretId: string; configPath: string; versionSelector: SecretVersionSelector }>;
+  }) {
+    if (input.desired.length === 0) return;
+    if (input.actor?.type === "board") return;
+    const existing = input.targetId
+      ? await db
+          .select()
+          .from(companySecretBindings)
+          .where(
+            and(
+              eq(companySecretBindings.companyId, input.companyId),
+              eq(companySecretBindings.targetType, input.targetType),
+              eq(companySecretBindings.targetId, input.targetId),
+            ),
+          )
+      : [];
+    const existingByPath = new Map(existing.map((row) => [row.configPath, row]));
+    const added = input.desired.filter((ref) => {
+      const current = existingByPath.get(ref.configPath);
+      return (
+        !current
+        || current.secretId !== ref.secretId
+        || String(current.versionSelector) !== String(ref.versionSelector)
+      );
+    });
+    if (added.length === 0) return;
+    throw forbidden(
+      "Secret bindings can only be granted by board-authenticated callers. "
+      + `Blocked binding addition(s) at: ${added.map((ref) => ref.configPath).sort().join(", ")}. `
+      + "Removing existing bindings does not require board authentication.",
+    );
+  }
+
+  function collectSecretRefsFromEnvValue(
+    envValue: unknown,
+    pathPrefix: string,
+  ): Array<{ secretId: string; configPath: string; versionSelector: SecretVersionSelector }> {
+    const record = asRecord(envValue);
+    if (!record) return [];
+    const refs: Array<{ secretId: string; configPath: string; versionSelector: SecretVersionSelector }> = [];
+    for (const [key, rawBinding] of Object.entries(record)) {
+      const parsed = envBindingSchema.safeParse(rawBinding);
+      if (!parsed.success) continue;
+      const binding = canonicalizeBinding(parsed.data as EnvBinding);
+      if (binding.type !== "secret_ref") continue;
+      refs.push({
+        secretId: binding.secretId,
+        configPath: `${pathPrefix}.${key}`,
+        versionSelector: binding.version,
+      });
+    }
+    return refs;
   }
 
   async function getProviderConfigById(id: string) {
@@ -1867,6 +1942,48 @@ export function secretService(db: Db) {
         .then((rows) => rows[0] ?? null);
     },
 
+    /**
+     * Pre-persistence board gate for routes that store env maps containing
+     * secret_ref entries (agent adapterConfig.env, project env). Call this
+     * BEFORE persisting the entity so a refused grant never leaves a
+     * secret_ref in stored config. The sync functions below re-enforce the
+     * same gate at the binding write itself.
+     */
+    assertEnvBindingMutationAllowed: async (
+      actor: SecretBindingWriteActor,
+      companyId: string,
+      target: { targetType: SecretBindingTargetType; targetId: string | null; pathPrefix?: string },
+      envValue: unknown,
+    ) => {
+      await assertBindingAdditionsAllowed({
+        actor,
+        companyId,
+        targetType: target.targetType,
+        targetId: target.targetId,
+        desired: collectSecretRefsFromEnvValue(envValue, target.pathPrefix ?? "env"),
+      });
+    },
+
+    /** Pre-persistence board gate for explicit secret-ref lists (environments). */
+    assertSecretRefMutationAllowed: async (
+      actor: SecretBindingWriteActor,
+      companyId: string,
+      target: { targetType: SecretBindingTargetType; targetId: string | null },
+      refs: Array<{ secretId: string; configPath: string; versionSelector?: SecretVersionSelector }>,
+    ) => {
+      await assertBindingAdditionsAllowed({
+        actor,
+        companyId,
+        targetType: target.targetType,
+        targetId: target.targetId,
+        desired: refs.map((ref) => ({
+          secretId: ref.secretId,
+          configPath: ref.configPath,
+          versionSelector: ref.versionSelector ?? "latest",
+        })),
+      });
+    },
+
     createBinding: async (input: {
       companyId: string;
       secretId: string;
@@ -1876,8 +1993,19 @@ export function secretService(db: Db) {
       versionSelector?: SecretVersionSelector;
       required?: boolean;
       label?: string | null;
-    }) => {
+    }, actor: SecretBindingWriteActor) => {
       await assertSecretInCompany(input.companyId, input.secretId);
+      await assertBindingAdditionsAllowed({
+        actor,
+        companyId: input.companyId,
+        targetType: input.targetType,
+        targetId: input.targetId,
+        desired: [{
+          secretId: input.secretId,
+          configPath: input.configPath,
+          versionSelector: input.versionSelector ?? "latest",
+        }],
+      });
       const existing = await db
         .select()
         .from(companySecretBindings)
@@ -1917,6 +2045,7 @@ export function secretService(db: Db) {
         required?: boolean;
         label?: string | null;
       }>,
+      actor: SecretBindingWriteActor,
     ) => {
       const normalizedRefs: Array<{
         secretId: string;
@@ -1935,6 +2064,14 @@ export function secretService(db: Db) {
           label: ref.label ?? null,
         });
       }
+
+      await assertBindingAdditionsAllowed({
+        actor,
+        companyId,
+        targetType: target.targetType,
+        targetId: target.targetId,
+        desired: normalizedRefs,
+      });
 
       const pathPrefixes = [...new Set(normalizedRefs.map((ref) => ref.configPath.split(".")[0]))];
 
@@ -1984,26 +2121,21 @@ export function secretService(db: Db) {
       companyId: string,
       target: { targetType: SecretBindingTargetType; targetId: string; pathPrefix?: string },
       envValue: unknown,
+      actor: SecretBindingWriteActor,
     ) => {
-      const record = asRecord(envValue) ?? {};
-      const refs: Array<{
-        secretId: string;
-        configPath: string;
-        versionSelector: SecretVersionSelector;
-      }> = [];
       const pathPrefix = target.pathPrefix ?? "env";
-      for (const [key, rawBinding] of Object.entries(record)) {
-        const parsed = envBindingSchema.safeParse(rawBinding);
-        if (!parsed.success) continue;
-        const binding = canonicalizeBinding(parsed.data as EnvBinding);
-        if (binding.type !== "secret_ref") continue;
-        await assertSecretInCompany(companyId, binding.secretId);
-        refs.push({
-          secretId: binding.secretId,
-          configPath: `${pathPrefix}.${key}`,
-          versionSelector: binding.version,
-        });
+      const refs = collectSecretRefsFromEnvValue(envValue, pathPrefix);
+      for (const ref of refs) {
+        await assertSecretInCompany(companyId, ref.secretId);
       }
+
+      await assertBindingAdditionsAllowed({
+        actor,
+        companyId,
+        targetType: target.targetType,
+        targetId: target.targetId,
+        desired: refs,
+      });
 
       await db.transaction(async (tx) => {
         await tx

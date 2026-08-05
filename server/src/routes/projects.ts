@@ -140,6 +140,12 @@ export function projectRoutes(db: Db) {
         projectData.env,
         { strictMode: strictSecretsMode, fieldPath: "env" },
       );
+      await secretsSvc.assertEnvBindingMutationAllowed?.(
+        req.actor,
+        companyId,
+        { targetType: "project", targetId: null },
+        projectData.env,
+      );
     }
     const project = await svc.create(companyId, projectData);
     if (project.env) {
@@ -147,6 +153,7 @@ export function projectRoutes(db: Db) {
         companyId,
         { targetType: "project", targetId: project.id },
         project.env,
+        req.actor,
       );
     }
     let createdWorkspaceId: string | null = null;
@@ -208,6 +215,12 @@ export function projectRoutes(db: Db) {
         strictMode: strictSecretsMode,
         fieldPath: "env",
       });
+      await secretsSvc.assertEnvBindingMutationAllowed?.(
+        req.actor,
+        existing.companyId,
+        { targetType: "project", targetId: existing.id },
+        body.env,
+      );
     }
     const project = await svc.update(id, body);
     if (!project) {
@@ -219,6 +232,7 @@ export function projectRoutes(db: Db) {
         project.companyId,
         { targetType: "project", targetId: project.id },
         project.env,
+        req.actor,
       );
     }
 

@@ -400,30 +400,56 @@ Agent environment variables use secret references:
 
 The server resolves and decrypts these at runtime, injecting the real value into the agent process environment.
 
-## Injecting Secrets Into Routine & Worker Runs
+### Adding a binding requires board authentication (AUR-4093)
 
-Routines, scheduled workers, and other unattended runs need secrets in their
-process env the same way an interactive agent run does. The **supported**
-pattern is the same `secret_ref` binding described above — there is no
-separate mechanism for routine/worker runs:
+Every write path that can create or change a `secret_ref` binding — agent
+`adapterConfig.env`, project `env`, environment config — is gated in the
+secrets service itself (`assertBindingAdditionsAllowed`,
+`server/src/services/secrets.ts`), not per-route. The gate is delta-based:
 
-1. Create (or reuse) the company secret in `Company Settings > Secrets`.
-2. Bind it as a `secret_ref` row into the **executing agent's** `env`, or into
-   the **project's** `env` if every agent/routine in that project needs it.
-3. `resolveExecutionRunAdapterConfig` (`server/src/services/heartbeat.ts`)
-   resolves the binding server-side and injects the decrypted value into the
-   run's process env before the agent process starts, for both interactive
-   heartbeats and routine-triggered runs — the run type does not change how
-   the value gets there.
+- **Adding** a binding, or **changing** the `secretId`/`version` at an
+  existing config path, requires a **board-authenticated** caller. Agent
+  actors — including CEO-role agents — get `403`.
+- **Removing** a binding, or resubmitting an unchanged one, is allowed for
+  agent actors. De-escalation must never require an escalation.
+- A caller that cannot supply an actor context **fails closed**.
 
-The org-scoped `GOOGLE_WORKSPACE_SA_KEY` binding used by the CTO agent's
-gmail-intake routine (AUR-3531) is the worked example: the secret is bound
-once on the CTO agent's `env`, and every routine execution that runs as that
-agent inherits the resolved value automatically.
+If an agent run legitimately needs a new secret, the grant is a board action
+in `Company Settings > Secrets` (or a board-session API call) — an agent
+cannot self-provision it, and must not try to route around the gate.
+
+## Server-Consumed Credentials Do NOT Belong In Run Bindings
+
+Credentials that the **server process itself** consumes — Google Workspace
+service-account keys, mail-provider API keys, anything resolved by server-side
+services rather than by code the agent runs — belong in the **server's own
+environment** (hydrated from the instance env file, on this deployment
+`/home/ievgen/paperclip-data/instances/default/.env`), never in a per-agent or
+per-project `secret_ref` binding.
+
+A run binding puts the decrypted value into the **agent process env**, where
+every tool call, subprocess, and transcript in that run can read it. For a
+credential the agent code never needs, that is pure exposure with zero
+function. Exactly this pattern — an org-scoped `GOOGLE_WORKSPACE_SA_KEY`
+bound into an agent's `env` "so the routine inherits it" — was the AUR-4090
+exposure: the binding survived 3755 resolutions before it was noticed and
+revoked, and this section previously prescribed it as the worked example.
+
+Rules of thumb:
+
+- Server-side services read their credentials from the server env
+  (`process.env` in the server process). If a server-side feature is missing a
+  credential, fix the instance env file and restart the server — do not bind.
+- `secret_ref` bindings are only for **tenant- or agent-scoped application
+  secrets** that the agent's own run genuinely consumes (e.g. a
+  deploy-target SSH key on an `ssh` environment, a tenant's API token used by
+  code the agent executes).
+- Routines and workers run as their agent: if the *server* resolves the
+  integration for them (as with gmail intake), they need **no** binding at
+  all. Do not "bind once on the agent so routines inherit it".
 
 **Do not hand-roll a per-worker dotenv loader, a custom secret-fetch script,
 or a bespoke env file for a routine.** That bypasses the audit trail, the
-custody boundary above, and rotation — and it silently drifts from the bound
-secret the next time the value is rotated. If a routine or worker is missing
-an env var, fix it by adding or updating the `secret_ref` binding on the
-agent/project, not by loading it another way in code.
+custody boundary above, and rotation. If a routine or worker is missing an
+env var that its own run code consumes, request the binding through a board
+actor; if the credential is server-consumed, it goes in the server env.

@@ -183,7 +183,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         targetType: "environment",
         targetId: environmentId,
         configPath: "privateKeySecretRef",
-      });
+      }, { type: "board" });
       config = {
         ...config,
         privateKey: null,
@@ -561,7 +561,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       targetType: "environment",
       targetId: environment.id,
       configPath: "apiKey",
-    });
+    }, { type: "board" });
     await environmentService(db).update(environment.id, {
       driver: "sandbox",
       name: environment.name,

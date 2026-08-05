@@ -213,11 +213,21 @@ export function environmentRoutes(
         pluginWorkerManager: options.pluginWorkerManager,
       }),
     };
+    await secrets.assertSecretRefMutationAllowed(
+      req.actor,
+      companyId,
+      { targetType: "environment", targetId: null },
+      await collectEnvironmentSecretRefs({
+        db,
+        environment: { id: "", driver: input.driver ?? req.body.driver, config: input.config },
+      }),
+    );
     const environment = await svc.create(companyId, input);
     await secrets.syncSecretRefsForTarget(
       companyId,
       { targetType: "environment", targetId: environment.id },
       await collectEnvironmentSecretRefs({ db, environment }),
+      req.actor,
     );
     await logActivity(db, {
       companyId,
@@ -324,6 +334,17 @@ export function environmentRoutes(
           }
         : {}),
     };
+    if (patch.config !== undefined || patch.driver !== undefined) {
+      await secrets.assertSecretRefMutationAllowed(
+        req.actor,
+        existing.companyId,
+        { targetType: "environment", targetId: existing.id },
+        await collectEnvironmentSecretRefs({
+          db,
+          environment: { id: existing.id, driver: nextDriver, config: patch.config ?? existing.config },
+        }),
+      );
+    }
     const environment = await svc.update(existing.id, patch);
     if (!environment) {
       res.status(404).json({ error: "Environment not found" });
@@ -334,6 +355,7 @@ export function environmentRoutes(
         environment.companyId,
         { targetType: "environment", targetId: environment.id },
         await collectEnvironmentSecretRefs({ db, environment }),
+        req.actor,
       );
     }
     await logActivity(db, {

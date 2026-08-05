@@ -37,6 +37,7 @@ const mockSecretService = vi.hoisted(() => ({
   create: vi.fn(),
   resolveSecretValue: vi.fn(),
   syncSecretRefsForTarget: vi.fn(),
+  assertSecretRefMutationAllowed: vi.fn(),
   remove: vi.fn(),
 }));
 const mockValidatePluginEnvironmentDriverConfig = vi.hoisted(() => vi.fn());
@@ -156,11 +157,13 @@ describe("environment routes", () => {
     mockSecretService.create.mockReset();
     mockSecretService.resolveSecretValue.mockReset();
     mockSecretService.syncSecretRefsForTarget.mockReset();
+    mockSecretService.assertSecretRefMutationAllowed.mockReset();
     mockSecretService.remove.mockReset();
     mockSecretService.create.mockResolvedValue({
       id: "11111111-1111-1111-1111-111111111111",
     });
     mockSecretService.syncSecretRefsForTarget.mockResolvedValue([]);
+    mockSecretService.assertSecretRefMutationAllowed.mockResolvedValue(undefined);
     mockSecretService.remove.mockResolvedValue(null);
     delete process.env.PAPERCLIP_SECRETS_PROVIDER;
     mockValidatePluginEnvironmentDriverConfig.mockReset();

@@ -16,6 +16,7 @@ import type {
   CancelIssueThreadInteraction,
   CreateIssueThreadInteraction,
   IssueThreadInteraction,
+  IssueThreadInteractionResult,
   RequestConfirmationInteraction,
   RequestConfirmationTarget,
   RejectIssueThreadInteraction,
@@ -446,6 +447,140 @@ async function expireStaleRequestConfirmationTarget(db: Db | any, args: {
   return hydrateInteraction(updated);
 }
 
+const PENDING_INTERACTION_AGE_CEILING_MS = 14 * 24 * 60 * 60 * 1000;
+
+function buildExpiredInteractionResult(
+  kind: IssueThreadInteraction["kind"],
+  reason: "superseded" | "age_ceiling",
+  supersededBy: string | null,
+): IssueThreadInteractionResult {
+  switch (kind) {
+    case "ask_user_questions":
+      return { version: 1, answers: [], expiredReason: reason, supersededBy };
+    case "request_confirmation":
+      return {
+        version: 1,
+        outcome: reason,
+        supersededBy,
+      };
+    case "suggest_tasks":
+      return { version: 1, expiredReason: reason, supersededBy };
+  }
+}
+
+function isSameInteractionCreator(row: IssueThreadInteractionRow, actor: {
+  createdByAgentId: string | null;
+  createdByUserId: string | null;
+}) {
+  if (actor.createdByAgentId) {
+    return row.createdByAgentId === actor.createdByAgentId;
+  }
+  if (actor.createdByUserId) {
+    return row.createdByUserId === actor.createdByUserId;
+  }
+  return false;
+}
+
+async function expireSupersededPendingInteractionsByCreator(db: Db, args: {
+  companyId: string;
+  issueId: string;
+  createdByAgentId: string | null;
+  createdByUserId: string | null;
+  supersedingInteractionId: string;
+  actor: InteractionActor;
+}): Promise<IssueThreadInteraction[]> {
+  if (!args.createdByAgentId && !args.createdByUserId) return [];
+
+  const rows = await db
+    .select()
+    .from(issueThreadInteractions)
+    .where(and(
+      eq(issueThreadInteractions.companyId, args.companyId),
+      eq(issueThreadInteractions.issueId, args.issueId),
+      eq(issueThreadInteractions.status, "pending"),
+    ));
+
+  const supersededRows = rows.filter((row) => {
+    if (row.id === args.supersedingInteractionId) return false;
+    return isSameInteractionCreator(row, args);
+  });
+
+  if (supersededRows.length === 0) return [];
+
+  const now = new Date();
+  const expired: IssueThreadInteraction[] = [];
+  for (const row of supersededRows) {
+    const [updated] = await db
+      .update(issueThreadInteractions)
+      .set({
+        status: "expired",
+        result: buildExpiredInteractionResult(row.kind as IssueThreadInteraction["kind"], "superseded", args.supersedingInteractionId),
+        resolvedByAgentId: args.actor.agentId ?? null,
+        resolvedByUserId: args.actor.userId ?? null,
+        resolvedAt: now,
+        updatedAt: now,
+      })
+      .where(and(
+        eq(issueThreadInteractions.id, row.id),
+        eq(issueThreadInteractions.status, "pending"),
+      ))
+      .returning();
+    if (updated) expired.push(hydrateInteraction(updated));
+  }
+
+  if (expired.length > 0) {
+    await touchIssue(db, args.issueId);
+  }
+
+  return expired;
+}
+
+async function expireAgedPendingInteractionsForIssue(db: Db, issueId: string): Promise<IssueThreadInteraction[]> {
+  const rows = await db
+    .select()
+    .from(issueThreadInteractions)
+    .where(and(
+      eq(issueThreadInteractions.issueId, issueId),
+      eq(issueThreadInteractions.status, "pending"),
+    ));
+
+  if (rows.length < 2) return [];
+
+  const ageCeilingMs = Date.now() - PENDING_INTERACTION_AGE_CEILING_MS;
+  const expiredRows = rows.filter((row) => {
+    const createdAtMs = row.createdAt.getTime();
+    if (createdAtMs > ageCeilingMs) return false;
+    return rows.some((other) => other.id !== row.id && other.createdAt.getTime() > createdAtMs);
+  });
+
+  if (expiredRows.length === 0) return [];
+
+  const resolvedAt = new Date();
+  const expired: IssueThreadInteraction[] = [];
+  for (const row of expiredRows) {
+    const [updated] = await db
+      .update(issueThreadInteractions)
+      .set({
+        status: "expired",
+        result: buildExpiredInteractionResult(row.kind as IssueThreadInteraction["kind"], "age_ceiling", null),
+        resolvedAt,
+        updatedAt: resolvedAt,
+      })
+      .where(and(
+        eq(issueThreadInteractions.id, row.id),
+        eq(issueThreadInteractions.status, "pending"),
+      ))
+      .returning();
+    if (updated) expired.push(hydrateInteraction(updated));
+  }
+
+  if (expired.length > 0) {
+    await touchIssue(db, issueId);
+  }
+
+  return expired;
+}
+
 export function issueThreadInteractionService(db: Db) {
   async function getIdempotentInteraction(args: {
     issueId: string;
@@ -748,6 +883,8 @@ export function issueThreadInteractionService(db: Db) {
 
   return {
     listForIssue: async (issueId: string) => {
+      await expireAgedPendingInteractionsForIssue(db, issueId);
+
       const rows = await db
         .select()
         .from(issueThreadInteractions)
@@ -878,6 +1015,14 @@ export function issueThreadInteractionService(db: Db) {
       }
 
       await touchIssue(db, issue.id);
+      await expireSupersededPendingInteractionsByCreator(db, {
+        companyId: issue.companyId,
+        issueId: issue.id,
+        createdByAgentId: actor.agentId ?? null,
+        createdByUserId: actor.userId ?? null,
+        supersedingInteractionId: created.id,
+        actor,
+      });
       return hydrateInteraction(created);
     },
 

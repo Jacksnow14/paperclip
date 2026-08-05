@@ -646,6 +646,10 @@ export interface SuggestTasksResult {
   rejectionReason?: string | null;
   cancelled?: true;
   cancellationReason?: string | null;
+  /** Set when this pending interaction was auto-expired instead of resolved manually. */
+  expiredReason?: "superseded" | "age_ceiling";
+  /** Id of the newer interaction that superseded this one, when applicable. */
+  supersededBy?: string | null;
 }
 
 export interface AskUserQuestionsQuestionOption {
@@ -681,6 +685,10 @@ export interface AskUserQuestionsResult {
   cancelled?: true;
   cancellationReason?: string | null;
   summaryMarkdown?: string | null;
+  /** Set when this pending interaction was auto-expired instead of resolved manually. */
+  expiredReason?: "superseded" | "age_ceiling";
+  /** Id of the newer interaction that superseded this one, when applicable. */
+  supersededBy?: string | null;
 }
 
 export interface RequestConfirmationIssueDocumentTarget {
@@ -723,12 +731,21 @@ export interface RequestConfirmationPayload {
 
 export interface RequestConfirmationResult {
   version: 1;
-  outcome: "accepted" | "rejected" | "superseded_by_comment" | "stale_target" | "cancelled";
+  outcome:
+    | "accepted"
+    | "rejected"
+    | "superseded_by_comment"
+    | "stale_target"
+    | "cancelled"
+    | "superseded"
+    | "age_ceiling";
   reason?: string | null;
   /** Optional reviewer note captured on acceptance (agent-to-agent review sign-off). */
   note?: string | null;
   commentId?: string | null;
   staleTarget?: RequestConfirmationTarget | null;
+  /** Id of the newer interaction that superseded this one, when applicable. */
+  supersededBy?: string | null;
 }
 
 export interface IssueThreadInteractionBase extends IssueThreadInteractionActorFields {

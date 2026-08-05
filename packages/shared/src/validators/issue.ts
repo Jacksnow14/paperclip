@@ -608,6 +608,8 @@ export const suggestTasksResultSchema = z.object({
   rejectionReason: z.string().trim().max(4000).nullable().optional(),
   cancelled: z.literal(true).optional(),
   cancellationReason: z.string().trim().max(4000).nullable().optional(),
+  expiredReason: z.enum(["superseded", "age_ceiling"]).optional(),
+  supersededBy: z.string().uuid().nullable().optional(),
 });
 
 export const askUserQuestionsQuestionOptionSchema = z.object({
@@ -667,6 +669,8 @@ export const askUserQuestionsResultSchema = z.object({
   cancelled: z.literal(true).optional(),
   cancellationReason: z.string().trim().max(4000).nullable().optional(),
   summaryMarkdown: z.string().max(20000).nullable().optional(),
+  expiredReason: z.enum(["superseded", "age_ceiling"]).optional(),
+  supersededBy: z.string().uuid().nullable().optional(),
 });
 
 const requestConfirmationHrefSchema = z.string().trim().min(1).max(2000).refine((value) => {
@@ -718,12 +722,21 @@ export const requestConfirmationPayloadSchema = z.object({
 
 export const requestConfirmationResultSchema = z.object({
   version: z.literal(1),
-  outcome: z.enum(["accepted", "rejected", "superseded_by_comment", "stale_target", "cancelled"]),
+  outcome: z.enum([
+    "accepted",
+    "rejected",
+    "superseded_by_comment",
+    "stale_target",
+    "cancelled",
+    "superseded",
+    "age_ceiling",
+  ]),
   reason: z.string().trim().max(4000).nullable().optional(),
   /** Optional reviewer note captured on acceptance (agent-to-agent review sign-off). */
   note: z.string().trim().max(4000).nullable().optional(),
   commentId: z.string().uuid().nullable().optional(),
   staleTarget: requestConfirmationTargetSchema.nullable().optional(),
+  supersededBy: z.string().uuid().nullable().optional(),
 });
 
 export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [

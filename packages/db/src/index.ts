@@ -26,6 +26,7 @@ export {
   BackupProducerConflictError,
   type BackupProducerConflictReason,
   type BackupRetentionPolicy,
+  type BackupTier,
   type PruneBackupsResult,
   type RunDatabaseBackupOptions,
   type RunDatabaseBackupResult,

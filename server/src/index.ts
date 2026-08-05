@@ -641,6 +641,22 @@ export async function startServer(): Promise<StartedServer> {
         },
         `${label} database backup complete: ${formatDatabaseBackupResult(result)}`,
       );
+      // AUR-4611: the byte cap is tier-aware (hourly evicted before daily/weekly/
+      // monthly), so it only reaches into "weekly"/"monthly" once dump growth has
+      // outrun the size-aware hourly shrink AND the full ladder. That's DR
+      // coverage regressing under cap pressure — previously silent.
+      if (result.evictedTiers.includes("weekly") || result.evictedTiers.includes("monthly")) {
+        logger.warn(
+          {
+            evictedTiers: result.evictedTiers,
+            sizeBytes: result.sizeBytes,
+            backupDir: config.databaseBackupDir,
+            retention,
+            trigger,
+          },
+          `Database backup cap eviction reached the ${result.evictedTiers.includes("monthly") ? "monthly" : "weekly"} tier — DR coverage is regressing under cap pressure (AUR-4611)`,
+        );
+      }
       return response;
     } catch (err) {
       if (err instanceof BackupProducerConflictError) {

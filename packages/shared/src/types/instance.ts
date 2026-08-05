@@ -18,6 +18,27 @@ export const MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS = 24 * 30;
 // pinning the backup dir at the cap and evicting the daily/weekly/monthly
 // restore points. 6 hourly + 7 daily + 4 weekly + 1 monthly ≈ 18 dumps keeps
 // the ladder intact with headroom under the 8 GiB backstop.
+//
+// AUR-4611: that "≈18 dumps" framing decayed silently as the live dump grew
+// 370 MiB -> 548 MiB in 5 days (~1.6 MiB/hr) — a fixed dump count under a
+// fixed byte cap cannot hold a fixed footprint once per-dump size grows.
+// Steady-state footprint is a function of dump size, not a constant:
+//
+//   footprint ≈ (hourlyCount + dailyDays + weeklyWeeks + monthlyMonths) × avgDumpSize
+//
+// `pruneOldBackups` (packages/db/src/backup-lib.ts) now solves this backwards
+// from the cap each cycle instead of trusting the configured hourlyCount:
+//
+//   effectiveHourlyCount = clamp(floor(maxBytes / avgDumpSize) - (dailyDays + weeklyWeeks + monthlyMonths), 1, hourlyCount)
+//
+// so the full daily/weekly/monthly ladder — the DR-relevant tiers — stays
+// intact with headroom as avgDumpSize grows, by shrinking the low-value
+// near-duplicate hourly tier first. The hard byte cap below remains a
+// tier-aware backstop (hourly evicted before daily/weekly/monthly) for the
+// case where even a single hourly dump plus the full ladder can't fit; that
+// backstop reaching into the weekly/monthly tier is reported via
+// `evictedTiers` on `RunDatabaseBackupResult`/`PruneBackupsResult` — DR
+// coverage regressing under cap pressure is no longer a silent event.
 export const DEFAULT_HOURLY_COUNT = 6;
 export const DEFAULT_MAX_BYTES = 8 * 1024 * 1024 * 1024; // 8 GiB
 

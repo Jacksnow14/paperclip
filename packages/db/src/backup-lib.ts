@@ -45,11 +45,20 @@ export type RunDatabaseBackupOptions = {
   minIntervalMs?: number;
 };
 
+export type BackupTier = "hourly" | "daily" | "weekly" | "monthly";
+
 export type RunDatabaseBackupResult = {
   backupFile: string;
   sizeBytes: number;
   prunedCount: number;
   prunedBytes: number;
+  /**
+   * Tiers that lost at least one member to hard byte-cap eviction this run
+   * (AUR-4611). Empty means the ladder fit under the cap unaided. `"weekly"`
+   * or `"monthly"` present means DR coverage is regressing under cap
+   * pressure — callers should alert.
+   */
+  evictedTiers: BackupTier[];
 };
 
 export type PruneBackupsResult = {
@@ -57,6 +66,8 @@ export type PruneBackupsResult = {
   prunedBytes: number;
   keptCount: number;
   keptBytes: number;
+  /** See {@link RunDatabaseBackupResult.evictedTiers}. */
+  evictedTiers: BackupTier[];
 };
 
 export type BackupProducerConflictReason = "lock_held" | "recent_backup";
@@ -168,7 +179,7 @@ const PRUNE_DEFAULT_MAX_BYTES = 8 * 1024 * 1024 * 1024; // 8 GiB
 const EMERGENCY_PRUNE_HOURLY_COUNT = 2;
 const EMERGENCY_PRUNE_MAX_BYTES = 4 * 1024 * 1024 * 1024; // 4 GiB
 
-const EMPTY_PRUNE_RESULT: PruneBackupsResult = { prunedCount: 0, prunedBytes: 0, keptCount: 0, keptBytes: 0 };
+const EMPTY_PRUNE_RESULT: PruneBackupsResult = { prunedCount: 0, prunedBytes: 0, keptCount: 0, keptBytes: 0, evictedTiers: [] };
 
 function resolveEffectiveRetention(retention: BackupRetentionPolicy): { hourlyCount: number; maxBytes: number } {
   const rawHourlyCount = retention.hourlyCount ?? PRUNE_DEFAULT_HOURLY_COUNT;
@@ -180,6 +191,41 @@ function resolveEffectiveRetention(retention: BackupRetentionPolicy): { hourlyCo
     maxBytes: !isNaN(envMaxBytes) && envMaxBytes >= 0 ? envMaxBytes : rawMaxBytes,
     hourlyCount: Math.max(1, !isNaN(envHourlyCount) && envHourlyCount > 0 ? envHourlyCount : rawHourlyCount),
   };
+}
+
+/**
+ * Steady-state footprint is `(hourlyCount + dailyDays + weeklyWeeks +
+ * monthlyMonths) × avgDumpSize` — a function of dump size, not a fixed
+ * number (AUR-4611: a prior fixed-footprint claim decayed silently as the
+ * dump grew 370MiB -> 548MiB in 5 days). A fixed slot count under a fixed
+ * byte cap cannot hold a fixed footprint once avgDumpSize grows, so the
+ * hourly count — the only slot count that's safe to shrink, since hourly
+ * dumps are near-duplicates and the lowest-DR-value tier — is solved
+ * backwards from the cap instead of configured as a constant:
+ *
+ *   effectiveHourlyCount = floor(maxBytes / avgDumpSize) - (dailyDays + weeklyWeeks + monthlyMonths)
+ *
+ * clamped to [1, configuredHourlyCount]. This keeps the full daily/weekly/
+ * monthly ladder intact (and the total footprint under the cap with
+ * headroom) as dump size grows, up to the point where even a single hourly
+ * dump plus the full ladder can't fit — at which point this floors at 1 and
+ * the tier-aware byte cap below (tier 5) becomes the backstop again, now
+ * evicting into the daily/weekly/monthly tiers. That backstop hit is the
+ * signal exposed via `evictedTiers`.
+ */
+function computeSizeAwareHourlyCount(
+  newestFirstEntries: { sizeBytes: number }[],
+  configuredHourlyCount: number,
+  maxBytes: number,
+  retention: BackupRetentionPolicy,
+): number {
+  if (maxBytes <= 0 || newestFirstEntries.length === 0) return configuredHourlyCount;
+  const sampleSize = Math.min(configuredHourlyCount, newestFirstEntries.length);
+  const avgDumpSize = newestFirstEntries.slice(0, sampleSize).reduce((sum, e) => sum + e.sizeBytes, 0) / sampleSize;
+  if (avgDumpSize <= 0) return configuredHourlyCount;
+  const ladderReserve = Math.max(1, retention.dailyDays) + Math.max(1, retention.weeklyWeeks) + Math.max(1, retention.monthlyMonths);
+  const affordableHourlyCount = Math.floor(maxBytes / avgDumpSize) - ladderReserve;
+  return Math.max(1, Math.min(configuredHourlyCount, affordableHourlyCount));
 }
 
 /**
@@ -197,12 +243,16 @@ function resolveEffectiveRetention(retention: BackupRetentionPolicy): { hourlyCo
  * 6. Everything else is deleted
  *
  * Under hourly cadence the directory self-bounds to roughly hourlyCount + dailyDays +
- * weeklyWeeks + monthlyMonths instead of 24×dailyDays.
+ * weeklyWeeks + monthlyMonths instead of 24×dailyDays. `hourlyCount` here is
+ * itself size-aware (see {@link computeSizeAwareHourlyCount}, AUR-4611): it
+ * shrinks below the configured ceiling as measured dump size grows, so the
+ * ladder keeps fitting under `maxBytes` instead of relying on tier 5 cap
+ * eviction to bail it out every cycle.
  */
 export function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, filenamePrefix: string): PruneBackupsResult {
   if (!existsSync(backupDir)) return { ...EMPTY_PRUNE_RESULT };
 
-  const { hourlyCount: effectiveHourlyCount, maxBytes: effectiveMaxBytes } = resolveEffectiveRetention(retention);
+  const { hourlyCount: configuredHourlyCount, maxBytes: effectiveMaxBytes } = resolveEffectiveRetention(retention);
 
   const now = Date.now();
   const dailyCutoff = now - Math.max(1, retention.dailyDays) * 24 * 60 * 60 * 1000;
@@ -223,8 +273,10 @@ export function pruneOldBackups(backupDir: string, retention: BackupRetentionPol
   // Sort newest first so tier buckets always claim the freshest representative
   entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
+  const effectiveHourlyCount = computeSizeAwareHourlyCount(entries, configuredHourlyCount, effectiveMaxBytes, retention);
+
   const kept = new Set<string>();
-  type Tier = "hourly" | "daily" | "weekly" | "monthly";
+  type Tier = BackupTier;
   const tierOf = new Map<string, Tier>();
 
   // Tier 1: hourly — newest effectiveHourlyCount dumps unconditionally kept
@@ -281,6 +333,13 @@ export function pruneOldBackups(backupDir: string, retention: BackupRetentionPol
   // the one closest to the coverage of the tier above it, while the oldest
   // carries the tier's unique reach-back. The newest dump overall always
   // survives (restore-latest floor).
+  // Tiers that lost a member to cap eviction below — "weekly"/"monthly" here
+  // means the size-aware hourly count above could no longer absorb dump
+  // growth on its own and DR coverage is regressing under cap pressure
+  // (AUR-4611). Populated in eviction order so callers see the worst tier hit.
+  const evictedTierOrder: Tier[] = ["hourly", "daily", "weekly", "monthly"];
+  const evictedTierSet = new Set<Tier>();
+
   if (effectiveMaxBytes > 0) {
     const keptEntries = entries.filter((e) => kept.has(e.fullPath)); // newest first
     let totalBytes = keptEntries.reduce((sum, e) => sum + e.sizeBytes, 0);
@@ -301,6 +360,8 @@ export function pruneOldBackups(backupDir: string, retention: BackupRetentionPol
         if (entry.fullPath === newestPath) continue;
         kept.delete(entry.fullPath);
         evicted.push(entry.name);
+        const tier = tierOf.get(entry.fullPath);
+        if (tier) evictedTierSet.add(tier);
         totalBytes -= entry.sizeBytes;
       }
       if (evicted.length > 0) {
@@ -322,6 +383,7 @@ export function pruneOldBackups(backupDir: string, retention: BackupRetentionPol
     prunedBytes: toDelete.reduce((sum, e) => sum + e.sizeBytes, 0),
     keptCount: keptFinal.length,
     keptBytes: keptFinal.reduce((sum, e) => sum + e.sizeBytes, 0),
+    evictedTiers: evictedTierOrder.filter((tier) => evictedTierSet.has(tier)),
   };
 }
 
@@ -905,6 +967,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
           sizeBytes,
           prunedCount: pruneResult.prunedCount,
           prunedBytes: pruneResult.prunedBytes,
+          evictedTiers: pruneResult.evictedTiers,
         };
       } catch (error) {
         if (existsSync(stagingGzFile)) {
@@ -1320,6 +1383,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       sizeBytes,
       prunedCount: pruneResult.prunedCount,
       prunedBytes: pruneResult.prunedBytes,
+      evictedTiers: pruneResult.evictedTiers,
     };
   } catch (error) {
     await writer.abort();

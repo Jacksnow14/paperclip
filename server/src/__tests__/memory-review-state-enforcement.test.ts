@@ -215,7 +215,7 @@ describeEmbeddedPostgres("memoryService review-state enforcement (AUR-4145)", ()
         source: { kind: "manual_note" as const },
         title: "retrospective/AUR-9006/lessons",
         content: "Distilled lesson prose.",
-        metadata: { category: "retrospective" },
+        metadata: { category: "observation" },
       }, actor);
       expect(captured.records[0].reviewState).toBe("pending");
 
@@ -239,7 +239,7 @@ describeEmbeddedPostgres("memoryService review-state enforcement (AUR-4145)", ()
         source: { kind: "manual_note" as const },
         title: "retrospective/AUR-9007/lessons",
         content: "v1",
-        metadata: { category: "retrospective" },
+        metadata: { category: "observation" },
       }, actor);
 
       const updated = await svc.agentUpdate(

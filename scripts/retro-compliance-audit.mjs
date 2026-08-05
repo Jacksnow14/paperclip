@@ -11,6 +11,10 @@
  *   - Only `done` issues are in scope. `cancelled` issues are EXCLUDED — they represent
  *     abandoned work; neither a retro comment nor scorecard captures are expected.
  *   - Content-pipeline / automation closures remain exempt via isExempt().
+ *   - Synthetic harness probes (`probe-title-N` / `__probe__`) are exempt (AUR-4235).
+ *   - Sweep-closures of legacy work are exempt as `stale_sweep_closure` and reported in
+ *     their own named bucket, never silently dropped — see classifyStaleSweepClosure
+ *     (AUR-4235). `completedAt` is a status-flip timestamp, not a completion timestamp.
  *
  * Dry-run by default; pass --apply to capture memory records. The digest comment
  * and run-issue summary are posted by the caller (CTO) using this script's JSON plan.
@@ -73,9 +77,32 @@ export function hasRetro(comments, issue) {
   });
 }
 
+/**
+ * Synthetic harness probe detector (AUR-4235).
+ *
+ * Probe issues (`probe-title-2` / `__probe__`) are created by wake/checkout smoke tests.
+ * They carry no work, so a retro + two scorecards for them is pure noise in the registry
+ * the CEO routing path reads as evidence.
+ *
+ * The matcher is deliberately tight: the title must be a bare `probe`-shaped token with no
+ * trailing prose, AND the description must be a stub. A real issue titled "Probe the DNS
+ * failure" or "Probe why sends stall" does NOT match — only the `__probe__` marker bypasses
+ * the shape rule, and that marker is never present on genuine work.
+ */
+const PROBE_TITLE_RE = /^\s*(?:__probe__|probe)[-_\s]?(?:title|desc)?[-_\s]?\d*\s*$/i;
+const PROBE_STUB_DESC_MAX = 40;
+
+export function isProbeIssue(issue) {
+  const title = issue.title ?? '';
+  const desc = issue.description ?? '';
+  if (/__probe__/i.test(title) || /__probe__/i.test(desc)) return true;
+  return PROBE_TITLE_RE.test(title) && desc.trim().length <= PROBE_STUB_DESC_MAX;
+}
+
 /** AUR-2694 exemption: content-pipeline / automation closures never emit retros. */
 export function isExempt(issue) {
   if (CONTENT_BOTS.has(issue.assigneeAgentId)) return { exempt: true, reason: 'content-bot assignee' };
+  if (isProbeIssue(issue)) return { exempt: true, reason: 'synthetic probe issue' };
   const title = issue.title ?? '';
   const desc = issue.description ?? '';
   if (/content slot/i.test(title)) return { exempt: true, reason: 'title:content slot' };
@@ -84,6 +111,102 @@ export function isExempt(issue) {
   if (/daily\b.*\bbrief/i.test(title)) return { exempt: true, reason: 'title:daily brief' };
   if (issue.originKind && issue.originKind !== 'manual') return { exempt: true, reason: `originKind:${issue.originKind}` };
   return { exempt: false, reason: null };
+}
+
+/**
+ * STALE-SWEEP EXEMPTION (AUR-4235).
+ *
+ * The audit's population is "status=done AND completedAt in the last N hours". But
+ * `completedAt` is stamped when the status flips, not when the work happened. A backlog
+ * sweep that closes a months-old `in_review` issue therefore drags that old work into
+ * today's compliance window and demands a `performance/{agent}/{task_type}/{today}` record
+ * whose `token_cost` nobody can know and whose `quality_signal` would be retro-fitted from
+ * memory — into the exact registry the routing path reads as evidence. A compliance metric
+ * that pressures agents to fabricate the data it exists to protect is worse than no metric.
+ *
+ * Detection is the *work-to-closure idle gap*, NOT "has a closing comment". AUR-402 (the
+ * motivating case) does have closing comments — the CEO's `ACCEPTED, closing done (3 months
+ * later)` verdict, written at `completedAt` itself.
+ *
+ * A FIXED WALL-CLOCK "closing window" DOES NOT WORK, and the production rows prove it:
+ *   AUR-402  closing burst spans     7 seconds, then an 89.6-day silence  → sweep close
+ *   AUR-2471 genuine work session    4 minutes, then a 33.3-day silence   → real work
+ * Any cutoff wide enough to swallow a close-out also bisects a real work session. So the
+ * final burst is delimited by CONTIGUITY instead: walk back from `completedAt` while
+ * consecutive events are ≤ SESSION_GAP_MS apart, and measure the idle gap to the event
+ * immediately before that burst. No threshold can bisect a session, because a session is
+ * defined by its own internal spacing.
+ *
+ * That still cannot tell a 4-minute close-out from a 4-minute work session — nothing derived
+ * from timestamps can (see AUR-4333 for the durable write-time fix). Two guards bound it:
+ *
+ *   1. ORDERING (enforced by the caller): the exemption is only ever consulted for an issue
+ *      that would otherwise be reported as a GAP. An exemption suppresses a *demand*; where
+ *      the retro and both scorecards already exist there is no demand to suppress, so a
+ *      compliant issue is never rerouted into the exempt bucket. Without this, AUR-2471 and
+ *      AUR-2472 — fully compliant, worked and closed in one session — were demoted out of
+ *      `compliant`, hiding real coverage.
+ *   2. LOUD REPORTING: every exempt id is printed with its idle gap and last substantive
+ *      activity, and carried in PLAN_JSON.stale_sweep_exempt, so the exemption can never
+ *      read as coverage.
+ *
+ * Residual, deliberately accepted: an issue dormant >7d that is worked AND closed in a single
+ * session today without a retro is exempted rather than flagged. It is named in the bucket
+ * with its idle gap, so it is auditable rather than silent.
+ *
+ * `issue.read_marked` is excluded: a human opening an old issue is not work, and counting it
+ * would let a single page view re-arm the false positive. The list is a BLOCKlist, not an
+ * allowlist, so an unrecognised future action counts as substantive — i.e. unknown actions
+ * fail toward flagging (status quo), never toward silent exemption.
+ */
+export const STALE_SWEEP_IDLE_DAYS = 7;
+export const SESSION_GAP_MS = 60 * 60 * 1000;
+export const NON_SUBSTANTIVE_ACTIONS = new Set(['issue.read_marked']);
+
+/**
+ * @returns {{stale: boolean, idleDays: number, lastActivityAt: string|null}}
+ *   `activity` may be omitted; it can only ever add events, which can only shorten the
+ *   measured idle gap, so a comments-only verdict of "not stale" is already final.
+ */
+export function classifyStaleSweepClosure(issue, comments = [], activity = []) {
+  const completedMs = new Date(issue.completedAt ?? 0).getTime();
+  if (!Number.isFinite(completedMs) || completedMs <= 0) {
+    return { stale: false, idleDays: 0, lastActivityAt: null };
+  }
+
+  // The close itself anchors the final burst. Events stamped microseconds after
+  // `completedAt` are part of the same closing transaction; anything later (e.g. a retro
+  // written the next day) is post-closure and must not extend the timeline.
+  const stamps = [
+    completedMs,
+    new Date(issue.createdAt ?? 0).getTime(),
+    ...comments.map(c => new Date(c?.createdAt ?? 0).getTime()),
+    ...activity
+      .filter(a => !NON_SUBSTANTIVE_ACTIONS.has(a?.action))
+      .map(a => new Date(a?.createdAt ?? 0).getTime()),
+  ].filter(ms => Number.isFinite(ms) && ms > 0 && ms <= completedMs + 60_000);
+
+  const ordered = [...new Set(stamps)].sort((a, b) => b - a);
+
+  // Walk back through the final contiguous burst; the first jump wider than
+  // SESSION_GAP_MS ends it, and the event on its far side is the last real work.
+  for (let i = 0; i < ordered.length - 1; i++) {
+    if (ordered[i] - ordered[i + 1] <= SESSION_GAP_MS) continue;
+    const lastMs = ordered[i + 1];
+    const idleDays = (completedMs - lastMs) / 86400000;
+    return {
+      stale: idleDays > STALE_SWEEP_IDLE_DAYS,
+      idleDays: Math.round(idleDays * 10) / 10,
+      lastActivityAt: new Date(lastMs).toISOString(),
+    };
+  }
+
+  // Activity is contiguous all the way back to creation — no dormancy, never a sweep.
+  return {
+    stale: false,
+    idleDays: 0,
+    lastActivityAt: ordered.length ? new Date(ordered[ordered.length - 1]).toISOString() : null,
+  };
 }
 
 /**
@@ -188,6 +311,7 @@ export async function main({ hours, apply, apiUrl, apiKey, companyId, runIssueId
 
   const compliant = [];   // retro + both scorecards present
   const exempt = [];
+  const staleSweepExempt = []; // AUR-4235: legacy work dragged in by a sweep-close
   const retroGaps = [];   // missing `## Retrospective` comment
   const scorecardGaps = []; // has retro, missing performance or scorecard-adjusted record
 
@@ -205,12 +329,33 @@ export async function main({ hours, apply, apiUrl, apiKey, companyId, runIssueId
     const scorecardOk = perfOk && adjOk;
 
     if (retroOk && scorecardOk) {
+      // Compliant wins outright. The stale-sweep exemption suppresses a DEMAND, so it must
+      // never reroute an issue whose artifacts already exist — that would hide real coverage
+      // (AUR-2471/AUR-2472 were demoted out of `compliant` by an earlier ordering).
       compliant.push(issue);
-    } else {
-      if (!retroOk) retroGaps.push(issue);
-      // Report scorecard gap even when retro is also missing (distinct fix needed).
-      if (!scorecardOk) scorecardGaps.push({ issue, missingPerf: !perfOk, missingAdj: !adjOk });
+      continue;
     }
+
+    // AUR-4235 stale-sweep gate — consulted only for issues that would otherwise be flagged.
+    // Comments alone are checked first: activity can only add events, which can only shorten
+    // the idle gap, so a comments-only "not stale" is already final and the extra GET is
+    // skipped. Only a comments-stale issue pays for the activity confirmation, which can
+    // still rescue it (e.g. status transitions carrying no comment traffic).
+    let sweep = classifyStaleSweepClosure(issue, comments, []);
+    if (sweep.stale) {
+      let activity = [];
+      try { activity = asArray(await get(`/api/issues/${issue.id}/activity`), 'activity'); }
+      catch { activity = []; }
+      sweep = classifyStaleSweepClosure(issue, comments, activity);
+    }
+    if (sweep.stale) {
+      staleSweepExempt.push({ issue, reason: 'stale_sweep_closure', ...sweep });
+      continue;
+    }
+
+    if (!retroOk) retroGaps.push(issue);
+    // Report scorecard gap even when retro is also missing (distinct fix needed).
+    if (!scorecardOk) scorecardGaps.push({ issue, missingPerf: !perfOk, missingAdj: !adjOk });
   }
 
   // Resolve manager-to-notify for each gap.
@@ -238,10 +383,17 @@ export async function main({ hours, apply, apiUrl, apiKey, companyId, runIssueId
   // Plan output
   console.log(`\n=== Retro Compliance Audit (window ${hours}h, since ${new Date(since).toISOString()}) ===`);
   console.log(`Scope: done-only (cancelled excluded per AUR-2851 policy)`);
-  console.log(`Scanned: ${closedRecent.length} | Fully Compliant: ${compliant.length} | Exempt: ${exempt.length} | Retro Gaps: ${retroGaps.length} | Scorecard Gaps: ${scorecardGaps.length}\n`);
+  console.log(`Scanned: ${closedRecent.length} | Fully Compliant: ${compliant.length} | Exempt: ${exempt.length} | Stale-Sweep Exempt: ${staleSweepExempt.length} | Retro Gaps: ${retroGaps.length} | Scorecard Gaps: ${scorecardGaps.length}\n`);
 
   console.log('-- EXEMPT --');
   exempt.forEach(e => console.log(`  ${e.issue.identifier}  [${e.reason}]  ${e.issue.title.slice(0, 70)}`));
+
+  // Never let the exemption read as coverage: every stale-sweep id is named, with the
+  // idle gap and the last substantive activity that justified it (AUR-4235).
+  console.log('\n-- EXEMPT: stale_sweep_closure (legacy work; completedAt is a sweep timestamp) --');
+  staleSweepExempt.forEach(e => console.log(
+    `  ${e.issue.identifier}  idle=${e.idleDays}d  lastActivity=${e.lastActivityAt}  closed=${e.issue.completedAt}  ${e.issue.title.slice(0, 60)}`
+  ));
 
   console.log('\n-- FULLY COMPLIANT (retro + scorecards) --');
   compliant.forEach(i => console.log(`  ${i.identifier}  ${i.title.slice(0, 70)}`));
@@ -305,6 +457,10 @@ export async function main({ hours, apply, apiUrl, apiKey, companyId, runIssueId
     scope_policy: 'done-only; cancelled excluded (AUR-2851)',
     compliant: compliant.map(i => i.identifier),
     exempt: exempt.map(e => ({ id: e.issue.identifier, reason: e.reason })),
+    stale_sweep_exempt: staleSweepExempt.map(e => ({
+      id: e.issue.identifier, reason: e.reason,
+      idle_days: e.idleDays, last_activity_at: e.lastActivityAt, closed_at: e.issue.completedAt,
+    })),
     retro_gaps: retroGapPlan,
     scorecard_gaps: scorecardGapPlan,
   };

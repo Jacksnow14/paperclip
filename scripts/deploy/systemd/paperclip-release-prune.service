@@ -1,0 +1,40 @@
+# AUR-4037: release retention, decoupled from the deploy path.
+#
+# prune-releases.sh already implements the policy correctly and is well
+# guarded (release-guard.test.sh + prune-releases.test.sh, 46 cases). The
+# defect this unit fixes is not the policy, it is the TRIGGER: retention only
+# ever ran as the tail step of a successful build-release.sh, and that script
+# skips pruning — silently, exit 0 — on three separate conditions (unresolvable
+# `current`, lock held by a concurrent deploy, unopenable lock). Nothing
+# retried, nothing alarmed, and no other deploy path called it at all. Since
+# AUR-4155 refuses `build-release.sh --activate`, activation moved to
+# safe-deploy.sh / hand-rolled finish-deploy scripts, so in practice the one
+# trigger retention had was frequently not on the path taken.
+#
+# Measured consequence (2026-08-05): 5 releases x 2.0 GB = 10 GB on a disk at
+# 92%, where the policy's own ceiling is 3 (running/current + previous + 1
+# rollback). 4.0 GB was stranded by a policy that was correct and simply never
+# fired.
+#
+# Retention that depends on a build succeeding AND winning a lock is not
+# retention. This runs it on a clock instead, so a skip costs one interval
+# rather than being permanent.
+#
+# Installed by scripts/deploy/install-release-prune-timer.sh. Runs
+# system-level (not as a paperclip.service child) so it survives control-plane
+# restarts, and points at the ACTIVE RELEASE — same convention as the drift and
+# auto-deploy units — so it tracks whatever retention policy is deployed.
+[Unit]
+Description=Paperclip release retention (prune old /opt/paperclip/app/releases)
+Documentation=https://paperclip/AUR/issues/AUR-4037
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ievgen
+Group=ievgen
+ExecStart=/opt/paperclip/app/current/scripts/deploy/prune-releases.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=paperclip-release-prune

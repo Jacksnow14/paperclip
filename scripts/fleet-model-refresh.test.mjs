@@ -40,6 +40,8 @@ test('bumpCandidates proposes plausible next releases, never known ids', () => {
   assert.ok(c.includes('claude-fable-6'));
   assert.ok(c.includes('claude-opus-6'));
   assert.ok(c.includes('claude-opus-4-9'));
+  assert.ok(c.includes('claude-opus-5-1'));
+  assert.ok(c.includes('claude-opus-5.1'));
   for (const known of CLAUDE) assert.ok(!c.includes(known));
   const g = bumpCandidates(CODEX);
   assert.ok(g.includes('gpt-5.6'));
@@ -47,21 +49,34 @@ test('bumpCandidates proposes plausible next releases, never known ids', () => {
   assert.ok(g.includes('gpt-5.5-mini'));
 });
 
-test('policy: CEO=best-overall, CCM=latest fable, default keeps family/tier', () => {
+test('policy: CEO=latest opus, CCM=latest fable, CCF=latest sonnet, default keeps family/tier', () => {
   const policy = {
     agents: {
-      CEO: { rule: 'best-overall', effort: 'xhigh' },
+      CEO: { rule: 'latest-family:opus', effort: 'xhigh' },
       'Claude Code Max': { rule: 'latest-family:fable', effort: 'xhigh' },
+      'Claude Code Fast': { rule: 'latest-family:sonnet', effort: 'keep' },
     },
     default: { rule: 'latest-same-tier', effort: 'keep' },
   };
   const available = { claude_local: CLAUDE, codex_local: CODEX };
   const ceo = resolveTarget(
-    { name: 'CEO', adapterType: 'claude_local', model: 'claude-opus-5', adapterConfig: {} },
+    { name: 'CEO', adapterType: 'claude_local', model: 'claude-fable-5', adapterConfig: {} },
     policy,
     available,
   );
-  assert.deepEqual(ceo, { model: 'claude-fable-5', effort: 'xhigh' });
+  assert.deepEqual(ceo, { model: 'claude-opus-5', effort: 'xhigh' });
+  const ccf = resolveTarget(
+    { name: 'Claude Code Fast', adapterType: 'claude_local', model: 'claude-sonnet-4-6', adapterConfig: {} },
+    policy,
+    available,
+  );
+  assert.deepEqual(ccf, { model: 'claude-sonnet-5', effort: null });
+  const opus51 = resolveTarget(
+    { name: 'CEO', adapterType: 'claude_local', model: 'claude-opus-5', adapterConfig: {} },
+    policy,
+    { claude_local: [...CLAUDE, 'claude-opus-5.1'], codex_local: CODEX },
+  );
+  assert.deepEqual(opus51, { model: 'claude-opus-5.1', effort: 'xhigh' });
   const ccm = resolveTarget(
     { name: 'Claude Code Max', adapterType: 'claude_local', model: 'claude-fable-5', adapterConfig: {} },
     policy,

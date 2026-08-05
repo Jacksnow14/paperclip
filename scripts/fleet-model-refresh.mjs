@@ -248,9 +248,11 @@ async function main() {
   }
   const policy = JSON.parse(readFileSync(args.policy, 'utf8'));
   const state = loadState(args.stateDir);
+  // Founder directive 2026-08-06: telegram is immediate-attention only — fleet
+  // housekeeping goes out as INFO (audit-logged, filtered from DMs).
   const alert = (msg) => {
     try {
-      if (!args.dryRun) execFileSync(args.alertCmd, [msg]);
+      if (!args.dryRun) execFileSync(args.alertCmd, ['INFO', msg]);
     } catch {
       /* alerting is best-effort */
     }

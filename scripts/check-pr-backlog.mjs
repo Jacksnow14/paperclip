@@ -267,7 +267,8 @@ async function main() {
   for (const e of escalate) {
     try {
       execFileSync(args.alertCmd, [
-        `SEV3 pr-backlog: PR #${e.number} open ${e.ageHours}h without landing — ${e.title}. ` +
+        'SEV2',
+        `pr-backlog: PR #${e.number} open ${e.ageHours}h without landing — ${e.title}. ` +
           `Review pipeline is not keeping up (this is a pipeline alarm, not a code-review request).`,
       ]);
       state.prs[String(e.number)] = {

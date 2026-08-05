@@ -16,6 +16,7 @@ export interface IssueLivenessIssueInput {
   identifier: string | null;
   title: string;
   status: string;
+  description?: string | null;
   projectId?: string | null;
   goalId?: string | null;
   parentId?: string | null;
@@ -305,6 +306,43 @@ function ownerCandidatesForRecoveryIssue(
   return candidates;
 }
 
+// An issue whose description declares an explicit external wait ("External owner:" +
+// "External action:" lines) is deliberately parked on a party outside the system. Shared with
+// the blocked-inbox classifier in services/issues.ts, which additionally redacts those
+// description lines before responses leave the server.
+export function externalWaitFromDescription(description: string | null): { owner: string; action: string } | null {
+  if (!description) return null;
+  const owner = description.match(/^\s*external owner\s*:\s*(.+)$/im)?.[1]?.trim();
+  const action = description.match(/^\s*external action\s*:\s*(.+)$/im)?.[1]?.trim();
+  if (!owner || !action) return null;
+  return {
+    owner: owner.slice(0, 120),
+    action: action.slice(0, 240),
+  };
+}
+
+// True when the shorter dependency path is an exact tail match of the longer one, i.e. both
+// findings describe a walk that ends by crossing the exact same final edge into the same
+// recoveryIssue (same lineage), as opposed to two different sources independently landing on
+// the same recoveryIssue by coincidence.
+function dependencyPathTailsMatch(a: IssueLivenessFinding, b: IssueLivenessFinding): boolean {
+  const [shortPath, longPath] = a.dependencyPath.length <= b.dependencyPath.length
+    ? [a.dependencyPath, b.dependencyPath]
+    : [b.dependencyPath, a.dependencyPath];
+  const offset = longPath.length - shortPath.length;
+  return shortPath.every((entry, index) => entry.issueId === longPath[offset + index]?.issueId);
+}
+
+// A "self" finding (issueId === recoveryIssueId) only exists because a leaf-level walk had
+// nothing else to blame; a finding naming a distinct blocker/blocked-by issue is always more
+// specific. Among non-self findings, the shortest dependency path is the most proximate report.
+function isMoreSpecificFinding(candidate: IssueLivenessFinding, existing: IssueLivenessFinding): boolean {
+  const candidateIsSelf = candidate.issueId === candidate.recoveryIssueId;
+  const existingIsSelf = existing.issueId === existing.recoveryIssueId;
+  if (candidateIsSelf !== existingIsSelf) return !candidateIsSelf;
+  return candidate.dependencyPath.length < existing.dependencyPath.length;
+}
+
 function incidentKey(input: {
   companyId: string;
   issueId: string;
@@ -356,6 +394,7 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   const issuesById = new Map(input.issues.map((issue) => [issue.id, issue]));
   const agentsById = new Map(input.agents.map((agent) => [agent.id, agent]));
   const blockersByBlockedIssueId = new Map<string, IssueLivenessRelationInput[]>();
+  const childrenByParentId = new Map<string, IssueLivenessIssueInput[]>();
   const unresolvedBlockers = new Set<string>();
   const findings: IssueLivenessFinding[] = [];
   const activeRuns = input.activeRuns ?? [];
@@ -384,14 +423,16 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     }
   }
 
-  for (const relations of blockersByBlockedIssueId.values()) {
-    relations.sort((left, right) => {
-      const leftIssue = issuesById.get(left.blockerIssueId);
-      const rightIssue = issuesById.get(right.blockerIssueId);
-      const leftLabel = leftIssue ? issueLabel(leftIssue) : left.blockerIssueId;
-      const rightLabel = rightIssue ? issueLabel(rightIssue) : right.blockerIssueId;
-      return leftLabel.localeCompare(rightLabel);
-    });
+  // Children are implicit blockers of their parent (mirrors listIssueBlockerAttentionMap's
+  // childRows edge in services/issues.ts): a parent can't complete until its open children do.
+  for (const issue of input.issues) {
+    if (!issue.parentId) continue;
+    const parent = issuesById.get(issue.parentId);
+    if (!parent || parent.companyId !== issue.companyId) continue;
+
+    const list = childrenByParentId.get(issue.parentId) ?? [];
+    list.push(issue);
+    childrenByParentId.set(issue.parentId, list);
   }
 
   function hasExplicitWaitingPath(issue: IssueLivenessIssueInput) {
@@ -552,6 +593,36 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     return null;
   }
 
+  function blockerCandidatesFor(
+    source: IssueLivenessIssueInput,
+    current: IssueLivenessIssueInput,
+  ): IssueLivenessIssueInput[] {
+    const seenIds = new Set<string>();
+    const candidates: IssueLivenessIssueInput[] = [];
+
+    const relations = blockersByBlockedIssueId.get(current.id) ?? [];
+    for (const relation of relations) {
+      if (relation.companyId !== current.companyId || relation.companyId !== source.companyId) continue;
+      const blocker = issuesById.get(relation.blockerIssueId);
+      if (!blocker || blocker.companyId !== source.companyId || blocker.status === "done") continue;
+      if (seenIds.has(blocker.id)) continue;
+      seenIds.add(blocker.id);
+      candidates.push(blocker);
+    }
+
+    const children = childrenByParentId.get(current.id) ?? [];
+    for (const child of children) {
+      if (child.companyId !== current.companyId || child.companyId !== source.companyId) continue;
+      if (child.status === "done" || child.status === "cancelled") continue;
+      if (seenIds.has(child.id)) continue;
+      seenIds.add(child.id);
+      candidates.push(child);
+    }
+
+    candidates.sort((left, right) => issueLabel(left).localeCompare(issueLabel(right)));
+    return candidates;
+  }
+
   function firstBlockedChainFinding(
     source: IssueLivenessIssueInput,
     current: IssueLivenessIssueInput,
@@ -561,11 +632,8 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     if (seen.has(current.id)) return null;
     seen.add(current.id);
 
-    const relations = blockersByBlockedIssueId.get(current.id) ?? [];
-    for (const relation of relations) {
-      if (relation.companyId !== current.companyId || relation.companyId !== source.companyId) continue;
-      const blocker = issuesById.get(relation.blockerIssueId);
-      if (!blocker || blocker.companyId !== source.companyId || blocker.status === "done") continue;
+    const blockers = blockerCandidatesFor(source, current);
+    for (const blocker of blockers) {
       const path = [...dependencyPath, blocker];
 
       if (blocker.status === "blocked") {
@@ -585,7 +653,24 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     if (issue.status === "blocked") {
       if (unresolvedBlockers.has(issue.id)) continue;
       const chainFinding = firstBlockedChainFinding(issue, issue, [issue], new Set());
-      if (chainFinding) findings.push(chainFinding);
+      if (chainFinding) {
+        findings.push(chainFinding);
+      } else if (
+        !hasExplicitWaitingPath(issue) &&
+        blockerCandidatesFor(issue, issue).length === 0 &&
+        // An explicit external wait is a live (if slow) path: the issue is parked on a party
+        // outside the system, not structurally inert. Emitting a self-finding here would also
+        // let the blocked-inbox classifier prefer the finding over its `external_wait` state
+        // and skip that state's description redaction, leaking external owner/action details.
+        !externalWaitFromDescription(issue.description ?? null)
+      ) {
+        // Leaf-level check: a blocked issue with no relation/child blockers of its own is
+        // structurally inert on its own terms (AUR-3918's shape) regardless of its parent's
+        // status. It only surfaces above via blockerCandidatesFor when some ancestor is also
+        // being walked as a root, so check it directly here too.
+        const selfFinding = blockedFindingForLeaf(issue, issue, [issue]);
+        if (selfFinding) findings.push(selfFinding);
+      }
     }
 
     if (issue.status === "in_review" && !unresolvedBlockers.has(issue.id)) {
@@ -594,5 +679,24 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     }
   }
 
-  return findings;
+  // Not root-skipping a child from its own independent walk (above) means the exact same
+  // blocked-issue-to-recoveryIssue edge can now surface twice: once from the child's own walk,
+  // once from an ancestor's walk landing on the same child via the parent/child edge. That is a
+  // duplicate report of the same edge (same recoveryIssueId AND one's dependency path is the
+  // tail of the other's) and should collapse to the most specific one. It is NOT a duplicate
+  // when two unrelated issues are independently blocked by the same shared blocker — that is
+  // two distinct, equally actionable findings and both must survive.
+  const deduped: IssueLivenessFinding[] = [];
+  for (const candidate of findings) {
+    const duplicateIndex = deduped.findIndex(
+      (existing) => existing.recoveryIssueId === candidate.recoveryIssueId && dependencyPathTailsMatch(candidate, existing),
+    );
+    if (duplicateIndex === -1) {
+      deduped.push(candidate);
+    } else if (isMoreSpecificFinding(candidate, deduped[duplicateIndex]!)) {
+      deduped[duplicateIndex] = candidate;
+    }
+  }
+
+  return deduped;
 }

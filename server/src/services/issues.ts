@@ -76,7 +76,7 @@ import {
   type ActiveIssueTreePauseHoldGate,
 } from "./issue-tree-control.js";
 import { parseIssueGraphLivenessIncidentKey } from "./recovery/origins.js";
-import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
+import { classifyIssueGraphLiveness, externalWaitFromDescription, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
 import { recoveryActionDormancyCutoff } from "./issue-recovery-actions.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
@@ -2051,17 +2051,6 @@ async function listSuccessfulRunHandoffMapForIssues(
   return states;
 }
 
-function externalWaitFromDescription(description: string | null): { owner: string; action: string } | null {
-  if (!description) return null;
-  const owner = description.match(/^\s*external owner\s*:\s*(.+)$/im)?.[1]?.trim();
-  const action = description.match(/^\s*external action\s*:\s*(.+)$/im)?.[1]?.trim();
-  if (!owner || !action) return null;
-  return {
-    owner: owner.slice(0, 120),
-    action: action.slice(0, 240),
-  };
-}
-
 function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -2334,6 +2323,7 @@ async function listIssueBlockedInboxAttentionMap(
       identifier: issue.identifier,
       title: issue.title,
       status: issue.status,
+      description: issue.description,
       projectId: issue.projectId,
       goalId: issue.goalId,
       parentId: issue.parentId,

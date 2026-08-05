@@ -160,6 +160,14 @@ When adding endpoints:
 - write activity log entries for mutations
 - return consistent HTTP errors (`400/401/403/404/409/422/500`)
 
+### House rule: never trust a mutation's response body
+
+Never read a mutation's success off its response body. Check the HTTP status, then re-fetch. A 409 body has no top-level `status`/`assigneeAgentId`, so the ordinary `.get('status')` idiom silently reports success.
+
+Bash callers must use `scripts/lib/paperclip-api.sh` (`pc_api` / `pc_api_patch_issue`) instead of hand-rolled `curl -s` — it captures the HTTP status, fails loud (non-zero exit + full error body on stderr) on any non-2xx, and `pc_api_patch_issue` PATCHes then re-fetches so callers never parse a mutation's own response as ground truth.
+
+`GET /api/issues/{id}/children` is a routed alias for `GET /api/companies/{companyId}/issues?parentId={id}` — either query form works.
+
 ### Permission keys (`tasks:comment_cross_issue`)
 
 Agents granted `tasks:comment_cross_issue` (or with `role=ceo`) may post a **coordination comment** on any issue they do not own — including `done`, `cancelled`, and `in_progress` issues owned by another agent — without checking out or reopening the issue.

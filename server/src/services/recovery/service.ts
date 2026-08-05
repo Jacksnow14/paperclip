@@ -85,6 +85,11 @@ const MISSING_BLOCKER_EDGE_ESCALATION_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 // would flip it back every tick. Cap auto-recovery at one per
 // (issueId, blocker-set) per rolling window and downgrade to Class B after.
 const CLASS_A_OSCILLATION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const ISSUE_GRAPH_LIVENESS_RESULT_ID_ARRAY_LIMIT = 50;
+
+function pushBoundedIssueId(ids: string[], issueId: string) {
+  if (ids.length < ISSUE_GRAPH_LIVENESS_RESULT_ID_ARRAY_LIMIT) ids.push(issueId);
+}
 
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
@@ -3290,6 +3295,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       issueGraphRecoveryActionsResolved: 0,
       actionErrors: 0,
       errorIssueIds: [] as string[],
+      classAIssueIds: [] as string[],
+      classBNudgedIssueIds: [] as string[],
+      classBEscalatedIssueIds: [] as string[],
     };
 
     // These pre-loop loaders used to sit outside every try/catch. A throw here
@@ -3541,6 +3549,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           if (!updatedIssue) continue;
 
           result.classAAutoRecovered += 1;
+          pushBoundedIssueId(result.classAIssueIds, classification.issue.id);
 
           const blockerSummaries = classification.directBlockers.map((blocker) => ({
             issueId: blocker.blockerIssueId,
@@ -3694,8 +3703,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             : "Review this stale blocked issue, attach a real first-class blocker, or move it out of blocked.",
         });
 
-        if (stage === "wake_assignee") result.classBNudged += 1;
-        else result.classBEscalated += 1;
+        if (stage === "wake_assignee") {
+          result.classBNudged += 1;
+          pushBoundedIssueId(result.classBNudgedIssueIds, classification.issue.id);
+        } else {
+          result.classBEscalated += 1;
+          pushBoundedIssueId(result.classBEscalatedIssueIds, classification.issue.id);
+        }
       } catch (error) {
         result.actionErrors += 1;
         result.errorIssueIds.push(classification.issue.id);
@@ -4024,6 +4038,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       issueGraphRecoveryActionsResolved: 0,
       actionErrors: 0,
       actionErrorIssueIds: [] as string[],
+      classAIssueIds: [] as string[],
+      classBNudgedIssueIds: [] as string[],
+      classBEscalatedIssueIds: [] as string[],
     };
 
     if (!autoRecoveryEnabled) {
@@ -4052,6 +4069,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     result.issueGraphRecoveryActionsResolved = durableBlockedIssueActuation.issueGraphRecoveryActionsResolved;
     result.actionErrors = durableBlockedIssueActuation.actionErrors;
     result.actionErrorIssueIds = durableBlockedIssueActuation.errorIssueIds;
+    result.classAIssueIds = durableBlockedIssueActuation.classAIssueIds;
+    result.classBNudgedIssueIds = durableBlockedIssueActuation.classBNudgedIssueIds;
+    result.classBEscalatedIssueIds = durableBlockedIssueActuation.classBEscalatedIssueIds;
 
     const findings = await collectIssueGraphLivenessFindings();
     result.findings = findings.length;

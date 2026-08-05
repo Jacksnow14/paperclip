@@ -299,6 +299,7 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   labelIds?: string[];
   blockedByIssueIds?: string[];
   inheritExecutionWorkspaceFromIssueId?: string | null;
+  actorRunId?: string | null;
 };
 type IssueChildCreateInput = IssueCreateInput & {
   acceptanceCriteria?: string[];
@@ -1677,6 +1678,7 @@ const issueListSelect = {
   executionWorkspaceSettings: sql<null>`null`,
   startedAt: issues.startedAt,
   completedAt: issues.completedAt,
+  completedByRunId: issues.completedByRunId,
   cancelledAt: issues.cancelledAt,
   hiddenAt: issues.hiddenAt,
   createdAt: issues.createdAt,
@@ -4133,6 +4135,7 @@ export function issueService(db: Db) {
         labelIds: inputLabelIds,
         blockedByIssueIds,
         inheritExecutionWorkspaceFromIssueId,
+        actorRunId,
         ...issueData
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
@@ -4349,6 +4352,10 @@ export function issueService(db: Db) {
         if (values.status === "cancelled") {
           values.cancelledAt = new Date();
         }
+        // completedByRunId is server-derived provenance (AUR-4333): the run
+        // attached to the write that put the issue into `done`. Never accept a
+        // caller-supplied value.
+        values.completedByRunId = values.status === "done" ? (actorRunId ?? null) : null;
         Object.assign(
           values,
           buildInitialIssueMonitorFields({
@@ -4471,8 +4478,18 @@ export function issueService(db: Db) {
       }
 
       applyStatusSideEffects(issueData.status, patch);
+      // completedByRunId is server-derived provenance (AUR-4333): the run that
+      // held the checkout when the issue entered `done`. Never accept a
+      // caller-supplied value. Captured from `existing` here because the
+      // non-in_progress cleanup below nulls checkoutRunId in the same write.
+      // A redundant done -> done update keeps the original stamp.
+      delete patch.completedByRunId;
+      if (issueData.status === "done" && existing.status !== "done") {
+        patch.completedByRunId = existing.checkoutRunId;
+      }
       if (issueData.status && issueData.status !== "done") {
         patch.completedAt = null;
+        patch.completedByRunId = null;
       }
       if (issueData.status && issueData.status !== "cancelled") {
         patch.cancelledAt = null;

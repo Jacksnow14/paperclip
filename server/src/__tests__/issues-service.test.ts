@@ -3437,3 +3437,216 @@ describeEmbeddedPostgres("issueService.wasAgentPriorParticipantInThread", () => 
     ).resolves.toBe(false);
   });
 });
+
+describeEmbeddedPostgres("issueService completedByRunId provenance (AUR-4333)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-completed-by-run-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issueRelations);
+    await db.delete(issueInboxArchives);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(heartbeatRuns);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(goals);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedCompanyAgentRuns(runCount: number) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runIds = Array.from({ length: runCount }, () => randomUUID());
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    if (runIds.length > 0) {
+      await db.insert(heartbeatRuns).values(
+        runIds.map((id) => ({
+          id,
+          companyId,
+          agentId,
+          status: "running",
+          invocationSource: "manual",
+        })),
+      );
+    }
+    return { companyId, agentId, runIds };
+  }
+
+  async function readIssueRow(issueId: string) {
+    return db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+  }
+
+  it("stamps completedByRunId from the checkout run when an update closes the issue", async () => {
+    const { companyId, agentId, runIds: [runId] } = await seedCompanyAgentRuns(1);
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Worked to completion",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      checkoutRunId: runId,
+      startedAt: new Date(),
+    });
+
+    const updated = await svc.update(issueId, { status: "done" });
+
+    expect(updated).not.toBeNull();
+    const row = await readIssueRow(issueId);
+    expect(row!.completedByRunId).toBe(runId);
+    // the stamp must survive the same write that clears the checkout
+    expect(row!.checkoutRunId).toBeNull();
+    expect(row!.completedAt).not.toBeNull();
+  });
+
+  it("closes with null completedByRunId when no run holds the checkout (sweep-shape close)", async () => {
+    const { companyId, agentId } = await seedCompanyAgentRuns(0);
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Swept shut",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+
+    await svc.update(issueId, { status: "done" });
+
+    const row = await readIssueRow(issueId);
+    expect(row!.completedAt).not.toBeNull();
+    expect(row!.completedByRunId).toBeNull();
+  });
+
+  it("clears completedByRunId on reopen and re-stamps on the next close", async () => {
+    const { companyId, agentId, runIds: [runA, runB] } = await seedCompanyAgentRuns(2);
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Reopened and finished again",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      checkoutRunId: runA,
+    });
+
+    await svc.update(issueId, { status: "done" });
+    expect((await readIssueRow(issueId))!.completedByRunId).toBe(runA);
+
+    await svc.update(issueId, { status: "todo" });
+    const reopened = await readIssueRow(issueId);
+    expect(reopened!.completedAt).toBeNull();
+    expect(reopened!.completedByRunId).toBeNull();
+
+    await db.update(issues).set({ status: "in_progress", checkoutRunId: runB }).where(eq(issues.id, issueId));
+    await svc.update(issueId, { status: "done" });
+    expect((await readIssueRow(issueId))!.completedByRunId).toBe(runB);
+  });
+
+  it("keeps the original stamp on a redundant done -> done update", async () => {
+    const { companyId, agentId, runIds: [runId] } = await seedCompanyAgentRuns(1);
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Double closed",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      checkoutRunId: runId,
+    });
+
+    await svc.update(issueId, { status: "done" });
+    // checkout is now cleared; a second done write must not null the stamp
+    await svc.update(issueId, { status: "done" });
+
+    expect((await readIssueRow(issueId))!.completedByRunId).toBe(runId);
+  });
+
+  it("ignores caller-supplied completedByRunId on update (server-owned field)", async () => {
+    const { companyId, agentId, runIds: [checkoutRun, smuggledRun] } = await seedCompanyAgentRuns(2);
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Injection attempt",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      checkoutRunId: checkoutRun,
+    });
+
+    await svc.update(issueId, { status: "done", completedByRunId: smuggledRun });
+    expect((await readIssueRow(issueId))!.completedByRunId).toBe(checkoutRun);
+
+    await svc.update(issueId, { title: "Injection attempt (renamed)", completedByRunId: smuggledRun });
+    expect((await readIssueRow(issueId))!.completedByRunId).toBe(checkoutRun);
+  });
+
+  it("stamps the creating run on create-with-done and stays null otherwise", async () => {
+    const { companyId, runIds: [runId] } = await seedCompanyAgentRuns(1);
+
+    const closedAtBirth = await svc.create(companyId, {
+      title: "Filed as already finished",
+      status: "done",
+      priority: "low",
+      actorRunId: runId,
+    });
+    expect((await readIssueRow(closedAtBirth.id))!.completedByRunId).toBe(runId);
+    expect((await readIssueRow(closedAtBirth.id))!.completedAt).not.toBeNull();
+
+    const openWithRun = await svc.create(companyId, {
+      title: "Open issue created by a run",
+      status: "todo",
+      priority: "low",
+      actorRunId: runId,
+    });
+    expect((await readIssueRow(openWithRun.id))!.completedByRunId).toBeNull();
+
+    const doneWithoutRun = await svc.create(companyId, {
+      title: "System record with no run",
+      status: "done",
+      priority: "low",
+    });
+    expect((await readIssueRow(doneWithoutRun.id))!.completedByRunId).toBeNull();
+  });
+});

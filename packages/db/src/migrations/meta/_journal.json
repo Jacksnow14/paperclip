@@ -675,6 +675,13 @@
       "breakpoints": true
     },
     {
+      "idx": 96,
+      "version": "7",
+      "when": 1785454276675,
+      "tag": "0096_issue_completed_by_run",
+      "breakpoints": true
+    },
+    {
       "idx": 97,
       "version": "7",
       "when": 1785413713416,

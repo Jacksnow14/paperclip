@@ -13,22 +13,57 @@ import {
 const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+`?claude\s+login`?|login\s+required|requires\s+login|unauthorized|authentication\s+required)/i;
 const URL_RE = /(https?:\/\/[^\s'"`<>()[\]{};,!?]+[^\s'"`<>()[\]{};,!.?:]+)/gi;
 
-const CLAUDE_TRANSIENT_UPSTREAM_RE =
-  /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached|session\s+limit|hit\s+your\s+(?:weekly|session|usage|\d+[-\s]?hour)\s+limit)/i;
-// Prefixes recognized ahead of a "resets <time>" hint. Must stay in sync with
-// the quota-exhaustion wording covered by CLAUDE_TRANSIENT_UPSTREAM_RE above
-// (AUR-4055: "You've hit your session limit" carries a live reset timestamp
-// but was falling outside this list, so the retry scheduler never learned
-// when it was safe to try again and fell back to the generic bounded-backoff
-// ladder instead).
+// AUR-4531: the quota-exhaustion wording, factored into ONE source of truth shared by
+// the transient classifier and the reset-time extractor below. Production emits this in
+// two grammatically different shapes:
 //
-// AUR-4192: the weekly cap uses the same shape with no "reached" suffix —
-// "You've hit your weekly limit · resets 11am (UTC)" and
-// "You've hit your weekly limit · resets Jul 29, 11am (UTC)" — so it fell
-// outside the AUR-4055 wording list too. Both forms are matched via the
-// `hit your <window> limit` alternative below.
-const CLAUDE_EXTRA_USAGE_RESET_RE =
-  /(?:out\s+of\s+extra\s+usage|extra\s+usage|usage\s+limit\s+reached|usage\s+cap\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|claude\s+usage\s+limit\s+reached|session\s+limit|hit\s+your\s+(?:weekly|session|usage|\d+[-\s]?hour)\s+limit)[\s\S]{0,80}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;
+//   "Claude usage limit reached"                        <- "<kind> limit reached"
+//   "You've hit your weekly limit"                      <- "hit your <kind> limit"
+//   "You've hit your weekly limit · resets Aug 1"
+//   "You've hit your weekly limit · resets Jul 29, 11am (UTC)"   (AUR-4192)
+//   "You've hit your session limit · resets 4pm (UTC)"
+//
+// The pre-AUR-4192/AUR-4531 regexes only covered the first shape (and `session limit` as
+// a bare literal, which is why the session variant happened to match). Every
+// "You've hit your weekly limit" failure therefore classified as NON-transient: no
+// `errorFamily`, no `retryNotBefore`, no quota pause. That is the root of AUR-4336,
+// which burned 72h of fleet quota against a wall nothing was watching.
+//
+// Keeping both regexes derived from this one fragment is deliberate: the previous
+// duplicated-literal arrangement is exactly how the two lists drifted apart (AUR-4055
+// had to patch the same omission once already, and AUR-4192 a second time). A string
+// that classifies transient but yields no reset time silently degrades the scheduler
+// back to the bounded-ladder behaviour this issue exists to kill.
+const CLAUDE_QUOTA_LIMIT_KIND = String.raw`(?:\d+[-\s]?hour|weekly|session|usage|extra\s+usage|opus)`;
+const CLAUDE_QUOTA_EXHAUSTION_SOURCE = [
+  String.raw`out\s+of\s+extra\s+usage`,
+  String.raw`extra\s+usage\b`,
+  // "<kind> limit reached" / "<kind> cap reached", optionally brand-prefixed.
+  String.raw`(?:claude\s+)?${CLAUDE_QUOTA_LIMIT_KIND}\s+(?:limit|cap)\s+reached`,
+  // AUR-4531 / AUR-4192: "You've hit your weekly limit" — the word "reached" never
+  // appears in this shape.
+  String.raw`hit\s+your\s+${CLAUDE_QUOTA_LIMIT_KIND}\s+(?:limit|cap)`,
+  // Retained as bare literals for back-compatibility with the pre-AUR-4531 wording set.
+  String.raw`session\s+limit`,
+  String.raw`usage\s+limit\s+reached`,
+].join("|");
+
+const CLAUDE_TRANSIENT_UPSTREAM_RE = new RegExp(
+  `(?:rate[-\\s]?limit(?:ed)?|rate_limit_error|too\\s+many\\s+requests|\\b429\\b|overloaded(?:_error)?|server\\s+overloaded|service\\s+unavailable|\\b503\\b|\\b529\\b|high\\s+demand|try\\s+again\\s+later|temporarily\\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|${CLAUDE_QUOTA_EXHAUSTION_SOURCE})`,
+  "i",
+);
+
+// Prefixes recognized ahead of a "resets <time>" hint. Shares
+// CLAUDE_QUOTA_EXHAUSTION_SOURCE with the classifier above so the two can no longer
+// drift (AUR-4055: "You've hit your session limit" carries a live reset timestamp but
+// was falling outside the old hand-maintained list, so the retry scheduler never learned
+// when it was safe to try again and fell back to the generic bounded-backoff ladder.
+// AUR-4192/AUR-4531: the same happened again for the weekly/5-hour "hit your ... limit"
+// wording).
+const CLAUDE_EXTRA_USAGE_RESET_RE = new RegExp(
+  `(?:${CLAUDE_QUOTA_EXHAUSTION_SOURCE})[\\s\\S]{0,80}?\\bresets?\\s+(?:at\\s+)?([^\\n()]+?)(?:\\s*\\(([^)]+)\\))?(?:[.!]|\\n|$)`,
+  "i",
+);
 
 // AUR-4513: a prompt-size rejection is DETERMINISTIC -- the same prompt re-sent
 // unchanged can never succeed, so it must never share the transient/retryable
@@ -425,8 +460,71 @@ function resolveDatedResetTime(input: {
   return best;
 }
 
+// AUR-4531: a *weekly* limit resets on a calendar day, not at a clock time, so its
+// wording carries no am/pm at all: "You've hit your weekly limit · resets Aug 1".
+// The clock-time parser below requires an am/pm match (even after the AUR-4192
+// date-prefix split) and returns null for this shape, so even once the classifier was
+// widened the reset time stayed null — and a null reset time is precisely what
+// collapses the scheduler back onto the bounded retry ladder. A bare date is
+// interpreted as midnight at the start of that day (the earliest instant the quota
+// could plausibly be back), which errs toward re-probing early rather than
+// over-suppressing.
+function parseClaudeResetCalendarDate(
+  normalized: string,
+  now: Date,
+  timeZoneHint?: string | null,
+): Date | null {
+  // "Aug 1", "Aug 1, 2026", "August 1 2026", "1 Aug" — plus an optional trailing time.
+  const match = normalized.match(
+    /^(?:([a-z]{3,9})\.?\s+(\d{1,2})|(\d{1,2})\s+([a-z]{3,9})\.?)(?:,?\s+(\d{4}))?(?:\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?)?$/i,
+  );
+  if (!match) return null;
+
+  const monthName = (match[1] ?? match[4] ?? "").toLowerCase();
+  const day = Number.parseInt(match[2] ?? match[3] ?? "", 10);
+  const month = RESET_MONTH_NUMBERS[monthName.slice(0, 3)];
+  if (!month) return null;
+  if (!Number.isInteger(day) || day < 1 || day > 31) return null;
+
+  let hour = 0;
+  let minute = 0;
+  if (match[6]) {
+    const hour12 = Number.parseInt(match[6], 10);
+    minute = Number.parseInt(match[7] ?? "0", 10);
+    if (!Number.isInteger(hour12) || hour12 < 1 || hour12 > 12) return null;
+    if (!Number.isInteger(minute) || minute < 0 || minute > 59) return null;
+    hour = hour12 % 12;
+    if ((match[8] ?? "").toLowerCase() === "p") hour += 12;
+  }
+
+  const timeZone = normalizeResetTimeZone(timeZoneHint);
+  const explicitYear = match[5] ? Number.parseInt(match[5], 10) : null;
+  // No year in the wording: pick the year that puts the reset in the FUTURE. A weekly
+  // limit hit on Dec 28 that "resets Jan 3" is next year's Jan 3, and resolving it to a
+  // date already past would impose no pause at all.
+  const candidateYears = explicitYear != null
+    ? [explicitYear]
+    : timeZone
+      ? [readTimeZoneParts(now, timeZone).year, readTimeZoneParts(now, timeZone).year + 1]
+      : [now.getFullYear(), now.getFullYear() + 1];
+
+  for (const year of candidateYears) {
+    const resolved = timeZone
+      ? dateFromTimeZoneWallClock({ year, month, day, hour, minute, timeZone })
+      : (() => {
+          const local = new Date(year, month - 1, day, hour, minute, 0, 0);
+          return Number.isNaN(local.getTime()) ? null : local;
+        })();
+    if (!resolved) continue;
+    if (explicitYear != null || resolved.getTime() > now.getTime()) return resolved;
+  }
+  return null;
+}
+
 function parseClaudeResetClockTime(clockText: string, now: Date, timeZoneHint?: string | null): Date | null {
   const normalized = clockText.trim().replace(/\s+/g, " ");
+  const calendarDate = parseClaudeResetCalendarDate(normalized, now, timeZoneHint);
+  if (calendarDate) return calendarDate;
   const { monthDay, clockText: clockOnly } = splitResetDatePrefix(normalized);
   const match = clockOnly.match(/^(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?/i);
   if (!match) return null;

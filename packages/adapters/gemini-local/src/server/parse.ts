@@ -252,8 +252,21 @@ export function describeGeminiFailure(parsed: Record<string, unknown>): string |
 }
 
 const GEMINI_AUTH_REQUIRED_RE = /(?:not\s+authenticated|please\s+authenticate|api[_ ]?key\s+(?:required|missing|invalid)|authentication\s+required|unauthorized|invalid\s+credentials|not\s+logged\s+in|login\s+required|run\s+`?gemini\s+auth(?:\s+login)?`?\s+first)/i;
+// AUR-4531: tightened from a bare `quota` alternative. `detectGeminiQuotaExhausted` is now
+// wired into the execute path (it previously had no non-test caller at all), so a
+// false positive is no longer harmless: it would tag a deterministic failure as
+// `transient_upstream` and park the agent behind a quota breaker it can never clear.
+// Bare `quota` matches an agent merely saying the word, which is exactly the AUR-4513
+// transcript-contamination shape. Require a quota *verb*.
 const GEMINI_QUOTA_EXHAUSTED_RE =
-  /(?:resource_exhausted|quota|rate[-\s]?limit|too many requests|\b429\b|billing details)/i;
+  /(?:resource_exhausted|quota\s+(?:exceeded|exhausted|limit)|exceeded\s+your\s+(?:current\s+)?quota|rate[-\s]?limit(?:ed|ing|s)?|too many requests|\b429\b|billing details)/i;
+
+// AUR-4531: gemini RESOURCE_EXHAUSTED errors carry their backoff as a duration, not as a
+// wall-clock reset ("retryDelay":"57s" in the google.rpc.RetryInfo detail, or a
+// Retry-After header echoed into the message). Without a reset time the quota breaker has
+// no lifetime to key on, so this is what makes Defect B reachable for gemini at all.
+const GEMINI_RETRY_DELAY_RE =
+  /(?:"?retry[_-]?delay"?\s*[:=]\s*"?(\d+(?:\.\d+)?)\s*s(?:ec(?:onds?)?)?"?|retry[- ]after\s*[:=]?\s*(\d+(?:\.\d+)?)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes)?\b|(?:try|retry)\s+again\s+in\s+(\d+(?:\.\d+)?)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes)\b)/i;
 
 export function detectGeminiAuthRequired(input: {
   parsed: Record<string, unknown> | null;
@@ -285,6 +298,41 @@ export function detectGeminiQuotaExhausted(input: {
 
   const exhausted = messages.some((line) => GEMINI_QUOTA_EXHAUSTED_RE.test(line));
   return { exhausted };
+}
+
+/**
+ * AUR-4531: extract the provider's own "safe to retry at" instant from a gemini quota
+ * rejection, so the quota breaker gets a lifetime derived from the provider rather than
+ * from our retry ladder. Returns null when the rejection carries no duration hint — the
+ * caller then falls back to the bounded ladder, which is the pre-existing behaviour.
+ */
+export function extractGeminiRetryNotBefore(
+  input: {
+    parsed: Record<string, unknown> | null;
+    stdout: string;
+    stderr: string;
+  },
+  now = new Date(),
+): Date | null {
+  const errors = extractGeminiErrorMessages(input.parsed ?? {});
+  const haystack = [...errors, input.stdout, input.stderr].join("\n");
+  const match = haystack.match(GEMINI_RETRY_DELAY_RE);
+  if (!match) return null;
+
+  // Group 1 is the RetryInfo form (always seconds); groups 2/3 and 4/5 carry an
+  // explicit unit that may be minutes.
+  const rawValue = match[1] ?? match[2] ?? match[4];
+  if (!rawValue) return null;
+  const value = Number.parseFloat(rawValue);
+  if (!Number.isFinite(value) || value <= 0) return null;
+
+  const unit = (match[1] ? "s" : (match[3] ?? match[5] ?? "s")).toLowerCase();
+  const multiplierMs = unit.startsWith("m") ? 60_000 : 1_000;
+  const delayMs = value * multiplierMs;
+  // Guard against an absurd parse wedging an agent: a gemini backoff hint is minutes, not
+  // days. Anything beyond 6h is treated as unparseable rather than honoured.
+  if (delayMs > 6 * 60 * 60 * 1000) return null;
+  return new Date(now.getTime() + delayMs);
 }
 
 export function isGeminiTurnLimitResult(

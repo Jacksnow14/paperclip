@@ -81,6 +81,84 @@ describe("isClaudeTransientUpstreamError", () => {
     ).toBe(true);
   });
 
+  // AUR-4531 AC1. These four strings are the LITERAL production wordings; the fleet burned
+  // 72h of quota against a wall nothing was watching because the shipped regex only
+  // recognised "<kind> limit reached" and never "You've hit your <kind> limit". A bare
+  // `toBe(true)` on the classifier is not enough for the two that carry a reset hint: if
+  // the reset time is null the breaker has no lifetime to key on and silently degrades back
+  // to the bounded ladder, which is the exact bug AUR-4531 exists to kill. So the table
+  // asserts BOTH axes per row.
+  const QUOTA_WORDING_TABLE: Array<{
+    errorMessage: string;
+    expectsResetTime: boolean;
+    // Set for the bare-date shape, which carries no clock time at all.
+    expectedResetIso?: string;
+  }> = [
+    { errorMessage: "You've hit your weekly limit", expectsResetTime: false },
+    {
+      errorMessage: "You've hit your weekly limit · resets Aug 1",
+      expectsResetTime: true,
+      // A weekly limit resets on a calendar day, not at a clock time: no am/pm anywhere in
+      // the string. Interpreted as the start of Aug 1 UTC (no timezone hint given, and the
+      // test pins TZ-independence by comparing against a locally-constructed midnight).
+      expectedResetIso: undefined,
+    },
+    {
+      errorMessage: "You've hit your session limit · resets 4pm (UTC)",
+      expectsResetTime: true,
+      expectedResetIso: "2026-07-30T16:00:00.000Z",
+    },
+    { errorMessage: "Claude usage limit reached", expectsResetTime: false },
+  ];
+
+  it.each(QUOTA_WORDING_TABLE)(
+    "classifies the live production wording as transient: $errorMessage",
+    ({ errorMessage }) => {
+      expect(isClaudeTransientUpstreamError({ errorMessage })).toBe(true);
+      // Same string arriving on stderr rather than as a harness errorMessage must classify
+      // identically -- the adapter does not control which channel the CLI uses.
+      expect(isClaudeTransientUpstreamError({ stderr: errorMessage })).toBe(true);
+    },
+  );
+
+  it.each(QUOTA_WORDING_TABLE)(
+    "yields a parsed reset time exactly when the wording carries one: $errorMessage",
+    ({ errorMessage, expectsResetTime, expectedResetIso }) => {
+      const now = new Date("2026-07-30T09:00:00.000Z");
+      const extracted = extractClaudeRetryNotBefore({ errorMessage }, now);
+      if (!expectsResetTime) {
+        expect(extracted).toBeNull();
+        return;
+      }
+      expect(extracted).not.toBeNull();
+      expect(extracted!.getTime()).toBeGreaterThan(now.getTime());
+      if (expectedResetIso) {
+        expect(extracted!.toISOString()).toBe(expectedResetIso);
+      }
+    },
+  );
+
+  // Called out separately because it is the shape `parseClaudeResetClockTime` used to reject
+  // outright: a bare date with no clock time at all. Asserted in local time because the
+  // wording carries no timezone hint, so the parser resolves it against the host zone.
+  it("parses the bare-date weekly reset hint ('resets Aug 1') as the start of that day", () => {
+    const now = new Date("2026-07-30T09:00:00.000Z");
+    const extracted = extractClaudeRetryNotBefore(
+      { errorMessage: "You've hit your weekly limit · resets Aug 1" },
+      now,
+    );
+    expect(extracted?.getTime()).toBe(new Date(2026, 7, 1, 0, 0, 0, 0).getTime());
+  });
+
+  it("rolls a bare-date weekly reset into next year when this year's date has passed", () => {
+    const now = new Date("2026-12-28T09:00:00.000Z");
+    const extracted = extractClaudeRetryNotBefore(
+      { errorMessage: "You've hit your weekly limit · resets Jan 3" },
+      now,
+    );
+    expect(extracted?.getTime()).toBe(new Date(2027, 0, 3, 0, 0, 0, 0).getTime());
+  });
+
   it("does not classify login/auth failures as transient", () => {
     expect(
       isClaudeTransientUpstreamError({

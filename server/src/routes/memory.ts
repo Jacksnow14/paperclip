@@ -450,6 +450,14 @@ export function memoryRoutes(
         );
       }
     }
+    if (result.upsertOverwrite) {
+      warnings.push(
+        `upsert:true just overwrote record ${result.upsertOverwrite.recordId}, whose metadata.issue_id ` +
+        `('${result.upsertOverwrite.previousIssueId}') differs from this capture's metadata.issue_id ` +
+        `('${result.upsertOverwrite.incomingIssueId}'). That issue's prior measurements under this title ` +
+        "were destroyed by this write (AUR-4522) — use an issue-unique title to avoid future collisions.",
+      );
+    }
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId,

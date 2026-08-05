@@ -339,6 +339,15 @@ export interface MemoryCaptureResult {
   // True when this capture matched an existing record (idempotencyKey replay, upsert-by-title,
   // or the tool_gap dedup window) and no new record was created.
   dedup?: boolean;
+  // Set when an upsert-by-title write just overwrote a record whose metadata.issue_id
+  // differed from this capture's — i.e. it destroyed a different issue's data under a
+  // colliding title (AUR-4522). Absent on a non-upsert capture, a fresh insert, or a
+  // same-issue re-capture (the intended convergent case).
+  upsertOverwrite?: {
+    recordId: string;
+    previousIssueId: string;
+    incomingIssueId: string;
+  };
 }
 
 export interface MemoryForgetResult {

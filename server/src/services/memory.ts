@@ -1081,7 +1081,12 @@ export function memoryService(
       idempotencyKey?: string | null;
     },
     operationId: string | null,
-  ): Promise<{ records: MemoryRecord[]; dedup: boolean; dedupKind?: "idempotency_key" | "upsert" | "tool_gap_window" }> {
+  ): Promise<{
+    records: MemoryRecord[];
+    dedup: boolean;
+    dedupKind?: "idempotency_key" | "upsert" | "tool_gap_window";
+    upsertOverwrite?: { recordId: string; previousIssueId: string; incomingIssueId: string };
+  }> {
     const scopeType = input.scopeType ?? normalizeScopeType(scope);
     const scopeId = input.scopeId ?? normalizeScopeId(binding.companyId, scopeType, scope);
     const createdBy = actorPrincipal(input.actor);
@@ -1141,6 +1146,20 @@ export function memoryService(
           input.metadata !== undefined
             ? { ...(existing[0].metadata ?? {}), ...input.metadata }
             : existing[0].metadata;
+        // AUR-4522: an upsert-by-title match whose existing row belongs to a different
+        // issue is a silent destructive overwrite (date-bucketed scorecard titles collided
+        // across same-day, same-type closes). Detected here, before the write, because this
+        // is the only place that holds both the pre-overwrite and incoming metadata.
+        const previousIssueId = existing[0].metadata?.issue_id;
+        const incomingIssueId = input.metadata?.issue_id;
+        const upsertOverwrite =
+          typeof previousIssueId === "string" &&
+          previousIssueId.trim().length > 0 &&
+          typeof incomingIssueId === "string" &&
+          incomingIssueId.trim().length > 0 &&
+          previousIssueId !== incomingIssueId
+            ? { recordId: existing[0].id, previousIssueId, incomingIssueId }
+            : undefined;
         const [updated] = await db
           .update(memoryLocalRecords)
           .set({
@@ -1151,7 +1170,7 @@ export function memoryService(
           })
           .where(eq(memoryLocalRecords.id, existing[0].id))
           .returning();
-        return { records: [mapRecord(updated)], dedup: true, dedupKind: "upsert" };
+        return { records: [mapRecord(updated)], dedup: true, dedupKind: "upsert", upsertOverwrite };
       }
     }
 
@@ -2560,6 +2579,7 @@ export function memoryService(
       let providerResultJson: Record<string, unknown> | null = null;
       let isDedup = false;
       let dedupKind: "idempotency_key" | "upsert" | "tool_gap_window" | undefined;
+      let upsertOverwrite: { recordId: string; previousIssueId: string; incomingIssueId: string } | undefined;
 
       if (binding.providerKey === LOCAL_BASIC_PROVIDER_KEY) {
         const captureResult = await captureLocalBasic(
@@ -2588,6 +2608,7 @@ export function memoryService(
         records = captureResult.records;
         isDedup = captureResult.dedup;
         dedupKind = captureResult.dedupKind;
+        upsertOverwrite = captureResult.upsertOverwrite;
       } else {
         if (!pluginMemoryProviders) {
           throw unprocessable(`Unknown memory provider: ${binding.providerKey}`);
@@ -2644,6 +2665,7 @@ export function memoryService(
           recordIds: records.map((record) => record.id),
           providerResult: providerResultJson,
           ...(isDedup && { dedup: true, dedupKind }),
+          ...(upsertOverwrite && { upsertOverwrite }),
         },
         recordCount: records.length,
         usage,
@@ -2651,7 +2673,7 @@ export function memoryService(
       if (!isDedup) {
         records = await attachCreatedByOperation(companyId, records, operation.id);
       }
-      return { operation, records, dedup: isDedup } satisfies MemoryCaptureResult;
+      return { operation, records, dedup: isDedup, upsertOverwrite } satisfies MemoryCaptureResult;
     },
 
     forget: async (companyId: string, data: MemoryForget, actor: ActorInfo, triggerKind: MemoryOperation["triggerKind"] = "manual") => {

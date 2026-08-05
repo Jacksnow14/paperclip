@@ -657,7 +657,13 @@ describeEmbeddedPostgres("secretService", () => {
       value: "runtime-secret",
     });
     const rotated = await svc.rotate(secret.id, { value: "rotated-runtime-secret" });
-    const resolved = await svc.resolveSecretValue(companyId, rotated.id, "latest");
+    const resolved = await svc.resolveSecretValue(
+      companyId,
+      rotated.id,
+      "latest",
+      undefined,
+      { type: "board" },
+    );
 
     expect(resolved).toBe("resolved-secret");
     expect(createSpy).toHaveBeenCalledWith(expect.objectContaining({
@@ -1671,5 +1677,136 @@ describeEmbeddedPostgres("secretService", () => {
     await expect(svc.resolveSecretValue(companyId, secret.id, "latest")).rejects.toThrow(
       /not active/i,
     );
+  });
+
+  describe("assertBindingContext fails closed (AUR-4279)", () => {
+    it("throws rather than resolving when no consumer context is supplied", async () => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+      const secret = await svc.create(companyId, {
+        name: `no-context-${randomUUID()}`,
+        provider: "local_encrypted",
+        value: "should-never-leak",
+      });
+
+      await expect(svc.resolveSecretValue(companyId, secret.id, "latest")).rejects.toThrow(
+        /requires a consumer binding context/i,
+      );
+    });
+
+    it("never returns a plaintext value via resolveSecretValue when zero bindings match", async () => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+      const secret = await svc.create(companyId, {
+        name: `unbound-${randomUUID()}`,
+        provider: "local_encrypted",
+        value: "should-never-leak",
+      });
+
+      const bindings = await db
+        .select()
+        .from(companySecretBindings)
+        .where(eq(companySecretBindings.secretId, secret.id));
+      expect(bindings).toHaveLength(0);
+
+      await expect(
+        svc.resolveSecretValue(companyId, secret.id, "latest", {
+          consumerType: "agent",
+          consumerId: "unbound-agent",
+          configPath: "env.STOLEN",
+        }),
+      ).rejects.toThrow(/not bound/i);
+    });
+
+    it("never returns a plaintext value via resolveEnvBindings when zero bindings match", async () => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+      const secret = await svc.create(companyId, {
+        name: `unbound-env-${randomUUID()}`,
+        provider: "local_encrypted",
+        value: "should-never-leak",
+      });
+      const env = {
+        API_KEY: { type: "secret_ref" as const, secretId: secret.id, version: "latest" as const },
+      };
+
+      await expect(svc.resolveEnvBindings(companyId, env)).rejects.toThrow(
+        /requires a consumer binding context/i,
+      );
+      await expect(
+        svc.resolveEnvBindings(companyId, env, {
+          consumerType: "agent",
+          consumerId: "unbound-agent",
+        }),
+      ).rejects.toThrow(/not bound/i);
+    });
+
+    it("never returns a plaintext value via resolveAdapterConfigForRuntime when zero bindings match", async () => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+      const secret = await svc.create(companyId, {
+        name: `unbound-adapter-${randomUUID()}`,
+        provider: "local_encrypted",
+        value: "should-never-leak",
+      });
+      const adapterConfig = {
+        env: {
+          API_KEY: { type: "secret_ref" as const, secretId: secret.id, version: "latest" as const },
+        },
+      };
+
+      await expect(svc.resolveAdapterConfigForRuntime(companyId, adapterConfig)).rejects.toThrow(
+        /requires a consumer binding context/i,
+      );
+      await expect(
+        svc.resolveAdapterConfigForRuntime(companyId, adapterConfig, {
+          consumerType: "agent",
+          consumerId: "unbound-agent",
+        }),
+      ).rejects.toThrow(/not bound/i);
+    });
+
+    it("only a board actor may resolve without a consumer context, and still needs a real secret", async () => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+      const secret = await svc.create(companyId, {
+        name: `board-bypass-${randomUUID()}`,
+        provider: "local_encrypted",
+        value: "board-only-value",
+      });
+
+      await expect(
+        svc.resolveSecretValue(companyId, secret.id, "latest", undefined, { type: "agent" }),
+      ).rejects.toThrow(/requires a consumer binding context/i);
+
+      await expect(
+        svc.resolveSecretValue(companyId, secret.id, "latest", undefined, { type: "board" }),
+      ).resolves.toBe("board-only-value");
+    });
+
+    it("resolves successfully end-to-end once a real binding exists (no regression)", async () => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+      const secret = await svc.create(companyId, {
+        name: `bound-${randomUUID()}`,
+        provider: "local_encrypted",
+        value: "bound-value",
+      });
+      await svc.createBinding({
+        companyId,
+        secretId: secret.id,
+        targetType: "agent",
+        targetId: "agent-bound",
+        configPath: "env.API_KEY",
+      }, { type: "board" });
+
+      const resolved = await svc.resolveAdapterConfigForRuntime(
+        companyId,
+        { env: { API_KEY: { type: "secret_ref" as const, secretId: secret.id, version: "latest" as const } } },
+        { consumerType: "agent", consumerId: "agent-bound" },
+      );
+
+      expect(resolved.config.env).toMatchObject({ API_KEY: "bound-value" });
+    });
   });
 });

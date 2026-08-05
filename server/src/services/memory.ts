@@ -474,6 +474,19 @@ function scopeMatches(record: MemoryRecord, allowedScopes: MemoryGovernedScope[]
   });
 }
 
+// AUR-4140: the review gate applies to everyone EXCEPT the record's owner —
+// capture returned "succeeded" for pending records the author could never read
+// back, making writes unverifiable. Other agents must still never see a pending
+// record that isn't theirs.
+function isRecordOwner(record: MemoryRecord, actor: ActorInfo): boolean {
+  return (
+    actor.actorType === "agent" &&
+    !!actor.agentId &&
+    record.owner?.type === "agent" &&
+    record.owner.id === actor.agentId
+  );
+}
+
 function canReadRecord(companyId: string, record: MemoryRecord, actor: ActorInfo, scope: MemoryScope = {}) {
   if (record.deletedAt || record.revokedAt || record.retentionState !== "active") return false;
   if (record.supersededByRecordId) return false;
@@ -481,7 +494,7 @@ function canReadRecord(companyId: string, record: MemoryRecord, actor: ActorInfo
   const maxSensitivity = maxSensitivityForActor(actor, scope);
   if (SENSITIVITY_RANK[record.sensitivityLabel] > SENSITIVITY_RANK[maxSensitivity]) return false;
   if (actor.actorType !== "agent") return true;
-  if (record.reviewState !== "accepted") return false;
+  if (record.reviewState !== "accepted" && !isRecordOwner(record, actor)) return false;
   return scopeMatches(record, deriveAllowedScopes(companyId, scope, actor));
 }
 
@@ -747,6 +760,7 @@ function buildRecordVisibilityConditions(
     includeExpired?: boolean;
     includeSuperseded?: boolean;
     includeDeleted?: boolean;
+    includeOwnPending?: boolean;
   },
 ) {
   const conditions = [
@@ -763,7 +777,20 @@ function buildRecordVisibilityConditions(
   if (!options?.includeSuperseded) {
     conditions.push(isNull(memoryLocalRecords.supersededByRecordId));
   }
-  conditions.push(eq(memoryLocalRecords.reviewState, "accepted"));
+  // AUR-4140: with includeOwnPending, an agent's own records are readable in any
+  // reviewState so a capture is always verifiable by its author. Everyone else
+  // still only sees accepted records — a plain `?reviewState=pending` used to
+  // compile to `accepted AND pending`, which is empty for every agent, always.
+  if (options?.includeOwnPending && actor.actorType === "agent" && actor.agentId) {
+    conditions.push(
+      or(
+        eq(memoryLocalRecords.reviewState, "accepted"),
+        and(eq(memoryLocalRecords.ownerType, "agent"), eq(memoryLocalRecords.ownerId, actor.agentId))!,
+      )!,
+    );
+  } else {
+    conditions.push(eq(memoryLocalRecords.reviewState, "accepted"));
+  }
 
   const maxSensitivity = maxSensitivityForActor(actor, scope);
   conditions.push(inArray(memoryLocalRecords.sensitivityLabel, allowedSensitivityLabels(maxSensitivity)));
@@ -1017,7 +1044,10 @@ export function memoryService(
   // need no board review — captures land as accepted immediately so CEO
   // routing queries and SGI Loop 2 see them within the same heartbeat.
   // Revoke by removing a category from this set and running a policy sweep.
-  const AUTO_ACCEPT_CATEGORIES = new Set(["performance_scorecard", "tool_gap", "lesson", "routing_rationale", "synthesis", "scorecard_adjusted", "roi_ledger", "capacity_decision", "prompt_improvement_proposal", "experiment", "experiment_conclusion"]);
+  // "retrospective"/"retrospective_lesson" (AUR-4140): every agent's closing
+  // checklist mandates these captures; their absence here stranded 1,080
+  // records as pending. Same review posture as the already-listed "lesson".
+  const AUTO_ACCEPT_CATEGORIES = new Set(["performance_scorecard", "tool_gap", "lesson", "retrospective", "retrospective_lesson", "routing_rationale", "synthesis", "scorecard_adjusted", "roi_ledger", "capacity_decision", "prompt_improvement_proposal", "experiment", "experiment_conclusion"]);
 
   const TOOL_GAP_DEDUP_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -1457,6 +1487,10 @@ export function memoryService(
           includeExpired: filters.includeExpired,
           includeRevoked: filters.includeRevoked,
           includeSuperseded: filters.includeSuperseded,
+          // AUR-4140: authors read back their own pending records; combined with
+          // the filters.reviewState condition above, `?reviewState=pending` now
+          // returns exactly the caller's own pending records instead of nothing.
+          includeOwnPending: true,
         }).filter((condition, index) => index > 1),
       );
     }

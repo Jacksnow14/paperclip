@@ -1018,9 +1018,13 @@ describe("memory routes", () => {
         .send(captureBody);
 
       expect(res.status).toBe(201);
+      // AUR-4140: machine-readable visibility signal, and the warning must name
+      // the record id so the author can actually verify the write.
+      expect(res.body.visibility).toBe("pending_review");
       expect(res.body.warnings).toBeInstanceOf(Array);
       expect(res.body.warnings.length).toBeGreaterThan(0);
       expect(res.body.warnings[0]).toMatch(/pending review/);
+      expect(res.body.warnings[0]).toContain("dd000000-0000-4000-8000-000000000000");
     });
 
     it("returns no warnings for an auto-accepted org-scoped record", async () => {
@@ -1047,6 +1051,7 @@ describe("memory routes", () => {
         .send(captureBody);
 
       expect(res.status).toBe(201);
+      expect(res.body.visibility).toBe("visible");
       expect(res.body.warnings).toEqual([]);
     });
 

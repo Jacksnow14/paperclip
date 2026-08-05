@@ -1198,7 +1198,7 @@ describe("memory routes", () => {
       expect(res.status).toBe(201);
       expect(mockMemoryService.listRecords).toHaveBeenCalledWith(
         companyA,
-        { key: title, limit: 200 },
+        expect.objectContaining({ key: title, limit: 200 }),
         expect.objectContaining({ actorType: "system", actorId: "memory-capture-collision-probe" }),
       );
       expect(res.body.warnings.some((w: string) => w.includes("cc680000-0000-4000-8000-000000000000"))).toBe(true);
@@ -1251,7 +1251,12 @@ describe("memory routes", () => {
 
       const res = await request(app)
         .post(`/api/companies/${companyA}/memory/capture`)
-        .send({ ...captureBody, title, metadata: { category: "routing_rationale" } });
+        .send({
+          ...captureBody,
+          title,
+          // chosen_agent is required for routing_rationale captures (AUR-4280/AUR-4303).
+          metadata: { category: "routing_rationale", chosen_agent: "441a5729-1a2c-4f2e-83d4-1bdd65982872" },
+        });
 
       expect(res.status).toBe(201);
       expect(res.body.warnings.some((w: string) => w.includes("PATCH the existing record"))).toBe(false);

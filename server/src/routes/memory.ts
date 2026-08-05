@@ -568,7 +568,7 @@ export function memoryRoutes(
         try {
           const sameTitleRecords = await memory.listRecords(
             companyId,
-            { key: title, limit: 200 },
+            memoryListRecordsQuerySchema.parse({ key: title, limit: 200 }),
             collisionProbeActorFromReq(req),
           );
           for (const existing of sameTitleRecords) {

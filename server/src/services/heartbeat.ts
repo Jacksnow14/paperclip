@@ -323,7 +323,13 @@ export function readHeartbeatRunErrorFamily(
   const persistedFamily = readNonEmptyString(resultJson.errorFamily);
   if (persistedFamily) return persistedFamily;
 
-  if (run.errorCode === "codex_transient_upstream" || run.errorCode === "claude_transient_upstream") {
+  // AUR-4531: gemini_local joins this set now that its execute path classifies quota
+  // exhaustion at all.
+  if (
+    run.errorCode === "codex_transient_upstream" ||
+    run.errorCode === "claude_transient_upstream" ||
+    run.errorCode === "gemini_transient_upstream"
+  ) {
     return "transient_upstream";
   }
   return null;

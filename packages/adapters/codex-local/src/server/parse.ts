@@ -8,6 +8,14 @@ import {
 const CODEX_TRANSIENT_UPSTREAM_RE =
   /(?:we(?:'|’)re\s+currently\s+experiencing\s+high\s+demand|temporary\s+errors|rate[-\s]?limit(?:ed)?|too\s+many\s+requests|\b429\b|server\s+overloaded|service\s+unavailable|try\s+again\s+later)/i;
 const CODEX_REMOTE_COMPACTION_RE = /remote\s+compact\s+task/i;
+// AUR-4531: an explicit throttle/quota signal is transient BY DEFINITION -- waiting and
+// re-sending the same request is the documented remedy. The narrowing return at the bottom
+// of isCodexTransientUpstreamError additionally required the remote-compaction or
+// high-demand wording, so a bare `429` or a bare `rate limit` matched
+// CODEX_TRANSIENT_UPSTREAM_RE and was then thrown away: no errorFamily, no bounded retry,
+// no quota pause, no breaker. Checked on its own below and short-circuits to transient.
+const CODEX_EXPLICIT_THROTTLE_RE =
+  /(?:\b429\b|rate[-\s]?limit(?:ed|ing|s)?|rate_limit(?:_error)?|too\s+many\s+requests|quota\s+exceeded|throttl(?:ed|ing)|throttlingexception|\b503\b|\b529\b|server\s+overloaded|overloaded_error|service\s+unavailable)/i;
 // Matches both the model-scoped wording ("...usage limit for GPT-5.3-Codex-Spark.
 // Switch to another model now, or try again at ...") and the account-level wording
 // ("...usage limit. Upgrade to Pro (...), visit ... to purchase more credits or try
@@ -97,6 +105,24 @@ function buildCodexErrorHaystack(input: {
     input.stdout ?? "",
     input.stderr ?? "",
   ]
+    .join("\n")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+// AUR-4531 / AUR-4513 discipline: `stdout` for codex_local is the agent's own JSONL
+// transcript, so any wording an agent merely *discusses* lands in the haystack above.
+// AUR-4513 showed exactly how that goes wrong: 2,394 runs were mis-tagged transient
+// because agents talk about quota wording. The widened bare-`429`/bare-`rate limit` test
+// therefore reads only the adapter's genuine failure channels -- the harness-supplied
+// errorMessage and the process's stderr -- never the transcript.
+function buildCodexFailureChannelHaystack(input: {
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): string {
+  return [input.errorMessage ?? "", input.stderr ?? ""]
     .join("\n")
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -285,6 +311,10 @@ export function isCodexTransientUpstreamError(input: {
   const haystack = buildCodexErrorHaystack(input);
 
   if (extractCodexRetryNotBefore(input) != null) return true;
+  // AUR-4531: a bare `429` / bare `rate limit` on a real failure channel is transient on
+  // its own and must not have to also carry the remote-compaction or high-demand wording
+  // demanded by the narrowing return below.
+  if (CODEX_EXPLICIT_THROTTLE_RE.test(buildCodexFailureChannelHaystack(input))) return true;
   if (!CODEX_TRANSIENT_UPSTREAM_RE.test(haystack)) return false;
   // Keep automatic retries scoped to the observed remote-compaction/high-demand
   // failure shape, plus explicit usage-limit windows that tell us when retrying

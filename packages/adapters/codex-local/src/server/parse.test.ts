@@ -143,6 +143,66 @@ describe("isCodexTransientUpstreamError", () => {
     );
   });
 
+  // AUR-4531 AC6. A bare throttle signal is transient BY DEFINITION -- waiting and
+  // re-sending is the documented remedy. Before this, the narrowing return at the bottom of
+  // isCodexTransientUpstreamError additionally demanded the remote-compaction or
+  // high-demand wording, so a bare `429` matched the transient regex and was then thrown
+  // away: no errorFamily, no bounded retry, no quota pause, no breaker.
+  it.each([
+    { channel: "errorMessage" as const, text: "429" },
+    { channel: "errorMessage" as const, text: "Codex request failed: HTTP 429" },
+    { channel: "stderr" as const, text: "429 Too Many Requests" },
+    { channel: "stderr" as const, text: "rate limit exceeded" },
+    { channel: "stderr" as const, text: "stream error: 503 Service Unavailable" },
+  ])("classifies a bare throttle signal on $channel as transient: $text", ({ channel, text }) => {
+    expect(isCodexTransientUpstreamError({ [channel]: text })).toBe(true);
+  });
+
+  // THE regression guard that `buildCodexFailureChannelHaystack` exists for. codex `stdout`
+  // is the agent's own JSONL transcript, and AUR-4513 is the 2,394-run demonstration of
+  // what happens when a transient classifier is fed the conversation it is resuming: our
+  // agents constantly *discuss* quota wording. Widening to bare `429`/bare `rate limit`
+  // would have made every such transcript "transient" if the widened test read stdout.
+  it("does not classify quota wording that appears only in the stdout transcript", () => {
+    const contaminatedStdout = [
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "agent_message",
+          text: "LANE HEALTH: two codex coders saw 429 Too Many Requests and a rate limit exceeded error; quota exceeded on the shared key.",
+        },
+      }),
+      JSON.stringify({ type: "turn.failed", error: { message: "tool call rejected" } }),
+    ].join("\n");
+
+    const input = {
+      stdout: contaminatedStdout,
+      // A genuinely deterministic failure on the real failure channels.
+      stderr: "Error: tool call rejected by policy",
+      errorMessage: "Codex exited with code 1",
+    };
+
+    expect(isCodexTransientUpstreamError(input)).toBe(false);
+  });
+
+  // Control for the guard above: the SAME contaminated transcript with a real throttle on a
+  // real failure channel must still classify transient, so the guard cannot be a blanket
+  // suppressor.
+  it("still classifies a real throttle even when the stdout transcript is contaminated", () => {
+    const contaminatedStdout = JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", text: "discussing 429 rate limit wording" },
+    });
+
+    expect(
+      isCodexTransientUpstreamError({
+        stdout: contaminatedStdout,
+        stderr: "429 Too Many Requests",
+        errorMessage: "Codex request failed",
+      }),
+    ).toBe(true);
+  });
+
   it("does not classify deterministic compaction errors as transient", () => {
     expect(
       isCodexTransientUpstreamError({

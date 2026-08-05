@@ -523,4 +523,177 @@ describe("gemini execute", () => {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
+
+  // AUR-4531 AC7. `detectGeminiQuotaExhausted` shipped with NO non-test caller at all, so a
+  // gemini quota wall produced a plain `adapter_failed` run: no errorFamily, therefore
+  // heartbeat's readTransientRecoveryContractFromRun returned null, therefore no bounded
+  // retry, no quota pause and no breaker. Every wake walked straight back into the wall.
+  //
+  // Asserting on `errorFamily` / `resultJson.errorFamily` specifically because that is what
+  // heartbeat actually reads (readHeartbeatRunErrorFamily consults resultJson.errorFamily
+  // first, then the errorCode allowlist) -- a test that only asserted errorCode would pass
+  // while the retry contract stayed unreachable.
+  it("wires detectGeminiQuotaExhausted into the execute path and emits errorFamily transient_upstream", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-gemini-quota-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "gemini");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeFailingGeminiCommand(commandPath, {
+      stdoutLines: [
+        {
+          type: "result",
+          subtype: "error",
+          session_id: "gemini-session-1",
+          status: "error",
+          error:
+            "[429 Too Many Requests] You exceeded your current quota. " +
+            'details: [{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"57s"}]',
+        },
+      ],
+      exitCode: 1,
+    });
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+
+    try {
+      const before = Date.now();
+      const result = await execute({
+        runId: "run-gemini-quota",
+        agent: { id: "a1", companyId: "c1", name: "G", adapterType: "gemini_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { command: commandPath, cwd: workspace },
+        context: {},
+        authToken: "t",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorFamily).toBe("transient_upstream");
+      expect(result.errorCode).toBe("gemini_transient_upstream");
+      // The persisted copy is the one heartbeat reads off the run row.
+      expect(result.resultJson).toMatchObject({ errorFamily: "transient_upstream" });
+
+      // The RetryInfo duration must become a concrete instant, otherwise the breaker has no
+      // lifetime to key on and Defect B degrades back to the bounded ladder.
+      expect(result.retryNotBefore).toBeTruthy();
+      const retryNotBefore = new Date(result.retryNotBefore!).getTime();
+      expect(retryNotBefore).toBeGreaterThanOrEqual(before + 57_000);
+      expect(retryNotBefore).toBeLessThan(Date.now() + 60_000);
+      expect(result.resultJson?.transientRetryNotBefore).toBe(result.retryNotBefore);
+
+      // The wall is not a session problem: clearing the session would throw away context
+      // for a failure that has nothing to do with it.
+      expect(result.clearSession).toBe(false);
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = previousHome;
+      }
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  // Control for the classifier above: an auth wall is DETERMINISTIC and must never be
+  // dressed up as transient, even though quota-ish billing wording sits right next to it in
+  // real gemini output. Without this, the AC7 test would also pass on a build that simply
+  // tagged every failure transient.
+  it("does not tag a gemini auth wall as transient_upstream", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-gemini-quota-auth-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "gemini");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeFailingGeminiCommand(commandPath, {
+      stderr: "Error: unauthorized - please authenticate. Check your billing details.",
+      exitCode: 41,
+    });
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+
+    try {
+      const result = await execute({
+        runId: "run-gemini-quota-auth",
+        agent: { id: "a1", companyId: "c1", name: "G", adapterType: "gemini_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { command: commandPath, cwd: workspace },
+        context: {},
+        authToken: "t",
+        onLog: async () => {},
+      });
+
+      expect(result.errorCode).toBe("gemini_auth_required");
+      expect(result.errorFamily ?? null).toBeNull();
+      expect(result.resultJson?.errorFamily).toBeUndefined();
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = previousHome;
+      }
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  // Control for the stdout-exclusion decision in the execute path: gemini stdout is the
+  // assistant transcript. AUR-4513 (2,394 mis-tagged claude runs) is what happens when a
+  // transient classifier reads the conversation it is resuming.
+  it("does not tag a failure transient when the quota wording appears only in the stdout transcript", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-gemini-quota-stdout-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "gemini");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeFailingGeminiCommand(commandPath, {
+      stdoutLines: [
+        {
+          type: "assistant",
+          message: {
+            content: [
+              {
+                type: "output_text",
+                text: "LANE HEALTH: gemini returned 429 Too Many Requests and we exceeded your current quota on the shared key.",
+              },
+            ],
+          },
+        },
+        {
+          type: "result",
+          subtype: "error",
+          session_id: "gemini-session-1",
+          status: "error",
+          error: "Tool call rejected by policy",
+        },
+      ],
+      stderr: "Error: tool call rejected by policy",
+      exitCode: 1,
+    });
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+
+    try {
+      const result = await execute({
+        runId: "run-gemini-quota-stdout",
+        agent: { id: "a1", companyId: "c1", name: "G", adapterType: "gemini_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { command: commandPath, cwd: workspace },
+        context: {},
+        authToken: "t",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorFamily ?? null).toBeNull();
+      expect(result.errorCode).not.toBe("gemini_transient_upstream");
+      expect(result.resultJson?.errorFamily).toBeUndefined();
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = previousHome;
+      }
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
 });

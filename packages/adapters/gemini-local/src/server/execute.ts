@@ -51,6 +51,8 @@ import { DEFAULT_GEMINI_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js
 import {
   describeGeminiFailure,
   detectGeminiAuthRequired,
+  detectGeminiQuotaExhausted,
+  extractGeminiRetryNotBefore,
   isGeminiTurnLimitResult,
   isGeminiUnknownSessionError,
   parseGeminiJsonl,
@@ -605,6 +607,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       attempt.proc.exitCode,
     );
 
+    // AUR-4531: before this, `detectGeminiQuotaExhausted` had no non-test caller, so a
+    // gemini quota wall produced a plain `adapter_failed` run: no `errorFamily`, so
+    // `readTransientRecoveryContractFromRun` returned null, so no bounded retry, no quota
+    // pause and no breaker. Every wake walked straight back into the wall.
+    //
+    // Deliberately NOT reading `attempt.proc.stdout`: gemini stdout is the assistant
+    // transcript, and AUR-4513 is the 2,394-run demonstration of what happens when a
+    // transient classifier is fed the conversation it is resuming. Only the structured
+    // result event and stderr -- the adapter's real failure channels -- are consulted.
+    // Also gated on an actual non-zero exit and on auth taking precedence: a login wall is
+    // deterministic and must never be retried as transient.
+    const quotaHaystack = {
+      parsed: attempt.parsed.resultEvent,
+      stdout: "",
+      stderr: attempt.proc.stderr,
+    };
+    const quotaExhausted =
+      failed &&
+      !authMeta.requiresAuth &&
+      !clearSessionForTurnLimit &&
+      detectGeminiQuotaExhausted(quotaHaystack).exhausted;
+    const quotaRetryNotBefore = quotaExhausted ? extractGeminiRetryNotBefore(quotaHaystack) : null;
+
     // On retry, don't fall back to old session ID — the old session was stale
     const canFallbackToRuntimeSession = !isRetry;
     const resolvedSessionId = attempt.parsed.sessionId
@@ -629,6 +654,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         stderr: attempt.proc.stderr,
       }),
       ...(failed && clearSessionForTurnLimit ? { stopReason: "max_turns_exhausted" } : {}),
+      // Mirrors the claude-local contract: heartbeat's `readHeartbeatRunErrorFamily`
+      // consults the persisted `resultJson.errorFamily` FIRST, and
+      // `readTransientRetryNotBeforeFromRun` reads `retryNotBefore` /
+      // `transientRetryNotBefore` from the same object.
+      ...(quotaExhausted ? { errorFamily: "transient_upstream" } : {}),
+      ...(quotaRetryNotBefore
+        ? {
+            retryNotBefore: quotaRetryNotBefore.toISOString(),
+            transientRetryNotBefore: quotaRetryNotBefore.toISOString(),
+          }
+        : {}),
     };
 
     return {
@@ -640,7 +676,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ? "gemini_auth_required"
         : failed && clearSessionForTurnLimit
         ? "max_turns_exhausted"
+        : quotaExhausted
+        ? "gemini_transient_upstream"
         : null,
+      errorFamily: quotaExhausted ? "transient_upstream" : null,
+      retryNotBefore: quotaRetryNotBefore ? quotaRetryNotBefore.toISOString() : null,
       usage: attempt.parsed.usage,
       sessionId: resolvedSessionId,
       sessionParams: resolvedSessionParams,

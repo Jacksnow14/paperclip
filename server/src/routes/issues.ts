@@ -12,6 +12,7 @@ import {
   issues as issueRows,
   projectWorkspaces,
 } from "@paperclipai/db";
+import { captureCloseTimeScorecard } from "../services/close-time-scorecard.js";
 import {
   addIssueCommentSchema,
   acceptIssueThreadInteractionSchema,
@@ -71,6 +72,7 @@ import {
   clampIssueListLimit,
   documentService,
   logActivity,
+  memoryService,
   projectService,
   routineService,
   workProductService,
@@ -843,6 +845,12 @@ export function issueRoutes(
     searchService?: CompanySearchService;
     searchRateLimiter?: CompanySearchRateLimiter;
     pluginWorkerManager?: PluginWorkerManager;
+    /**
+     * AUR-4224: resolved lazily at the done-transition call site (not at factory
+     * construction) so existing tests that vi.mock('../services/index.js') without a
+     * memoryService export don't crash when building issueRoutes.
+     */
+    memoryService?: ReturnType<typeof memoryService>;
   } = {},
 ) {
   const router = Router();
@@ -3822,6 +3830,22 @@ export function issueRoutes(
             model,
           });
         }
+      }
+
+      // AUR-4224: don't rely on agents to hand-author a performance_scorecard +
+      // scorecard_adjusted capture at close time — that prose step is the fleet-wide
+      // compliance gap. Build and write both records here instead, from data the server
+      // already has. Never blocks or fails the close (see captureCloseTimeScorecard).
+      if (issue.assigneeAgentId) {
+        const memorySvc = opts.memoryService ?? memoryService(db);
+        await captureCloseTimeScorecard(db, memorySvc, issue.companyId, {
+          id: issue.id,
+          identifier: issue.identifier,
+          title: issue.title,
+          description: issue.description,
+          assigneeAgentId: issue.assigneeAgentId,
+          projectId: issue.projectId,
+        });
       }
     }
 

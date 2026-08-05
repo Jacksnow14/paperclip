@@ -23,6 +23,32 @@ const SENDER_ROUTES: Array<{
   { senderMatch: "workspace-noreply@google.com", targetRole: "cfo" },
 ];
 
+// DMARC aggregate-report telemetry (AUR-4466): mailbox providers deliver
+// aggregate reports to board@ daily, and each one was minting an issue that
+// self-assigned and burned a heartbeat. These reports are machine telemetry
+// consumed in place from the mailbox by the DMARC sensor (AUR-4241/AUR-4295) —
+// mail-side filters were deliberately removed (AUR-4318) to keep that sensor's
+// view live, so suppression must happen here at intake classification instead.
+const DMARC_REPORT_SENDERS = [
+  "dmarcreport@microsoft.com",
+  "noreply-dmarc-support@google.com",
+  "noreply@dmarc.yahoo.com",
+];
+// Outlook reports arrive from subdomained senders (e.g.
+// postmaster@mail.protection.outlook.com), so match the domain suffix.
+const DMARC_REPORT_SENDER_DOMAIN_RE = /[@.]protection\.outlook\.com\b/;
+// RFC 7489 aggregate-report subject convention:
+// "Report Domain: <domain> Submitter: <org> Report-ID: <id>" — catches
+// submitters not yet in the sender list.
+const DMARC_REPORT_SUBJECT_RE = /^report domain:\s*\S+[\s\S]*\bsubmitter\b/i;
+
+export function isDmarcAggregateReport(from: string, subject: string): boolean {
+  const fromLower = from.toLowerCase();
+  if (DMARC_REPORT_SENDERS.some((s) => fromLower.includes(s))) return true;
+  if (DMARC_REPORT_SENDER_DOMAIN_RE.test(fromLower)) return true;
+  return DMARC_REPORT_SUBJECT_RE.test(subject);
+}
+
 // Gmail label names applied by the intake pipeline.
 export const INTAKE_LABELS = {
   TRIAGED: "paperclip/triaged",
@@ -170,6 +196,27 @@ function normalizeSubject(subject: string): string {
   return s.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
+// Row shape for gmail_intake_records, shared by the issue-linked insert and
+// the telemetry-suppression insert (issueId null).
+function buildIntakeRecordValues(
+  companyId: string,
+  mailbox: GmailAlias,
+  parsed: ParsedMessage,
+  issueId: string | null,
+) {
+  return {
+    companyId,
+    mailbox,
+    gmailThreadId: parsed.gmailThreadId,
+    gmailMessageId: parsed.gmailMessageId,
+    issueId,
+    sender: parsed.from.slice(0, 512),
+    subject: normalizeSubject(parsed.subject).slice(0, 512),
+    snippet: parsed.bodySnippet.slice(0, 512),
+    receivedAt: parsed.dateMs ? new Date(parsed.dateMs) : null,
+  };
+}
+
 function matchSenderRoute(from: string): (typeof SENDER_ROUTES)[number] | null {
   const fromLower = from.toLowerCase();
   return SENDER_ROUTES.find((r) => fromLower.includes(r.senderMatch)) ?? null;
@@ -279,6 +326,22 @@ export function createGmailIntakeService(db: Db) {
       processed++;
 
       try {
+        // DMARC aggregate reports are telemetry, not correspondence (AUR-4466).
+        // Record the intake so the message is not reprocessed on later polls,
+        // but mint no issue and leave the mail fully untouched — no label, no
+        // archive — so the DMARC sensor (AUR-4241) still sees it in place.
+        if (isDmarcAggregateReport(parsed.from, parsed.subject)) {
+          await db.insert(gmailIntakeRecords).values(
+            buildIntakeRecordValues(companyId, mailbox, parsed, null),
+          );
+          logger.info(
+            { mailbox, messageId: parsed.gmailMessageId, from: parsed.from },
+            "gmail-intake: suppressed DMARC aggregate report (telemetry, no issue)",
+          );
+          skipped++;
+          continue;
+        }
+
         // Find any existing record in this Gmail thread that has an issueId.
         const existingThreadRecord = await db
           .select({ issueId: gmailIntakeRecords.issueId })
@@ -381,17 +444,9 @@ export function createGmailIntakeService(db: Db) {
         }
 
         // Record the intake so we don't process this message again.
-        await db.insert(gmailIntakeRecords).values({
-          companyId,
-          mailbox,
-          gmailThreadId: parsed.gmailThreadId,
-          gmailMessageId: parsed.gmailMessageId,
-          issueId,
-          sender: parsed.from.slice(0, 512),
-          subject: normalizeSubject(parsed.subject).slice(0, 512),
-          snippet: parsed.bodySnippet.slice(0, 512),
-          receivedAt: parsed.dateMs ? new Date(parsed.dateMs) : null,
-        });
+        await db.insert(gmailIntakeRecords).values(
+          buildIntakeRecordValues(companyId, mailbox, parsed, issueId),
+        );
 
         // Apply paperclip/triaged label.
         if (triagedLabelId) {

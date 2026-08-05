@@ -31,7 +31,7 @@ vi.mock("../services/issues.js", () => ({
   }),
 }));
 
-const { createGmailIntakeService, INTAKE_LABELS, repairUtf8Mojibake } = await import(
+const { createGmailIntakeService, INTAKE_LABELS, repairUtf8Mojibake, isDmarcAggregateReport } = await import(
   "../services/gmail-intake.js"
 );
 
@@ -571,6 +571,129 @@ describe("cross-thread sender+subject dedupe (AUR-2674)", () => {
     expect(commentBody).toContain("New reply in Gmail thread");
     expect(result.updated).toBe(1);
     expect(result.created).toBe(0);
+  });
+});
+
+describe("DMARC aggregate-report suppression (AUR-4466)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function makeDmarcMessage(id: string, threadId: string, from: string, subject: string) {
+    const msg = makeMessage(id, threadId, subject);
+    msg.payload.headers[0].value = from;
+    return msg;
+  }
+
+  it.each([
+    ["dmarcreport@microsoft.com", "Report Domain: tryauranode.com Submitter: Outlook.com Report-ID: <abc123>"],
+    ["noreply-dmarc-support@google.com", "Report domain: tryauranode.com Submitter: google.com Report-ID: 1234567890"],
+    ["noreply@dmarc.yahoo.com", "Report Domain: tryauranode.com Submitter: yahoo.com Report-ID: <xyz>"],
+    ["Postmaster <postmaster@mail.protection.outlook.com>", "Report Domain: tryauranode.com Submitter: Outlook.com"],
+  ])("skips issue creation for DMARC report from %s", async (from, subject) => {
+    const msg = makeDmarcMessage("dmarc-1", "thread-dmarc-1", from, subject);
+    mockListMessages.mockResolvedValue({ messages: [{ id: "dmarc-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "should-not-exist" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockIssueCreate).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(result.processed).toBe(1);
+  });
+
+  it("classifies by subject shape alone for an unknown submitter address", async () => {
+    const msg = makeDmarcMessage(
+      "dmarc-unknown",
+      "thread-dmarc-u",
+      "dmarc_agg@some-new-provider.example",
+      "Report Domain: tryauranode.com Submitter: some-new-provider.example Report-ID: r1",
+    );
+    mockListMessages.mockResolvedValue({ messages: [{ id: "dmarc-unknown" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([]);
+    mockIssueCreate.mockResolvedValue({ id: "should-not-exist" });
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockIssueCreate).not.toHaveBeenCalled();
+    expect(result.skipped).toBe(1);
+  });
+
+  it("leaves the mail untouched (no label) and records the intake with null issueId", async () => {
+    const msg = makeDmarcMessage(
+      "dmarc-2",
+      "thread-dmarc-2",
+      "dmarcreport@microsoft.com",
+      "Report Domain: tryauranode.com Submitter: Outlook.com Report-ID: <r2>",
+    );
+    mockListMessages.mockResolvedValue({ messages: [{ id: "dmarc-2" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    await svc.processMailbox(COMPANY_ID, "board");
+
+    // The message must not be labeled, archived, or otherwise modified — the
+    // DMARC sensor (AUR-4241) reads the report from the mailbox in place.
+    expect(mockModifyMessageLabels).not.toHaveBeenCalled();
+    expect(mockSendMessage).not.toHaveBeenCalled();
+
+    // The intake record is still written (issueId null) so the report is not
+    // reprocessed on the next poll.
+    const insertValues = (db as ReturnType<typeof buildDbMock>)._insertChain.values.mock.calls[0][0] as Record<string, unknown>;
+    expect(insertValues.gmailMessageId).toBe("dmarc-2");
+    expect(insertValues.issueId).toBeNull();
+  });
+
+  it("still mints an issue for a normal board@ mail (guard does not over-suppress)", async () => {
+    const msg = makeDmarcMessage(
+      "normal-1",
+      "thread-normal-1",
+      "Jane Founder <jane@example.com>",
+      "Question about the report you sent",
+    );
+    mockListMessages.mockResolvedValue({ messages: [{ id: "normal-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-normal-1" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockIssueCreate).toHaveBeenCalledOnce();
+    expect(result.created).toBe(1);
+    expect(result.skipped).toBe(0);
+  });
+
+  it("classifier: matches known senders and subject shape, rejects lookalikes", () => {
+    // Sender-based positives.
+    expect(isDmarcAggregateReport("dmarcreport@microsoft.com", "anything")).toBe(true);
+    expect(isDmarcAggregateReport("Postmaster <a@b.protection.outlook.com>", "x")).toBe(true);
+    // Subject-based positive (unknown sender).
+    expect(
+      isDmarcAggregateReport("x@y.example", "Report Domain: d.com Submitter: y.example"),
+    ).toBe(true);
+    // Negatives: a human mail that merely mentions reports, and a subject
+    // missing the Submitter: component.
+    expect(isDmarcAggregateReport("jane@example.com", "Your weekly report domain ideas")).toBe(false);
+    expect(isDmarcAggregateReport("jane@example.com", "Report Domain: d.com is down")).toBe(false);
+    expect(isDmarcAggregateReport("jane@example.com", "Re: Report Domain: d.com Submitter: z")).toBe(false);
   });
 });
 

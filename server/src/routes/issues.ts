@@ -3837,15 +3837,21 @@ export function issueRoutes(
       // compliance gap. Build and write both records here instead, from data the server
       // already has. Never blocks or fails the close (see captureCloseTimeScorecard).
       if (issue.assigneeAgentId) {
-        const memorySvc = opts.memoryService ?? memoryService(db);
-        await captureCloseTimeScorecard(db, memorySvc, issue.companyId, {
-          id: issue.id,
-          identifier: issue.identifier,
-          title: issue.title,
-          description: issue.description,
-          assigneeAgentId: issue.assigneeAgentId,
-          projectId: issue.projectId,
-        });
+        try {
+          const memorySvc = opts.memoryService ?? memoryService(db);
+          await captureCloseTimeScorecard(db, memorySvc, issue.companyId, {
+            id: issue.id,
+            identifier: issue.identifier,
+            title: issue.title,
+            description: issue.description,
+            assigneeAgentId: issue.assigneeAgentId,
+            projectId: issue.projectId,
+          });
+        } catch (err) {
+          console.warn(
+            `close-time scorecard capture unavailable for ${issue.identifier}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
       }
     }
 

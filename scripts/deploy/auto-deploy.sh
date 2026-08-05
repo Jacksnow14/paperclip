@@ -56,6 +56,13 @@ BUILD_CMD=${PAPERCLIP_DEPLOY_BUILD_CMD:-$HERE/safe-deploy.sh}
 # purpose: a refused tick is a no-strike skip and the timer retries in 10 min.
 ARM_PREFLIGHT_WAIT=${PAPERCLIP_DEPLOY_ARM_PREFLIGHT_WAIT_SEC:-60}
 RUN_COUNTS_CMD=${PAPERCLIP_DEPLOY_RUN_COUNTS_CMD:-${PAPERCLIP_DEPLOY_NODE:-/usr/bin/node} $HERE/query-active-runs.mjs}
+# AUR-5019: pre-flip migration gate. Replays the candidate's pending migrations
+# against a scratch DB seeded from a live-data snapshot, via the candidate's own
+# applier. Runs between "release built" and the `current` flip — both arm paths
+# (fresh build and flip-only resume) pass through it. PAPERCLIP_MIGRATION_GATE_ENABLED=0
+# is the break-glass.
+MIGRATION_GATE_CMD=${PAPERCLIP_DEPLOY_MIGRATION_GATE_CMD:-${PAPERCLIP_DEPLOY_NODE:-/usr/bin/node} $HERE/migration-gate.mjs}
+MIGRATION_GATE_ENABLED=${PAPERCLIP_MIGRATION_GATE_ENABLED:-1}
 MEM_FLOOR_MB=${PAPERCLIP_DEPLOY_MEM_FLOOR_MB:-2500}
 RESTART_ENABLED=${PAPERCLIP_AUTO_RESTART_ENABLED:-0}
 ROLLBACK_ENABLED=${PAPERCLIP_AUTO_ROLLBACK_ENABLED:-1}
@@ -72,6 +79,7 @@ QUAR_FILE=$STATE_DIR/auto-deploy.quarantine
 FAIL_FILE=$STATE_DIR/auto-deploy.build-failures
 HALT_FILE=$STATE_DIR/auto-deploy.halt
 BUILD_OUT=$STATE_DIR/auto-deploy.last-build.out
+GATE_OUT=$STATE_DIR/auto-deploy.last-migration-gate.out
 
 log() {
   local line
@@ -250,7 +258,7 @@ else
     rel12=${master_sha:0:12}
     release_dir="$APP_ROOT/releases/$rel12"
     built_sha=$(python3 -c "import json; print(json.load(open('$release_dir/build-info.json'))['sha'])" 2>/dev/null || echo none)
-    arm_built=0 arm_blocked=0
+    arm_built=0 arm_blocked=0 gate_refused=0
     if [[ "$built_sha" == "$master_sha" ]]; then
       # build-release.sh writes build-info.json LAST, after its own artifact
       # asserts, so a matching sha means a complete build is already on disk —
@@ -291,7 +299,33 @@ else
         cat "$BUILD_OUT" >> "$LOG_FILE" 2>/dev/null || true
       fi
     fi
-    if (( arm_built )); then
+    if (( arm_built )) && [[ "$MIGRATION_GATE_ENABLED" == "1" ]]; then
+      # AUR-5019: the gate stands between a complete build and the flip. Exit 2
+      # means the replay ABORTED — a property of this SHA against today's live
+      # data, the exact class that crash-looped production on 2026-08-05 (0098,
+      # 0099): quarantine immediately (retrying adds no information) and page.
+      # Any other nonzero is the gate itself failing — not a property of the
+      # SHA: fail closed (no flip), no strike, retry next tick.
+      gate_rc=0
+      $MIGRATION_GATE_CMD --release "$release_dir" > "$GATE_OUT" 2>&1 || gate_rc=$?
+      cat "$GATE_OUT" >> "$LOG_FILE" 2>/dev/null || true
+      if (( gate_rc == 2 )); then
+        gate_refused=1
+        quarantine "$master_sha" migration-gate-blocked
+        PHASE=arm-blocked-migration-gate ARMED_SHA=$master_sha NOTE="migration gate BLOCKED (replay aborted) — see $GATE_OUT"
+        write_state
+        log "arm BLOCKED by migration gate: $(tail -2 "$GATE_OUT" 2>/dev/null | tr '\n' ' ')"
+        notify SEV2 "auto-deploy migration gate BLOCKED ${master_sha:0:12}: a pending migration aborts when replayed against a live-data snapshot — deploying it would crash-loop boot (AUR-5019). SHA quarantined; production unaffected (still on ${activated_sha:0:12}). Detail: $GATE_OUT"
+      elif (( gate_rc != 0 )); then
+        gate_refused=1
+        PHASE=arm-gate-infra-failed ARMED_SHA=$master_sha NOTE="migration gate could not run (exit $gate_rc) — failing closed, no flip; see $GATE_OUT"
+        write_state
+        log "arm deferred: migration gate infra failure (exit $gate_rc) — no strike, retry next tick"
+      else
+        log "migration gate PASS for $rel12: $(tail -1 "$GATE_OUT" 2>/dev/null)"
+      fi
+    fi
+    if (( arm_built && ! gate_refused )); then
       if repoint_current "$rel12"; then
         set_fail_count "$master_sha" 0
         activated_sha=$(read_activated_sha)
@@ -303,6 +337,11 @@ else
         write_state
         log "arm flip FAILED: $NOTE"
       fi
+    elif (( gate_refused )); then
+      # The gate already wrote its phase, state, and (for BLOCK) the quarantine
+      # entry + SEV2 above. Crucially this branch keeps a gate refusal out of
+      # the build-failure strike ledger below: the build was fine.
+      :
     elif (( ! arm_blocked )); then
       if grep -qE 'preflight did not clear within|WATCHDOG: mem_avail' "$BUILD_OUT" 2>/dev/null; then
         # safe-deploy refused for resources (busy box) or its watchdog stopped

@@ -149,7 +149,11 @@ wait_sha() { # $1=sha $2=timeout
 }
 
 run_tick() { # extra env as KEY=VAL args
+  # AUR-5019: the migration gate defaults to a pass-through stub (`true`) so the
+  # pre-gate cases keep asserting their own concern; the J cases point GATE_CMD
+  # at a scripted stub to drive block/infra/pass outcomes.
   env "$@" \
+    PAPERCLIP_DEPLOY_MIGRATION_GATE_CMD="${GATE_CMD:-true}" \
     PAPERCLIP_DEPLOY_APP_ROOT="$APP" \
     PAPERCLIP_DEPLOY_REMOTE="$FIX" \
     PAPERCLIP_HEALTH_URL="$HEALTH" \
@@ -421,6 +425,89 @@ if [[ ! -e "$APP/releases/$K12/half-written.tmp" && "$(readlink "$APP/current")"
 else
   fail "I4: partial release dir cleared (guarded) and rebuilt, then flipped" \
     "rc=$rc current=$(readlink "$APP/current") leftover=$(ls "$APP/releases/$K12" 2>/dev/null | tr '\n' ' ')"
+fi
+
+# ================================================================================
+# J. AUR-5019 migration gate: stands between a complete build and the flip.
+GATE_LOG="$TMP/gate.log"
+GATE_STUB="$TMP/gate.sh"
+cat > "$GATE_STUB" <<STUB
+#!/usr/bin/env bash
+# \$1 = exit code to simulate; remaining args are what auto-deploy passed.
+rc="\$1"; shift
+printf 'gate %s\n' "\$*" >> "$GATE_LOG"
+echo "MIGRATION-GATE: stub exit \$rc"
+exit "\$rc"
+STUB
+chmod +x "$GATE_STUB"
+
+# J1: gate exit 2 (replay aborted) on a complete on-disk release -> NO flip,
+#     sha quarantined as migration-gate-blocked, SEV2 paged, and crucially NOT
+#     counted as a build failure (the build was fine).
+SHA_L=$(fixture_commit "blocked by migration gate"); L12=${SHA_L:0:12}
+make_release "$SHA_L" ok
+point_current "$SHA_G"; set_master "$SHA_L"; set_counts 0 0
+: > "$ALERTS"; rm -f "$BUILD_LOG" "$GATE_LOG" "$STATE_DIR/auto-deploy.build-failures"
+GATE_CMD="$GATE_STUB 2" run_tick; rc=$?
+if [[ "$(readlink "$APP/current")" == "releases/$G12" ]] \
+   && grep -q "^$SHA_L migration-gate-blocked" "$STATE_DIR/auto-deploy.quarantine" \
+   && grep -q "migration gate BLOCKED" "$ALERTS"; then
+  ok "J1: gate exit 2 blocks the flip, quarantines the sha, pages SEV2"
+else
+  fail "J1: gate exit 2 blocks the flip, quarantines the sha, pages SEV2" \
+    "rc=$rc current=$(readlink "$APP/current") quarantine=$(cat "$STATE_DIR/auto-deploy.quarantine" 2>/dev/null) alerts=$(cat "$ALERTS" 2>/dev/null)"
+fi
+[[ "$(state_get phase)" == "arm-blocked-migration-gate" ]] \
+  && ok "J1: state file names the gate block (drift detector reads why master is not arming)" \
+  || fail "J1: state file names the gate block (drift detector reads why master is not arming)" "phase=$(state_get phase)"
+[[ ! -s "$STATE_DIR/auto-deploy.build-failures" ]] \
+  && ok "J1: a gate block is not a build-failure strike" \
+  || fail "J1: a gate block is not a build-failure strike" "$(cat "$STATE_DIR/auto-deploy.build-failures")"
+# ...and the quarantine holds: the next tick must not re-run the gate.
+run_tick
+[[ "$(wc -l < "$GATE_LOG")" == "1" ]] \
+  && ok "J1: quarantined sha is not re-gated every tick" \
+  || fail "J1: quarantined sha is not re-gated every tick" "gate_log=$(cat "$GATE_LOG")"
+
+# J2: gate exit 3 (gate infra failure) -> NO flip, NO quarantine, NO page;
+#     the next tick retries the gate; a recovered gate then flips.
+SHA_M=$(fixture_commit "gate infra flake"); M12=${SHA_M:0:12}
+make_release "$SHA_M" ok
+set_master "$SHA_M"; : > "$ALERTS"; rm -f "$GATE_LOG"
+GATE_CMD="$GATE_STUB 3" run_tick
+if [[ "$(readlink "$APP/current")" == "releases/$G12" ]] \
+   && ! grep -q "^$SHA_M " "$STATE_DIR/auto-deploy.quarantine" 2>/dev/null \
+   && [[ ! -s "$ALERTS" && "$(state_get phase)" == "arm-gate-infra-failed" ]]; then
+  ok "J2: gate infra failure fails closed — no flip, no strike, no quarantine, no page"
+else
+  fail "J2: gate infra failure fails closed — no flip, no strike, no quarantine, no page" \
+    "current=$(readlink "$APP/current") phase=$(state_get phase) alerts=$(cat "$ALERTS" 2>/dev/null)"
+fi
+GATE_CMD="$GATE_STUB 3" run_tick
+[[ "$(wc -l < "$GATE_LOG")" == "2" ]] \
+  && ok "J2: infra failure is retried next tick (no quarantine backoff)" \
+  || fail "J2: infra failure is retried next tick (no quarantine backoff)" "gate_log=$(cat "$GATE_LOG")"
+GATE_CMD="$GATE_STUB 0" run_tick; rc=$?
+if [[ "$(readlink "$APP/current")" == "releases/$M12" && "$rc" == 0 ]] \
+   && grep -q -- "--release $APP/releases/$M12" "$GATE_LOG"; then
+  ok "J2: recovered gate passes the CANDIDATE release dir and the flip proceeds"
+else
+  fail "J2: recovered gate passes the CANDIDATE release dir and the flip proceeds" \
+    "rc=$rc current=$(readlink "$APP/current") gate_log=$(cat "$GATE_LOG" 2>/dev/null)"
+fi
+
+# J3: break-glass — PAPERCLIP_MIGRATION_GATE_ENABLED=0 flips without invoking
+#     the gate at all (a gate that would have blocked is bypassed, loudly owned
+#     by whoever set the env).
+SHA_O=$(fixture_commit "break-glass ungated"); O12=${SHA_O:0:12}
+make_release "$SHA_O" ok
+set_master "$SHA_O"; rm -f "$GATE_LOG"
+GATE_CMD="$GATE_STUB 2" run_tick PAPERCLIP_MIGRATION_GATE_ENABLED=0; rc=$?
+if [[ "$(readlink "$APP/current")" == "releases/$O12" && ! -s "$GATE_LOG" && "$rc" == 0 ]]; then
+  ok "J3: break-glass env flips ungated (gate not invoked)"
+else
+  fail "J3: break-glass env flips ungated (gate not invoked)" \
+    "rc=$rc current=$(readlink "$APP/current") gate_log=$(cat "$GATE_LOG" 2>/dev/null)"
 fi
 
 echo

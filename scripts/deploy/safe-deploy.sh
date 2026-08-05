@@ -243,6 +243,25 @@ if [[ "$ASSUME_YES" -ne 1 ]]; then
   [[ "$ans" == y || "$ans" == Y ]] || die "aborted by operator"
 fi
 
+# AUR-5019: migration gate — replay the candidate's pending migrations against
+# a scratch DB seeded from a live-data snapshot BEFORE the flip. A migration
+# that aborts here would have crash-looped production boot (2026-08-05: 0098,
+# 0099). Exit 2 = replay aborted; any other nonzero = the gate itself failed —
+# both fail closed. Break-glass: PAPERCLIP_MIGRATION_GATE_ENABLED=0.
+if [[ "${PAPERCLIP_MIGRATION_GATE_ENABLED:-1}" == "1" ]]; then
+  log "=== migration gate (AUR-5019): replaying pending migrations against a live-data snapshot ==="
+  GATE_RC=0
+  "${PAPERCLIP_DEPLOY_NODE:-/usr/bin/node}" "$REPO/scripts/deploy/migration-gate.mjs" --release "$RELEASE" || GATE_RC=$?
+  if [[ "$GATE_RC" -eq 2 ]]; then
+    die "migration gate BLOCKED activation of $SHA12: a pending migration aborts against live data. Fix the migration (or converge the data) instead of deploying the abort into boot. Break-glass: PAPERCLIP_MIGRATION_GATE_ENABLED=0"
+  elif [[ "$GATE_RC" -ne 0 ]]; then
+    die "migration gate could not run (exit $GATE_RC) — failing closed, 'current' untouched. Break-glass: PAPERCLIP_MIGRATION_GATE_ENABLED=0"
+  fi
+  log "migration gate PASS"
+else
+  log "migration gate DISABLED via PAPERCLIP_MIGRATION_GATE_ENABLED=0 (break-glass) — flipping ungated"
+fi
+
 sudo install -d -m 755 "$STATE_DIR"
 sudo ln -sfn "$CURRENT_TARGET" "$PREV_LINK"          # rollback anchor
 log "=== activate $SHA12 (previous: ${CURRENT_TARGET#releases/}) ==="

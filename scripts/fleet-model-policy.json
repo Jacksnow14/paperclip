@@ -1,9 +1,10 @@
 {
-  "comment": "Fleet model policy — data, not code. Rules: 'best-overall' = highest-ranked model across all families for the agent's adapter; 'latest-family:<fam>' = newest version within one family; 'latest-same-tier' (default) = keep the agent's current family and tier (full/mini/nano), newest version. Effort: explicit value, or 'keep'. Rank order (claude): fable > opus > sonnet > haiku; (codex): larger version first, tier full > mini > nano.",
+  "comment": "Fleet model policy — data, not code. Rules: 'best-overall' = highest-ranked model across all families for the agent's adapter; 'latest-family:<fam>' = newest version within one family; 'latest-same-tier' (default) = keep the agent's current family and tier (full/mini/nano), newest version. Effort: explicit value, or 'keep'. Rank order (claude): fable > opus > sonnet > haiku; (codex): larger version first, tier full > mini > nano. Founder decisions 2026-08-06: CEO stays on latest OPUS (not fable — fable is rate-limited and the CEO runs constantly); Claude Code Max is the only fable seat; Claude Code Fast tracks latest sonnet.",
   "agents": {
-    "CEO": { "rule": "best-overall", "effort": "xhigh" },
+    "CEO": { "rule": "latest-family:opus", "effort": "xhigh" },
     "Claude Code Max": { "rule": "latest-family:fable", "effort": "xhigh" },
-    "CTO": { "rule": "best-overall", "effort": "high" }
+    "Claude Code Fast": { "rule": "latest-family:sonnet", "effort": "keep" },
+    "CTO": { "rule": "latest-family:opus", "effort": "high" }
   },
   "default": { "rule": "latest-same-tier", "effort": "keep" },
   "tuning": {

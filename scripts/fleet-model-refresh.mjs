@@ -103,7 +103,10 @@ export function bumpCandidates(ids) {
       const v = c.ver;
       if (v.length === 1) {
         out.add(`claude-${c.family}-${v[0] + 1}`);
+        // A minor release off a single-version id could be spelled either way
+        // (opus 5.1 → claude-opus-5-1 or claude-opus-5.1) — probe both.
         out.add(`claude-${c.family}-${v[0]}-1`);
+        out.add(`claude-${c.family}-${v[0]}.1`);
       } else {
         out.add(`claude-${c.family}-${v[0]}-${v[1] + 1}`);
         out.add(`claude-${c.family}-${v[0] + 1}`);

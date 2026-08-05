@@ -227,6 +227,75 @@ describe("execution workspace policy helpers", () => {
     expect(issueExecutionWorkspaceModeForPersistedWorkspace(undefined)).toBe("agent_default");
   });
 
+  it("degrades a git-requiring mode to shared_workspace when the pinned workspace has no git ancestor", () => {
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: { enabled: true, defaultMode: "isolated_workspace" },
+        issueSettings: null,
+        legacyUseProjectWorkspace: null,
+        workspaceHasGitAncestor: false,
+      }),
+    ).toBe("shared_workspace");
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: { enabled: true, defaultMode: "operator_branch" },
+        issueSettings: null,
+        legacyUseProjectWorkspace: null,
+        workspaceHasGitAncestor: false,
+      }),
+    ).toBe("shared_workspace");
+  });
+
+  it("leaves git-primary projects unaffected: isolated_workspace policy is a no-op when the workspace has a git ancestor", () => {
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: { enabled: true, defaultMode: "isolated_workspace" },
+        issueSettings: null,
+        legacyUseProjectWorkspace: null,
+        workspaceHasGitAncestor: true,
+      }),
+    ).toBe("isolated_workspace");
+    // Omitting workspaceHasGitAncestor (unknown) must also stay a no-op for callers not yet updated.
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: { enabled: true, defaultMode: "isolated_workspace" },
+        issueSettings: null,
+        legacyUseProjectWorkspace: null,
+      }),
+    ).toBe("isolated_workspace");
+  });
+
+  it("degrades a per-issue explicit isolated_workspace override on a non-git workspace", () => {
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: { enabled: true, defaultMode: "shared_workspace" },
+        issueSettings: { mode: "isolated_workspace" },
+        legacyUseProjectWorkspace: null,
+        workspaceHasGitAncestor: false,
+      }),
+    ).toBe("shared_workspace");
+  });
+
+  it("preserves per-issue override precedence over project policy when the git-ancestor clamp does not apply", () => {
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: { enabled: true, defaultMode: "shared_workspace" },
+        issueSettings: { mode: "isolated_workspace" },
+        legacyUseProjectWorkspace: null,
+        workspaceHasGitAncestor: true,
+      }),
+    ).toBe("isolated_workspace");
+    // shared_workspace and agent_default never require git, so a non-git workspace never clamps them.
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: { enabled: true, defaultMode: "adapter_default" },
+        issueSettings: null,
+        legacyUseProjectWorkspace: null,
+        workspaceHasGitAncestor: false,
+      }),
+    ).toBe("agent_default");
+  });
+
   it("disables project execution workspace policy when the instance flag is off", () => {
     expect(
       gateProjectExecutionWorkspacePolicy(

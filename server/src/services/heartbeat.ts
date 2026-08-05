@@ -7781,11 +7781,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       (explicitResumeSessionDisplayId ? { sessionId: explicitResumeSessionDisplayId } : null) ??
       normalizeSessionParams(sessionCodec.deserialize(taskSessionForRun?.sessionParamsJson ?? null));
     const config = parseObject(agent.adapterConfig);
-    const requestedExecutionWorkspaceMode = resolveExecutionWorkspaceMode({
+    const pinnedProjectWorkspaceId =
+      issueContext?.projectWorkspaceId ?? readNonEmptyString(context.projectWorkspaceId);
+    const pinnedWorkspaceGitRow = pinnedProjectWorkspaceId
+      ? await db
+          .select({ repoUrl: projectWorkspaces.repoUrl })
+          .from(projectWorkspaces)
+          .where(
+            and(
+              eq(projectWorkspaces.id, pinnedProjectWorkspaceId),
+              eq(projectWorkspaces.companyId, agent.companyId),
+            ),
+          )
+          .then((rows) => rows[0] ?? null)
+      : null;
+    // null = unknown (no workspace pinned yet); resolveExecutionWorkspaceMode
+    // treats that as a no-op so this stays backward compatible.
+    const pinnedWorkspaceHasGitAncestor = pinnedWorkspaceGitRow ? Boolean(pinnedWorkspaceGitRow.repoUrl) : null;
+    const unclampedExecutionWorkspaceMode = resolveExecutionWorkspaceMode({
       projectPolicy: projectExecutionWorkspacePolicy,
       issueSettings: issueExecutionWorkspaceSettings,
       legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
     });
+    const requestedExecutionWorkspaceMode = resolveExecutionWorkspaceMode({
+      projectPolicy: projectExecutionWorkspacePolicy,
+      issueSettings: issueExecutionWorkspaceSettings,
+      legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
+      workspaceHasGitAncestor: pinnedWorkspaceHasGitAncestor,
+    });
+    const executionWorkspaceModeDegradeWarnings: string[] =
+      unclampedExecutionWorkspaceMode !== requestedExecutionWorkspaceMode
+        ? [
+            `Execution workspace mode "${unclampedExecutionWorkspaceMode}" requires a git-backed workspace, but the workspace pinned to this issue has no git remote configured. Falling back to "shared_workspace" for this run.`,
+          ]
+        : [];
     const resolvedWorkspace = await resolveWorkspaceForRun(
       agent,
       context,
@@ -8233,6 +8262,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     const runtimeSessionParams = runtimeSessionResolution.sessionParams;
     const runtimeWorkspaceWarnings = [
+      ...executionWorkspaceModeDegradeWarnings,
       ...resolvedWorkspace.warnings,
       ...executionWorkspace.warnings,
       ...(runtimeSessionResolution.warning ? [runtimeSessionResolution.warning] : []),

@@ -37,6 +37,10 @@ jobs:
           cache: pnpm
       # Loop/audit scripts under scripts/ are dependency-free node:test suites.
       - run: node --test scripts/
+      # node --test never executes the *.test.sh suites — before AUR-4675 this
+      # job was green while asserting nothing about them (AUR-4042). The runner
+      # fails loudly if it discovers zero suites.
+      - run: bash scripts/run-shell-suites.sh
 
   test:
     runs-on: ubuntu-latest

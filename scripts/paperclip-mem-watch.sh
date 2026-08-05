@@ -84,8 +84,22 @@ load1=$(awk '{print $1}' /proc/loadavg)
 # unlike the ievgen-run ad hoc check (defect 3/4, routine description) it
 # needs no `sudo -n` workaround and can use `-k` to restrict to the KERNEL
 # transport outright, which cannot match app log text by construction.
+#
+# AUR-4338 fire 9 (defect 9): count GLOBAL OOM kills only. The kernel tags each
+# kill with a constraint: CONSTRAINT_NONE is a true box-wide out-of-memory --
+# the AUR-3924 P0 failure mode (measured 96h: 6 such kills, node, anon-rss
+# 4.68-6.34 GB). CONSTRAINT_MEMCG is a CGROUP hitting its OWN limit, which is
+# bounded by construction and is not a host-memory breach (measured: one such
+# kill, python3, anon-rss 49 MB, on a box with 6175 MB swap free -- it still
+# SEV2-paged the founder at 07:04:40Z, Telegram message_id=89804).
+# This matters ahead of AUR-4536, which enforces a per-run memory ceiling at
+# the adapter spawn path: every correct enforcement action it takes WILL emit a
+# CONSTRAINT_MEMCG kill. Counting those here would page the founder on every
+# ceiling hit and would hold AUR-4338 rule 1 clause 3 at FAIL forever -- the
+# "fires forever" failure mode, re-armed by the very fix meant to end it.
 ooms=$(journalctl -k --since "-5min" --no-pager 2>/dev/null \
-        | grep -cE "oom-kill:" || true)
+        | grep -E "oom-kill:" \
+        | grep -cE "constraint=CONSTRAINT_NONE" || true)
 
 # AUR-4056. `pgrep -c` prints "0" and ALSO exits 1 when nothing matches, so the
 # old `|| echo 0` fired in ADDITION to pgrep's own output and produced the

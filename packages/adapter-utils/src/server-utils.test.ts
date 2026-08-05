@@ -16,6 +16,7 @@ import {
   materializePaperclipSkillCopy,
   refreshPaperclipWorkspaceEnvForExecution,
   renderPaperclipWakePrompt,
+  resolveInheritedSecretEnvScrubMode,
   runningProcesses,
   runChildProcess,
   sanitizeSshRemoteEnv,
@@ -1305,6 +1306,124 @@ describe("buildChildProcessEnv host-credential runEnv denylist (AUR-4046)", () =
       { mode: "enforce", log: (message) => messages.push(message) },
     );
     expect(messages).toHaveLength(0);
+  });
+});
+
+describe("buildChildProcessEnv provenance-based host-credential value scrub (AUR-4094)", () => {
+  const REAL_SA_KEY_VALUE = "real-google-sa-key-fixture-value-0123456789";
+
+  it("blocks a host-credential value carried under a renamed runEnv key (renaming cannot bypass the scrub)", () => {
+    const result = buildChildProcessEnv(
+      { PATH: "/usr/bin", GOOGLE_WORKSPACE_SA_KEY: REAL_SA_KEY_VALUE },
+      { MY_HARMLESS_VAR: REAL_SA_KEY_VALUE },
+      { mode: "enforce", log: () => {} },
+    );
+    expect(result).not.toHaveProperty("MY_HARMLESS_VAR");
+  });
+
+  it("passes through a legitimate tenant vault binding with an unrelated name and value", () => {
+    const result = buildChildProcessEnv(
+      { PATH: "/usr/bin", GOOGLE_WORKSPACE_SA_KEY: REAL_SA_KEY_VALUE },
+      { STRIPE_API_KEY: "distinct-tenant-vault-value-abcdefghijklmnop" },
+      { mode: "enforce", log: () => {} },
+    );
+    expect(result.STRIPE_API_KEY).toBe("distinct-tenant-vault-value-abcdefghijklmnop");
+  });
+
+  it("does not false-block a short/common value shared with a host var", () => {
+    const result = buildChildProcessEnv(
+      { PATH: "/usr/bin", API_TOKEN: "true" },
+      { SOME_OTHER_KEY: "true" },
+      { mode: "enforce", log: () => {} },
+    );
+    expect(result.SOME_OTHER_KEY).toBe("true");
+  });
+
+  it("does not false-block a long value that also appears as a non-credential host var (shared config, not a secret)", () => {
+    const sharedValue = "shared-config-value-not-actually-a-secret-12345";
+    const result = buildChildProcessEnv(
+      { PATH: "/usr/bin", API_KEY_ID: sharedValue, DEPLOY_REGION: sharedValue },
+      { CUSTOM_CONFIG: sharedValue },
+      { mode: "enforce", log: () => {} },
+    );
+    expect(result.CUSTOM_CONFIG).toBe(sharedValue);
+  });
+
+  it("allowRunEnvKeys still permits a reviewed exception for a value-matched (renamed) entry", () => {
+    const result = buildChildProcessEnv(
+      { GOOGLE_WORKSPACE_SA_KEY: REAL_SA_KEY_VALUE },
+      { RENAMED_KEY: REAL_SA_KEY_VALUE },
+      { mode: "enforce", log: () => {}, allowRunEnvKeys: ["RENAMED_KEY"] },
+    );
+    expect(result.RENAMED_KEY).toBe(REAL_SA_KEY_VALUE);
+  });
+
+  it("logs the blocked key and the matched host var name, but never the value", () => {
+    const messages: string[] = [];
+    buildChildProcessEnv(
+      { GOOGLE_WORKSPACE_SA_KEY: REAL_SA_KEY_VALUE },
+      { RENAMED_KEY: REAL_SA_KEY_VALUE },
+      { mode: "enforce", log: (message) => messages.push(message) },
+    );
+    expect(messages.some((m) => m.includes("RENAMED_KEY"))).toBe(true);
+    expect(messages.some((m) => m.includes("GOOGLE_WORKSPACE_SA_KEY"))).toBe(true);
+    expect(messages.some((m) => m.includes(REAL_SA_KEY_VALUE))).toBe(false);
+  });
+
+  it("report mode logs the value-matched block but does not block it", () => {
+    const messages: string[] = [];
+    const result = buildChildProcessEnv(
+      { GOOGLE_WORKSPACE_SA_KEY: REAL_SA_KEY_VALUE },
+      { RENAMED_KEY: REAL_SA_KEY_VALUE },
+      { mode: "report", log: (message) => messages.push(message) },
+    );
+    expect(result.RENAMED_KEY).toBe(REAL_SA_KEY_VALUE);
+    expect(messages.some((m) => m.includes("would block"))).toBe(true);
+  });
+});
+
+describe("PAPERCLIP_ENV_SCRUB_MODE=report production downgrade refusal (AUR-4094)", () => {
+  it("resolveInheritedSecretEnvScrubMode forces enforce and warns when report is requested under NODE_ENV=production", () => {
+    const messages: string[] = [];
+    const mode = resolveInheritedSecretEnvScrubMode(
+      { PAPERCLIP_ENV_SCRUB_MODE: "report", NODE_ENV: "production" },
+      { log: (message) => messages.push(message) },
+    );
+    expect(mode).toBe("enforce");
+    expect(messages.some((m) => m.includes("production"))).toBe(true);
+  });
+
+  it("resolveInheritedSecretEnvScrubMode still honors report outside production", () => {
+    const mode = resolveInheritedSecretEnvScrubMode(
+      { PAPERCLIP_ENV_SCRUB_MODE: "report", NODE_ENV: "development" },
+      { log: () => {} },
+    );
+    expect(mode).toBe("report");
+  });
+
+  it("resolveInheritedSecretEnvScrubMode enforces normally when NODE_ENV is unset", () => {
+    const mode = resolveInheritedSecretEnvScrubMode({}, { log: () => {} });
+    expect(mode).toBe("enforce");
+  });
+
+  it("buildChildProcessEnv end-to-end: production forces enforce even though PAPERCLIP_ENV_SCRUB_MODE=report and no explicit mode is passed", () => {
+    const result = buildChildProcessEnv(
+      { NODE_ENV: "production", PAPERCLIP_ENV_SCRUB_MODE: "report", PATH: "/usr/bin" },
+      { GOOGLE_WORKSPACE_SA_KEY: "vault-bound-fixture" },
+      { log: () => {} },
+    );
+    expect(result).not.toHaveProperty("GOOGLE_WORKSPACE_SA_KEY");
+  });
+
+  it("buildChildProcessEnv end-to-end: report mode still works outside production with no explicit mode passed", () => {
+    const messages: string[] = [];
+    const result = buildChildProcessEnv(
+      { NODE_ENV: "development", PAPERCLIP_ENV_SCRUB_MODE: "report", PATH: "/usr/bin" },
+      { GOOGLE_WORKSPACE_SA_KEY: "vault-bound-fixture" },
+      { log: (message) => messages.push(message) },
+    );
+    expect(result.GOOGLE_WORKSPACE_SA_KEY).toBe("vault-bound-fixture");
+    expect(messages.some((m) => m.includes("would block"))).toBe(true);
   });
 });
 

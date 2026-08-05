@@ -1213,10 +1213,24 @@ const INHERITED_SECRET_ENV_KEEPLIST = new Set([
 
 export type InheritedSecretEnvScrubMode = "enforce" | "report";
 
+// AUR-4094: PAPERCLIP_ENV_SCRUB_MODE=report is a local-development escape hatch
+// only. A security control that any env var can silently switch off in
+// production is not a control, so a "report" request is refused (and loudly
+// logged) whenever NODE_ENV=production, and forced back to "enforce".
 export function resolveInheritedSecretEnvScrubMode(
   baseEnv: NodeJS.ProcessEnv = process.env,
+  opts: { log?: (message: string) => void } = {},
 ): InheritedSecretEnvScrubMode {
-  return baseEnv.PAPERCLIP_ENV_SCRUB_MODE === "report" ? "report" : "enforce";
+  const requested: InheritedSecretEnvScrubMode =
+    baseEnv.PAPERCLIP_ENV_SCRUB_MODE === "report" ? "report" : "enforce";
+  if (requested === "report" && baseEnv.NODE_ENV === "production") {
+    const log = opts.log ?? ((message: string) => console.warn(message));
+    log(
+      "[paperclip] env-scrub PAPERCLIP_ENV_SCRUB_MODE=report requested with NODE_ENV=production — refusing downgrade, forcing enforce",
+    );
+    return "enforce";
+  }
+  return requested;
 }
 
 export function sanitizeInheritedSecretEnv(
@@ -1227,7 +1241,7 @@ export function sanitizeInheritedSecretEnv(
     log?: (message: string) => void;
   } = {},
 ): NodeJS.ProcessEnv {
-  const mode = opts.mode ?? resolveInheritedSecretEnvScrubMode();
+  const mode = opts.mode ?? resolveInheritedSecretEnvScrubMode(baseEnv, { log: opts.log });
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   const stripped: string[] = [];
   for (const key of Object.keys(env)) {
@@ -1262,12 +1276,48 @@ const RUN_ENV_HOST_CREDENTIAL_DENYLIST = new Set([
   "INTEROP_R2_SECRET_ACCESS_KEY",
 ]);
 
+// AUR-4094: renaming a runEnv key must not resurrect a host-credential leak, so
+// blocking cannot rely on the runEnv key name alone. A value is only treated as
+// host-credential material if it is long enough to not be a common/short
+// coincidence, and it does not also appear as the value of some *non*
+// credential-shaped host var (which would make it a shared, non-secret value
+// like a hostname rather than a real credential).
+const HOST_CREDENTIAL_VALUE_MIN_LENGTH = 20;
+
+function isHostCredentialShapedKey(key: string): boolean {
+  return (
+    RUN_ENV_HOST_CREDENTIAL_DENYLIST.has(key) ||
+    INHERITED_SECRET_ENV_EXPLICIT_DENYLIST.has(key) ||
+    SENSITIVE_ENV_KEY.test(key)
+  );
+}
+
+// Maps a host-credential value (from baseEnv) to the host var name it came
+// from, so a match can be logged without ever logging the value itself.
+function deriveHostCredentialValueMap(baseEnv: NodeJS.ProcessEnv): Map<string, string> {
+  const credentialValues = new Map<string, string>();
+  const nonCredentialValues = new Set<string>();
+  for (const [key, value] of Object.entries(baseEnv)) {
+    if (value === undefined || value.length < HOST_CREDENTIAL_VALUE_MIN_LENGTH) continue;
+    if (isHostCredentialShapedKey(key)) {
+      if (!credentialValues.has(value)) credentialValues.set(value, key);
+    } else {
+      nonCredentialValues.add(value);
+    }
+  }
+  for (const value of nonCredentialValues) credentialValues.delete(value);
+  return credentialValues;
+}
+
 // The one supported way to build a child-process env from the host env plus the
 // per-run env. Scrubs identity and secret-shaped vars from the inherited side,
-// and separately default-denies the small set of host-owned credential names
-// above from the per-run side (opt-in only, see RUN_ENV_HOST_CREDENTIAL_DENYLIST).
-// All other per-run values (tenant-scoped vault bindings) always win and are
-// never filtered here.
+// and separately default-denies host-owned credential material from the
+// per-run side (opt-in only, via opts.allowRunEnvKeys). Blocking is
+// provenance-based: a runEnv entry is blocked if its key is one of the known
+// host-credential names OR its value matches a host-credential value under
+// any key name — so renaming the binding key cannot bypass it. All other
+// per-run values (tenant-scoped vault bindings) always win and are never
+// filtered here.
 export function buildChildProcessEnv(
   baseEnv: NodeJS.ProcessEnv,
   runEnv: Record<string, string | undefined>,
@@ -1278,28 +1328,41 @@ export function buildChildProcessEnv(
     allowRunEnvKeys?: Iterable<string>;
   } = {},
 ): NodeJS.ProcessEnv {
-  const mode = opts.mode ?? resolveInheritedSecretEnvScrubMode();
+  const mode = opts.mode ?? resolveInheritedSecretEnvScrubMode(baseEnv, { log: opts.log });
   const allowed = new Set(opts.allowRunEnvKeys ?? []);
+  const hostCredentialValues = deriveHostCredentialValueMap(baseEnv);
   const scrubbedRunEnv: Record<string, string | undefined> = {};
-  const blocked: string[] = [];
+  const blockedByName: string[] = [];
+  const blockedByValue: string[] = [];
   for (const [key, value] of Object.entries(runEnv)) {
-    if (RUN_ENV_HOST_CREDENTIAL_DENYLIST.has(key) && !allowed.has(key)) {
-      blocked.push(key);
+    if (allowed.has(key)) {
+      scrubbedRunEnv[key] = value;
+      continue;
+    }
+    const nameMatch = RUN_ENV_HOST_CREDENTIAL_DENYLIST.has(key);
+    const matchedHostKey = value !== undefined ? hostCredentialValues.get(value) : undefined;
+    if (nameMatch || matchedHostKey) {
+      if (nameMatch) blockedByName.push(key);
+      if (matchedHostKey) blockedByValue.push(`${key}<-${matchedHostKey}`);
       if (mode === "enforce") continue;
     }
     scrubbedRunEnv[key] = value;
   }
-  if (blocked.length > 0) {
+  if (blockedByName.length > 0 || blockedByValue.length > 0) {
     const log = opts.log ?? ((message: string) => console.info(message));
     const runSuffix = opts.runId ? ` run=${opts.runId}` : "";
+    const parts = [
+      ...(blockedByName.length > 0 ? [`by-name: ${blockedByName.sort().join(", ")}`] : []),
+      ...(blockedByValue.length > 0 ? [`by-value: ${blockedByValue.sort().join(", ")}`] : []),
+    ];
     log(
       `[paperclip] env-scrub mode=${mode}${runSuffix} ${
         mode === "enforce" ? "blocked" : "would block"
-      } host-credential keys from runEnv (not opted in): ${blocked.sort().join(", ")}`,
+      } host-credential keys from runEnv (not opted in): ${parts.join("; ")}`,
     );
   }
   return {
-    ...sanitizeInheritedSecretEnv(sanitizeInheritedPaperclipEnv(baseEnv), opts),
+    ...sanitizeInheritedSecretEnv(sanitizeInheritedPaperclipEnv(baseEnv), { ...opts, mode }),
     ...scrubbedRunEnv,
   };
 }

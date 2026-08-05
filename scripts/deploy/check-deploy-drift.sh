@@ -75,6 +75,24 @@
 # lines carrying the same reason), so there is no separate state to get stale.
 # Alerts are rate-limited per reason. Delivery failure is logged loudly and never
 # swallowed — see AUR-3930 on channels that print "sent" for undelivered messages.
+#
+# CHECKOUT-DRIFT AXIS (AUR-4227, control-plane half of AUR-4187): the running
+# server is not the only place production code executes. Scheduled routines
+# execute repo code by `cd`-ing into a checkout on disk, and AUR-4187 found one
+# running a full day of stale code from a checkout that predated a merged safety
+# fix — a class of drift the server-facing axes above cannot see. The axis below
+# walks a configured list of routine-executable checkouts and runs the same
+# graded escalation gate per checkout, isolated in its own log/state file pair so
+# an unrelated reason (or an unrelated checkout) can never interrupt another's
+# sustained-duration clock or rate-limit window. Per the artifact-provenance
+# doctrine (AUR-4324), currency is checked against FETCH_HEAD from an explicit
+# fetch, never a possibly-stale origin/<branch> tracking ref.
+#
+#   checkout-debt (checkout-behind:<label>)
+#               A watched checkout's HEAD is not up to date with its intended
+#               upstream branch. Same debt character as deploy-debt but measured
+#               against a checkout on disk; a routine can legitimately lag a few
+#               hours behind merges, so the threshold stays at the original 24h.
 set -uo pipefail
 
 HEALTH_URL=${PAPERCLIP_HEALTH_URL:-http://127.0.0.1:3100/api/health}
@@ -102,6 +120,17 @@ MERGE_DEBT_MIN_CLEAN=${PAPERCLIP_DRIFT_MERGE_DEBT_MIN_CLEAN:-3}
 MERGE_DEBT_THRESHOLD_SEC=${PAPERCLIP_DRIFT_MERGE_DEBT_THRESHOLD_SEC:-7200}
 MERGE_DEBT_RECHECK_DELAY_SEC=${PAPERCLIP_DRIFT_MERGE_DEBT_RECHECK_DELAY_SEC:-3}
 MERGE_DEBT_ISSUE_URL=${PAPERCLIP_DRIFT_MERGE_DEBT_ISSUE_URL:-https://paperclip/AUR/issues/AUR-4661}
+# checkout-drift axis (AUR-4227): `label:path:branch`, one entry per line.
+# DELIBERATELY EMPTY by default — the axis is opt-in via
+# PAPERCLIP_DRIFT_CHECKOUTS, because a wrong default here perpetually pages:
+# e.g. /home/ievgen/paperclip deliberately sits on a non-master branch, so a
+# baked-in "watch it against master" default would alarm forever. Each entry
+# names the branch that checkout is INTENDED to track, so a checkout that
+# legitimately lives on another branch is simply configured with that branch
+# (or not configured at all).
+CHECKOUTS=${PAPERCLIP_DRIFT_CHECKOUTS-}
+CHECKOUT_DEBT_THRESHOLD_SEC=${PAPERCLIP_DRIFT_CHECKOUT_DEBT_THRESHOLD_SEC:-86400}
+CHECKOUT_ISSUE_URL=${PAPERCLIP_DRIFT_CHECKOUT_ISSUE_URL:-https://paperclip/AUR/issues/AUR-4227}
 
 ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -232,22 +261,27 @@ line="$ts running=${running_sha:0:12} activated=${activated_sha:0:12} master=${m
 echo "$line"
 echo "$line" >> "$DRIFT_LOG" 2>/dev/null || true
 
-if [[ "$status" != "DRIFT" ]]; then
-  exit 0
-fi
-
-echo "paperclip deploy drift: $reason (running=${running_sha:0:12} master=${master_sha:0:12})" >&2
+overall_drift=0
+[[ "$status" == "DRIFT" ]] && overall_drift=1
 
 # --- escalation gate -------------------------------------------------------
-# Decides, from the drift log + the alert-state file, whether this sustained
-# drift has earned a founder page. Prints "ALERT<TAB><text>" or "QUIET<TAB><why>".
-decision=$(
-  DRIFT_LOG="$DRIFT_LOG" ALERT_STATE="$ALERT_STATE" REASON="$reason" \
+# Decides, from a reason's own drift log + alert-state file, whether sustained
+# drift on that reason has earned a founder page. Parameterized on its
+# (log, state) pair so each checkout's sustained-duration clock and rate-limit
+# window is isolated from the primary axis and from every other checkout
+# (AUR-4227). Prints "ALERT<TAB><text>" or "QUIET<TAB><why>".
+run_drift_gate() {
+  local gate_log=$1 gate_state=$2 gate_reason=$3 gate_context=$4
+  local decision
+  decision=$(
+  DRIFT_LOG="$gate_log" ALERT_STATE="$gate_state" REASON="$gate_reason" \
   PROVENANCE_THRESHOLD_SEC="$PROVENANCE_THRESHOLD_SEC" DEBT_THRESHOLD_SEC="$DEBT_THRESHOLD_SEC" \
   QUIESCENCE_THRESHOLD_SEC="$QUIESCENCE_THRESHOLD_SEC" DARK_THRESHOLD_SEC="$DARK_THRESHOLD_SEC" \
   AD_RUNNING_COUNT="$ad_running_count" AD_WAITING_SINCE="$ad_waiting_since" \
   MERGE_DEBT_THRESHOLD_SEC="$MERGE_DEBT_THRESHOLD_SEC" CLEAN_COUNT="$clean_count" \
   TIP_AGE_SEC="$tip_age_sec" MERGE_DEBT_ISSUE_URL="$MERGE_DEBT_ISSUE_URL" \
+  CHECKOUT_DEBT_THRESHOLD_SEC="$CHECKOUT_DEBT_THRESHOLD_SEC" \
+  CHECKOUT_ISSUE_URL="$CHECKOUT_ISSUE_URL" CONTEXT="$gate_context" \
   ALERT_COOLDOWN_SEC="$ALERT_COOLDOWN_SEC" RUNNING_SHA="${running_sha:0:12}" \
   MASTER_SHA="${master_sha:0:12}" ISSUE_URL="$ISSUE_URL" \
   python3 -c '
@@ -266,6 +300,11 @@ elif reason == "behind-origin-master":
     klass, threshold = "deploy-debt", int(os.environ["DEBT_THRESHOLD_SEC"])
 elif reason == "merge-debt":
     klass, threshold = "merge-debt", int(os.environ["MERGE_DEBT_THRESHOLD_SEC"])
+elif reason.startswith("checkout-behind:"):
+    # AUR-4227: same debt character as deploy-debt but measured against a
+    # checkout on disk; routines legitimately lag merges by hours, so this
+    # keeps the original 24h debt threshold instead of the retuned 1h one.
+    klass, threshold = "checkout-debt", int(os.environ["CHECKOUT_DEBT_THRESHOLD_SEC"])
 else:
     print("QUIET\tunclassified-reason:%s" % reason); raise SystemExit(0)
 
@@ -369,6 +408,14 @@ if reason == "merge-debt":
         % (hours, days, os.environ.get("CLEAN_COUNT") or "?",
            os.environ["MERGE_DEBT_ISSUE_URL"], note)
     )
+elif reason.startswith("checkout-behind:"):
+    # "running vs master" phrasing would be wrong here too — the server may be
+    # fully converged while a routine checkout executes stale code (AUR-4187).
+    text = (
+        "Paperclip checkout drift sustained %dh (%s): %s. %s %s%s"
+        % (hours, klass, reason, os.environ.get("CONTEXT", ""),
+           os.environ["CHECKOUT_ISSUE_URL"], note)
+    )
 else:
     text = (
         "Paperclip deploy drift sustained %dh (%s): %s.%s "
@@ -378,21 +425,77 @@ else:
     )
 print("ALERT\t%s" % text)
 ' 2>/dev/null || printf 'QUIET\tescalation-gate-failed'
-)
+  )
 
-verdict=${decision%%$'\t'*}
-detail=${decision#*$'\t'}
+  local verdict=${decision%%$'\t'*}
+  local detail=${decision#*$'\t'}
 
-if [[ "$verdict" == "ALERT" ]]; then
-  if [[ -x "$NOTIFY" ]] && "$NOTIFY" SEV2 "$detail"; then
-    echo "paperclip deploy drift: escalated to founder (SEV2): $detail" >&2
+  if [[ "$verdict" == "ALERT" ]]; then
+    if [[ -x "$NOTIFY" ]] && "$NOTIFY" SEV2 "$detail"; then
+      echo "paperclip deploy drift: escalated to founder (SEV2): $detail" >&2
+    else
+      # Never swallow a delivery failure — that is the exact failure shape
+      # AUR-3930 documents. A missed page must be visible in the journal.
+      echo "paperclip deploy drift: ESCALATION FAILED to deliver via $NOTIFY: $detail" >&2
+    fi
   else
-    # Never swallow a delivery failure — that is the exact failure shape
-    # AUR-3930 documents. A missed page must be visible in the journal.
-    echo "paperclip deploy drift: ESCALATION FAILED to deliver via $NOTIFY: $detail" >&2
+    echo "paperclip deploy drift: not escalating ($detail)" >&2
   fi
-else
-  echo "paperclip deploy drift: not escalating ($detail)" >&2
+}
+
+if [[ "$status" == "DRIFT" ]]; then
+  echo "paperclip deploy drift: $reason (running=${running_sha:0:12} master=${master_sha:0:12})" >&2
+  run_drift_gate "$DRIFT_LOG" "$ALERT_STATE" "$reason" ""
 fi
 
-exit 1
+# --- checkout-drift axis (AUR-4227) -----------------------------------------
+# A routine can be running fixed, reviewed code that is simply an older commit
+# than its intended upstream — the AUR-4187 incident class, measured against a
+# checkout on disk instead of the live server. Each checkout gets its own
+# log/state file pair so one drifting checkout can never mask or reset
+# another's sustained-duration clock, and a missing/unreachable checkout is
+# skipped (not alarmed) — this axis reports what it can prove.
+while IFS=: read -r co_label co_path co_branch; do
+  [[ -n "$co_label" ]] || continue
+
+  if [[ ! -d "$co_path" ]] || ! git -C "$co_path" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "checkout drift: $co_label ($co_path) not present on this host, skipping" >&2
+    continue
+  fi
+
+  # Artifact-provenance doctrine (AUR-4324): fetch explicitly and compare
+  # FETCH_HEAD, never a possibly-stale origin/<branch> tracking ref.
+  if ! timeout 15 git -C "$co_path" fetch --quiet origin "$co_branch" 2>/dev/null; then
+    echo "checkout drift: $co_label ($co_path) fetch of origin/$co_branch failed, skipping (network/remote unreachable)" >&2
+    continue
+  fi
+
+  co_fetch_head=$(git -C "$co_path" rev-parse FETCH_HEAD 2>/dev/null || echo none)
+  co_local_head=$(git -C "$co_path" rev-parse HEAD 2>/dev/null || echo none)
+  [[ "$co_fetch_head" != "none" && "$co_local_head" != "none" ]] || continue
+
+  if git -C "$co_path" merge-base --is-ancestor "$co_fetch_head" "$co_local_head" 2>/dev/null; then
+    co_status=ok
+    co_reason=-
+  else
+    co_status=DRIFT
+    co_reason="checkout-behind:${co_label}"
+    overall_drift=1
+  fi
+
+  co_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  co_line="$co_ts checkout=$co_label local=${co_local_head:0:12} remote=${co_fetch_head:0:12} status=$co_status reason=$co_reason"
+  echo "$co_line"
+  co_log="${DRIFT_LOG}.checkout-${co_label}"
+  co_state="${ALERT_STATE}.checkout-${co_label}"
+  echo "$co_line" >> "$co_log" 2>/dev/null || true
+
+  if [[ "$co_status" == "DRIFT" ]]; then
+    echo "paperclip checkout drift: $co_label ($co_path) is behind origin/$co_branch (local=${co_local_head:0:12} remote=${co_fetch_head:0:12})" >&2
+    run_drift_gate "$co_log" "$co_state" "$co_reason" \
+      "Checkout $co_label ($co_path) is pinned at ${co_local_head:0:12}; origin/$co_branch is ${co_fetch_head:0:12}."
+  fi
+done <<< "$CHECKOUTS"
+
+[[ "$overall_drift" == "1" ]] && exit 1
+exit 0

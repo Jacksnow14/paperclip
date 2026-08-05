@@ -1,0 +1,26 @@
+# Daily fleet model refresh: CLIs updated, new models probed live, policy
+# applied (CEO = frontier at highest effort, Claude Code Max = latest fable,
+# everyone else newest in their family/tier), judgment dispatched as ONE
+# budget-capped tuning issue. See scripts/fleet-model-refresh.mjs header.
+#
+# Morning window (06:30 UTC) deliberately: CLI updates swap version symlinks,
+# which caused the :00/:30 PATH thundering-herd races of 2026-07-06 when done
+# mid-flight by the in-run autoupdater (which stays disabled). One controlled
+# update at low tide instead.
+[Unit]
+Description=Paperclip daily fleet model refresh (CLI updates, model discovery, policy)
+Documentation=https://paperclip/AUR/issues/AUR-4990
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ievgen
+Group=ievgen
+EnvironmentFile=/etc/paperclip/pr-review.env
+Environment=HOME=/home/ievgen
+Environment=PATH=/home/ievgen/.local/bin:/home/ievgen/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/node /opt/paperclip/app/current/scripts/fleet-model-refresh.mjs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=paperclip-fleet-refresh

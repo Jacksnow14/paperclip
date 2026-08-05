@@ -1,0 +1,13 @@
+{
+  "comment": "Fleet model policy — data, not code. Rules: 'best-overall' = highest-ranked model across all families for the agent's adapter; 'latest-family:<fam>' = newest version within one family; 'latest-same-tier' (default) = keep the agent's current family and tier (full/mini/nano), newest version. Effort: explicit value, or 'keep'. Rank order (claude): fable > opus > sonnet > haiku; (codex): larger version first, tier full > mini > nano.",
+  "agents": {
+    "CEO": { "rule": "best-overall", "effort": "xhigh" },
+    "Claude Code Max": { "rule": "latest-family:fable", "effort": "xhigh" },
+    "CTO": { "rule": "best-overall", "effort": "high" }
+  },
+  "default": { "rule": "latest-same-tier", "effort": "keep" },
+  "tuning": {
+    "reviewer": "Claude Code Max",
+    "minDaysBetween": 6
+  }
+}

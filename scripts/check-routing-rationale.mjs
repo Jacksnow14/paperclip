@@ -297,6 +297,48 @@ function extractRecords(response) {
 }
 
 /**
+ * A routing rationale is keyed either `routing/{issueId}` (legacy flat shape)
+ * or `routing/{issueId}/{ownerId}` (forward shape — one row per decider, so a
+ * re-route records the new owner's rationale without clobbering the previous
+ * owner's). BOTH satisfy AGENTS.md §12, so the watchdog must accept both or a
+ * re-routed issue reads as an unrouted gap forever (AUR-4280).
+ *
+ * Accept an exact match, or a match under the `{exact}/` boundary — never a
+ * bare `startsWith(exact)`, which would let `routing/AUR-2756` satisfy a lookup
+ * for `routing/AUR-27` (the AUR-3855 collision class this guard exists to stop).
+ */
+export function matchesRoutingKey(title, targetId) {
+  if (typeof title !== 'string') return false;
+  const exact = `routing/${targetId}`;
+  return title === exact || title.startsWith(`${exact}/`);
+}
+
+/** Epoch millis for ordering, with unparseable/missing timestamps sorting oldest. */
+function createdAtMillis(record) {
+  const parsed = new Date(record?.createdAt ?? 0).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * Picks the operative rationale among the rows matching an issue. Several rows
+ * legitimately coexist: a legacy flat `routing/{id}` alongside a new
+ * `routing/{id}/{ownerId}`, or one row per decider after a re-route. Resolve by
+ * `max(createdAt)` — the most recent routing decision is the operative one.
+ *
+ * Deliberately NOT resolved by "does the record's `chosen_agent` equal the
+ * issue's CURRENT assignee": that reports a gap on every re-route, because the
+ * pre-route owner's row is the only one an assignee-matched read can see. That
+ * mismatch IS the AUR-4280 defect.
+ *
+ * Returns null when nothing matches.
+ */
+export function pickNewestRoutingRecord(records, targetId) {
+  const matches = extractRecords(records).filter(r => matchesRoutingKey(r?.title, targetId));
+  if (matches.length === 0) return null;
+  return matches.reduce((best, r) => (createdAtMillis(r) > createdAtMillis(best) ? r : best));
+}
+
+/**
  * The Paperclip memory list route returns ONLY org-scoped records unless
  * `projectId=<uuid>` is passed. A `routing/{id}` record captured with
  * `scope.projectId` (per AGENTS.md § "Routing rationale capture
@@ -308,29 +350,28 @@ function extractRecords(response) {
  * "found": the rationale exists, it was just written to a narrower scope.
  *
  * @param {{ companyId: string, targetId: string, projectId?: string|null, apiGet: (path: string) => Promise<any> }} opts
- * @returns {Promise<{ found: boolean, scope: 'org'|'project'|null }>}
+ * @returns {Promise<{ found: boolean, scope: 'org'|'project'|null, record: object|null }>}
  */
 export async function lookupRoutingRecord({ companyId, targetId, projectId, apiGet }) {
-  const exactTitle = `routing/${targetId}`;
-
   const orgRecords = await apiGet(
     `/api/companies/${companyId}/memory/records?titlePrefix=routing/${targetId}&limit=${ROUTING_RECORD_LOOKUP_LIMIT}`
   );
-  const matchesTarget = (r) => r.title === exactTitle || r.title.startsWith(`${exactTitle}/`);
-  if (extractRecords(orgRecords).some(matchesTarget)) {
-    return { found: true, scope: 'org' };
+  const orgWinner = pickNewestRoutingRecord(orgRecords, targetId);
+  if (orgWinner) {
+    return { found: true, scope: 'org', record: orgWinner };
   }
 
   if (projectId) {
     const projectRecords = await apiGet(
       `/api/companies/${companyId}/memory/records?titlePrefix=routing/${targetId}&limit=${ROUTING_RECORD_LOOKUP_LIMIT}&projectId=${projectId}`
     );
-    if (extractRecords(projectRecords).some(matchesTarget)) {
-      return { found: true, scope: 'project' };
+    const projectWinner = pickNewestRoutingRecord(projectRecords, targetId);
+    if (projectWinner) {
+      return { found: true, scope: 'project', record: projectWinner };
     }
   }
 
-  return { found: false, scope: null };
+  return { found: false, scope: null, record: null };
 }
 
 // ── API helpers ───────────────────────────────────────────────────────────────

@@ -16,6 +16,8 @@ import {
   findRollingIssue,
   rollingIssueTitle,
   todayDateKey,
+  matchesRoutingKey,
+  pickNewestRoutingRecord,
 } from "./check-routing-rationale.mjs";
 
 // A stub apiGet that records every query string it receives and returns a
@@ -43,7 +45,7 @@ test("org-scoped hit: found true, scope org, no project query issued", async () 
     apiGet,
   });
 
-  assert.deepEqual(result, { found: true, scope: "org" });
+  assert.deepEqual({ found: result.found, scope: result.scope }, { found: true, scope: "org" });
   assert.deepEqual(calls, [
     `/api/companies/c1/memory/records?titlePrefix=routing/AUR-100&limit=${ROUTING_RECORD_LOOKUP_LIMIT}`,
   ]);
@@ -63,7 +65,7 @@ test("project-scoped-only hit: org query returns [], project query hits", async 
     apiGet,
   });
 
-  assert.deepEqual(result, { found: true, scope: "project" });
+  assert.deepEqual({ found: result.found, scope: result.scope }, { found: true, scope: "project" });
   assert.deepEqual(calls, [
     `/api/companies/c1/memory/records?titlePrefix=routing/AUR-200&limit=${ROUTING_RECORD_LOOKUP_LIMIT}`,
     `/api/companies/c1/memory/records?titlePrefix=routing/AUR-200&limit=${ROUTING_RECORD_LOOKUP_LIMIT}&projectId=p1`,
@@ -83,7 +85,8 @@ test("genuinely missing in both scopes: found false, scope null", async () => {
     apiGet,
   });
 
-  assert.deepEqual(result, { found: false, scope: null });
+  assert.deepEqual({ found: result.found, scope: result.scope }, { found: false, scope: null });
+  assert.equal(result.record, null);
   assert.deepEqual(calls, [
     `/api/companies/c1/memory/records?titlePrefix=routing/AUR-300&limit=${ROUTING_RECORD_LOOKUP_LIMIT}`,
     `/api/companies/c1/memory/records?titlePrefix=routing/AUR-300&limit=${ROUTING_RECORD_LOOKUP_LIMIT}&projectId=p1`,
@@ -102,7 +105,8 @@ test("no projectId: exactly one org query, never fabricates projectId=undefined"
     apiGet,
   });
 
-  assert.deepEqual(result, { found: false, scope: null });
+  assert.deepEqual({ found: result.found, scope: result.scope }, { found: false, scope: null });
+  assert.equal(result.record, null);
   assert.deepEqual(calls, [
     `/api/companies/c1/memory/records?titlePrefix=routing/AUR-400&limit=${ROUTING_RECORD_LOOKUP_LIMIT}`,
   ]);
@@ -124,7 +128,7 @@ test("tolerant response parsing: {records:[...]} wrapper shape works for both sc
     apiGet,
   });
 
-  assert.deepEqual(result, { found: true, scope: "project" });
+  assert.deepEqual({ found: result.found, scope: result.scope }, { found: true, scope: "project" });
 });
 
 // ── AUR-3855: titlePrefix collision must not produce a false positive ──────
@@ -146,7 +150,8 @@ test("collision (org scope): only routing/AUR-2756 exists for prefix AUR-27 -> f
     apiGet,
   });
 
-  assert.deepEqual(result, { found: false, scope: null });
+  assert.deepEqual({ found: result.found, scope: result.scope }, { found: false, scope: null });
+  assert.equal(result.record, null);
 });
 
 test("collision (org scope): exact hit still found true even with colliding neighbors present", async () => {
@@ -165,7 +170,7 @@ test("collision (org scope): exact hit still found true even with colliding neig
     apiGet,
   });
 
-  assert.deepEqual(result, { found: true, scope: "org" });
+  assert.deepEqual({ found: result.found, scope: result.scope }, { found: true, scope: "org" });
 });
 
 test("collision (project scope): real record only present project-scoped, alongside collisions", async () => {
@@ -187,7 +192,7 @@ test("collision (project scope): real record only present project-scoped, alongs
     apiGet,
   });
 
-  assert.deepEqual(result, { found: true, scope: "project" });
+  assert.deepEqual({ found: result.found, scope: result.scope }, { found: true, scope: "project" });
 });
 
 test("collision (project scope): only collisions in both scopes -> found false, not a false positive", async () => {
@@ -208,7 +213,8 @@ test("collision (project scope): only collisions in both scopes -> found false, 
     apiGet,
   });
 
-  assert.deepEqual(result, { found: false, scope: null });
+  assert.deepEqual({ found: result.found, scope: result.scope }, { found: false, scope: null });
+  assert.equal(result.record, null);
 });
 
 // ── AUR-4475: sweeper decider-suffix routing key format ─────────────────────
@@ -594,4 +600,91 @@ test("aggregation regression: a second run on the same day updates the existing 
 
   assert.equal(patchCalls, 1);
   assert.equal(postIssueCalls, 0, "must never POST a new issue when one already exists for today");
+});
+
+// ── AUR-4280 / AUR-4303: owner-suffixed forward key shape ────────────────────
+
+test("matchesRoutingKey: accepts legacy flat and owner-suffixed keys, rejects prefix collisions", () => {
+  assert.equal(matchesRoutingKey("routing/AUR-27", "AUR-27"), true, "legacy flat key");
+  assert.equal(matchesRoutingKey("routing/AUR-27/agent-a", "AUR-27"), true, "owner-suffixed key");
+  // The AUR-3855 collision class MUST stay closed: a longer identifier that
+  // merely starts with the target must never satisfy the lookup.
+  assert.equal(matchesRoutingKey("routing/AUR-2756", "AUR-27"), false, "collision AUR-2756");
+  assert.equal(matchesRoutingKey("routing/AUR-2756/agent-a", "AUR-27"), false, "suffixed collision");
+  assert.equal(matchesRoutingKey(undefined, "AUR-27"), false, "non-string title");
+});
+
+test("pickNewestRoutingRecord: re-routed issue resolves to the NEWEST row, not the current assignee's", () => {
+  // AUR-4280 defect shape: AUR-4147 was routed to agent-a, then re-routed to
+  // agent-b. Both rationales exist. Recency — not assignee matching — decides.
+  const records = [
+    { id: "old", title: "routing/AUR-4147/agent-a", createdAt: "2026-07-01T00:00:00.000Z" },
+    { id: "new", title: "routing/AUR-4147/agent-b", createdAt: "2026-07-20T00:00:00.000Z" },
+  ];
+  assert.equal(pickNewestRoutingRecord(records, "AUR-4147").id, "new");
+  // Order-independent: the winner is max(createdAt), not last-seen.
+  assert.equal(pickNewestRoutingRecord([...records].reverse(), "AUR-4147").id, "new");
+});
+
+test("pickNewestRoutingRecord: a legacy flat row and a new suffixed row coexist; newest wins", () => {
+  const records = [
+    { id: "flat", title: "routing/AUR-4147", createdAt: "2026-06-01T00:00:00.000Z" },
+    { id: "suffixed", title: "routing/AUR-4147/agent-b", createdAt: "2026-07-20T00:00:00.000Z" },
+  ];
+  assert.equal(pickNewestRoutingRecord(records, "AUR-4147").id, "suffixed");
+});
+
+test("pickNewestRoutingRecord: a legacy flat row alone still satisfies (no backfill required)", () => {
+  const records = [{ id: "flat", title: "routing/AUR-4147", createdAt: "2026-06-01T00:00:00.000Z" }];
+  assert.equal(pickNewestRoutingRecord(records, "AUR-4147").id, "flat");
+});
+
+test("pickNewestRoutingRecord: NEGATIVE CONTROL — only colliding neighbours -> null", () => {
+  const records = [
+    { id: "c1", title: "routing/AUR-2756", createdAt: "2026-07-20T00:00:00.000Z" },
+    { id: "c2", title: "routing/AUR-2749/agent-a", createdAt: "2026-07-21T00:00:00.000Z" },
+  ];
+  assert.equal(pickNewestRoutingRecord(records, "AUR-27"), null);
+});
+
+test("lookupRoutingRecord: re-routed AUR-4147 is satisfied ONCE, newest row returned", async () => {
+  const { apiGet, calls } = makeStubApiGet({
+    [`/api/companies/c1/memory/records?titlePrefix=routing/AUR-4147&limit=${ROUTING_RECORD_LOOKUP_LIMIT}`]: [
+      { id: "old", title: "routing/AUR-4147/agent-a", createdAt: "2026-07-01T00:00:00.000Z" },
+      { id: "new", title: "routing/AUR-4147/agent-b", createdAt: "2026-07-20T00:00:00.000Z" },
+    ],
+  });
+
+  const result = await lookupRoutingRecord({
+    companyId: "c1",
+    targetId: "AUR-4147",
+    projectId: "p1",
+    apiGet,
+  });
+
+  assert.equal(result.found, true, "re-routed issue must NOT read as a gap");
+  assert.equal(result.scope, "org");
+  assert.equal(result.record.id, "new", "newest row wins on recency");
+  // Satisfied once: the org query short-circuits, no duplicate project query.
+  assert.equal(calls.length, 1);
+});
+
+test("lookupRoutingRecord: NEGATIVE CONTROL — genuinely unrouted issue still reads as a gap", async () => {
+  const { apiGet } = makeStubApiGet({
+    [`/api/companies/c1/memory/records?titlePrefix=routing/AUR-9999&limit=${ROUTING_RECORD_LOOKUP_LIMIT}`]: [
+      // Only a colliding neighbour under the prefix — no rationale for AUR-9999.
+      { id: "c1", title: "routing/AUR-99991/agent-a", createdAt: "2026-07-20T00:00:00.000Z" },
+    ],
+    [`/api/companies/c1/memory/records?titlePrefix=routing/AUR-9999&limit=${ROUTING_RECORD_LOOKUP_LIMIT}&projectId=p1`]: [],
+  });
+
+  const result = await lookupRoutingRecord({
+    companyId: "c1",
+    targetId: "AUR-9999",
+    projectId: "p1",
+    apiGet,
+  });
+
+  assert.equal(result.found, false, "unrouted issue MUST still be flagged");
+  assert.equal(result.record, null);
 });

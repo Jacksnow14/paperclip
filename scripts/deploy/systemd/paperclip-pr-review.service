@@ -1,0 +1,30 @@
+# PR-backlog dispatcher: improvements must never strand in open PRs.
+#
+# 74 PRs accumulated May→Aug 2026 because nothing ROUTED them to a reviewer —
+# detection existed (#191 merge-debt alarm) but dispatch did not. This unit
+# runs scripts/check-pr-backlog.mjs, which files one review-and-land issue per
+# (open PR, head sha) assigned to the strongest code-review agent; the issue
+# assignment wake triggers the review run. See the script header for the
+# dispatch/escalation semantics.
+#
+# Runs system-level (not as a paperclip.service child) so it survives
+# control-plane restarts, and points at the ACTIVE RELEASE — same convention
+# as the drift/prune units — so it tracks whatever dispatch policy is
+# deployed. Requires /etc/paperclip/pr-review.env providing PAPERCLIP_API_KEY
+# and PAPERCLIP_COMPANY_ID; the installer refuses to install without it.
+[Unit]
+Description=Paperclip PR-backlog dispatcher (file review issues for open PRs)
+Documentation=https://paperclip/AUR/issues/AUR-4990
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ievgen
+Group=ievgen
+EnvironmentFile=/etc/paperclip/pr-review.env
+Environment=HOME=/home/ievgen
+ExecStart=/usr/bin/node /opt/paperclip/app/current/scripts/check-pr-backlog.mjs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=paperclip-pr-review

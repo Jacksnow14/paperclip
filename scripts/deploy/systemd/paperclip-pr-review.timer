@@ -1,0 +1,16 @@
+# PR-backlog dispatch on a clock. 30min is deliberately much faster than PRs
+# are authored: each sweep is near-free when there is nothing new (one gh api
+# call + a state-file read), and the cost of a missed sweep is a PR sitting
+# undispatched — the exact months-long stranding this timer exists to end.
+# OnBootSec 15min lets a boot-time auto-deploy settle first.
+[Unit]
+Description=Run the Paperclip PR-backlog dispatcher every 30 minutes
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=30min
+RandomizedDelaySec=120
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, or, sql } from "drizzle-orm";
+import { eq, inArray, or, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -1189,5 +1189,353 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(wakeup?.status).toBe("skipped");
     expect(wakeup?.error).toContain("continuation summary says the executor should wait");
     expect(countExecuteCallsForRun(runId)).toBe(0);
+  });
+
+  it("promotes a deferred wake once a queued run blocked by unresolved dependencies is cancelled (AUR-4388 G3)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: blockerIssueId,
+        companyId,
+        title: "Unresolved blocker",
+        status: "in_progress",
+        priority: "medium",
+      },
+      {
+        id: issueId,
+        companyId,
+        title: "Blocked by an open dependency",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      id: randomUUID(),
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    const { runId } = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_assigned",
+    });
+    // Same field state as the G1/G2 dead letters: a wake parked behind the lock
+    // this queued run would have held once claimed.
+    const deferredWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_execution_deferred",
+      payload: {
+        issueId,
+        _paperclipWakeContext: { issueId, wakeReason: "issue_commented", source: "issue_update" },
+      },
+      status: "deferred_issue_execution",
+      requestedByActorType: "system",
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "cancelled";
+    });
+
+    const run = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("issue_dependencies_blocked");
+    expect(countExecuteCallsForRun(runId)).toBe(0);
+
+    await waitForCondition(async () => {
+      const wake = await db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, deferredWakeId))
+        .then((rows) => rows[0] ?? null);
+      return wake?.status !== "deferred_issue_execution";
+    }, 8_000);
+
+    const deferredWake = await db
+      .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredWakeId))
+      .then((rows) => rows[0] ?? null);
+    expect(deferredWake?.status).not.toBe("deferred_issue_execution");
+    expect(deferredWake?.runId).toBeTruthy();
+  });
+
+  it("promotes a deferred wake once a reassignment-suppressed scheduled retry is cancelled (AUR-4388 G1)", async () => {
+    const { companyId, agentId: originalAgentId } = await seedCompanyAndAgent({ agentName: "OriginalAssignee" });
+    const newAssigneeId = randomUUID();
+    await db.insert(agents).values({
+      id: newAssigneeId,
+      companyId,
+      name: "NewAssignee",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Reassigned while a retry was scheduled",
+      status: "in_progress",
+      priority: "medium",
+      // Reassigned away from the agent the scheduled retry still belongs to.
+      assigneeAgentId: newAssigneeId,
+    });
+
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    const sourceRunId = randomUUID();
+    const retryRunId = randomUUID();
+    const wakeupRequestId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId: originalAgentId,
+      invocationSource: "assignment",
+      status: "failed",
+      error: "transient failure",
+      errorCode: "adapter_failed",
+      finishedAt: now,
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      updatedAt: now,
+      createdAt: now,
+    });
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId,
+      agentId: originalAgentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_retry_scheduled",
+      payload: { issueId },
+      status: "queued",
+      runId: retryRunId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: retryRunId,
+      companyId,
+      agentId: originalAgentId,
+      invocationSource: "assignment",
+      status: "scheduled_retry",
+      retryOfRunId: sourceRunId,
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "transient_failure",
+      scheduledRetryAt: now,
+      wakeupRequestId,
+      contextSnapshot: { issueId, wakeReason: "issue_assigned", retryReason: "transient_failure" },
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    // The new assignee's wake, parked behind the lock the old agent's retry
+    // still nominally held.
+    const deferredWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeId,
+      companyId,
+      agentId: newAssigneeId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_execution_deferred",
+      payload: {
+        issueId,
+        _paperclipWakeContext: { issueId, wakeReason: "issue_assigned", source: "issue_update" },
+      },
+      status: "deferred_issue_execution",
+      requestedByActorType: "system",
+    });
+
+    // Gate-suppressed retries are cancelled, not promoted, so they never land in
+    // `promotedRunIds` -- assert the cancellation directly instead.
+    await heartbeat.promoteDueScheduledRetries(now);
+
+    const retryRun = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, retryRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(retryRun?.status).toBe("cancelled");
+    expect(retryRun?.errorCode).toBe("issue_reassigned");
+
+    await waitForCondition(async () => {
+      const wake = await db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, deferredWakeId))
+        .then((rows) => rows[0] ?? null);
+      return wake?.status !== "deferred_issue_execution";
+    }, 8_000);
+
+    const deferredWake = await db
+      .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredWakeId))
+      .then((rows) => rows[0] ?? null);
+    expect(deferredWake?.status).not.toBe("deferred_issue_execution");
+    expect(deferredWake?.runId).toBeTruthy();
+  });
+
+  it("promotes a deferred wake once enqueueWakeup clears a stale terminal execution lock (AUR-4388 G4)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Execution lock leaked onto a terminal run",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+
+    // A run that finished (terminal status, not in
+    // EXECUTION_PATH_HEARTBEAT_RUN_STATUSES) but whose id was never cleared off
+    // issues.executionRunId -- the leaked-lock precondition enqueueWakeup's
+    // stale-terminal-lock branch exists to clean up.
+    const staleRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: staleRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "cancelled",
+      error: "test fixture: terminal run with a leaked lock reference",
+      errorCode: "test_fixture",
+      finishedAt: new Date(),
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    });
+    await db
+      .update(issues)
+      .set({
+        executionRunId: staleRunId,
+        executionAgentNameKey: "claudecoder",
+        executionLockedAt: new Date(),
+      })
+      .where(eq(issues.id, issueId));
+
+    // Same agent's own wake, parked behind the stale lock -- exactly the dead
+    // letter this gap produces if the lock is cleared without draining.
+    const deferredWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_execution_deferred",
+      payload: {
+        issueId,
+        _paperclipWakeContext: { issueId, wakeReason: "issue_commented", source: "issue_update" },
+      },
+      status: "deferred_issue_execution",
+      requestedByActorType: "system",
+    });
+
+    // Occupy the agent's only concurrency slot (maxConcurrentRuns: 1) with an
+    // unrelated in-flight run on a different issue. Otherwise the queued run
+    // this wakeup() call creates for `issueId` gets claimed and executed
+    // immediately by the post-transaction startNextQueuedRunForAgent call, and
+    // its own completion path (finalizeAgentStatus -> releaseIssueExecutionAndPromote)
+    // drains `deferredWakeId` too -- masking whether the G4 in-transaction drain
+    // itself did anything.
+    const unrelatedIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: unrelatedIssueId,
+      companyId,
+      title: "Unrelated in-flight work holding the agent's only concurrency slot",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+    const blockerRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: blockerRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "running",
+      contextSnapshot: { issueId: unrelatedIssueId, wakeReason: "issue_assigned" },
+    });
+    await db
+      .update(issues)
+      .set({ executionRunId: blockerRunId, executionAgentNameKey: "claudecoder", executionLockedAt: new Date() })
+      .where(eq(issues.id, unrelatedIssueId));
+
+    await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      contextSnapshot: { issueId, source: "issue_update" },
+      requestedByActorType: "system",
+    });
+
+    await waitForCondition(async () => {
+      const wake = await db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, deferredWakeId))
+        .then((rows) => rows[0] ?? null);
+      return wake?.status !== "deferred_issue_execution";
+    }, 8_000);
+
+    const deferredWake = await db
+      .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredWakeId))
+      .then((rows) => rows[0] ?? null);
+    expect(deferredWake?.status).not.toBe("deferred_issue_execution");
+    expect(deferredWake?.runId).toBeTruthy();
+
+    const staleRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, staleRunId))
+      .then((rows) => rows[0] ?? null);
+    // The stale run's own terminal status must be left untouched -- only the
+    // issue-level lock reference to it is cleared.
+    expect(staleRun?.status).toBe("cancelled");
+
+    const issueRow = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issueRow?.executionRunId).not.toBe(staleRunId);
+
+    // Both the concurrency-blocker run and the newly-promoted run are left in
+    // non-terminal statuses by design (nothing in this test ever executes
+    // them). The shared afterEach hook polls up to 5s waiting for every
+    // heartbeatRuns row to reach a terminal status before it will proceed to
+    // cleanup -- settle them here so that poll exits immediately instead of
+    // burning its full budget on every run of this test.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: new Date() })
+      .where(inArray(heartbeatRuns.id, [blockerRunId, ...(deferredWake?.runId ? [deferredWake.runId] : [])]));
   });
 });

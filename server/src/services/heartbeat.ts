@@ -4990,6 +4990,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * storms. Only pending retries are touched; a retry that already started
    * running is left alone. If the issue's execution lock was repointed at a
    * cancelled ghost retry, it is repointed back at the successful source run.
+   *
+   * AUR-4388 near-miss: this function does not itself drain any
+   * `deferred_issue_execution` wake parked behind the cancelled retry. It is
+   * safe today only by caller ordering — its sole call site (in the run
+   * finalization flow) runs before `releaseIssueExecutionAndPromote` is
+   * called on the same source run, and that call drains whatever the repoint
+   * above leaves behind. If this is ever called from a path that does not
+   * follow with `releaseIssueExecutionAndPromote` on `sourceRunId`, any wake
+   * parked behind a cancelled retry here becomes a dead letter.
    */
   async function cancelSupersededRetryRunsForSourceRun(sourceRunId: string, now = new Date()) {
     const pendingRetries = await db
@@ -5327,23 +5336,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(eq(agentWakeupRequests.id, cancelled.wakeupRequestId));
     }
 
-    if (gate.issueId) {
-      await db
-        .update(issues)
-        .set({
-          executionRunId: null,
-          executionAgentNameKey: null,
-          executionLockedAt: null,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(issues.companyId, cancelled.companyId),
-            eq(issues.id, gate.issueId),
-            eq(issues.executionRunId, cancelled.id),
-          ),
-        );
-    }
+    // AUR-4388 (G1): clearing the lock alone is not enough -- any wake that arrived for
+    // this issue while this retry held the execution slot is parked as
+    // `deferred_issue_execution` and needs its own drain, or it becomes a dead letter.
+    await releaseIssueExecutionAndPromote(cancelled, { allowImmediateRecovery: false });
 
     await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
       eventType: "lifecycle",
@@ -6502,21 +6498,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       error: reason,
     });
 
-    await db
-      .update(issues)
-      .set({
-        executionRunId: null,
-        executionAgentNameKey: null,
-        executionLockedAt: null,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(issues.companyId, run.companyId),
-          eq(issues.id, issueId),
-          eq(issues.executionRunId, run.id),
-        ),
-      );
+    // AUR-4388 (G3): clearing the lock alone is not enough -- any wake that arrived for
+    // this issue while this queued run held the execution slot is parked as
+    // `deferred_issue_execution` and needs its own drain, or it becomes a dead letter.
+    await releaseIssueExecutionAndPromote(cancelled, { allowImmediateRecovery: false });
 
     await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
       eventType: "lifecycle",
@@ -9977,21 +9962,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // still respect the issue execution lock so a second agent cannot start on the
       // same issue workspace while the assignee already has a live run.
       const agentNameKey = normalizeAgentNameKey(agent.name);
+      let drainedReopenedActivity: LogActivityInput | null = null;
+      let drainedPromotedRun: typeof heartbeatRuns.$inferSelect | null = null;
 
       const outcome = await db.transaction(async (tx) => {
         await tx.execute(
           sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
         );
 
-        const issue = await tx
-          .select({
-            id: issues.id,
-            companyId: issues.companyId,
-            status: issues.status,
-            assigneeAgentId: issues.assigneeAgentId,
-            executionRunId: issues.executionRunId,
-            executionAgentNameKey: issues.executionAgentNameKey,
-          })
+        let issue = await tx
+          .select()
           .from(issues)
           .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
           .then((rows) => rows[0] ?? null);
@@ -10152,8 +10132,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           activeExecutionRun = null;
         }
 
+        // AUR-4388 (G4): every branch below that clears issues.executionRunId without
+        // immediately repointing it to a replacement run leaves any parked
+        // `deferred_issue_execution` wake undrained. Track that and drain once the lock
+        // is confirmed free, mirroring the reaper's select-for-update + drain-in-tx shape.
+        let staleLockClearedThisTx = false;
+
         if (activeExecutionRun && await cancelStaleUnstartedRun(activeExecutionRun)) {
           activeExecutionRun = null;
+          staleLockClearedThisTx = true;
         }
 
         if (!activeExecutionRun && issue.executionRunId) {
@@ -10166,6 +10153,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               updatedAt: new Date(),
             })
             .where(eq(issues.id, issue.id));
+          staleLockClearedThisTx = true;
         }
 
         if (!activeExecutionRun) {
@@ -10189,6 +10177,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (legacyRun) {
             if (await cancelStaleUnstartedRun(legacyRun)) {
               activeExecutionRun = null;
+              staleLockClearedThisTx = true;
             } else {
               activeExecutionRun = legacyRun;
               const legacyAgent = await tx
@@ -10206,6 +10195,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 })
                 .where(eq(issues.id, issue.id));
             }
+          }
+        }
+
+        if (staleLockClearedThisTx && !activeExecutionRun) {
+          const drained = await drainDeferredWakesForIssue(tx, issue, { runId: null });
+          issue = drained.issue;
+          if (drained.promoted) {
+            activeExecutionRun = drained.promoted.run;
+            drainedPromotedRun = drained.promoted.run;
+            drainedReopenedActivity = drained.promoted.reopenedActivity;
           }
         }
 
@@ -10416,6 +10415,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         return { kind: "queued" as const, run: newRun };
       });
+
+      // `drainedReopenedActivity`/`drainedPromotedRun` are only ever assigned inside the
+      // transaction closure above; TS's control-flow analysis doesn't carry that
+      // assignment across the closure boundary and would otherwise narrow both to
+      // `never` here, so re-type them explicitly before branching on them.
+      const reopenedActivity = drainedReopenedActivity as LogActivityInput | null;
+      const promotedRun = drainedPromotedRun as typeof heartbeatRuns.$inferSelect | null;
+      if (reopenedActivity) {
+        await logActivity(db, reopenedActivity);
+      }
+      if (promotedRun) {
+        publishLiveEvent({
+          companyId: promotedRun.companyId,
+          type: "heartbeat.run.queued",
+          payload: {
+            runId: promotedRun.id,
+            agentId: promotedRun.agentId,
+            invocationSource: promotedRun.invocationSource,
+            triggerDetail: promotedRun.triggerDetail,
+            wakeupRequestId: promotedRun.wakeupRequestId,
+          },
+        });
+        await startNextQueuedRunForAgent(promotedRun.agentId);
+      }
 
       if (outcome.kind === "deferred" || outcome.kind === "skipped") return null;
       if (outcome.kind === "coalesced") {

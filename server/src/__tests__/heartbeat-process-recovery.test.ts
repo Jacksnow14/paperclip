@@ -320,63 +320,45 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     await waitForHeartbeatIdle(db, 5_000);
     await new Promise((resolve) => setTimeout(resolve, 100));
-    await db.delete(activityLog);
-    await db.delete(agentRuntimeState);
-    await db.delete(companySkills);
-    await db.delete(costEvents);
-    await db.delete(environmentLeases);
-    await db.delete(environments);
-    await db.delete(issueWorkProducts);
-    await db.delete(issueComments);
-    await db.delete(issueDocuments);
-    await db.delete(documentRevisions);
-    await db.delete(documents);
-    await db.delete(issueRelations);
-    await db.delete(issueRecoveryActions);
-    await db.delete(issueTreeHoldMembers);
-    await db.delete(issueTreeHolds);
-    for (let attempt = 0; attempt < 5; attempt += 1) {
+    // Background recovery work (settling runs, deferred wakes, work-product writes) can
+    // still insert rows between any two deletes below despite the idle-waits above, which
+    // surfaces as a 23503 FK violation partway through the cascade. Retrying only the
+    // single failing delete cannot recover (its dependents were re-inserted upstream), so
+    // retry the whole ordered cascade until it completes cleanly.
+    const cascadeDelete = async () => {
+      await db.delete(activityLog);
+      await db.delete(agentRuntimeState);
+      await db.delete(companySkills);
+      await db.delete(costEvents);
+      await db.delete(environmentLeases);
+      await db.delete(environments);
+      await db.delete(issueWorkProducts);
       await db.delete(issueComments);
       await db.delete(issueDocuments);
-      try {
-        await db.delete(issues);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await db.delete(documentRevisions);
+      await db.delete(documents);
+      await db.delete(issueRelations);
+      await db.delete(issueRecoveryActions);
+      await db.delete(issueTreeHoldMembers);
+      await db.delete(issueTreeHolds);
+      await db.delete(issues);
       await db.delete(activityLog);
       await db.delete(heartbeatRunEvents);
-      try {
-        await db.delete(heartbeatRuns);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    await db.delete(agentWakeupRequests);
-    await db.delete(budgetPolicies);
-    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await db.delete(heartbeatRuns);
+      await db.delete(agentWakeupRequests);
+      await db.delete(budgetPolicies);
       await db.delete(agentRuntimeState);
-      try {
-        await db.delete(agents);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await db.delete(agents);
       await db.delete(companySkills);
+      await db.delete(companies);
+    };
+    for (let attempt = 0; attempt < 10; attempt += 1) {
       try {
-        await db.delete(companies);
+        await cascadeDelete();
         break;
       } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
+        if (attempt === 9) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 100));
       }
     }
   });
@@ -2508,9 +2490,35 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     const heartbeat = heartbeatService(db);
 
+    // Composed with AUR-4647: the sweep's dependency-readiness gate runs before the
+    // escalation branch, so while the blocker is still open the reconciler skips the issue
+    // (edge-triggered — it escalates on the first tick after the blocker resolves) instead
+    // of escalating it mid-blocked.
     const result = await heartbeat.reconcileStrandedAssignedIssues();
-    expect(result.escalated).toBe(1);
-    expect(result.issueIds).toEqual([issueId]);
+    expect(result.escalated).toBe(0);
+    expect(result.dependencyBlockedSkipped).toBe(1);
+    expect(result.issueIds).toEqual([]);
+
+    // The zero-edge fix must not leak into the real-blocker case. When escalation does run
+    // (heartbeat's retry-exhaustion promotion path calls `escalateStrandedAssignedIssue`
+    // directly, without the sweep's dependency gate), an issue with a genuinely unresolved
+    // blocker must still fall back to `blocked` and keep its edges.
+    const recovery = recoveryService(db, {
+      enqueueWakeup: (async () => null) as never,
+    });
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    const latestRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))
+      .then((rows) => rows[0] ?? null);
+    const updated = await recovery.escalateStrandedAssignedIssue({
+      issue,
+      previousStatus: "todo",
+      latestRun,
+      comment: "Paperclip escalated this stranded issue for intervention.",
+    });
+    expect(updated?.status).toBe("blocked");
 
     const recoveryAction = await waitForValue(() => strandedRecoveryActionFor(companyId, issueId));
     expect(recoveryAction).toMatchObject({
@@ -2520,27 +2528,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       attemptCount: 1,
     });
 
-    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
-    expect(issue?.status).toBe("blocked");
+    const after = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(after?.status).toBe("blocked");
     // The blocker edge survives: escalation must not reconcile `blockedByIssueIds` to an empty list.
     await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([blockerIssueId]);
-
-    // The recovery wake is still enqueued, but a genuinely blocked issue is not dispatched.
-    const recoveryWake = await waitForValue(async () => {
-      const wakeups = await db
-        .select()
-        .from(agentWakeupRequests)
-        .where(eq(agentWakeupRequests.agentId, agentId));
-      return wakeups.find((wakeup) =>
-        (wakeup.payload as Record<string, unknown> | null)?.recoveryActionId === recoveryAction?.id
-      ) ?? null;
-    });
-    expect(recoveryWake).toMatchObject({
-      reason: "issue_dependencies_blocked",
-      status: "skipped",
-    });
-    expect((recoveryWake?.payload as Record<string, unknown> | null)?.unresolvedBlockerIssueIds)
-      .toEqual([blockerIssueId]);
 
     const escalation = await db
       .select()

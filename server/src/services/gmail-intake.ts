@@ -257,7 +257,7 @@ async function ensureLabel(
 }
 
 export function createGmailIntakeService(db: Db) {
-  const gmail = createGmailService();
+  const gmail = createGmailService(db);
   const isvc = issueService(db);
 
   async function processMailbox(companyId: string, mailbox: GmailAlias): Promise<{
@@ -463,11 +463,17 @@ export function createGmailIntakeService(db: Db) {
         const route = matchSenderRoute(parsed.from);
         if (route?.forwardTo) {
           try {
-            await gmail.sendMessage(mailbox, {
-              to: route.forwardTo,
-              subject: `Fwd: ${parsed.subject}`,
-              body: `---------- Forwarded message ----------\nFrom: ${parsed.from}\nDate: ${parsed.dateMs ? new Date(parsed.dateMs).toISOString() : "unknown"}\nSubject: ${parsed.subject}\n\n${parsed.bodySnippet}`,
-            });
+            await gmail.sendMessage(
+              mailbox,
+              {
+                to: route.forwardTo,
+                subject: `Fwd: ${parsed.subject}`,
+                body: `---------- Forwarded message ----------\nFrom: ${parsed.from}\nDate: ${parsed.dateMs ? new Date(parsed.dateMs).toISOString() : "unknown"}\nSubject: ${parsed.subject}\n\n${parsed.bodySnippet}`,
+              },
+              undefined,
+              // AUR-1796: sender-routed forwards are outbound too — track them.
+              { companyId },
+            );
             logger.info(
               { mailbox, to: route.forwardTo, messageId: parsed.gmailMessageId },
               "gmail-intake: forwarded sender-routed email",

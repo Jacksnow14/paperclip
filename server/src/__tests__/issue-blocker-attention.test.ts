@@ -297,7 +297,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
   });
 
   it("keeps mixed blockers attention-required when any path lacks active work", async () => {
-    const { companyId, agentId } = await createCompany("PBM");
+    const { companyId, agentId, pausedAgentId } = await createCompany("PBM");
     const parentId = await insertIssue({ companyId, identifier: "PBM-1", title: "Parent", status: "blocked" });
     const activeChildId = await insertIssue({
       companyId,
@@ -307,12 +307,15 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       parentId,
       assigneeAgentId: agentId,
     });
+    // Assigned to a paused (non-invokable) agent — the one path that must keep raising
+    // attentionBlockerCount even after AUR-4273 makes an idle/active/running assignee a
+    // covered waiting path.
     const idleBlockerId = await insertIssue({
       companyId,
       identifier: "PBM-3",
-      title: "Idle blocker",
+      title: "Parked blocker",
       status: "todo",
-      assigneeAgentId: agentId,
+      assigneeAgentId: pausedAgentId,
     });
     await block({ companyId, blockerIssueId: activeChildId, blockedIssueId: parentId });
     await block({ companyId, blockerIssueId: idleBlockerId, blockedIssueId: parentId });
@@ -330,15 +333,100 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
+  // AUR-4273: the invokability branch in classifyPath was dead code — both the
+  // invokable and non-invokable paths returned `covered: false`, so assignee status
+  // never affected the outcome. These two tests prove the fix in both directions.
+  it("covers a queued blocker leaf assigned to a healthy invokable agent with no active run yet (AUR-4273)", async () => {
+    const { companyId, agentId } = await createCompany("PIA");
+    const parentId = await insertIssue({ companyId, identifier: "PIA-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PIA-2",
+      title: "Queued blocker, idle assignee",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "covered",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      attentionBlockerCount: 0,
+      sampleBlockerIdentifier: "PIA-2",
+    });
+  });
+
+  it("still flags a queued blocker leaf assigned to a non-invokable (paused) agent (AUR-4273)", async () => {
+    const { companyId, pausedAgentId } = await createCompany("PIB");
+    const parentId = await insertIssue({ companyId, identifier: "PIB-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PIB-2",
+      title: "Queued blocker, paused assignee",
+      status: "todo",
+      assigneeAgentId: pausedAgentId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 1,
+      sampleBlockerIdentifier: "PIB-2",
+    });
+  });
+
+  it("still flags a queued blocker leaf assigned to an agent stuck in error status (AUR-4273)", async () => {
+    const { companyId } = await createCompany("PIC");
+    const erroredAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: erroredAgentId,
+      companyId,
+      name: "PIC Errored",
+      role: "engineer",
+      status: "error",
+    });
+    const parentId = await insertIssue({ companyId, identifier: "PIC-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PIC-2",
+      title: "Queued blocker, errored assignee",
+      status: "todo",
+      assigneeAgentId: erroredAgentId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 1,
+      sampleBlockerIdentifier: "PIC-2",
+    });
+  });
+
   it("can flip from needs_attention to covered without changing the blocker edges", async () => {
-    const { companyId, agentId } = await createCompany("PBF");
+    const { companyId, agentId, pausedAgentId } = await createCompany("PBF");
     const parentId = await insertIssue({ companyId, identifier: "PBF-1", title: "Parent", status: "blocked" });
+    // Assigned to a paused agent so the "before" state isn't already covered by the
+    // AUR-4273 invokable-assignee path — the transition demonstrated here is the active
+    // run appearing, not the assignee's own status.
     const blockerId = await insertIssue({
       companyId,
       identifier: "PBF-2",
       title: "Assigned blocker",
       status: "todo",
-      assigneeAgentId: agentId,
+      assigneeAgentId: pausedAgentId,
     });
     await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
 
@@ -393,15 +481,18 @@ describeEmbeddedPostgres("issue blocker attention", () => {
   });
 
   it("does not let another company's active run cover the blocker", async () => {
-    const { companyId, agentId } = await createCompany("PBS");
+    const { companyId, pausedAgentId } = await createCompany("PBS");
     const other = await createCompany("PBT");
     const parentId = await insertIssue({ companyId, identifier: "PBS-1", title: "Parent", status: "blocked" });
+    // Assigned to a paused (non-invokable) agent so the only candidate coverage path is
+    // the cross-company run this test means to rule out — an idle/active assignee would
+    // otherwise cover it via the AUR-4273 invokable-assignee path regardless.
     const blockerId = await insertIssue({
       companyId,
       identifier: "PBS-2",
       title: "Same-company blocker",
       status: "todo",
-      assigneeAgentId: agentId,
+      assigneeAgentId: pausedAgentId,
     });
     await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
     await activeRun({ companyId: other.companyId, agentId: other.agentId, issueId: blockerId });
@@ -419,14 +510,16 @@ describeEmbeddedPostgres("issue blocker attention", () => {
   });
 
   it("does not cover a blocker from a stale run the issue no longer owns", async () => {
-    const { companyId, agentId } = await createCompany("PBX");
+    const { companyId, agentId, pausedAgentId } = await createCompany("PBX");
     const parentId = await insertIssue({ companyId, identifier: "PBX-1", title: "Parent", status: "blocked" });
+    // Assigned to a paused (non-invokable) agent so the stale run is the only candidate
+    // coverage path this test means to rule out.
     const blockerId = await insertIssue({
       companyId,
       identifier: "PBX-2",
       title: "Previously running blocker",
       status: "blocked",
-      assigneeAgentId: agentId,
+      assigneeAgentId: pausedAgentId,
     });
     await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
     await activeRun({ companyId, agentId, issueId: blockerId, current: false });
@@ -783,14 +876,16 @@ describeEmbeddedPostgres("issue blocker attention", () => {
   });
 
   it("does not treat a scheduled retry as actively covered work", async () => {
-    const { companyId, agentId } = await createCompany("PBY");
+    const { companyId, agentId, pausedAgentId } = await createCompany("PBY");
     const parentId = await insertIssue({ companyId, identifier: "PBY-1", title: "Parent", status: "blocked" });
+    // Assigned to a paused (non-invokable) agent so the scheduled_retry run is the only
+    // candidate coverage path this test means to rule out.
     const blockerId = await insertIssue({
       companyId,
       identifier: "PBY-2",
       title: "Retrying blocker",
       status: "blocked",
-      assigneeAgentId: agentId,
+      assigneeAgentId: pausedAgentId,
     });
     await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
     await activeRun({ companyId, agentId, issueId: blockerId, status: "scheduled_retry" });

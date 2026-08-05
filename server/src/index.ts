@@ -106,6 +106,7 @@ type IssueGraphLivenessReconciliationSummary = {
   blockedEnteredAtFallbacks?: number;
   issueGraphRecoveryActionsResolved?: number;
   actionErrors?: number;
+  openNonTerminalIssues?: number;
 };
 
 export function shouldLogIssueGraphLivenessReconciliation(
@@ -128,7 +129,8 @@ export function shouldLogIssueGraphLivenessReconciliation(
     (reconciled.classBEscalated ?? 0) > 0 ||
     (reconciled.classBBoardOnly ?? 0) > 0 ||
     (reconciled.issueGraphRecoveryActionsResolved ?? 0) > 0 ||
-    (reconciled.actionErrors ?? 0) > 0
+    (reconciled.actionErrors ?? 0) > 0 ||
+    (reconciled.openNonTerminalIssues ?? 0) > 0
   );
 }
 

@@ -1864,6 +1864,219 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
+  it("prefers the child project's policy default over the parent's project workspace", async () => {
+    // AUR-4277: parent inheritance ran before the project-policy default, so a
+    // parent pinned to a sibling workspace of the SAME project silently won
+    // over that project's explicit defaultProjectWorkspaceId. This is the
+    // silent case: both workspaces belong to the project, so
+    // assertValidProjectWorkspace passes and nothing errors or warns.
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const parentIssueId = randomUUID();
+    const policyDefaultWorkspaceId = randomUUID();
+    const parentWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace project",
+      status: "in_progress",
+      executionWorkspacePolicy: {
+        enabled: true,
+        defaultMode: "shared_workspace",
+        allowIssueOverride: true,
+        defaultProjectWorkspaceId: policyDefaultWorkspaceId,
+      },
+    });
+
+    await db.insert(projectWorkspaces).values([
+      {
+        id: policyDefaultWorkspaceId,
+        companyId,
+        projectId,
+        name: "Pinned default workspace",
+        isPrimary: true,
+      },
+      {
+        id: parentWorkspaceId,
+        companyId,
+        projectId,
+        name: "Parent's other workspace",
+      },
+    ]);
+
+    await db.insert(issues).values({
+      id: parentIssueId,
+      companyId,
+      projectId,
+      projectWorkspaceId: parentWorkspaceId,
+      title: "Parent issue",
+      status: "in_progress",
+      priority: "medium",
+    });
+
+    const child = await svc.create(companyId, {
+      parentId: parentIssueId,
+      projectId,
+      title: "Child issue",
+      status: "todo",
+      priority: "medium",
+    });
+
+    expect(child.projectWorkspaceId).toBe(policyDefaultWorkspaceId);
+  });
+
+  it("prefers the child project's policy default over a cross-project parent workspace", async () => {
+    // AUR-4277: the cross-project variant. Before the fix the parent's
+    // workspace was adopted and then rejected by assertValidProjectWorkspace,
+    // so creating the child failed outright instead of falling back to the
+    // child project's own declared default.
+    const companyId = randomUUID();
+    const childProjectId = randomUUID();
+    const parentProjectId = randomUUID();
+    const parentIssueId = randomUUID();
+    const policyDefaultWorkspaceId = randomUUID();
+    const parentWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(projects).values([
+      {
+        id: childProjectId,
+        companyId,
+        name: "Child project",
+        status: "in_progress",
+        executionWorkspacePolicy: {
+          enabled: true,
+          defaultMode: "shared_workspace",
+          allowIssueOverride: true,
+          defaultProjectWorkspaceId: policyDefaultWorkspaceId,
+        },
+      },
+      {
+        id: parentProjectId,
+        companyId,
+        name: "Parent project",
+        status: "in_progress",
+      },
+    ]);
+
+    await db.insert(projectWorkspaces).values([
+      {
+        id: policyDefaultWorkspaceId,
+        companyId,
+        projectId: childProjectId,
+        name: "Child pinned workspace",
+        isPrimary: true,
+      },
+      {
+        id: parentWorkspaceId,
+        companyId,
+        projectId: parentProjectId,
+        name: "Parent project workspace",
+        isPrimary: true,
+      },
+    ]);
+
+    await db.insert(issues).values({
+      id: parentIssueId,
+      companyId,
+      projectId: parentProjectId,
+      projectWorkspaceId: parentWorkspaceId,
+      title: "Parent issue in another project",
+      status: "in_progress",
+      priority: "medium",
+    });
+
+    const child = await svc.create(companyId, {
+      parentId: parentIssueId,
+      projectId: childProjectId,
+      title: "Child issue",
+      status: "todo",
+      priority: "medium",
+    });
+
+    expect(child.projectWorkspaceId).toBe(policyDefaultWorkspaceId);
+  });
+
+  it("still inherits the parent project workspace when the child project declares no policy default", async () => {
+    // AUR-4277 regression guard: inheritance must keep filling a genuine hole.
+    // The project also has a primary workspace that the no-policy fallback
+    // would pick, so this fails if inheritance is ordered below that fallback.
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const parentIssueId = randomUUID();
+    const primaryWorkspaceId = randomUUID();
+    const parentWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace project",
+      status: "in_progress",
+      executionWorkspacePolicy: {
+        enabled: true,
+        defaultMode: "shared_workspace",
+        allowIssueOverride: true,
+      },
+    });
+
+    await db.insert(projectWorkspaces).values([
+      {
+        id: primaryWorkspaceId,
+        companyId,
+        projectId,
+        name: "Primary workspace",
+        isPrimary: true,
+      },
+      {
+        id: parentWorkspaceId,
+        companyId,
+        projectId,
+        name: "Parent's workspace",
+      },
+    ]);
+
+    await db.insert(issues).values({
+      id: parentIssueId,
+      companyId,
+      projectId,
+      projectWorkspaceId: parentWorkspaceId,
+      title: "Parent issue",
+      status: "in_progress",
+      priority: "medium",
+    });
+
+    const child = await svc.create(companyId, {
+      parentId: parentIssueId,
+      projectId,
+      title: "Child issue",
+      status: "todo",
+      priority: "medium",
+    });
+
+    expect(child.projectWorkspaceId).toBe(parentWorkspaceId);
+  });
+
   it("keeps explicit workspace fields instead of inheriting the parent linkage", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();

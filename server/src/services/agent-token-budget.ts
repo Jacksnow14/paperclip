@@ -53,10 +53,34 @@ interface TokenBudgetOverride {
   maxTokensPerWindow?: number;
 }
 
+// adapterConfig is agent-authored jsonb, not a typed API surface — a non-numeric value
+// here (e.g. windowMs: "1d") must be dropped, not trusted: it would flow into
+// `new Date(now - NaN)` and throw inside the heartbeat_runs query, and since
+// resolveContendedCeiling runs this check for every candidate on every admission pass,
+// one malformed override on one agent would abort admission fleet-wide.
+function asBudgetNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
 function readOverride(adapterConfig: Record<string, unknown> | null | undefined): TokenBudgetOverride | null {
   const raw = adapterConfig?.tokenBudget;
   if (!raw || typeof raw !== "object") return null;
-  return raw as TokenBudgetOverride;
+  const fields = raw as Record<string, unknown>;
+  const override: TokenBudgetOverride = {
+    windowMs: asBudgetNumber(fields.windowMs),
+    maxTokensPerRun: asBudgetNumber(fields.maxTokensPerRun),
+    maxTokensPerWindow: asBudgetNumber(fields.maxTokensPerWindow),
+  };
+  // An override with no valid numeric field is no override at all — in particular it
+  // must not opt an unlisted adapter type into enforcement.
+  if (
+    override.windowMs === undefined &&
+    override.maxTokensPerRun === undefined &&
+    override.maxTokensPerWindow === undefined
+  ) {
+    return null;
+  }
+  return override;
 }
 
 // Adapters not in DEFAULT_POLICY_BY_ADAPTER_TYPE stay unenforced unless an agent opts in

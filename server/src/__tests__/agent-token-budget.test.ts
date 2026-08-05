@@ -67,6 +67,31 @@ describe("resolveAgentTokenBudgetPolicy", () => {
     });
     expect(policy?.maxTokensPerRun).toBe(500);
   });
+
+  // adapterConfig is agent-authored jsonb: a malformed field must fall back to the
+  // shipped default rather than poison the policy — a string windowMs reaching the
+  // breach query as new Date(NaN) would throw on every admission pass fleet-wide.
+  it("drops non-numeric/negative override fields and keeps the shipped defaults", () => {
+    const policy = resolveAgentTokenBudgetPolicy({
+      adapterType: "codex_local",
+      adapterConfig: {
+        tokenBudget: { windowMs: "1d", maxTokensPerRun: -5, maxTokensPerWindow: Number.NaN },
+      },
+    });
+    expect(policy).toEqual({
+      windowMs: 24 * 60 * 60 * 1000,
+      maxTokensPerRun: DEFAULT_MAX_TOKENS_PER_RUN,
+      maxTokensPerWindow: DEFAULT_MAX_TOKENS_PER_WINDOW,
+    });
+  });
+
+  it("does not opt an unlisted adapter into enforcement on an override with no valid numeric field", () => {
+    const policy = resolveAgentTokenBudgetPolicy({
+      adapterType: "process",
+      adapterConfig: { tokenBudget: { maxTokensPerRun: "500" } },
+    });
+    expect(policy).toBeNull();
+  });
 });
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();

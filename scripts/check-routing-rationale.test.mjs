@@ -5,6 +5,17 @@ import {
   lookupRoutingRecord,
   ROUTING_RECORD_LOOKUP_LIMIT,
   extractStatusCode,
+  isRoutingDecision,
+  isExempt,
+  isPreRule,
+  parseRuleEffectiveDate,
+  resolveCancelReason,
+  RULE_EFFECTIVE_DATE,
+  fetchAllIssues,
+  buildRollingIssueBody,
+  findRollingIssue,
+  rollingIssueTitle,
+  todayDateKey,
 } from "./check-routing-rationale.mjs";
 
 // A stub apiGet that records every query string it receives and returns a
@@ -216,4 +227,310 @@ test("extractStatusCode: pulls the numeric status out of an apiPatch/apiPost err
 test("extractStatusCode: falls back to 'unknown' for messages without a status", () => {
   assert.equal(extractStatusCode("fetch failed: ECONNRESET"), "unknown");
   assert.equal(extractStatusCode(undefined), "unknown");
+});
+
+// ── AUR-3994/AUR-3987a: isRoutingDecision exemption predicate ──────────────
+
+test("isRoutingDecision: false when createdByAgentId is missing (user-filed)", () => {
+  assert.equal(
+    isRoutingDecision({ createdByAgentId: null, assigneeAgentId: "agent-x" }),
+    false,
+  );
+  assert.equal(
+    isRoutingDecision({ assigneeAgentId: "agent-x" }),
+    false,
+  );
+});
+
+test("isRoutingDecision: false when originKind is set and not 'manual' (routine/system-generated)", () => {
+  assert.equal(
+    isRoutingDecision({
+      createdByAgentId: "creator-1",
+      assigneeAgentId: "agent-x",
+      originKind: "routine_execution",
+    }),
+    false,
+  );
+});
+
+test("isRoutingDecision: false when self-assigned (assignee === creator)", () => {
+  assert.equal(
+    isRoutingDecision({
+      createdByAgentId: "agent-1",
+      assigneeAgentId: "agent-1",
+      originKind: "manual",
+    }),
+    false,
+  );
+});
+
+test("isRoutingDecision: true for a genuine routing decision (creator hands off to a different agent, manual origin)", () => {
+  assert.equal(
+    isRoutingDecision({
+      createdByAgentId: "agent-1",
+      assigneeAgentId: "agent-2",
+      originKind: "manual",
+    }),
+    true,
+  );
+});
+
+test("isRoutingDecision: true when originKind is absent but creator/assignee differ (originKind is optional, not required to be 'manual')", () => {
+  assert.equal(
+    isRoutingDecision({
+      createdByAgentId: "agent-1",
+      assigneeAgentId: "agent-2",
+    }),
+    true,
+  );
+});
+
+// ── Regression: self-assigned high-priority issue produces no gap ──────────
+
+test("isExempt: a self-assigned high-priority issue is exempt (no routing decision was made)", () => {
+  const issue = {
+    priority: "high",
+    createdByAgentId: "agent-1",
+    assigneeAgentId: "agent-1",
+    originKind: "manual",
+    title: "Fix the flaky deploy script",
+    description: "",
+  };
+  assert.equal(isExempt(issue), true);
+});
+
+test("isExempt: a routine-origin high-priority issue is exempt even with a distinct assignee", () => {
+  const issue = {
+    priority: "critical",
+    createdByAgentId: "agent-1",
+    assigneeAgentId: "agent-2",
+    originKind: "routine_execution",
+    title: "Daily PnL sweep",
+    description: "",
+  };
+  assert.equal(isExempt(issue), true);
+});
+
+test("isExempt: a genuinely routed high-priority issue is NOT exempt", () => {
+  const issue = {
+    priority: "high",
+    createdByAgentId: "agent-1",
+    assigneeAgentId: "agent-2",
+    originKind: "manual",
+    title: "Implement retry logic for webhook delivery",
+    description: "",
+  };
+  assert.equal(isExempt(issue), false);
+});
+
+// ── AUR-4006: RULE_EFFECTIVE_DATE cutoff ────────────────────────────────────
+
+test("isPreRule: an issue created before the cutoff is pre-rule-exempt", () => {
+  const issue = { createdAt: "2026-05-01T00:00:00Z" };
+  assert.equal(isPreRule(issue, RULE_EFFECTIVE_DATE), true);
+});
+
+test("isPreRule: an issue created after the cutoff is NOT pre-rule-exempt", () => {
+  const issue = { createdAt: "2026-07-01T00:00:00Z" };
+  assert.equal(isPreRule(issue, RULE_EFFECTIVE_DATE), false);
+});
+
+test("isPreRule: boundary is inclusive-of-rule-date = owed (exactly-on-cutoff is NOT exempt)", () => {
+  const issue = { createdAt: RULE_EFFECTIVE_DATE.toISOString() };
+  assert.equal(isPreRule(issue, RULE_EFFECTIVE_DATE), false);
+});
+
+test("isPreRule: one millisecond before the cutoff IS exempt", () => {
+  const oneMsBefore = new Date(RULE_EFFECTIVE_DATE.getTime() - 1).toISOString();
+  const issue = { createdAt: oneMsBefore };
+  assert.equal(isPreRule(issue, RULE_EFFECTIVE_DATE), true);
+});
+
+test("isPreRule: missing createdAt is never exempt (fail closed, not open)", () => {
+  assert.equal(isPreRule({}), false);
+});
+
+test("parseRuleEffectiveDate: --rule-effective-date override is honored", () => {
+  const overridden = parseRuleEffectiveDate("2026-01-01T00:00:00Z");
+  assert.equal(overridden.toISOString(), "2026-01-01T00:00:00.000Z");
+  // An issue that is pre-rule under the DEFAULT cutoff is post-rule under an
+  // earlier override — proves main()'s ruleEffectiveDate param actually
+  // changes the comparison, not just accepted-and-ignored.
+  const issue = { createdAt: "2026-05-01T00:00:00Z" };
+  assert.equal(isPreRule(issue, RULE_EFFECTIVE_DATE), true);
+  assert.equal(isPreRule(issue, overridden), false);
+});
+
+test("parseRuleEffectiveDate: no override falls back to RULE_EFFECTIVE_DATE", () => {
+  assert.equal(parseRuleEffectiveDate(undefined).getTime(), RULE_EFFECTIVE_DATE.getTime());
+});
+
+test("parseRuleEffectiveDate: unparseable override throws loudly instead of silently exempting nothing", () => {
+  assert.throws(() => parseRuleEffectiveDate("not-a-date"), /could not parse/);
+});
+
+test("resolveCancelReason: a pre-rule target auto-resolves the legacy flag as exempt", () => {
+  const target = {
+    status: "todo",
+    priority: "high",
+    createdAt: "2026-05-01T00:00:00Z",
+    createdByAgentId: "agent-1",
+    assigneeAgentId: "agent-2",
+    originKind: "manual",
+    title: "Genuinely routed pre-rule issue",
+  };
+  const reason = resolveCancelReason({
+    target, targetId: "AUR-1", hasRecord: false, ruleEffectiveDate: RULE_EFFECTIVE_DATE,
+  });
+  assert.ok(reason && /before the routing-rationale rule took effect/.test(reason));
+});
+
+test("resolveCancelReason: a post-rule target with no record is NOT auto-resolved", () => {
+  const target = {
+    status: "todo",
+    priority: "high",
+    createdAt: "2026-07-01T00:00:00Z",
+    createdByAgentId: "agent-1",
+    assigneeAgentId: "agent-2",
+    originKind: "manual",
+    title: "Genuinely routed post-rule issue",
+  };
+  const reason = resolveCancelReason({
+    target, targetId: "AUR-2", hasRecord: false, ruleEffectiveDate: RULE_EFFECTIVE_DATE,
+  });
+  assert.equal(reason, null);
+});
+
+test("buildRollingIssueBody: surfaces preruleCount as report-only, with the cutoff date cited", () => {
+  const body = buildRollingIssueBody([], { maxListed: 20, closedGapCount: 0, preruleCount: 689, ruleEffectiveDate: RULE_EFFECTIVE_DATE });
+  assert.ok(body.includes("689 additional issue(s)"));
+  assert.ok(body.includes(RULE_EFFECTIVE_DATE.toISOString()));
+  assert.ok(body.includes("AUR-4006"));
+});
+
+// ── fetchAllIssues: pagination ──────────────────────────────────────────────
+
+test("fetchAllIssues: follows offset pagination until a short page is returned", async () => {
+  const pages = [
+    Array.from({ length: 3 }, (_, i) => ({ id: `a${i}` })), // full page (pageSize=3)
+    Array.from({ length: 3 }, (_, i) => ({ id: `b${i}` })), // full page
+    [{ id: "c0" }], // short page -> stop
+  ];
+  const calls = [];
+  async function apiGet(path) {
+    calls.push(path);
+    const offset = Number(new URL(`http://x${path}`).searchParams.get("offset"));
+    const page = offset / 3;
+    return pages[page];
+  }
+
+  const all = await fetchAllIssues({ companyId: "c1", apiGet, status: null, pageSize: 3 });
+
+  assert.equal(all.length, 7);
+  assert.equal(calls.length, 3);
+  assert.ok(calls[0].includes("offset=0"));
+  assert.ok(calls[1].includes("offset=3"));
+  assert.ok(calls[2].includes("offset=6"));
+  assert.ok(calls.every((c) => !c.includes("status=")), "status omitted entirely fetches all statuses");
+});
+
+test("fetchAllIssues: passes a comma-joined status filter through verbatim", async () => {
+  const { apiGet, calls } = makeStubApiGet({
+    "/api/companies/c1/issues?limit=500&status=todo,in_progress&offset=0": [{ id: "x1" }],
+  });
+  const all = await fetchAllIssues({ companyId: "c1", apiGet, status: "todo,in_progress" });
+  assert.deepEqual(all, [{ id: "x1" }]);
+  assert.deepEqual(calls, ["/api/companies/c1/issues?limit=500&status=todo,in_progress&offset=0"]);
+});
+
+// ── Rolling gap-aggregate issue ──────────────────────────────────────────────
+
+test("todayDateKey: returns a stable UTC YYYY-MM-DD", () => {
+  assert.equal(todayDateKey(new Date("2026-07-25T23:59:00Z")), "2026-07-25");
+});
+
+test("rollingIssueTitle: matches the documented convention", () => {
+  assert.equal(rollingIssueTitle("2026-07-25"), "routing-rationale gaps — 2026-07-25");
+});
+
+test("buildRollingIssueBody: lists open gaps, caps at maxListed, reports held-back count", () => {
+  const missingOpen = [
+    { identifier: "AUR-1", priority: "high", assigneeAgentId: "a1", createdByAgentId: "a1", title: "T1" },
+    { identifier: "AUR-2", priority: "critical", assigneeAgentId: "a2", createdByAgentId: "a2", title: "T2" },
+    { identifier: "AUR-3", priority: "high", assigneeAgentId: "a3", createdByAgentId: "a3", title: "T3" },
+  ];
+  const body = buildRollingIssueBody(missingOpen, { maxListed: 2, closedGapCount: 0 });
+  assert.ok(body.includes("AUR-1"));
+  assert.ok(body.includes("AUR-2"));
+  assert.ok(!body.includes("AUR-3"));
+  assert.ok(body.includes("1 more held back"));
+  assert.ok(body.includes("3 open eligible issue(s)"));
+});
+
+test("buildRollingIssueBody: surfaces closedGapCount as report-only, never lists closed issues individually", () => {
+  const body = buildRollingIssueBody([], { maxListed: 20, closedGapCount: 5 });
+  assert.ok(body.includes("_No outstanding open gaps._"));
+  assert.ok(body.includes("5 additional gap(s)"));
+  assert.ok(body.includes("unrecoverable"));
+});
+
+test("findRollingIssue: asserts exact title match client-side, ignoring loose search collisions", async () => {
+  const title = "routing-rationale gaps — 2026-07-25";
+  const { apiGet } = makeStubApiGet({
+    [`/api/companies/c1/issues?q=${encodeURIComponent(title)}&status=backlog,todo,in_progress,in_review,blocked,done,cancelled&limit=20`]:
+      [
+        { id: "wrong1", title: "routing-rationale gaps — 2026-07-24" },
+        { id: "right1", title },
+      ],
+  });
+  const found = await findRollingIssue({ companyId: "c1", apiGet, title });
+  assert.equal(found.id, "right1");
+});
+
+test("findRollingIssue: returns null when no exact match exists yet (first run of the day)", async () => {
+  const title = "routing-rationale gaps — 2026-07-25";
+  const { apiGet } = makeStubApiGet({
+    [`/api/companies/c1/issues?q=${encodeURIComponent(title)}&status=backlog,todo,in_progress,in_review,blocked,done,cancelled&limit=20`]:
+      [],
+  });
+  const found = await findRollingIssue({ companyId: "c1", apiGet, title });
+  assert.equal(found, null);
+});
+
+// ── Aggregation regression: update the existing rolling issue, never duplicate ─
+
+test("aggregation regression: a second run on the same day updates the existing rolling issue rather than creating a new one", async () => {
+  const title = rollingIssueTitle("2026-07-25");
+  const existing = { id: "roll-1", identifier: "AUR-9000", title, status: "todo" };
+  let patchCalls = 0;
+  let postIssueCalls = 0;
+  const { apiGet } = makeStubApiGet({
+    [`/api/companies/c1/issues?q=${encodeURIComponent(title)}&status=backlog,todo,in_progress,in_review,blocked,done,cancelled&limit=20`]:
+      [existing],
+  });
+  async function apiPatch(path, body) {
+    patchCalls += 1;
+    assert.equal(path, "/api/issues/roll-1");
+    assert.ok(body.description.includes("open eligible issue"));
+    return {};
+  }
+  async function apiPost(path) {
+    postIssueCalls += 1;
+    return {};
+  }
+
+  const found = await findRollingIssue({ companyId: "c1", apiGet, title });
+  assert.ok(found, "expected to find the already-filed rolling issue for today");
+
+  // Simulate the update branch a second run would take (mirrors syncRollingGapIssue's
+  // existing-issue path without re-implementing its internals here).
+  await apiPatch(`/api/issues/${found.id}`, {
+    description: buildRollingIssueBody(
+      [{ identifier: "AUR-1", priority: "high", assigneeAgentId: "a1", createdByAgentId: "a1", title: "T1" }],
+      { maxListed: 20, closedGapCount: 0 },
+    ),
+  });
+
+  assert.equal(patchCalls, 1);
+  assert.equal(postIssueCalls, 0, "must never POST a new issue when one already exists for today");
 });

@@ -1,4 +1,4 @@
-import type { UsageSummary } from "@paperclipai/adapter-utils";
+import { CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE, type UsageSummary } from "@paperclipai/adapter-utils";
 import {
   CLAUDE_CONTEXT_OVERFLOW_RE,
   isClaudeContextOverflowMessage,
@@ -48,6 +48,17 @@ const CLAUDE_QUOTA_EXHAUSTION_SOURCE = [
   String.raw`usage\s+limit\s+reached`,
 ].join("|");
 
+// AUR-4144: the quota wall gets its own error CODE (the family stays
+// `transient_upstream` -- see execute.ts for why), so the class is observable in the
+// run table without having to re-derive it from prose after the fact.
+export const CLAUDE_QUOTA_EXHAUSTED_ERROR_CODE = "claude_quota_exhausted";
+
+// AUR-4144: a dedicated matcher over the SAME shared wording fragment as the transient
+// classifier and the reset-hint extractor. Built here rather than re-listing the
+// literals, because a fourth copy of the list is a fourth thing to forget to patch
+// (AUR-4055 -> AUR-4192 -> AUR-4531 each patched one copy and missed another).
+const CLAUDE_QUOTA_EXHAUSTION_RE = new RegExp(`(?:${CLAUDE_QUOTA_EXHAUSTION_SOURCE})`, "i");
+
 const CLAUDE_TRANSIENT_UPSTREAM_RE = new RegExp(
   `(?:rate[-\\s]?limit(?:ed)?|rate_limit_error|too\\s+many\\s+requests|\\b429\\b|overloaded(?:_error)?|server\\s+overloaded|service\\s+unavailable|\\b503\\b|\\b529\\b|high\\s+demand|try\\s+again\\s+later|temporarily\\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|${CLAUDE_QUOTA_EXHAUSTION_SOURCE})`,
   "i",
@@ -72,7 +83,7 @@ const CLAUDE_EXTRA_USAGE_RESET_RE = new RegExp(
 // AUR-4557: both forms of the wording test now live in adapter-utils, shared with the
 // heartbeat service. The substring form is only ever applied to text the model cannot
 // author; anything that can carry model prose goes through the anchored form.
-export { CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE } from "@paperclipai/adapter-utils";
+export { CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE };
 
 export function parseClaudeStreamJson(stdout: string) {
   let sessionId: string | null = null;
@@ -256,27 +267,150 @@ export function isClaudeUnknownSessionError(parsed: Record<string, unknown>): bo
   );
 }
 
-function buildClaudeTransientHaystack(input: {
+interface ClaudeFailureFields {
   parsed?: Record<string, unknown> | null;
   stdout?: string | null;
   stderr?: string | null;
   errorMessage?: string | null;
-}): string {
-  const parsed = input.parsed ?? null;
-  const resultText = parsed ? asString(parsed.result, "") : "";
-  const parsedErrors = parsed ? extractClaudeErrorMessages(parsed) : [];
-  return [
-    input.errorMessage ?? "",
-    resultText,
-    ...parsedErrors,
-    input.stdout ?? "",
-    input.stderr ?? "",
-  ]
+}
+
+function normalizeHaystack(parts: string[]): string {
+  return parts
     .join("\n")
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean)
     .join("\n");
+}
+
+/**
+ * The adapter's OWN account of the failure: the harness error message plus whatever the
+ * CLI put in its terminal `result` event. Trustworthy, because none of it is transcript.
+ */
+function buildClaudePrimaryHaystack(input: ClaudeFailureFields): string {
+  const parsed = input.parsed ?? null;
+  return normalizeHaystack([
+    input.errorMessage ?? "",
+    parsed ? asString(parsed.result, "") : "",
+    ...(parsed ? extractClaudeErrorMessages(parsed) : []),
+  ]);
+}
+
+/**
+ * AUR-4144: raw stdout/stderr with every structured stream event dropped.
+ *
+ * Raw stdout is the entire resumed conversation transcript plus the CLI's own
+ * stream-JSON. Both are contaminated sources for a prose classifier: the original
+ * AUR-4144 run failed on `session limit` yet matched the transient regex only via an
+ * incidental `rate_limit` JSON key, and agents in this fleet routinely *discuss* quota
+ * wording in the conversation being resumed. Any line that parses as JSON with a `type`
+ * field is a stream event -- it is handled STRUCTURALLY now
+ * (`extractClaudeRateLimitEvents`), so folding its text into a regex haystack buys
+ * nothing and costs false positives.
+ */
+function buildClaudeRawHaystack(input: ClaudeFailureFields): string {
+  const lines: string[] = [];
+  for (const rawLine of [input.stdout ?? "", input.stderr ?? ""].join("\n").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const event = line.startsWith("{") ? parseJson(line) : null;
+    if (event && typeof event === "object" && !Array.isArray(event) && "type" in event) {
+      continue;
+    }
+    lines.push(line);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Legacy combined haystack (primary + raw, stream events included). Retained ONLY for
+ * `extractClaudeRetryNotBefore`, whose exported behaviour predates AUR-4144: scraping a
+ * `resets <time>` hint out of stderr is not a classification decision, so the
+ * contamination risk that motivated the split does not apply to it.
+ */
+function buildClaudeTransientHaystack(input: ClaudeFailureFields): string {
+  return normalizeHaystack([
+    buildClaudePrimaryHaystack(input),
+    input.stdout ?? "",
+    input.stderr ?? "",
+  ]);
+}
+
+export interface ClaudeRateLimitInfo {
+  status: string | null;
+  overageStatus: string | null;
+  overageDisabledReason: string | null;
+  rateLimitType: string | null;
+  resetsAtEpochSeconds: number | null;
+  isUsingOverage: boolean;
+}
+
+/**
+ * AUR-4144: the Claude CLI stream emits an AUTHORITATIVE, machine-readable quota event
+ * that nothing parsed until now. Verbatim from a production run log:
+ *
+ *   {"type":"rate_limit_event","rate_limit_info":{"status":"rejected",
+ *    "resetsAt":1785322800,"rateLimitType":"seven_day","overageStatus":"rejected",
+ *    "overageDisabledReason":"out_of_credits","isUsingOverage":false}, ...}
+ *
+ * `resetsAt` is unix SECONDS, and the lane recovered at exactly that instant. Note such
+ * a run can end with no `{"type":"result"}` line at all, so this must work off the raw
+ * stream, not off the parsed terminal result.
+ *
+ * Returned in stream order.
+ */
+export function extractClaudeRateLimitEvents(
+  stdout: string | null | undefined,
+): ClaudeRateLimitInfo[] {
+  const events: ClaudeRateLimitInfo[] = [];
+  if (!stdout) return events;
+
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || !line.startsWith("{")) continue;
+    const event = parseJson(line);
+    if (!event || typeof event !== "object" || Array.isArray(event)) continue;
+    if (asString(event.type, "") !== "rate_limit_event") continue;
+
+    const info = parseObject(event.rate_limit_info);
+    const resetsAt = asNumber(info.resetsAt, Number.NaN);
+    events.push({
+      status: asString(info.status, "") || null,
+      overageStatus: asString(info.overageStatus, "") || null,
+      overageDisabledReason: asString(info.overageDisabledReason, "") || null,
+      rateLimitType: asString(info.rateLimitType, "") || null,
+      resetsAtEpochSeconds: Number.isFinite(resetsAt) ? resetsAt : null,
+      isUsingOverage: info.isUsingOverage === true,
+    });
+  }
+
+  return events;
+}
+
+// A `rate_limit_event` is emitted for allowed requests too; only a rejection is a wall.
+function isRejectedRateLimit(info: ClaudeRateLimitInfo): boolean {
+  return info.status === "rejected" || info.overageStatus === "rejected";
+}
+
+// LAST rejection wins: a resumed session can carry an earlier, already-expired wall.
+function findLastRejectedRateLimit(input: ClaudeFailureFields): ClaudeRateLimitInfo | null {
+  const events = extractClaudeRateLimitEvents(
+    [input.stdout ?? "", input.stderr ?? ""].join("\n"),
+  );
+  let last: ClaudeRateLimitInfo | null = null;
+  for (const event of events) {
+    if (isRejectedRateLimit(event)) last = event;
+  }
+  return last;
+}
+
+function rateLimitResetDate(info: ClaudeRateLimitInfo): Date | null {
+  const seconds = info.resetsAtEpochSeconds;
+  // Only absent/non-finite/non-positive values are rejected. A reset that looks stale or
+  // implausibly distant is NOT nulled here -- the server clamps it, and silently
+  // discarding the one authoritative timestamp is how we end up back on the blind ladder.
+  if (seconds == null || !Number.isFinite(seconds) || seconds <= 0) return null;
+  return new Date(seconds * 1000);
 }
 
 function readTimeZoneParts(date: Date, timeZone: string) {
@@ -568,18 +702,115 @@ function parseClaudeResetClockTime(clockText: string, now: Date, timeZoneHint?: 
 }
 
 export function extractClaudeRetryNotBefore(
-  input: {
-    parsed?: Record<string, unknown> | null;
-    stdout?: string | null;
-    stderr?: string | null;
-    errorMessage?: string | null;
-  },
+  input: ClaudeFailureFields,
   now = new Date(),
 ): Date | null {
+  // AUR-4144: prefer the structured epoch. Prose is a scraped approximation of a number
+  // the CLI already told us exactly; when both exist the number wins.
+  const rejected = findLastRejectedRateLimit(input);
+  if (rejected) {
+    const structuredReset = rateLimitResetDate(rejected);
+    if (structuredReset) return structuredReset;
+  }
   const haystack = buildClaudeTransientHaystack(input);
   const match = haystack.match(CLAUDE_EXTRA_USAGE_RESET_RE);
   if (!match) return null;
   return parseClaudeResetClockTime(match[1] ?? "", now, match[2]);
+}
+
+export interface ClaudeQuotaExhaustion {
+  resetAt: Date | null;
+  rateLimitType: string | null;
+  overageDisabledReason: string | null;
+  outOfCredits: boolean;
+  source: "structured" | "prose";
+}
+
+/**
+ * AUR-4144: detect a QUOTA WALL -- structured event first, human prose only as fallback.
+ *
+ * The prose regex has now needed patching three separate times (AUR-4055, AUR-4192,
+ * AUR-4531) because it reads marketing copy that Anthropic is free to reword. The
+ * `rate_limit_event` stream event is a contract, so it is the primary discriminator and
+ * prose is demoted to a fallback for the (real) case where the CLI dies before emitting
+ * one.
+ *
+ * The prose fallback deliberately reads the PRIMARY haystack only -- never raw
+ * stdout/stderr. That is the whole defect: raw stdout is the resumed transcript.
+ */
+export function detectClaudeQuotaExhaustion(
+  input: ClaudeFailureFields,
+  now = new Date(),
+): ClaudeQuotaExhaustion | null {
+  const rejected = findLastRejectedRateLimit(input);
+  if (rejected) {
+    return {
+      resetAt: rateLimitResetDate(rejected),
+      rateLimitType: rejected.rateLimitType,
+      overageDisabledReason: rejected.overageDisabledReason,
+      outOfCredits: rejected.overageDisabledReason === "out_of_credits",
+      source: "structured",
+    };
+  }
+
+  const primary = buildClaudePrimaryHaystack(input);
+  if (!primary || !CLAUDE_QUOTA_EXHAUSTION_RE.test(primary)) return null;
+
+  const match = primary.match(CLAUDE_EXTRA_USAGE_RESET_RE);
+  const resetAt = match ? parseClaudeResetClockTime(match[1] ?? "", now, match[2]) : null;
+  return {
+    resetAt,
+    rateLimitType: null,
+    overageDisabledReason: null,
+    outOfCredits: false,
+    source: "prose",
+  };
+}
+
+export function isClaudeQuotaExhaustedError(input: ClaudeFailureFields): boolean {
+  return detectClaudeQuotaExhaustion(input) !== null;
+}
+
+/**
+ * AUR-4144: the `resultJson` payload for a quota wall. A follow-up issue reads this to
+ * surface quota state on the agent record and to escalate `out_of_credits` (which is NOT
+ * self-healing at the reset instant -- it needs a human to add credit), so it is
+ * persisted verbatim rather than re-derived from prose later.
+ */
+export function claudeQuotaExhaustionResultJson(
+  quota: ClaudeQuotaExhaustion | null,
+): Record<string, unknown> {
+  if (!quota) return {};
+  return {
+    quotaExhausted: true,
+    quotaExhaustion: {
+      source: quota.source,
+      resetAt: quota.resetAt ? quota.resetAt.toISOString() : null,
+      rateLimitType: quota.rateLimitType,
+      overageDisabledReason: quota.overageDisabledReason,
+      outOfCredits: quota.outOfCredits,
+    },
+  };
+}
+
+/**
+ * The failure-code precedence ladder, extracted as a pure function so it can be tested
+ * without standing up a CLI harness. Most specific class first; `transient_upstream` is
+ * the catch-all and therefore last.
+ */
+export function resolveClaudeFailureErrorCode(input: {
+  requiresLogin: boolean;
+  maxTurnsExhausted?: boolean;
+  contextOverflow: boolean;
+  quotaExhausted: boolean;
+  transientUpstream: boolean;
+}): string | null {
+  if (input.requiresLogin) return "claude_auth_required";
+  if (input.maxTurnsExhausted) return "max_turns_exhausted";
+  if (input.contextOverflow) return CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE;
+  if (input.quotaExhausted) return CLAUDE_QUOTA_EXHAUSTED_ERROR_CODE;
+  if (input.transientUpstream) return "claude_transient_upstream";
+  return null;
 }
 
 /**
@@ -617,6 +848,9 @@ export function isClaudeContextOverflowError(input: {
   /** Text the model cannot author (process stderr). Substring-matched. */
   trustedText?: string | null;
 }): boolean {
+  // AUR-4144 note: this deliberately does NOT use buildClaudePrimaryHaystack — the
+  // AUR-4557 split below is stricter (anchored matching for model-authorable text),
+  // and collapsing it into a substring test over the joined haystack would regress it.
   const parsed = input.parsed ?? null;
 
   const trusted = [
@@ -653,7 +887,24 @@ export function isClaudeTransientUpstreamError(input: {
   });
   if (loginMeta.requiresLogin) return false;
 
-  const haystack = buildClaudeTransientHaystack(input);
-  if (!haystack) return false;
-  return CLAUDE_TRANSIENT_UPSTREAM_RE.test(haystack);
+  // AUR-4144: QUOTA WINS. A quota wall is not a transient upstream hiccup -- it is a
+  // deterministic wall with a known reset instant, and conflating the two is what made
+  // 145+99 zero-token runs indistinguishable from ordinary 529s. execute.ts still assigns
+  // it `errorFamily: "transient_upstream"` (see the comment there) so scheduling is
+  // unchanged; the distinction lives in the error CODE and the structured metadata.
+  if (detectClaudeQuotaExhaustion(input)) return false;
+
+  const primary = buildClaudePrimaryHaystack(input);
+  if (primary && CLAUDE_TRANSIENT_UPSTREAM_RE.test(primary)) return true;
+
+  // AUR-4144: only reach for raw stdout/stderr when there is NO parsed terminal result to
+  // trust. When `parsed` exists, the CLI told us why it failed, and the resumed transcript
+  // can only add false positives (`rate_limit` appearing as a JSON key, or an agent
+  // discussing quota wording). Stream-event lines are stripped from the raw haystack
+  // because they are consumed structurally instead.
+  if (input.parsed != null) return false;
+
+  const raw = buildClaudeRawHaystack(input);
+  if (!raw) return false;
+  return CLAUDE_TRANSIENT_UPSTREAM_RE.test(raw);
 }

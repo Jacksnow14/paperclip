@@ -436,6 +436,61 @@ describe("claude execute", () => {
     }
   });
 
+  // AUR-4144 end-to-end, on the exact shape of the production run log
+  // (1bde2ebe-3abd-415d-83bf-e7e62b4ba9dd.ndjson): the CLI emits a structured
+  // `rate_limit_event` and then dies WITHOUT a `{"type":"result"}` line, so the adapter
+  // takes its `!parsed` branch and the structured event is the only evidence available.
+  // Before this change the run was coded `claude_transient_upstream` with no reset time --
+  // it matched the transient regex only via an incidental `rate_limit` substring.
+  it("classifies a structured rate_limit_event rejection as a quota wall with the CLI's own reset instant (AUR-4144)", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-quota-structured-"));
+    const { workspace, commandPath, restore } = await setupExecuteEnv(root, {
+      commandWriter: (commandPath) =>
+        writeTextFailingClaudeCommand(commandPath, {
+          // Two lines on purpose: this is what makes `JSON.parse(stdout)` fail and the
+          // adapter fall through to its no-terminal-result branch, exactly as in prod.
+          stdout:
+            '{"type":"system","subtype":"init","session_id":"d8c84a51-da8f-432b-94e5-ffcb5e8b4f44","model":"claude-opus-4"}\n' +
+            '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1785322800,"rateLimitType":"seven_day","overageStatus":"rejected","overageDisabledReason":"out_of_credits","isUsingOverage":false},"uuid":"1c6dd536-6d74-4e9c-92d6-b172d95f4ffa","session_id":"d8c84a51-da8f-432b-94e5-ffcb5e8b4f44"}\n',
+        }),
+    });
+
+    try {
+      const result = await execute({
+        runId: "run-quota-structured",
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Do work.",
+        },
+        context: {},
+        authToken: "tok",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBe("claude_quota_exhausted");
+      // The family and the retry hint are unchanged: quota-pause and the AUR-4531 breaker
+      // both gate on them, so a new family here would silently switch both off.
+      expect(result.errorFamily).toBe("transient_upstream");
+      expect(result.retryNotBefore).toBe("2026-07-29T11:00:00.000Z");
+      expect(result.resultJson?.transientRetryNotBefore).toBe("2026-07-29T11:00:00.000Z");
+      expect(result.resultJson?.quotaExhausted).toBe(true);
+      expect(result.resultJson?.quotaExhaustion).toEqual({
+        source: "structured",
+        resetAt: "2026-07-29T11:00:00.000Z",
+        rateLimitType: "seven_day",
+        overageDisabledReason: "out_of_credits",
+        outOfCredits: true,
+      });
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("does not normalize unstructured max-turn text into scheduler stop metadata", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-max-turn-text-"));
     const resultEvent = {
@@ -947,7 +1002,13 @@ describe("claude execute", () => {
     }
   }, 15_000);
 
-  it("classifies Claude 'out of extra usage' failures as transient upstream errors", async () => {
+  // AUR-4144: the error CODE changed here (quota exhaustion is its own class now) but the
+  // FAMILY and the retry hint deliberately did NOT. `server/src/services/quota-pause.ts`
+  // and the AUR-4531 breaker in `heartbeat.ts` both gate on
+  // `errorFamily === "transient_upstream"` plus the presence of
+  // `transientRetryNotBefore`, so this test pins both halves of that contract at once:
+  // a new code for observability, an unchanged family for scheduling.
+  it("classifies Claude 'out of extra usage' failures as a quota wall that still schedules a retry", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-transient-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "claude");
@@ -995,15 +1056,28 @@ describe("claude execute", () => {
       });
 
       expect(result.exitCode).toBe(1);
-      expect(result.errorCode).toBe("claude_transient_upstream");
+      expect(result.errorCode).toBe("claude_quota_exhausted");
+      expect(result.errorCode).not.toBe("claude_transient_upstream");
+      // Unchanged on purpose -- see the comment on this test.
       expect(result.errorFamily).toBe("transient_upstream");
       const expectedRetryNotBefore = "2026-04-22T21:00:00.000Z";
       expect(result.retryNotBefore).toBe(expectedRetryNotBefore);
       expect(result.resultJson?.retryNotBefore).toBe(expectedRetryNotBefore);
+      expect(result.resultJson?.errorFamily).toBe("transient_upstream");
       expect(result.errorMessage ?? "").toContain("extra usage");
       expect(new Date(String(result.resultJson?.transientRetryNotBefore)).getTime()).toBe(
         new Date("2026-04-22T21:00:00.000Z").getTime(),
       );
+      // AUR-4144: the structured metadata a follow-up issue reads to surface quota state
+      // on the agent record and to escalate `out_of_credits`. Persisted verbatim.
+      expect(result.resultJson?.quotaExhausted).toBe(true);
+      expect(result.resultJson?.quotaExhaustion).toEqual({
+        source: "prose",
+        resetAt: expectedRetryNotBefore,
+        rateLimitType: null,
+        overageDisabledReason: null,
+        outOfCredits: false,
+      });
     } finally {
       vi.useRealTimers();
       if (previousHome === undefined) delete process.env.HOME;

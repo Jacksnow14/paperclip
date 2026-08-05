@@ -153,6 +153,14 @@ function shouldReturnAcceptedConfirmationToCreatorAgent(args: {
   if (!args.current.createdByAgentId) return false;
   if (isTerminalIssueStatus(args.issue.status)) return false;
 
+  // Only a "wake_assignee_on_accept" confirmation is designed to hand the
+  // issue back to its creator once resolved. A plain "wake_assignee"
+  // confirmation just wants its current assignee woken up to look at the
+  // answer — reassigning them away is a side effect nobody asked for, and it
+  // orphans any other pending interaction on the issue that still needs the
+  // same assignee to resolve it (AUR-4657).
+  if (args.current.continuationPolicy !== "wake_assignee_on_accept") return false;
+
   // Human reviewer path: board user reviewing an agent-created confirmation on a user-assigned issue
   if (args.actor.userId && args.issue.assigneeUserId && !args.issue.assigneeAgentId) {
     return true;

@@ -1088,6 +1088,230 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     });
   });
 
+  it("keeps a wake_assignee confirmation's issue with its current assignee when accepted (AUR-4657)", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const deciderAgentId = randomUUID();
+    const otherCreatorAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Decide without ping-pong",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(agents).values([
+      {
+        id: deciderAgentId,
+        companyId,
+        name: "Decider",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: otherCreatorAgentId,
+        companyId,
+        name: "Requester",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "Merge PR #148 or request changes",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: deciderAgentId,
+    });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Merge PR #148 or request changes?",
+        acceptLabel: "Merge",
+        rejectLabel: "Request changes",
+      },
+    }, {
+      agentId: otherCreatorAgentId,
+    });
+
+    const accepted = await interactionsSvc.acceptInteraction({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, created.id, {}, {
+      agentId: deciderAgentId,
+    });
+
+    // Waking is the point — reassigning the decider away as a side effect is not.
+    expect(accepted.continuationIssue).toBeNull();
+
+    const updatedIssue = (await db.select().from(issues)).find((issue) => issue.id === issueId);
+    expect(updatedIssue).toMatchObject({
+      id: issueId,
+      status: "in_review",
+      assigneeAgentId: deciderAgentId,
+    });
+  });
+
+  it("lets the same decider resolve two duplicate confirmations from different creators without an intervening reassignment (AUR-4657)", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const deciderAgentId = randomUUID();
+    const creatorOneAgentId = randomUUID();
+    const creatorTwoAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Duplicate confirmations",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(agents).values([
+      {
+        id: deciderAgentId,
+        companyId,
+        name: "Decider",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: creatorOneAgentId,
+        companyId,
+        name: "Requester One",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: creatorTwoAgentId,
+        companyId,
+        name: "Requester Two",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "Merge PR #148 or request changes",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: deciderAgentId,
+    });
+
+    const first = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      idempotencyKey: `confirmation:${issueId}:creator-one`,
+      payload: {
+        version: 1,
+        prompt: "Merge PR #148 or request changes?",
+      },
+    }, {
+      agentId: creatorOneAgentId,
+    });
+
+    const second = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      idempotencyKey: `confirmation:${issueId}:creator-two`,
+      payload: {
+        version: 1,
+        prompt: "Merge PR #148 or request changes?",
+      },
+    }, {
+      agentId: creatorTwoAgentId,
+    });
+
+    const accepted = await interactionsSvc.acceptInteraction({
+      id: issueId,
+      companyId,
+      goalId,
+      projectId: null,
+    }, first.id, {}, {
+      agentId: deciderAgentId,
+    });
+    expect(accepted.continuationIssue).toBeNull();
+
+    const issueAfterAccept = (await db.select().from(issues)).find((issue) => issue.id === issueId);
+    expect(issueAfterAccept).toMatchObject({ id: issueId, assigneeAgentId: deciderAgentId, status: "in_review" });
+
+    // The decider is still the assignee, so the duplicate can be dismissed by
+    // the same agent that just resolved the first one — no 403, no reassignment
+    // in between.
+    const dismissed = await interactionsSvc.cancelInteraction({
+      id: issueId,
+      companyId,
+    }, second.id, {
+      reason: `Duplicate of ${first.id}`,
+    }, {
+      agentId: deciderAgentId,
+    });
+
+    expect(dismissed).toMatchObject({
+      id: second.id,
+      status: "cancelled",
+      result: {
+        version: 1,
+        outcome: "cancelled",
+        reason: `Duplicate of ${first.id}`,
+      },
+    });
+  });
+
   it("lets the creating agent cancel its own pending request_confirmation", async () => {
     const companyId = randomUUID();
     const goalId = randomUUID();

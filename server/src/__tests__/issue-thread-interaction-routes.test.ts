@@ -1214,4 +1214,57 @@ describe.sequential("issue thread interaction routes", () => {
     expect(res.status).toBe(403);
     expect(mockInteractionService.cancelInteraction).not.toHaveBeenCalled();
   });
+
+  it("allows the issue assignee (not the creator) to dismiss a redundant pending confirmation via cancel", async () => {
+    // AUR-4657: the decider on an issue must have a non-mutating way to clear a
+    // duplicate request_confirmation created by someone else, without it being
+    // recorded as a rejection/request-changes.
+    mockInteractionService.getByIdForIssue.mockResolvedValueOnce({
+      id: "interaction-rc",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      createdByAgentId: CREATED_AGENT_ID,
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:00:00.000Z",
+    });
+    mockInteractionService.cancelInteraction.mockResolvedValueOnce({
+      id: "interaction-rc",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "cancelled",
+      continuationPolicy: "wake_assignee",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: null,
+      payload: { version: 1, prompt: "Duplicate of an already-accepted ask" },
+      result: { version: 1, outcome: "cancelled", reason: "Duplicate of interaction-1" },
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:05:00.000Z",
+      resolvedAt: "2026-04-20T12:05:00.000Z",
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: ASSIGNEE_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-assignee-1",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-rc/cancel")
+      .send({ reason: "Duplicate of interaction-1" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("cancelled");
+    expect(res.body.result.outcome).toBe("cancelled");
+    expect(mockInteractionService.cancelInteraction).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      "interaction-rc",
+      { reason: "Duplicate of interaction-1" },
+      { agentId: ASSIGNEE_AGENT_ID, userId: null },
+    );
+  });
 });

@@ -845,6 +845,12 @@ export function issueRoutes(
     searchService?: CompanySearchService;
     searchRateLimiter?: CompanySearchRateLimiter;
     pluginWorkerManager?: PluginWorkerManager;
+    /**
+     * AUR-4224: resolved lazily at the done-transition call site (not at factory
+     * construction) so existing tests that vi.mock('../services/index.js') without a
+     * memoryService export don't crash when building issueRoutes.
+     */
+    memoryService?: ReturnType<typeof memoryService>;
   } = {},
 ) {
   const router = Router();
@@ -863,7 +869,6 @@ export function issueRoutes(
   const searchRateLimiter = opts.searchRateLimiter ?? defaultCompanySearchRateLimiter;
   const instanceSettings = instanceSettingsService(db);
   const agentsSvc = agentService(db);
-  const memorySvc = memoryService(db);
   const projectsSvc = projectService(db);
   const goalsSvc = goalService(db);
   const issueApprovalsSvc = issueApprovalService(db);
@@ -3832,6 +3837,7 @@ export function issueRoutes(
       // compliance gap. Build and write both records here instead, from data the server
       // already has. Never blocks or fails the close (see captureCloseTimeScorecard).
       if (issue.assigneeAgentId) {
+        const memorySvc = opts.memoryService ?? memoryService(db);
         await captureCloseTimeScorecard(db, memorySvc, issue.companyId, {
           id: issue.id,
           identifier: issue.identifier,

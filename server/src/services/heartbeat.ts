@@ -172,6 +172,7 @@ import { environmentService } from "./environments.js";
 import { environmentRuntimeService } from "./environment-runtime.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
 import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
+import { maybeEscalateOutOfCredits } from "./quota-founder-escalation.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
@@ -8826,6 +8827,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
           await scheduleBoundedRetryForRun(livenessRun, agent);
+        }
+        if (outcome === "failed") {
+          try {
+            await maybeEscalateOutOfCredits(db, {
+              companyId: agent.companyId,
+              agentId: agent.id,
+              agentName: agent.name,
+              runId: livenessRun.id,
+              issueId: issueId ?? null,
+              resultJson: persistedResultJson,
+            });
+          } catch (err) {
+            await onLog(
+              "stderr",
+              `[paperclip] Failed to run out-of-credits founder escalation: ${err instanceof Error ? err.message : String(err)}\n`,
+            );
+          }
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
         await releaseIssueExecutionAndPromote(livenessRun);

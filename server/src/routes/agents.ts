@@ -59,6 +59,11 @@ import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
 import { resolveEnvironmentExecutionTarget } from "../services/environment-execution-target.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
+import {
+  FLEET_CAPACITY_RUN_WINDOW,
+  computeFleetCapacity,
+  type FleetCapacityRunInput,
+} from "../services/fleet-capacity.js";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import type {
   AdapterEnvironmentCheck,
@@ -3215,6 +3220,73 @@ export function agentRoutes(
     const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10) || 200)) : undefined;
     const runs = await heartbeat.list(companyId, agentId, limit);
     res.json(runs);
+  });
+
+  // AUR-4385: one call answering "which agents can execute right now, and why
+  // not" for every agent. Derived from run history (see services/fleet-capacity.ts).
+  router.get("/companies/:companyId/fleet-capacity", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+
+    const agentRows = await svc.list(companyId);
+    const capacityAgents = agentRows.map((agent) => ({
+      id: agent.id as string,
+      name: agent.name as string,
+      adapterType: (agent.adapterType as string) ?? "unknown",
+      pausedAt: (agent as { pausedAt?: Date | string | null }).pausedAt ?? null,
+    }));
+
+    // Classification reads the newest terminal runs ONLY. Queued rows are the
+    // newest rows in the table, so fetching one shared window lets a deep
+    // backlog evict the terminal history the classifier needs — a quota-starved
+    // agent with 200 queued runs reads as healthy `no_recent_runs`, the exact
+    // blindness this route exists to remove. Queue depth gets its own query so
+    // it stays exact while classification stays backlog-proof.
+    const terminalRunColumns = {
+      status: heartbeatRuns.status,
+      createdAt: heartbeatRuns.createdAt,
+      finishedAt: heartbeatRuns.finishedAt,
+      error: heartbeatRuns.error,
+    };
+    const runsByAgent = new Map<string, FleetCapacityRunInput[]>(
+      await Promise.all(
+        capacityAgents.map(async (agent) => {
+          const [terminalRuns, queuedRuns] = await Promise.all([
+            db
+              .select(terminalRunColumns)
+              .from(heartbeatRuns)
+              .where(
+                and(
+                  eq(heartbeatRuns.companyId, companyId),
+                  eq(heartbeatRuns.agentId, agent.id),
+                  inArray(heartbeatRuns.status, ["succeeded", "failed"]),
+                ),
+              )
+              .orderBy(desc(heartbeatRuns.createdAt))
+              .limit(FLEET_CAPACITY_RUN_WINDOW),
+            db
+              .select({ status: heartbeatRuns.status, createdAt: heartbeatRuns.createdAt })
+              .from(heartbeatRuns)
+              .where(
+                and(
+                  eq(heartbeatRuns.companyId, companyId),
+                  eq(heartbeatRuns.agentId, agent.id),
+                  inArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+                ),
+              ),
+          ]);
+          return [
+            agent.id,
+            [
+              ...terminalRuns,
+              ...queuedRuns.map((run) => ({ ...run, finishedAt: null, error: null })),
+            ],
+          ] as [string, FleetCapacityRunInput[]];
+        }),
+      ),
+    );
+
+    res.json({ companyId, ...computeFleetCapacity(capacityAgents, runsByAgent, new Date()) });
   });
 
   router.get("/companies/:companyId/live-runs", async (req, res) => {

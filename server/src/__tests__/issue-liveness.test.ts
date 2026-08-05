@@ -621,6 +621,33 @@ describe("issue graph liveness classifier", () => {
     });
   });
 
+  it("does not emit a leaf-level self-finding for a blocked issue parked on an explicit external wait", () => {
+    // The blocked-inbox classifier prefers a liveness finding over its `external_wait`
+    // state, and only the `external_wait` state redacts the external owner/action lines
+    // out of the description. A self-finding here would leak those details.
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue({
+          id: "ext-1",
+          identifier: "PAP-4100",
+          title: "Waiting on vendor pentest",
+          status: "blocked",
+          description: [
+            "Waiting on the annual penetration test report.",
+            "External owner: Private Vendor Security Team",
+            "External action: Deliver the signed pentest report",
+          ].join("\n"),
+          assigneeAgentId: null,
+          assigneeUserId: null,
+        }),
+      ],
+      relations: [],
+      agents: [agent(), manager],
+    });
+
+    expect(findings).toEqual([]);
+  });
+
   it("flags each blocked child independently when a blocked parent has two blocked children with their own unassigned blockers", () => {
     const parentId = "epic-1";
     const childAId = "child-a";

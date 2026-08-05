@@ -16,6 +16,7 @@ export interface IssueLivenessIssueInput {
   identifier: string | null;
   title: string;
   status: string;
+  description?: string | null;
   projectId?: string | null;
   goalId?: string | null;
   parentId?: string | null;
@@ -303,6 +304,21 @@ function ownerCandidatesForRecoveryIssue(
   }
 
   return candidates;
+}
+
+// An issue whose description declares an explicit external wait ("External owner:" +
+// "External action:" lines) is deliberately parked on a party outside the system. Shared with
+// the blocked-inbox classifier in services/issues.ts, which additionally redacts those
+// description lines before responses leave the server.
+export function externalWaitFromDescription(description: string | null): { owner: string; action: string } | null {
+  if (!description) return null;
+  const owner = description.match(/^\s*external owner\s*:\s*(.+)$/im)?.[1]?.trim();
+  const action = description.match(/^\s*external action\s*:\s*(.+)$/im)?.[1]?.trim();
+  if (!owner || !action) return null;
+  return {
+    owner: owner.slice(0, 120),
+    action: action.slice(0, 240),
+  };
 }
 
 // True when the shorter dependency path is an exact tail match of the longer one, i.e. both
@@ -639,7 +655,15 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       const chainFinding = firstBlockedChainFinding(issue, issue, [issue], new Set());
       if (chainFinding) {
         findings.push(chainFinding);
-      } else if (!hasExplicitWaitingPath(issue) && blockerCandidatesFor(issue, issue).length === 0) {
+      } else if (
+        !hasExplicitWaitingPath(issue) &&
+        blockerCandidatesFor(issue, issue).length === 0 &&
+        // An explicit external wait is a live (if slow) path: the issue is parked on a party
+        // outside the system, not structurally inert. Emitting a self-finding here would also
+        // let the blocked-inbox classifier prefer the finding over its `external_wait` state
+        // and skip that state's description redaction, leaking external owner/action details.
+        !externalWaitFromDescription(issue.description ?? null)
+      ) {
         // Leaf-level check: a blocked issue with no relation/child blockers of its own is
         // structurally inert on its own terms (AUR-3918's shape) regardless of its parent's
         // status. It only surfaces above via blockerCandidatesFor when some ancestor is also

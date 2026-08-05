@@ -22,7 +22,9 @@
  *   (the author can always read back their own record by id or with ?reviewState=pending).
  *   The non-breaking `warnings: string[]` field additionally flags cases where the
  *   record won't appear in default reads (pending review, project-scoped, or
- *   agent-scoped to a different agent).
+ *   agent-scoped to a different agent), or when the same exact title already exists
+ *   under another owner and owner-keyed upsert therefore cannot converge the write
+ *   (AUR-4148).
  *
  * Scorecard integrity guard (POST /memory/capture, AUR-3993/AUR-3996):
  *   A capture with metadata.category `performance_scorecard` or `scorecard_adjusted` is
@@ -118,6 +120,8 @@ export const SCORECARD_INTEGRITY_CATEGORIES = new Set(["performance_scorecard", 
  * presence.
  */
 const SCORECARD_REQUIRED_METADATA_FIELDS = ["issue_id", "quality_signal", "token_cost", "agent_id", "task_type"] as const;
+const SHARED_CONTRIBUTOR_CATEGORY_LIST = ["lesson", "synthesis", "tool_gap"] as const;
+const SHARED_CONTRIBUTOR_CATEGORIES = new Set<string>(SHARED_CONTRIBUTOR_CATEGORY_LIST);
 
 function isBlankMetadataValue(value: unknown): boolean {
   return value === undefined || value === null || (typeof value === "string" && value.trim().length === 0);
@@ -213,6 +217,60 @@ function actorInfoFromReq(req: any) {
     userId: req.actor.type === "board" ? (req.actor.userId ?? null) : null,
     runId: req.actor.runId ?? null,
   };
+}
+
+function collisionProbeActorFromReq(req: any) {
+  return {
+    actorType: "system" as const,
+    actorId: "memory-capture-collision-probe",
+    agentId: null,
+    userId: null,
+    runId: req.actor.runId ?? null,
+  };
+}
+
+function recordCategory(record: { metadata?: Record<string, unknown> | null } | null | undefined): string | null {
+  const category = record?.metadata?.category;
+  return typeof category === "string" && category.trim().length > 0 ? category : null;
+}
+
+function collisionWarningGuidance(category: string | null): string {
+  if (category && SHARED_CONTRIBUTOR_CATEGORIES.has(category)) {
+    return "For shared contributor categories, PATCH the existing record instead of capturing a second row.";
+  }
+  switch (category) {
+    case "routing_rationale":
+      return "For routing_rationale, a second row can be legitimate when a later first-party reroute occurs; do not edit the other owner's row. Readers resolve routing/* by recency.";
+    case "performance_scorecard":
+    case "scorecard_adjusted":
+      return "For owner-keyed scorecards, do not edit the other owner's row. Distinct first-party scorecards must stay separate and be interpreted by recency/owner, not merged.";
+    default:
+      return "Review whether this title should stay owner-keyed or be reconciled by the original owner before creating additional rows.";
+  }
+}
+
+function buildCrossOwnerCollisionWarning(
+  title: string,
+  existing: {
+    id: string;
+    owner?: { type?: string | null; id?: string | null } | null;
+    reviewState?: string | null;
+    scopeType?: string | null;
+    sensitivityLabel?: string | null;
+  },
+  category: string | null,
+): string {
+  const base =
+    existing.sensitivityLabel === "restricted"
+      ? `A record with title '${title}' already exists under another owner (details withheld because the existing row is restricted). `
+      : `Record title '${title}' already exists as ${existing.id} owned by ${existing.owner?.type ?? "unknown"}:${existing.owner?.id ?? "unknown"} ` +
+        `(reviewState=${existing.reviewState ?? "unknown"}, scopeType=${existing.scopeType ?? "unknown"}). `;
+  const convergence = "Upsert is owner-keyed, so this capture did not converge with that row. ";
+  const followup =
+    existing.sensitivityLabel === "restricted"
+      ? "The existing row is restricted, so route any reconciliation through the owner or a board user."
+      : collisionWarningGuidance(category);
+  return `${base}${convergence}${followup}`;
 }
 
 export function memoryRoutes(
@@ -495,6 +553,39 @@ export function memoryRoutes(
           "it won't appear in default agent-scoped reads for this caller.",
         );
       }
+      const title =
+        typeof firstRecord.title === "string" && firstRecord.title.trim().length > 0
+          ? firstRecord.title
+          : typeof payload.title === "string" && payload.title.trim().length > 0
+            ? payload.title
+            : null;
+      const category =
+        recordCategory(firstRecord as { metadata?: Record<string, unknown> | null }) ??
+        (typeof payload.metadata?.category === "string" && payload.metadata.category.trim().length > 0
+          ? payload.metadata.category
+          : null);
+      if (title) {
+        try {
+          const sameTitleRecords = await memory.listRecords(
+            companyId,
+            memoryListRecordsQuerySchema.parse({ key: title, limit: 200 }),
+            collisionProbeActorFromReq(req),
+          );
+          for (const existing of sameTitleRecords) {
+            const exactTitleMatch = existing.title === title;
+            const sameRecord = existing.id === firstRecord.id;
+            const sameOwner =
+              existing.owner?.type === firstRecord.owner?.type && existing.owner?.id === firstRecord.owner?.id;
+            if (!exactTitleMatch || sameRecord || sameOwner) continue;
+            warnings.push(buildCrossOwnerCollisionWarning(title, existing, category));
+          }
+        } catch {
+          warnings.push(
+            `Cross-owner title collision check for '${title}' did not run after capture because the post-write lookup failed; ` +
+            "the record was still written, but this response could not verify whether another owner already holds that title.",
+          );
+        }
+      }
     }
     if (result.upsertOverwrite) {
       warnings.push(
@@ -598,12 +689,10 @@ export function memoryRoutes(
       if (!record) throw notFound("Memory record not found");
 
       if (req.actor.type === "agent") {
-        // Agents may only update records they own.
-        if (record.owner?.type !== "agent" || record.owner.id !== req.actor.agentId) {
-          throw forbidden("Agent can only update memory records it owns");
-        }
         // Restrict to allowlisted categories to prevent arbitrary record mutation.
-        const category = typeof record.metadata?.category === "string" ? record.metadata.category : null;
+        const category = recordCategory(record as { metadata?: Record<string, unknown> | null });
+        const isSharedContributorCategory = category !== null && SHARED_CONTRIBUTOR_CATEGORIES.has(category);
+        const isNonOwnerAgent = record.owner?.type !== "agent" || record.owner.id !== req.actor.agentId;
         if (!category || !AGENT_MUTABLE_CATEGORIES.has(category)) {
           throw forbidden(
             `Category '${category ?? "(none)"}' is immutable — agents cannot PATCH records in this category. ` +
@@ -617,6 +706,71 @@ export function memoryRoutes(
             },
           );
         }
+        if (isNonOwnerAgent && !isSharedContributorCategory) {
+          throw forbidden(
+            "Agents cannot PATCH non-shared memory records they do not own. " +
+              "Supported alternatives: ask the owner to update the record, or capture a new record via POST /memory/capture. " +
+              `Shared contributor categories: ${SHARED_CONTRIBUTOR_CATEGORY_LIST.join(", ")}.`,
+            {
+              category,
+              ownerType: record.owner?.type ?? null,
+              ownerId: record.owner?.id ?? null,
+              ownerAgentId: record.owner?.type === "agent" ? record.owner.id : null,
+              sharedContributorCategories: [...SHARED_CONTRIBUTOR_CATEGORY_LIST],
+              supportedAlternatives: ["ask_owner_to_patch", "capture_new_record"],
+              rule: "agent_non_owner_patch_disallowed",
+            },
+          );
+        }
+        if (isNonOwnerAgent && isSharedContributorCategory) {
+          const body = req.body as { title?: string | null; metadata?: Record<string, unknown> };
+          if (Object.prototype.hasOwnProperty.call(body, "title")) {
+            const requestedTitle = body.title ?? null;
+            const currentTitle = record.title ?? null;
+            if (requestedTitle !== currentTitle) {
+              throw forbidden(
+                "Non-owner contributors cannot change the title of a shared memory record. " +
+                  "Supported alternatives: keep the existing title and amend the record content, or ask the owner to retitle it.",
+                {
+                  category,
+                  ownerType: record.owner?.type ?? null,
+                  ownerId: record.owner?.id ?? null,
+                  ownerAgentId: record.owner?.type === "agent" ? record.owner.id : null,
+                  currentTitle,
+                  requestedTitle,
+                  supportedAlternatives: ["keep_existing_title", "ask_owner_to_retitle"],
+                  rule: "shared_contributor_title_change_disallowed",
+                },
+              );
+            }
+          }
+          if (
+            body.metadata &&
+            typeof body.metadata === "object" &&
+            Object.prototype.hasOwnProperty.call(body.metadata, "category")
+          ) {
+            const requestedCategory =
+              typeof body.metadata.category === "string" && body.metadata.category.trim().length > 0
+                ? body.metadata.category
+                : null;
+            if (requestedCategory !== category) {
+              throw forbidden(
+                "Non-owner contributors cannot change metadata.category on a shared memory record. " +
+                  "Supported alternatives: keep the existing category and amend the record, or ask the owner to reclassify it.",
+                {
+                  category,
+                  ownerType: record.owner?.type ?? null,
+                  ownerId: record.owner?.id ?? null,
+                  ownerAgentId: record.owner?.type === "agent" ? record.owner.id : null,
+                  currentCategory: category,
+                  requestedCategory,
+                  supportedAlternatives: ["keep_existing_category", "ask_owner_to_reclassify"],
+                  rule: "shared_contributor_category_change_disallowed",
+                },
+              );
+            }
+          }
+        }
       } else {
         // Board users have unrestricted update access (they can already use /correct).
         assertBoard(req);
@@ -624,6 +778,8 @@ export function memoryRoutes(
 
       const result = await memory.agentUpdate(companyId, recordId, req.body, actorInfoFromReq(req));
       const actor = getActorInfo(req);
+      const contributorAmendment =
+        req.actor.type === "agent" && (record.owner?.type !== "agent" || record.owner.id !== req.actor.agentId);
       await logActivity(db, {
         companyId,
         actorType: actor.actorType,
@@ -635,6 +791,9 @@ export function memoryRoutes(
         details: {
           recordId: result.record.id,
           updatedFields: Object.keys(req.body as Record<string, unknown>),
+          contributorAmendment,
+          recordOwnerType: record.owner?.type ?? null,
+          recordOwnerId: record.owner?.id ?? null,
         },
       });
       res.json(result);

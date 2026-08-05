@@ -1137,8 +1137,10 @@ export function memoryService(
       }
     }
 
-    // Upsert-by-title: when caller requests upsert and provides a title, find the latest
-    // non-revoked, non-deleted record with the same title and owner and update it in-place.
+    // Upsert-by-title is deliberately owner-keyed. Shared classes
+    // (lesson/synthesis/tool_gap) take the AUR-4148 contributor path via PATCH on the
+    // existing row rather than cross-owner last-writer-wins capture, so upsert must not
+    // silently merge different owners' records here.
     if (input.upsert && input.title) {
       const existing = await db
         .select()

@@ -14,15 +14,21 @@ const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s
 const URL_RE = /(https?:\/\/[^\s'"`<>()[\]{};,!?]+[^\s'"`<>()[\]{};,!.?:]+)/gi;
 
 const CLAUDE_TRANSIENT_UPSTREAM_RE =
-  /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached|session\s+limit)/i;
+  /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached|session\s+limit|hit\s+your\s+(?:weekly|session|usage|\d+[-\s]?hour)\s+limit)/i;
 // Prefixes recognized ahead of a "resets <time>" hint. Must stay in sync with
 // the quota-exhaustion wording covered by CLAUDE_TRANSIENT_UPSTREAM_RE above
 // (AUR-4055: "You've hit your session limit" carries a live reset timestamp
 // but was falling outside this list, so the retry scheduler never learned
 // when it was safe to try again and fell back to the generic bounded-backoff
 // ladder instead).
+//
+// AUR-4192: the weekly cap uses the same shape with no "reached" suffix —
+// "You've hit your weekly limit · resets 11am (UTC)" and
+// "You've hit your weekly limit · resets Jul 29, 11am (UTC)" — so it fell
+// outside the AUR-4055 wording list too. Both forms are matched via the
+// `hit your <window> limit` alternative below.
 const CLAUDE_EXTRA_USAGE_RESET_RE =
-  /(?:out\s+of\s+extra\s+usage|extra\s+usage|usage\s+limit\s+reached|usage\s+cap\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|claude\s+usage\s+limit\s+reached|session\s+limit)[\s\S]{0,80}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;
+  /(?:out\s+of\s+extra\s+usage|extra\s+usage|usage\s+limit\s+reached|usage\s+cap\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|claude\s+usage\s+limit\s+reached|session\s+limit|hit\s+your\s+(?:weekly|session|usage|\d+[-\s]?hour)\s+limit)[\s\S]{0,80}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;
 
 // AUR-4513: a prompt-size rejection is DETERMINISTIC -- the same prompt re-sent
 // unchanged can never succeed, so it must never share the transient/retryable
@@ -340,9 +346,89 @@ function nextClockTimeInTimeZone(input: {
   return retryAt;
 }
 
+const RESET_MONTH_NUMBERS: Record<string, number> = {
+  jan: 1,
+  feb: 2,
+  mar: 3,
+  apr: 4,
+  may: 5,
+  jun: 6,
+  jul: 7,
+  aug: 8,
+  sep: 9,
+  oct: 10,
+  nov: 11,
+  dec: 12,
+};
+
+// AUR-4192: the weekly-cap wording can carry an explicit calendar date ahead of
+// the clock time ("resets Jul 29, 11am (UTC)"), which the clock-only parser
+// below rejects because it anchors on the hour. Peel the date off so the clock
+// parser sees what it expects, and report which day was named so the reset can
+// be pinned to it instead of guessing the next occurrence of the clock time.
+function splitResetDatePrefix(normalized: string): {
+  monthDay: { month: number; day: number } | null;
+  clockText: string;
+} {
+  const match = normalized.match(
+    /^(?:([a-z]{3,9})\.?\s+(\d{1,2})|(\d{1,2})\s+([a-z]{3,9})\.?)(?:st|nd|rd|th)?,?\s+(.*)$/i,
+  );
+  if (!match) return { monthDay: null, clockText: normalized };
+
+  const month = RESET_MONTH_NUMBERS[(match[1] ?? match[4] ?? "").slice(0, 3).toLowerCase()];
+  const day = Number.parseInt(match[2] ?? match[3] ?? "", 10);
+  if (!month || !Number.isInteger(day) || day < 1 || day > 31) {
+    return { monthDay: null, clockText: normalized };
+  }
+  return { monthDay: { month, day }, clockText: match[5] ?? "" };
+}
+
+// Resolve a month/day that carries no year against `now`, picking whichever
+// candidate year lands closest to it so a reset stated near a year boundary
+// does not resolve twelve months away. A resolved instant in the past is
+// returned as-is: the caller only ever uses `retryNotBefore` to push a retry
+// later, so an already-elapsed quota window correctly imposes no extra pause.
+function resolveDatedResetTime(input: {
+  now: Date;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  timeZoneHint?: string | null;
+}): Date | null {
+  const timeZone = normalizeResetTimeZone(input.timeZoneHint);
+  const baseYear = timeZone
+    ? readTimeZoneParts(input.now, timeZone).year
+    : input.now.getFullYear();
+
+  let best: Date | null = null;
+  for (const year of [baseYear - 1, baseYear, baseYear + 1]) {
+    const candidate = timeZone
+      ? dateFromTimeZoneWallClock({
+          year,
+          month: input.month,
+          day: input.day,
+          hour: input.hour,
+          minute: input.minute,
+          timeZone,
+        })
+      : new Date(year, input.month - 1, input.day, input.hour, input.minute, 0, 0);
+    if (!candidate || Number.isNaN(candidate.getTime())) continue;
+    if (
+      !best ||
+      Math.abs(candidate.getTime() - input.now.getTime()) <
+        Math.abs(best.getTime() - input.now.getTime())
+    ) {
+      best = candidate;
+    }
+  }
+  return best;
+}
+
 function parseClaudeResetClockTime(clockText: string, now: Date, timeZoneHint?: string | null): Date | null {
   const normalized = clockText.trim().replace(/\s+/g, " ");
-  const match = normalized.match(/^(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?/i);
+  const { monthDay, clockText: clockOnly } = splitResetDatePrefix(normalized);
+  const match = clockOnly.match(/^(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?/i);
   if (!match) return null;
 
   const hour12 = Number.parseInt(match[1] ?? "", 10);
@@ -352,6 +438,18 @@ function parseClaudeResetClockTime(clockText: string, now: Date, timeZoneHint?: 
 
   let hour24 = hour12 % 12;
   if ((match[3] ?? "").toLowerCase() === "p") hour24 += 12;
+
+  if (monthDay) {
+    const datedRetryAt = resolveDatedResetTime({
+      now,
+      month: monthDay.month,
+      day: monthDay.day,
+      hour: hour24,
+      minute,
+      timeZoneHint,
+    });
+    if (datedRetryAt) return datedRetryAt;
+  }
 
   if (timeZoneHint) {
     const explicitRetryAt = nextClockTimeInTimeZone({

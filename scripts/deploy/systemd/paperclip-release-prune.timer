@@ -1,0 +1,23 @@
+# AUR-4037: retention on a clock, not on the deploy path.
+#
+# Hourly is deliberately far more often than releases are built. Each run is
+# near-free when there is nothing to reap (a directory listing and a /proc
+# probe), and the point is that a skipped prune — concurrent-deploy lock held,
+# `current` mid-flip — costs one hour instead of being permanent. That skip
+# window is exactly how 4.0 GB accumulated unnoticed.
+#
+# OnBootSec is 20min rather than the drift timer's 5min so a boot-time deploy
+# has settled before retention looks at the symlinks; prune-releases.sh already
+# fails closed on an unresolvable `current`, but there is no reason to make it
+# exercise that path on every reboot.
+[Unit]
+Description=Run paperclip release retention every hour
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=1h
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

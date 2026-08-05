@@ -1,0 +1,26 @@
+[Unit]
+Description=Polymarket BTC 5m Taker Bot
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ievgen/polymarket-btc-5m-taker-bot
+
+# Bot reads .env from WorkingDirectory via dotenvy at startup.
+# Override individual vars here only when you need to diverge from .env.
+Environment="RUST_LOG=info"
+
+ExecStart=/home/ievgen/polymarket-btc-5m-taker-bot/target/release/polymarket-btc-5m-taker-bot
+
+# Restart on crash or unexpected exit. 30s delay prevents rapid-fire
+# restarts that could submit duplicate orders in a live session.
+Restart=on-failure
+RestartSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=poly-taker-btc-5m
+
+[Install]
+WantedBy=default.target

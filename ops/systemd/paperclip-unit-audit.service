@@ -1,0 +1,8 @@
+[Unit]
+Description=Paperclip systemd unit restart-counter audit (AUR-3952/AUR-3961)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/paperclip-unit-audit.sh
+MemoryMax=64M
+OOMScoreAdjust=-500

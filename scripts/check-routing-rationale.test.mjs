@@ -7,6 +7,7 @@ import {
   extractStatusCode,
   isRoutingDecision,
   isExempt,
+  isExemptForResolvedFlag,
   isPreRule,
   parseRuleEffectiveDate,
   resolveCancelReason,
@@ -233,7 +234,11 @@ test("routing/{id}/{ownerId} suffixed key found in org scope", async () => {
     apiGet,
   });
 
-  assert.deepEqual(result, { found: true, scope: "org" });
+  assert.deepEqual(result, {
+    found: true,
+    scope: "org",
+    record: { id: "r1", title: "routing/AUR-600/agent-uuid-decider" },
+  });
 });
 
 test("routing/{id}/{ownerId} suffixed key found in project scope when org scope misses", async () => {
@@ -251,7 +256,11 @@ test("routing/{id}/{ownerId} suffixed key found in project scope when org scope 
     apiGet,
   });
 
-  assert.deepEqual(result, { found: true, scope: "project" });
+  assert.deepEqual(result, {
+    found: true,
+    scope: "project",
+    record: { id: "r1", title: "routing/AUR-601/agent-uuid-decider" },
+  });
 });
 
 test("routing/{id}/{ownerId} suffix uses SWEEPER_AGENT_ID not chosen_agent (decider must not be confused with routed-to)", async () => {
@@ -687,4 +696,106 @@ test("lookupRoutingRecord: NEGATIVE CONTROL — genuinely unrouted issue still r
 
   assert.equal(result.found, false, "unrouted issue MUST still be flagged");
   assert.equal(result.record, null);
+});
+
+// ── AUR-3854: delegate-then-handback must not silently void a genuine flag ──
+
+test("AUR-3854 regression: delegated issue handed back to creator is NOT exempt for an existing flag", () => {
+  // Reproduces the AUR-3850/AUR-3853 sequence: CTO (A) creates and assigns to
+  // Claude Code Fast (B) — genuine delegation, flag filed. Coder ships and
+  // hands the issue back to A for review — assigneeAgentId now equals
+  // createdByAgentId again, but the flag must stay open until a routing/{id}
+  // record actually exists.
+  const target = {
+    identifier: "AUR-3850",
+    status: "in_review",
+    title: "Loop C baseline-delta detector",
+    description: "Implement the baseline-delta trend detector.",
+    createdByAgentId: "371a1b08-0286-4a12-a516-f587f42df5eb", // CTO (A)
+    assigneeAgentId: "371a1b08-0286-4a12-a516-f587f42df5eb", // handed back to A
+  };
+
+  // The self-assigned rule alone would wrongly call this exempt now.
+  assert.equal(isExempt(target), true);
+  // But re-evaluating an EXISTING flag must not use that rule.
+  assert.equal(isExemptForResolvedFlag(target), false);
+
+  const reason = resolveCancelReason({
+    target,
+    targetId: "AUR-3850",
+    hasRecord: false,
+  });
+  assert.equal(reason, null, "flag must remain open while the routing/{id} record is absent");
+});
+
+test("AUR-3854: once the routing/{id} record is captured, the handed-back flag DOES auto-resolve", () => {
+  const target = {
+    identifier: "AUR-3850",
+    status: "in_review",
+    title: "Loop C baseline-delta detector",
+    createdByAgentId: "371a1b08-0286-4a12-a516-f587f42df5eb",
+    assigneeAgentId: "371a1b08-0286-4a12-a516-f587f42df5eb",
+  };
+
+  const reason = resolveCancelReason({ target, targetId: "AUR-3850", hasRecord: true });
+  assert.match(reason, /record now exists/);
+});
+
+test("resolveCancelReason: hasRecord takes precedence over exemption in the resolution reason (secondary defect)", () => {
+  const target = {
+    identifier: "AUR-900",
+    status: "todo",
+    title: "content slot: some slot",
+    createdByAgentId: "a1",
+    assigneeAgentId: "b2",
+  };
+  // This target is statically exempt (content slot) AND has a record — the
+  // reported reason must be the record, not the exemption.
+  assert.equal(isExemptForResolvedFlag(target), true);
+  const reason = resolveCancelReason({ target, targetId: "AUR-900", hasRecord: true });
+  assert.match(reason, /record now exists/);
+  assert.doesNotMatch(reason, /exempt/);
+});
+
+test("resolveCancelReason: done target still auto-resolves regardless of exemption/record", () => {
+  const target = { identifier: "AUR-901", status: "done", createdByAgentId: "a1", assigneeAgentId: "b2" };
+  const reason = resolveCancelReason({ target, targetId: "AUR-901", hasRecord: false });
+  assert.match(reason, /is done/);
+});
+
+// ── isExemptForResolvedFlag mirrors static + immutable exemptions ───────────
+
+test("isExemptForResolvedFlag: static content exemptions still apply to an existing flag", () => {
+  const skipToken = {
+    title: "Some task",
+    description: "exec.routing-rationale: skip",
+    createdByAgentId: "a1",
+    assigneeAgentId: "b2",
+  };
+  assert.equal(isExempt(skipToken), true);
+  assert.equal(isExemptForResolvedFlag(skipToken), true);
+
+  const contentSlot = { title: "Content Slot: 2026-07-25 morning", createdByAgentId: "a1", assigneeAgentId: "b2" };
+  assert.equal(isExemptForResolvedFlag(contentSlot), true);
+
+  const dailyBrief = { title: "Post 2026-07-25 daily AI brief to AUR-27", createdByAgentId: "a1", assigneeAgentId: "b2" };
+  assert.equal(isExemptForResolvedFlag(dailyBrief), true);
+
+  const signOff = { title: "CFO sign-off: Standard ~$160/mo subscription tier", createdByAgentId: "a1", assigneeAgentId: "b2" };
+  assert.equal(isExemptForResolvedFlag(signOff), true);
+});
+
+test("isExemptForResolvedFlag: immutable non-decision signals (no creator, routine origin) still apply", () => {
+  // These properties can never flip after filing, so re-checking them is safe.
+  assert.equal(isExemptForResolvedFlag({ title: "T", assigneeAgentId: "b2" }), true);
+  assert.equal(
+    isExemptForResolvedFlag({ title: "T", createdByAgentId: "a1", assigneeAgentId: "b2", originKind: "routine_execution" }),
+    true,
+  );
+});
+
+test("isExempt: genuinely delegated + non-exempt issue is NOT exempt under either predicate", () => {
+  const issue = { title: "Build the widget", createdByAgentId: "a1", assigneeAgentId: "b2" };
+  assert.equal(isExempt(issue), false);
+  assert.equal(isExemptForResolvedFlag(issue), false);
 });

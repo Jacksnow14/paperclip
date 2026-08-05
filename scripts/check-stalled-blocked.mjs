@@ -50,10 +50,44 @@
  *                     and auto-resolves flags whose target no longer
  *                     qualifies.
  *
+ * AUR-5000 (fix for AUR-4987 — the watchdog turned one lane outage into
+ * ~100 wake generators, 67 of which targeted its own dispatch umbrellas):
+ *   - Self-exclusion: `isOwnOutput` skips the watchdog's own routine
+ *     dispatch umbrella and its own prior `stalled-blocked:` flags when
+ *     selecting candidates for Phase B. Phase A still evaluates them, so a
+ *     stale flag against the watchdog's own output still auto-resolves.
+ *   - Cause-grouping: any candidate whose `originKind` is
+ *     `routine_execution` (any routine, not just this one) is a stranded
+ *     dispatch umbrella, not a stalled dependency, and is folded into ONE
+ *     aggregate flag instead of one per umbrella.
+ *   - Lane-outage grading (AUR-4987 bullet 2) was evaluated and NOT
+ *     implemented: `latestRun.errorCode`/`retryReason` — the only fields
+ *     that would identify a `claude_transient_upstream` freeze — are
+ *     deliberately withheld from every issue-visible surface
+ *     (`summarizeRunFailureForIssueComment` in
+ *     server/src/services/recovery/service.ts returns a "details were
+ *     withheld" placeholder instead of the code) and are never written to
+ *     the issue row itself, only to `activity_log.details`, which the
+ *     issues LIST endpoint does not return. Distinguishing it from any
+ *     other lost-run-recovery block would require one extra API call per
+ *     genuine candidate, defeating the point of aggregation and inventing
+ *     a signal the data doesn't actually support (AUR-4528 precedent). Per
+ *     the ticket's explicit fallback: these candidates keep today's
+ *     one-flag-per-subject behaviour.
+ *   - `MAX_FLAGS_PER_RUN` (default 5, env-overridable) caps individual
+ *     per-subject flags filed in one run; truncated identifiers are logged
+ *     explicitly, never silently dropped.
+ *
  * Env vars required:
  *   PAPERCLIP_API_URL    Base URL (e.g. http://localhost:3100)
  *   PAPERCLIP_API_KEY    Bearer token
  *   PAPERCLIP_COMPANY_ID Company UUID
+ *
+ * Env vars optional:
+ *   STALLED_BLOCKED_WATCHDOG_ROUTINE_ID  Overrides the routine id used by
+ *                                        isOwnOutput's originId check.
+ *   MAX_FLAGS_PER_RUN                    Overrides the per-run cap on
+ *                                        individual flags filed (default 5).
  *
  * Exit codes:
  *   0 — clean, or all intended actions applied (a partial run where SOME
@@ -142,6 +176,100 @@ export function flagTitle(targetId, grade) {
     : `stalled-blocked: ${targetId} blocked with no blocker`;
 }
 
+// ── Self-exclusion & cause-grouping (AUR-5000, fix for AUR-4987) ────────────
+
+/**
+ * Id of this watchdog's own dispatch routine. Overridable by env so the
+ * default is not silently wrong in another company.
+ */
+export const WATCHDOG_ROUTINE_ID =
+  process.env.STALLED_BLOCKED_WATCHDOG_ROUTINE_ID || 'fe2ed80a-a08e-48d1-82d2-3eadacc10634';
+
+/** Title of the watchdog's own routine dispatch umbrella, verbatim. */
+export const WATCHDOG_ROUTINE_TITLE = 'Stalled-blocked watchdog';
+
+/**
+ * True when `issue` is output the watchdog itself produced: its own routine
+ * dispatch umbrella, or a `stalled-blocked:`/`stalled-blocked-mismodelled:`
+ * flag it filed previously. Without this, the watchdog detects itself —
+ * AUR-4978/4979/4980/4981 were flags whose subjects (AUR-4932/4931/4930/
+ * 4929) were the watchdog's own umbrellas, one new `critical` per zombie
+ * per run, compounding (AUR-4987).
+ */
+export function isOwnOutput(issue) {
+  if (issue.originKind === 'routine_execution' && issue.originId === WATCHDOG_ROUTINE_ID) return true;
+  const title = issue.title ?? '';
+  return FLAG_REGEX.test(title) || title === WATCHDOG_ROUTINE_TITLE;
+}
+
+/**
+ * True when `issue` is a stranded dispatch umbrella for ANY routine (not
+ * just this watchdog's own — that case is `isOwnOutput` and is excluded
+ * entirely, never aggregated). A routine-dispatch umbrella is a dispatch
+ * artifact, not a stalled human dependency, so subjects sharing this cause
+ * are grouped into one flag rather than filed one per subject.
+ */
+export function isRoutineDispatchUmbrella(issue) {
+  return issue.originKind === 'routine_execution';
+}
+
+/** Title prefix for the routine-dispatch-umbrella aggregate flag. */
+export const UMBRELLA_FLAG_TITLE_PREFIX = 'stalled-blocked-umbrellas:';
+
+export function buildUmbrellaFlagTitle(count) {
+  return `${UMBRELLA_FLAG_TITLE_PREFIX} ${count} routine dispatch umbrellas stranded blocked`;
+}
+
+export function buildUmbrellaFlagDescription(umbrellaIssues, now = new Date()) {
+  const lines = [
+    '## Routine dispatch umbrellas stranded `blocked` with no blocker',
+    '',
+    `${umbrellaIssues.length} routine-dispatch-umbrella issue(s) are \`blocked\` with **no unresolved ` +
+      'blocker**. Each is a dispatch artifact (`originKind: routine_execution`), not a stalled human ' +
+      'dependency, so they are grouped into one flag instead of one per umbrella (AUR-4987).',
+    '',
+  ];
+  for (const issue of umbrellaIssues) {
+    const id = issue.identifier ?? issue.id;
+    const hrs = Math.round(hoursSince(issue.updatedAt, now));
+    lines.push(`- **${id}** ("${issue.title}") — updated ${hrs}h ago`);
+  }
+  lines.push(
+    '',
+    'Per AUR-4250, dispatch mints its own issue, so the umbrella must be closed `done` (or `cancelled` on ' +
+      'a no-op) at the end of every run — never left `blocked`. That fix belongs to the routine engine, ' +
+      'not this watchdog (tracked separately under AUR-4987).',
+    '',
+    'This issue is commented in place on every run while umbrellas remain stranded, rather than refiled.',
+    '',
+    'exec.routing-rationale: skip',
+  );
+  return lines.join('\n');
+}
+
+/** Open statuses searched when looking for an existing umbrella aggregate flag. */
+export const UMBRELLA_FLAG_SEARCH_STATUSES = 'backlog,todo,in_progress,in_review,blocked';
+
+/** Finds an already-open umbrella aggregate flag by title prefix (search is a loose contains — assert the prefix client-side). */
+export async function findOpenUmbrellaFlag({ companyId, apiGet }) {
+  const results = await apiGet(
+    `/api/companies/${companyId}/issues?q=${encodeURIComponent(UMBRELLA_FLAG_TITLE_PREFIX)}` +
+      `&status=${UMBRELLA_FLAG_SEARCH_STATUSES}&limit=20`,
+  );
+  const rows = Array.isArray(results) ? results : (results?.issues ?? []);
+  return rows.find((issue) => (issue.title ?? '').startsWith(UMBRELLA_FLAG_TITLE_PREFIX)) ?? null;
+}
+
+/** Default per-run cap on individual (non-aggregate) flags filed. */
+export const DEFAULT_MAX_FLAGS_PER_RUN = 5;
+
+export function resolveMaxFlagsPerRun(env = process.env) {
+  const raw = env.MAX_FLAGS_PER_RUN;
+  if (raw === undefined) return DEFAULT_MAX_FLAGS_PER_RUN;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_FLAGS_PER_RUN;
+}
+
 export function buildFlagDescription(issue, grade) {
   const id = issue.identifier ?? issue.id;
   const hrs = Math.round(hoursSince(issue.updatedAt));
@@ -192,6 +320,12 @@ export function resolveCancelReason({ target, targetId }) {
   }
   if (!hasNoBlocker(target)) {
     return `Auto-resolved by stalled-blocked-watchdog: ${targetId} now has a real blocker attached (blockerAttention.state=${target.blockerAttention?.state}).`;
+  }
+  if (isOwnOutput(target)) {
+    return `Auto-resolved by stalled-blocked-watchdog: ${targetId} is the watchdog's own output — no longer filed individually (self-exclusion, AUR-5000).`;
+  }
+  if (isRoutineDispatchUmbrella(target)) {
+    return `Auto-resolved by stalled-blocked-watchdog: ${targetId} is a routine dispatch umbrella — now covered by the aggregate umbrella flag, not an individual flag (AUR-5000).`;
   }
   return null;
 }
@@ -264,7 +398,7 @@ export function resolveFlagOwner(issue) {
 
 export const ISSUE_STATUS_FILTER = 'backlog,todo,in_progress,in_review,blocked';
 
-export async function main({ apply, apiUrl, apiKey, companyId }) {
+export async function main({ apply, apiUrl, apiKey, companyId, maxFlagsPerRun = resolveMaxFlagsPerRun() }) {
   const headers = {
     Authorization: `Bearer ${apiKey}`,
     'Content-Type': 'application/json',
@@ -292,8 +426,17 @@ export async function main({ apply, apiUrl, apiKey, companyId }) {
     if (issue.identifier) issueByIdentifier.set(issue.identifier, issue);
   }
 
-  const candidates = blockedIssues.filter(hasNoBlocker);
-  const graded = candidates.map((issue) => ({ issue, grade: gradeBlockedIssue(issue) }));
+  // Self-exclusion (AUR-5000): own-output candidates are dropped entirely —
+  // never graded, never filed, never aggregated. Cause-grouping: candidates
+  // that are ANY routine's dispatch umbrella (not just this watchdog's) are
+  // pulled out and aggregated into one flag instead of graded individually.
+  const candidatesAll = blockedIssues.filter(hasNoBlocker);
+  const ownOutputCandidates = candidatesAll.filter(isOwnOutput);
+  const candidates = candidatesAll.filter((issue) => !isOwnOutput(issue));
+  const umbrellaCandidates = candidates.filter(isRoutineDispatchUmbrella);
+  const ordinaryCandidates = candidates.filter((issue) => !isRoutineDispatchUmbrella(issue));
+
+  const graded = ordinaryCandidates.map((issue) => ({ issue, grade: gradeBlockedIssue(issue) }));
 
   // A human-gated candidate that already carries a pending first-class
   // interaction is NOT mis-modelled — the "nothing attached" premise in
@@ -308,8 +451,18 @@ export async function main({ apply, apiUrl, apiKey, companyId }) {
 
   const awaitingHuman = graded.filter((g) => g.grade === 'human-gated' && g.pendingInteraction);
 
-  console.log(`── Scan: ${blockedIssues.length} blocked issue(s), ${candidates.length} with no unresolved blocker ──\n`);
-  console.log(`  STALLED (${graded.filter((g) => g.grade === 'stalled').length}):`);
+  console.log(`── Scan: ${blockedIssues.length} blocked issue(s), ${candidatesAll.length} with no unresolved blocker ` +
+    `(${ownOutputCandidates.length} own-output excluded, ${umbrellaCandidates.length} routine-dispatch-umbrella grouped, ` +
+    `${ordinaryCandidates.length} graded individually) ──\n`);
+  console.log(`  OWN-OUTPUT (excluded, ${ownOutputCandidates.length}):`);
+  ownOutputCandidates.forEach((issue) => {
+    console.log(`    - ${issue.identifier} — self-exclusion, not filed.`);
+  });
+  console.log(`\n  ROUTINE-DISPATCH-UMBRELLA (grouped, ${umbrellaCandidates.length}):`);
+  umbrellaCandidates.forEach((issue) => {
+    console.log(`    - ${issue.identifier} [${issue.priority}] "${issue.title}" updated=${Math.round(hoursSince(issue.updatedAt))}h ago`);
+  });
+  console.log(`\n  STALLED (${graded.filter((g) => g.grade === 'stalled').length}):`);
   graded.filter((g) => g.grade === 'stalled').forEach(({ issue }) => {
     console.log(`    - ${issue.identifier} [${issue.priority}] assignee=${issue.assigneeAgentId ?? 'none'} updated=${Math.round(hoursSince(issue.updatedAt))}h ago`);
   });
@@ -326,6 +479,9 @@ export async function main({ apply, apiUrl, apiKey, companyId }) {
   const failedMutations = [];
 
   // ── Phase A: auto-resolve stale flags ──────────────────────────────────────
+  // Deliberately NOT filtered through isOwnOutput/isRoutineDispatchUmbrella —
+  // a stale flag whose target now falls into either bucket must still
+  // auto-resolve (resolveCancelReason handles both cases directly).
   console.log('── Phase A: Auto-resolve stale flags ──');
   const flagIssues = allIssues.filter((issue) => FLAG_REGEX.test(issue.title ?? ''));
   const openFlagTargets = new Set();
@@ -364,14 +520,22 @@ export async function main({ apply, apiUrl, apiKey, companyId }) {
     console.log();
   }
 
-  // ── Phase B: detect + file ───────────────────────────────────────────────────
+  // ── Phase B: detect + file individual flags (capped) ────────────────────────
   console.log('── Phase B: Detect and file new flags ──');
-  const toFile = graded.filter(({ issue, pendingInteraction }) => !openFlagTargets.has(issue.identifier) && !pendingInteraction);
+  const toFileAll = graded.filter(({ issue, pendingInteraction }) => !openFlagTargets.has(issue.identifier) && !pendingInteraction);
   const skippedDedup = graded.filter(({ issue, pendingInteraction }) => openFlagTargets.has(issue.identifier) && !pendingInteraction);
+  const toFile = toFileAll.slice(0, maxFlagsPerRun);
+  const droppedByCap = toFileAll.slice(maxFlagsPerRun);
 
   if (skippedDedup.length > 0) {
     console.log(`  SKIPPED-DEDUP — open flag exists (${skippedDedup.length}):`);
     skippedDedup.forEach(({ issue }) => console.log(`    - ${issue.identifier}`));
+    console.log();
+  }
+
+  if (droppedByCap.length > 0) {
+    console.log(`  CAP: MAX_FLAGS_PER_RUN=${maxFlagsPerRun} reached — dropping ${droppedByCap.length} candidate(s) this run (will be reconsidered next run):`);
+    droppedByCap.forEach(({ issue }) => console.log(`    - ${issue.identifier ?? issue.id}`));
     console.log();
   }
 
@@ -401,25 +565,70 @@ export async function main({ apply, apiUrl, apiKey, companyId }) {
     console.log();
   }
 
+  // ── Phase B2: routine-dispatch-umbrella aggregate flag ───────────────────────
+  console.log('── Phase B2: Routine dispatch umbrella aggregate ──');
+  let umbrellaAction = 'none';
+  if (umbrellaCandidates.length === 0) {
+    console.log('  No routine dispatch umbrellas stranded blocked.\n');
+  } else {
+    const existingUmbrellaFlag = await findOpenUmbrellaFlag({ companyId, apiGet });
+    const umbrellaTitle = buildUmbrellaFlagTitle(umbrellaCandidates.length);
+    const umbrellaDescription = buildUmbrellaFlagDescription(umbrellaCandidates);
+    if (existingUmbrellaFlag) {
+      const existingId = existingUmbrellaFlag.identifier ?? existingUmbrellaFlag.id;
+      console.log(`  UPDATE ${existingId}: ${umbrellaCandidates.length} routine dispatch umbrella(s) stranded blocked — commenting, not refiling.`);
+      umbrellaAction = 'update';
+      if (apply) {
+        const ok = await runMutation(
+          `comment on umbrella aggregate ${existingId}`,
+          () => apiPost(`/api/issues/${existingUmbrellaFlag.id}/comments`, { body: umbrellaDescription }),
+          failedMutations,
+        );
+        if (ok) console.log('    → commented.');
+      }
+    } else {
+      console.log(`  FILE "${umbrellaTitle}" → owner ${CEO_AGENT_ID}.`);
+      umbrellaAction = 'file';
+      if (apply) {
+        const ok = await runMutation(
+          'file umbrella aggregate flag',
+          () => apiPost(`/api/companies/${companyId}/issues`, {
+            title: umbrellaTitle,
+            description: umbrellaDescription,
+            status: 'todo',
+            priority: 'high',
+            assigneeAgentId: CEO_AGENT_ID,
+          }),
+          failedMutations,
+        );
+        if (ok) console.log('    → filed.');
+      }
+    }
+    console.log();
+  }
+
   console.log('── Summary ──');
-  console.log(`  Candidates:      ${candidates.length} (stalled=${graded.filter((g) => g.grade === 'stalled').length}, human-gated=${graded.filter((g) => g.grade === 'human-gated').length})`);
-  console.log(`  Awaiting-human:  ${awaitingHuman.length} (correctly modelled, not filed)`);
-  console.log(`  Resolved:        ${toCancel.length}`);
-  console.log(`  Filed:           ${toFile.length}`);
-  console.log(`  Skipped-dedup:   ${skippedDedup.length}`);
-  console.log(`  Failed:          ${failedMutations.length}`);
+  console.log(`  Candidates:         ${candidatesAll.length} (own-output=${ownOutputCandidates.length}, routine-umbrella=${umbrellaCandidates.length}, stalled=${graded.filter((g) => g.grade === 'stalled').length}, human-gated=${graded.filter((g) => g.grade === 'human-gated').length})`);
+  console.log(`  Awaiting-human:     ${awaitingHuman.length} (correctly modelled, not filed)`);
+  console.log(`  Resolved:           ${toCancel.length}`);
+  console.log(`  Filed:              ${toFile.length}`);
+  console.log(`  Dropped (cap):      ${droppedByCap.length}${droppedByCap.length > 0 ? ' — ' + droppedByCap.map(({ issue }) => issue.identifier ?? issue.id).join(', ') : ''}`);
+  console.log(`  Umbrella aggregate: ${umbrellaAction}${umbrellaCandidates.length > 0 ? ` (${umbrellaCandidates.length} umbrella(s))` : ''}`);
+  console.log(`  Skipped-dedup:      ${skippedDedup.length}`);
+  console.log(`  Failed:             ${failedMutations.length}`);
   if (failedMutations.length > 0) {
     for (const { label, status } of failedMutations) console.log(`    - ${label} → ${status}`);
     console.log('  Re-run the watchdog to retry the above (idempotent).');
   }
 
-  const hasPendingActions = toCancel.length > 0 || toFile.length > 0;
+  const umbrellaPending = umbrellaCandidates.length > 0;
+  const hasPendingActions = toCancel.length > 0 || toFile.length > 0 || umbrellaPending;
   if (!apply && hasPendingActions) {
     console.log('\n[DRY-RUN] Pass --apply to execute the above actions.');
     return 1;
   }
 
-  const attemptedMutations = apply ? toCancel.length + toFile.length : 0;
+  const attemptedMutations = apply ? toCancel.length + toFile.length + (umbrellaCandidates.length > 0 ? 1 : 0) : 0;
   if (attemptedMutations > 0 && failedMutations.length === attemptedMutations) {
     console.log('\nERROR: every intended mutation failed this run — see Failed list above.');
     return 4;

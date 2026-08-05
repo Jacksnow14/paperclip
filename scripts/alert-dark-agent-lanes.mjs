@@ -159,6 +159,7 @@ export async function tickCompany({ agents, runs, now, issuePrefix, sendAlert, p
     const finalState = dryRun ? tentativeState : finalizeDarkLaneState(tentativeState, alert, confirmed, nowIso);
 
     let patched = false;
+    let patchError = null;
     if (!dryRun && !darkLaneStatesEqual(finalState, prevState)) {
       const nextMetadata = { ...(agent.metadata ?? {}) };
       if (darkLaneStatesEqual(finalState, DEFAULT_DARK_LANE_STATE)) {
@@ -166,8 +167,20 @@ export async function tickCompany({ agents, runs, now, issuePrefix, sendAlert, p
       } else {
         nextMetadata.darkLane = finalState;
       }
-      await patchAgent(agentId, nextMetadata);
-      patched = true;
+      // A patch failure (e.g. a permission gate on cross-agent writes) must
+      // not crash the whole census: every other candidate in this company,
+      // and every other company, still needs to be evaluated and alerted on.
+      // It DOES mean this agent's alertedAt/recoveryPending guard never
+      // persisted, so the next tick will legitimately re-plan the same
+      // alert — that is a real repeat-alert risk, not swallowed silently:
+      // it is surfaced via `patchError` in the result and logged by the
+      // caller so an unresolved permission gate is loud, not quiet.
+      try {
+        await patchAgent(agentId, nextMetadata);
+        patched = true;
+      } catch (err) {
+        patchError = err?.message ?? String(err);
+      }
     }
 
     results.push({
@@ -176,6 +189,7 @@ export async function tickCompany({ agents, runs, now, issuePrefix, sendAlert, p
       alert: alert?.kind ?? null,
       sendResult,
       patched,
+      patchError,
     });
   }
 
@@ -259,6 +273,15 @@ async function main() {
         );
       } else if (dryRun) {
         console.log(`[${companyId}] ${r.name} (${r.agentId}): no alert this tick`);
+      }
+      if (r.patchError) {
+        // Loud on purpose: an unresolved write-permission gate here means the
+        // alertedAt guard never persists, so the SAME transition re-plans an
+        // alert on every future tick. This must page attention, not scroll by.
+        console.error(
+          `[${companyId}] ${r.name} (${r.agentId}): metadata.darkLane PATCH failed — REPEAT-ALERT RISK until fixed: ${r.patchError}`,
+        );
+        anyError = true;
       }
     }
     if (results.length === 0) {

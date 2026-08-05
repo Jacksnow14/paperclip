@@ -152,6 +152,32 @@ test('AC4: rate-window refusal ("blocked") leaves the guard unset for retry, nev
   assert.equal(patched[0].metadata.darkLane.active, true);
 });
 
+test('a patchAgent failure (e.g. cross-agent write permission gate) is surfaced, not thrown, and does not block other agents', async () => {
+  const sent = [];
+  const results = await tickCompany({
+    agents: [makeAgent({ id: 'a1', name: 'Dark One' }), makeAgent({ id: 'a2', name: 'Dark Two' })],
+    runs: [...darkRuns('a1'), ...darkRuns('a2')],
+    now: NOW,
+    issuePrefix: 'aur',
+    sendAlert: async (msg) => {
+      sent.push(msg);
+      return 'confirmed';
+    },
+    patchAgent: async (id) => {
+      if (id === 'a1') throw new Error('403 Forbidden');
+      // a2 succeeds
+    },
+  });
+
+  assert.equal(sent.length, 2); // both alerts still went out
+  const a1 = results.find((r) => r.agentId === 'a1');
+  const a2 = results.find((r) => r.agentId === 'a2');
+  assert.equal(a1.patched, false);
+  assert.match(a1.patchError, /403 Forbidden/);
+  assert.equal(a2.patched, true);
+  assert.equal(a2.patchError, null);
+});
+
 test('healthy idle agent with no metadata and no parked runs produces zero candidates', async () => {
   const results = await tickCompany({
     agents: [makeAgent()],

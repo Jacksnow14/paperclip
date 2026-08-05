@@ -12,6 +12,10 @@
 #      running > 0) at 12h, or `armed-restart-disabled` (restart half dark) at
 #      24h; `behind-origin-master` now means the ARM automation is broken and
 #      pages at 1h.
+#   3. (AUR-4661) `merge-debt` — origin/master static while >=3 open PRs are
+#      CLEAN — fires on a replay of the 07-26..07-29 freeze, goes silent when
+#      either leg is mutated, and NEVER reads GitHub's lazy all-UNKNOWN
+#      mergeable_state as "zero CLEAN" (cases 14-19).
 #
 # Hermetic: fake git remote, file:// health document, stub notifier, fixture
 # auto-deploy state file. No network, no systemd, no /var, no node.
@@ -46,6 +50,44 @@ printf '%s\n' "$*" >> "$NOTIFY_SINK"
 exit "${NOTIFY_EXIT:-0}"
 STUB
 chmod +x "$NOTIFY"
+
+# Hermetic `gh` stub for the merge-debt leg (AUR-4661). Fixture protocol (env):
+#   FAKE_TIP_DATE     ISO-8601 committer date returned for the commits/{sha}
+#                     call (unset/empty = the call fails)
+#   FAKE_PR_DIR       directory with one file per open PR: pr_<n> holds the
+#                     mergeable_state to return, one line per poke, last line
+#                     repeating once exhausted — this models the lazy compute
+#                     (first poke "unknown", second poke the real state).
+#                     Poke counts land in .pokes_<n> so tests can assert the
+#                     two-pass property.
+#   FAKE_PR_LIST_FAIL non-empty = the open-PR list call exits 1
+GH="$TMP/gh"
+cat > "$GH" <<'STUB'
+#!/usr/bin/env bash
+set -u
+case "$*" in
+  *"/commits/"*)
+    [[ -n "${FAKE_TIP_DATE:-}" ]] || exit 1
+    printf '%s\n' "$FAKE_TIP_DATE" ;;
+  *"pulls?state=open"*)
+    [[ -z "${FAKE_PR_LIST_FAIL:-}" ]] || exit 1
+    for f in "${FAKE_PR_DIR:?}"/pr_*; do
+      [[ -e "$f" ]] || continue
+      printf '%s\n' "${f##*/pr_}"
+    done ;;
+  *"pulls/"*)
+    # NB: must go through a scalar — ${*##pattern} strips EACH arg, not "$*".
+    s="$*"; n=${s##*pulls/}; n=${n%% *}
+    cnt=$(( $(cat "${FAKE_PR_DIR:?}/.pokes_$n" 2>/dev/null || echo 0) + 1 ))
+    printf '%s' "$cnt" > "$FAKE_PR_DIR/.pokes_$n"
+    v=$(sed -n "${cnt}p" "$FAKE_PR_DIR/pr_$n")
+    [[ -n "$v" ]] || v=$(tail -n1 "$FAKE_PR_DIR/pr_$n")
+    printf '%s\n' "$v" ;;
+  *) exit 1 ;;
+esac
+STUB
+chmod +x "$GH"
+mkdir -p "$TMP/prs-none"
 
 set_activated() { printf '{"sha":"%s"}' "$1" > "$APP/current/build-info.json"; }
 set_health_release() { printf '{"status":"ok","build":{"source":"release","sha":"%s"}}' "$1" > "$HEALTH"; }
@@ -96,6 +138,11 @@ run_check() {
   PAPERCLIP_DRIFT_ALERT_STATE="$STATE" \
   PAPERCLIP_DRIFT_NOTIFY="$NOTIFY" \
   PAPERCLIP_AUTO_DEPLOY_STATE="$AD_STATE" \
+  PAPERCLIP_DRIFT_GH="$GH" \
+  PAPERCLIP_DRIFT_REPO="owner/repo" \
+  PAPERCLIP_DRIFT_MERGE_DEBT_RECHECK_DELAY_SEC=0 \
+  FAKE_TIP_DATE="${FAKE_TIP_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
+  FAKE_PR_DIR="${FAKE_PR_DIR:-$TMP/prs-none}" \
   NOTIFY_SINK="$SINK" \
   NOTIFY_EXIT="${NOTIFY_EXIT:-0}" \
     bash "$CHECK" 2>&1
@@ -274,6 +321,111 @@ grep -q "reason=armed-release-not-live" <<<"$out" \
   && ok "fresh state without a waiting claim keeps armed-release-not-live" \
   || fail "fresh state without a waiting claim keeps armed-release-not-live" "out=$out"
 clear_ad_state
+
+# --- AUR-4661: merge-debt cases ---------------------------------------------
+STALE_TIP=$(date -u -d "@$(( $(date -u +%s) - 3 * 86400 ))" +%Y-%m-%dT%H:%M:%SZ)
+
+# 14. THE AUR-4509 REPLAY — the control that reproduces the defect. Production
+#     converged with master, master tip 3 days old, 4 open PRs whose
+#     mergeable_state is UNKNOWN on the first poke (the lazy-compute trap) and
+#     only resolves on the second to 3 clean + 1 blocked. Must fire merge-debt
+#     and page. An implementation that counts off the list endpoint — or off a
+#     single poke pass — sees 0 CLEAN and fails this case (AC2 discriminator).
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"; clear_ad_state
+seed_log "merge-debt" 3
+PRD="$TMP/prs-replay"; mkdir -p "$PRD"
+printf 'unknown\nclean\n'   > "$PRD/pr_101"
+printf 'unknown\nclean\n'   > "$PRD/pr_102"
+printf 'unknown\nclean\n'   > "$PRD/pr_103"
+printf 'unknown\nblocked\n' > "$PRD/pr_104"
+out=$(FAKE_TIP_DATE="$STALE_TIP" FAKE_PR_DIR="$PRD" run_check); rc=$?
+grep -q "status=DRIFT reason=merge-debt " <<<"$out" && [[ "$rc" == "1" ]] \
+  && ok "static master + 3 CLEAN behind lazy UNKNOWNs fires merge-debt" \
+  || fail "static master + 3 CLEAN behind lazy UNKNOWNs fires merge-debt" "rc=$rc out=$out"
+[[ "$(alerts)" == "1" ]] && grep -q "merge debt" "$SINK" && grep -q "3 open PRs" "$SINK" \
+  && ok "sustained merge-debt (3h) pages the founder naming the CLEAN count" \
+  || fail "sustained merge-debt (3h) pages the founder naming the CLEAN count" "alerts=$(alerts) sink=$(cat "$SINK" 2>/dev/null)"
+pokes_ok=1
+for n in 101 102 103 104; do
+  [[ "$(cat "$PRD/.pokes_$n" 2>/dev/null)" == "2" ]] || pokes_ok=0
+done
+[[ "$pokes_ok" == "1" ]] \
+  && ok "every lazy-UNKNOWN PR was poked exactly twice (two-pass property)" \
+  || fail "every lazy-UNKNOWN PR was poked exactly twice (two-pass property)" "pokes=$(ls "$PRD"/.pokes_* 2>/dev/null | while read -r f; do printf '%s=%s ' "${f##*/}" "$(cat "$f")"; done)"
+
+# 15. Leg A mutated (AC3): the SAME clean pile but master moved 1h ago — must
+#     go silent, and the per-PR sweep must not even run (cost gate: a healthy
+#     tick is one API call).
+reset
+seed_log "merge-debt" 3
+PRD2="$TMP/prs-fresh"; mkdir -p "$PRD2"
+printf 'clean\n' > "$PRD2/pr_201"; printf 'clean\n' > "$PRD2/pr_202"; printf 'clean\n' > "$PRD2/pr_203"
+FRESH_TIP=$(date -u -d "@$(( $(date -u +%s) - 3600 ))" +%Y-%m-%dT%H:%M:%SZ)
+out=$(FAKE_TIP_DATE="$FRESH_TIP" FAKE_PR_DIR="$PRD2" run_check); rc=$?
+[[ "$rc" == "0" && "$(alerts)" == "0" ]] && grep -q "status=ok" <<<"$out" \
+  && ok "master moving silences merge-debt (leg A mutation)" \
+  || fail "master moving silences merge-debt (leg A mutation)" "rc=$rc alerts=$(alerts) out=$out"
+ls "$PRD2"/.pokes_* >/dev/null 2>&1 \
+  && fail "fresh master skips the per-PR sweep entirely (cost gate)" "pokes=$(ls "$PRD2"/.pokes_*)" \
+  || ok "fresh master skips the per-PR sweep entirely (cost gate)"
+
+# 16. Leg B mutated (AC3): master static 3 days but only 2 CLEAN (< M=3), the
+#     rest RESOLVED as not-mergeable — a real measurement of "not enough
+#     ready", so it stays ok and silent.
+reset
+seed_log "merge-debt" 3
+PRD3="$TMP/prs-below"; mkdir -p "$PRD3"
+printf 'clean\n'   > "$PRD3/pr_301"; printf 'clean\n' > "$PRD3/pr_302"
+printf 'blocked\n' > "$PRD3/pr_303"; printf 'dirty\n' > "$PRD3/pr_304"
+out=$(FAKE_TIP_DATE="$STALE_TIP" FAKE_PR_DIR="$PRD3" run_check); rc=$?
+[[ "$rc" == "0" && "$(alerts)" == "0" ]] && grep -q "status=ok" <<<"$out" && grep -q "clean=2" <<<"$out" \
+  && ok "CLEAN below M silences merge-debt but the count is measured (leg B mutation)" \
+  || fail "CLEAN below M silences merge-debt but the count is measured (leg B mutation)" "rc=$rc alerts=$(alerts) out=$out"
+
+# 17. THE AC2 TRAP ITSELF: every PR still UNKNOWN after BOTH poke passes must
+#     NOT be read as zero CLEAN / ok — that is a transport failure, and it is
+#     reported as unmeasurable (loud in the log, breaks any DRIFT run).
+reset
+seed_log "merge-debt" 3
+PRD4="$TMP/prs-unknown"; mkdir -p "$PRD4"
+for n in 401 402 403 404; do printf 'unknown\nunknown\n' > "$PRD4/pr_$n"; done
+out=$(FAKE_TIP_DATE="$STALE_TIP" FAKE_PR_DIR="$PRD4" run_check); rc=$?
+if grep -q "reason=merge-debt-unmeasurable:pr-state" <<<"$out" && ! grep -q "status=ok" <<<"$out"; then
+  ok "all-UNKNOWN after two passes reads unmeasurable, never a silent ok"
+else
+  fail "all-UNKNOWN after two passes reads unmeasurable, never a silent ok" "rc=$rc out=$out"
+fi
+[[ "$(cat "$PRD4/.pokes_401" 2>/dev/null)" == "2" ]] \
+  && ok "unresolved PRs still get the second poke pass before giving up" \
+  || fail "unresolved PRs still get the second poke pass before giving up" "pokes_401=$(cat "$PRD4/.pokes_401" 2>/dev/null)"
+
+# 18. Precedence: a deploy-class drift wins and the PR sweep never runs — the
+#     merge-debt leg only grades a converged pipeline.
+reset; clear_ad_state
+set_health_release "0000000000000000000000000000000000000000"; set_activated "0000000000000000000000000000000000000000"
+seed_log "behind-origin-master" 0
+PRD5="$TMP/prs-precedence"; mkdir -p "$PRD5"
+printf 'clean\n' > "$PRD5/pr_501"; printf 'clean\n' > "$PRD5/pr_502"; printf 'clean\n' > "$PRD5/pr_503"
+out=$(FAKE_TIP_DATE="$STALE_TIP" FAKE_PR_DIR="$PRD5" run_check); rc=$?
+if grep -q "reason=behind-origin-master" <<<"$out" && ! ls "$PRD5"/.pokes_* >/dev/null 2>&1; then
+  ok "deploy-class drift takes precedence and skips the PR sweep"
+else
+  fail "deploy-class drift takes precedence and skips the PR sweep" "out=$out pokes=$(ls "$PRD5"/.pokes_* 2>/dev/null)"
+fi
+
+# 19. Graded, not instant: the conjunction holding on the FIRST tick fires the
+#     DRIFT line (the log run starts) but does not page until 2h sustained.
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+: > "$LOG"
+PRD6="$TMP/prs-first-tick"; mkdir -p "$PRD6"
+printf 'clean\n' > "$PRD6/pr_601"; printf 'clean\n' > "$PRD6/pr_602"; printf 'clean\n' > "$PRD6/pr_603"
+out=$(FAKE_TIP_DATE="$STALE_TIP" FAKE_PR_DIR="$PRD6" run_check); rc=$?
+if grep -q "status=DRIFT reason=merge-debt " <<<"$out" && [[ "$rc" == "1" && "$(alerts)" == "0" ]] \
+   && grep -q "not escalating" <<<"$out"; then
+  ok "first-tick merge-debt fires the line but waits out the 2h sustain gate"
+else
+  fail "first-tick merge-debt fires the line but waits out the 2h sustain gate" "rc=$rc alerts=$(alerts) out=$out"
+fi
 
 echo
 if [[ "$FAILURES" -eq 0 ]]; then

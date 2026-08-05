@@ -8,6 +8,7 @@
 #   - build.source != "release"     (unknown provenance — the July 20 incident)
 #   - running != activated release  (a deploy was armed but never took effect)
 #   - running != origin/master      (merged work is not live — the 14-merge debt)
+#   - master static + CLEAN PRs     (reviewed work not merging — the AUR-4509 freeze)
 #
 # Emits one sampler-style line per run; exit 0 only when fully converged.
 # Wired to a systemd timer by scripts/deploy/install-drift-timer.sh.
@@ -48,6 +49,27 @@
 #               is broken (it should arm within one 10-min tick). Threshold: 1h
 #               (measured build wall time ~2.5 min; 2x that is far under the
 #               1h floor, so the floor applies).
+#   merge-debt  (merge-debt)                                         [AUR-4661]
+#               origin/master ITSELF is static (tip older than
+#               MERGE_DEBT_MASTER_AGE_SEC, default 2 days) while >=
+#               MERGE_DEBT_MIN_CLEAN (default 3) open PRs sit mergeable
+#               (mergeable_state "clean", force-refreshed — see the counting
+#               trap at the merge-debt block below). Both legs are required: a
+#               quiet master is fine if nothing is ready, and CLEAN PRs are
+#               fine while master moves — the CONJUNCTION is the defect. The
+#               07-26..07-29 freeze (AUR-4509) sat exactly here for ~3.4 days
+#               with 20+ CLEAN PRs while every class above was CORRECTLY
+#               silent: production matched master; the debt was one hop
+#               upstream. Threshold: 2h sustained (the conjunction already
+#               embeds >= 2 days of stagnation; 2h of consecutive ticks
+#               filters a flap right before a merge train lands).
+#
+# BOTH DEBT LEGS MUST STAY LIVE (AUR-4509's "merged" fallacy): PR #144 fixed
+# the dropped-handoff bug, was MERGED, and stayed UNDEPLOYED — the bug blocked
+# its own remedy. merge-debt closes the approved->merged gap; deploy-debt and
+# the armed/quiescence classes close merged->running. Neither leg alone covers
+# the chain: "it is merged" is not "it is live", and "production matches
+# master" is not "work is landing".
 #
 # Sustained duration is derived from the drift log itself (the run of consecutive
 # lines carrying the same reason), so there is no separate state to get stale.
@@ -72,6 +94,14 @@ ISSUE_URL=${PAPERCLIP_DRIFT_ISSUE_URL:-https://paperclip/AUR/issues/AUR-3937}
 AD_STATE_FILE=${PAPERCLIP_AUTO_DEPLOY_STATE:-/var/lib/paperclip/auto-deploy.state}
 # Fresh = within 3 timer periods of the 10-min auto-deploy tick.
 STATE_FRESH_SEC=${PAPERCLIP_DRIFT_STATE_FRESH_SEC:-1800}
+# merge-debt (AUR-4661)
+REPO=${PAPERCLIP_DRIFT_REPO:-Jacksnow14/paperclip}
+GH_BIN=${PAPERCLIP_DRIFT_GH:-gh}
+MERGE_DEBT_MASTER_AGE_SEC=${PAPERCLIP_DRIFT_MERGE_DEBT_MASTER_AGE_SEC:-172800}
+MERGE_DEBT_MIN_CLEAN=${PAPERCLIP_DRIFT_MERGE_DEBT_MIN_CLEAN:-3}
+MERGE_DEBT_THRESHOLD_SEC=${PAPERCLIP_DRIFT_MERGE_DEBT_THRESHOLD_SEC:-7200}
+MERGE_DEBT_RECHECK_DELAY_SEC=${PAPERCLIP_DRIFT_MERGE_DEBT_RECHECK_DELAY_SEC:-3}
+MERGE_DEBT_ISSUE_URL=${PAPERCLIP_DRIFT_MERGE_DEBT_ISSUE_URL:-https://paperclip/AUR/issues/AUR-4661}
 
 ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -133,7 +163,72 @@ elif [[ "$running_sha" != "$master_sha" ]]; then
   status=DRIFT reason=behind-origin-master
 fi
 
-line="$ts running=${running_sha:0:12} activated=${activated_sha:0:12} master=${master_sha:0:12} status=$status reason=$reason auto=$ad_phase"
+# --- merge-debt (AUR-4661) --------------------------------------------------
+# Only evaluated once every class above converged: during the AUR-4509 freeze
+# production matched master exactly, so this is the only branch that can see
+# it. Cost gate: the per-PR sweep only runs once master tip age already
+# exceeds the age leg — a healthy tick costs one extra API call.
+#
+# THE COUNTING TRAP (measured on AUR-4509): `gh pr list --json
+# mergeStateStatus` returned UNKNOWN for 64 of 68 open PRs — the field is a
+# LAZY server-side compute the list endpoint never triggers. Counting CLEAN
+# off the list reads 0, the conjunction never holds, and this class ships
+# dead while looking green. So: poke each PR individually (GET /pulls/{n}
+# forces the compute), then re-read stragglers in a second pass (pass 1
+# resolved 48/64 on AUR-4509, pass 2 the remaining 16). PRs still unresolved
+# after both passes make a below-the-line count UNTRUSTWORTHY: report
+# merge-debt-unmeasurable, never a silent ok — transport failure is not a
+# negative result.
+merge_debt_fields=""
+clean_count="" tip_age_sec=""
+if [[ "$status" == "ok" ]]; then
+  now_epoch=$(date -u +%s)
+  tip_date=$("$GH_BIN" api "repos/$REPO/commits/$master_sha" --jq '.commit.committer.date' 2>/dev/null || true)
+  tip_epoch=$(date -u -d "$tip_date" +%s 2>/dev/null || true)
+  if [[ -z "$tip_epoch" ]]; then
+    status=UNKNOWN reason=merge-debt-unmeasurable:tip-date
+    echo "merge-debt leg unmeasurable: could not resolve master tip commit date via $GH_BIN" >&2
+  elif (( now_epoch - tip_epoch > MERGE_DEBT_MASTER_AGE_SEC )); then
+    tip_age_sec=$(( now_epoch - tip_epoch ))
+    if pr_numbers=$("$GH_BIN" api --paginate "repos/$REPO/pulls?state=open&per_page=100" --jq '.[].number' 2>/dev/null); then
+      declare -A pr_state=()
+      for n in $pr_numbers; do
+        pr_state[$n]=$("$GH_BIN" api "repos/$REPO/pulls/$n" --jq '.mergeable_state' 2>/dev/null || echo poke-failed)
+      done
+      stragglers=()
+      for n in $pr_numbers; do
+        case "${pr_state[$n]}" in ""|unknown|poke-failed|null) stragglers+=("$n") ;; esac
+      done
+      if (( ${#stragglers[@]} > 0 )); then
+        sleep "$MERGE_DEBT_RECHECK_DELAY_SEC"
+        for n in "${stragglers[@]}"; do
+          pr_state[$n]=$("$GH_BIN" api "repos/$REPO/pulls/$n" --jq '.mergeable_state' 2>/dev/null || echo poke-failed)
+        done
+      fi
+      clean_count=0 unresolved=0
+      for n in $pr_numbers; do
+        case "${pr_state[$n]}" in
+          clean) clean_count=$(( clean_count + 1 )) ;;
+          ""|unknown|poke-failed|null) unresolved=$(( unresolved + 1 )) ;;
+        esac
+      done
+      merge_debt_fields=" clean=$clean_count unresolved=$unresolved tip_age_h=$(( tip_age_sec / 3600 ))"
+      if (( clean_count >= MERGE_DEBT_MIN_CLEAN )); then
+        status=DRIFT reason=merge-debt
+      elif (( unresolved > 0 )); then
+        # Below the fire line ONLY while some PRs never resolved: that is not
+        # a measurement of "nothing is ready", it is a transport failure.
+        status=UNKNOWN reason=merge-debt-unmeasurable:pr-state
+        echo "merge-debt leg unmeasurable: $unresolved PR(s) unresolved after two poke passes (clean=$clean_count < $MERGE_DEBT_MIN_CLEAN)" >&2
+      fi
+    else
+      status=UNKNOWN reason=merge-debt-unmeasurable:pr-list
+      echo "merge-debt leg unmeasurable: open-PR list fetch failed via $GH_BIN" >&2
+    fi
+  fi
+fi
+
+line="$ts running=${running_sha:0:12} activated=${activated_sha:0:12} master=${master_sha:0:12} status=$status reason=$reason auto=$ad_phase$merge_debt_fields"
 echo "$line"
 echo "$line" >> "$DRIFT_LOG" 2>/dev/null || true
 
@@ -151,6 +246,8 @@ decision=$(
   PROVENANCE_THRESHOLD_SEC="$PROVENANCE_THRESHOLD_SEC" DEBT_THRESHOLD_SEC="$DEBT_THRESHOLD_SEC" \
   QUIESCENCE_THRESHOLD_SEC="$QUIESCENCE_THRESHOLD_SEC" DARK_THRESHOLD_SEC="$DARK_THRESHOLD_SEC" \
   AD_RUNNING_COUNT="$ad_running_count" AD_WAITING_SINCE="$ad_waiting_since" \
+  MERGE_DEBT_THRESHOLD_SEC="$MERGE_DEBT_THRESHOLD_SEC" CLEAN_COUNT="$clean_count" \
+  TIP_AGE_SEC="$tip_age_sec" MERGE_DEBT_ISSUE_URL="$MERGE_DEBT_ISSUE_URL" \
   ALERT_COOLDOWN_SEC="$ALERT_COOLDOWN_SEC" RUNNING_SHA="${running_sha:0:12}" \
   MASTER_SHA="${master_sha:0:12}" ISSUE_URL="$ISSUE_URL" \
   python3 -c '
@@ -167,6 +264,8 @@ elif reason == "armed-restart-disabled":
     klass, threshold = "dark-armed", int(os.environ["DARK_THRESHOLD_SEC"])
 elif reason == "behind-origin-master":
     klass, threshold = "deploy-debt", int(os.environ["DEBT_THRESHOLD_SEC"])
+elif reason == "merge-debt":
+    klass, threshold = "merge-debt", int(os.environ["MERGE_DEBT_THRESHOLD_SEC"])
 else:
     print("QUIET\tunclassified-reason:%s" % reason); raise SystemExit(0)
 
@@ -259,12 +358,24 @@ if reason == "awaiting-quiescence":
         " (queued never blocks)."
         % (waited, os.environ.get("AD_RUNNING_COUNT", "?"))
     )
-text = (
-    "Paperclip deploy drift sustained %dh (%s): %s.%s "
-    "Production is running %s; origin/master is %s. %s%s"
-    % (hours, klass, reason, extra, os.environ["RUNNING_SHA"], os.environ["MASTER_SHA"],
-       os.environ["ISSUE_URL"], note)
-)
+if reason == "merge-debt":
+    # Production matches master here — "running vs master" phrasing would read
+    # as healthy. The page must say the stall is UPSTREAM of deploy.
+    days = float(os.environ.get("TIP_AGE_SEC") or 0) / 86400.0
+    text = (
+        "Paperclip merge debt sustained %dh: origin/master static for %.1f days "
+        "while %s open PRs are CLEAN and unmerged. Production matches master — "
+        "the stall is upstream: reviewed work is not landing. %s%s"
+        % (hours, days, os.environ.get("CLEAN_COUNT") or "?",
+           os.environ["MERGE_DEBT_ISSUE_URL"], note)
+    )
+else:
+    text = (
+        "Paperclip deploy drift sustained %dh (%s): %s.%s "
+        "Production is running %s; origin/master is %s. %s%s"
+        % (hours, klass, reason, extra, os.environ["RUNNING_SHA"], os.environ["MASTER_SHA"],
+           os.environ["ISSUE_URL"], note)
+    )
 print("ALERT\t%s" % text)
 ' 2>/dev/null || printf 'QUIET\tescalation-gate-failed'
 )

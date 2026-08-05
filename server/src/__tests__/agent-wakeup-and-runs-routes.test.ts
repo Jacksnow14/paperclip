@@ -115,7 +115,7 @@ describe("agent wakeup-requests and runs routes", () => {
     const res = await request(createApp()).get("/api/agents/11111111-1111-4111-8111-111111111111/wakeup-requests?limit=20");
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(mockHeartbeatService.listWakeupRequests).toHaveBeenCalledWith(AGENT_ID, 20);
+    expect(mockHeartbeatService.listWakeupRequests).toHaveBeenCalledWith(AGENT_ID, 20, {});
     expect(res.body).toHaveLength(2);
     expect(res.body[1]).toMatchObject({ status: "skipped", reason: "wakeup_skipped", runId: null });
   });
@@ -124,10 +124,64 @@ describe("agent wakeup-requests and runs routes", () => {
     mockHeartbeatService.listWakeupRequests.mockResolvedValue([]);
 
     await request(createApp()).get("/api/agents/11111111-1111-4111-8111-111111111111/wakeup-requests?limit=99999");
-    expect(mockHeartbeatService.listWakeupRequests).toHaveBeenLastCalledWith(AGENT_ID, 500);
+    expect(mockHeartbeatService.listWakeupRequests).toHaveBeenLastCalledWith(AGENT_ID, 500, {});
 
     await request(createApp()).get("/api/agents/11111111-1111-4111-8111-111111111111/wakeup-requests");
-    expect(mockHeartbeatService.listWakeupRequests).toHaveBeenLastCalledWith(AGENT_ID, 50);
+    expect(mockHeartbeatService.listWakeupRequests).toHaveBeenLastCalledWith(AGENT_ID, 50, {});
+  });
+
+  // AUR-4647: `offset`/`before`/`page` used to be silently ignored, so the
+  // endpoint always returned the newest 500 rows no matter what was asked
+  // for -- a bounded read masquerading as complete. These pin down that the
+  // params are now honoured (offset/before) or explicitly rejected (page,
+  // malformed offset/before) instead of silently doing nothing.
+  it("honours the offset query param", async () => {
+    mockHeartbeatService.listWakeupRequests.mockResolvedValue([]);
+
+    await request(createApp()).get("/api/agents/11111111-1111-4111-8111-111111111111/wakeup-requests?offset=500");
+    expect(mockHeartbeatService.listWakeupRequests).toHaveBeenLastCalledWith(AGENT_ID, 50, { offset: 500 });
+  });
+
+  it("honours the before query param as a parsed Date", async () => {
+    mockHeartbeatService.listWakeupRequests.mockResolvedValue([]);
+
+    await request(createApp()).get(
+      "/api/agents/11111111-1111-4111-8111-111111111111/wakeup-requests?before=2026-07-30T08:04:00.000Z",
+    );
+    const call = mockHeartbeatService.listWakeupRequests.mock.calls.at(-1);
+    expect(call?.[0]).toBe(AGENT_ID);
+    expect(call?.[1]).toBe(50);
+    expect(call?.[2]?.before).toBeInstanceOf(Date);
+    expect((call?.[2]?.before as Date).toISOString()).toBe("2026-07-30T08:04:00.000Z");
+  });
+
+  it("rejects a malformed before param instead of silently ignoring it", async () => {
+    const res = await request(createApp()).get(
+      "/api/agents/11111111-1111-4111-8111-111111111111/wakeup-requests?before=not-a-date",
+    );
+    expect(res.status).toBe(400);
+    expect(mockHeartbeatService.listWakeupRequests).not.toHaveBeenCalled();
+  });
+
+  it("rejects a negative or non-integer offset instead of silently ignoring it", async () => {
+    const negative = await request(createApp()).get(
+      "/api/agents/11111111-1111-4111-8111-111111111111/wakeup-requests?offset=-1",
+    );
+    expect(negative.status).toBe(400);
+
+    const nonInteger = await request(createApp()).get(
+      "/api/agents/11111111-1111-4111-8111-111111111111/wakeup-requests?offset=1.5",
+    );
+    expect(nonInteger.status).toBe(400);
+    expect(mockHeartbeatService.listWakeupRequests).not.toHaveBeenCalled();
+  });
+
+  it("rejects the unsupported page param instead of silently ignoring it", async () => {
+    const res = await request(createApp()).get(
+      "/api/agents/11111111-1111-4111-8111-111111111111/wakeup-requests?page=2",
+    );
+    expect(res.status).toBe(400);
+    expect(mockHeartbeatService.listWakeupRequests).not.toHaveBeenCalled();
   });
 
   it("404s when agent does not exist", async () => {

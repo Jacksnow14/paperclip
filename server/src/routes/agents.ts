@@ -3004,7 +3004,37 @@ export function agentRoutes(
 
     const limitParam = req.query.limit as string | undefined;
     const limit = limitParam ? Math.max(1, Math.min(500, parseInt(limitParam, 10) || 50)) : 50;
-    const requests = await heartbeat.listWakeupRequests(id, limit);
+
+    // AUR-4647: `before`/`offset` used to be silently ignored, so the endpoint
+    // always returned the newest 500 rows no matter what a caller asked for --
+    // a bounded read masquerading as a complete one. Reject malformed values
+    // explicitly instead of quietly falling back to "no pagination".
+    if (typeof req.query.page === "string" && req.query.page.length > 0) {
+      res.status(400).json({ error: "'page' is not supported; use 'offset' or 'before' instead" });
+      return;
+    }
+
+    let before: Date | undefined;
+    if (typeof req.query.before === "string" && req.query.before.length > 0) {
+      const parsed = new Date(req.query.before);
+      if (Number.isNaN(parsed.getTime())) {
+        res.status(400).json({ error: "Invalid 'before' query param: expected an ISO 8601 timestamp" });
+        return;
+      }
+      before = parsed;
+    }
+
+    let offset: number | undefined;
+    if (typeof req.query.offset === "string" && req.query.offset.length > 0) {
+      const parsed = Number(req.query.offset);
+      if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 0) {
+        res.status(400).json({ error: "Invalid 'offset' query param: expected a non-negative integer" });
+        return;
+      }
+      offset = parsed;
+    }
+
+    const requests = await heartbeat.listWakeupRequests(id, limit, { before, offset });
     res.json(requests);
   });
 

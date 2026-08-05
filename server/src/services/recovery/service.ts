@@ -2053,6 +2053,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       escalated: 0,
       skipped: 0,
       reviewParkedSkipped: 0,
+      dependencyBlockedSkipped: 0,
       issueIds: [] as string[],
     };
 
@@ -2092,6 +2093,25 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         } else {
           result.skipped += 1;
         }
+        continue;
+      }
+
+      // AUR-4647: every branch below this point dispatches by calling
+      // deps.enqueueWakeup, which re-enters heartbeat's own
+      // issue_dependencies_blocked gate and records another skipped wake if
+      // the issue isn't actually ready to run. Before AUR-4647 this reconciler
+      // had no memory of that outcome, so it retried the identical dispatch
+      // every scheduler tick (as often as every ~15s) forever -- a storm of
+      // ~11.6k/day dead wakes across two agents that also drowned out
+      // GET /agents/:id/wakeup-requests' unpaginated newest-500 window.
+      // Checking readiness here, fresh, each tick is edge-triggered by
+      // construction: the moment a blocker resolves, the very next tick sees
+      // isDependencyReady flip true and dispatches normally -- no separate
+      // backoff timer or persisted cooldown state is needed.
+      const dependencyReadiness = await issuesSvc.getDependencyReadiness(issue.id, db);
+      if (!dependencyReadiness.isDependencyReady) {
+        result.dependencyBlockedSkipped += 1;
+        result.skipped += 1;
         continue;
       }
 

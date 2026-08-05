@@ -8,6 +8,7 @@ but you shouldn't have to re-derive anything from scratch.
 | --- | --- |
 | [`process-lost-and-oom.md`](process-lost-and-oom.md) | A run failed with `Process lost -- server may have restarted`, or you're deciding whether an OOM/restart event is infra or agent behavior. |
 | [`production-deploy.md`](production-deploy.md) | You need to know what production is actually running, how a deploy lands, or you're chasing a deploy-drift alert. |
+| [`deploy-safety-gate.md`](deploy-safety-gate.md) | You're running or debugging a release build, or a deploy was refused/killed by the memory gate on the 7.7 GB host. |
 | [`agent-privilege-model.md`](agent-privilege-model.md) | You're reasoning about what an agent can do to this host (root, `hostguard`, the audit trail), or investigating a privileged/company-ending operation. |
 
 ## Not in this repo

@@ -623,11 +623,20 @@ async function main() {
       'TLDR:',
       '1. Read your `AGENTS.md` (your `instructions-path` file)',
       `2. Identify the section governing \`${t.task_type}\` work`,
-      `3. POST a \`prompt-improvement-proposal/${t.agent_id}/{YYYY-MM-DD}\` memory record`,
-      '4. POST a `request_board_approval` linking this issue',
-      '5. Set this issue `in_review`, assigned to CEO',
+      '3. Write the FULL proposed file (a BOUNDED edit — small add/delete/replace,',
+      '   never a rewrite) to a temp path, then run the validation gate:',
+      '   `node scripts/prompt-edit-gate.mjs --agent-name "<your name>" --proposed <tmpfile>`',
+      '   The gate replays your recent completed tasks under both prompt versions and',
+      '   only ACCEPTS an edit that beats the current prompt. If REJECTED: do NOT',
+      '   re-submit the same diff (the gate remembers) — refine or stand down.',
+      `4. On ACCEPTED only: POST a \`prompt-improvement-proposal/${t.agent_id}/{YYYY-MM-DD}\``,
+      '   memory record including the gate verdict JSON (diffHash, wins/losses/ties)',
+      '5. POST a `request_board_approval` linking this issue',
+      '6. Set this issue `in_review`, assigned to CEO',
       '',
       '**Safety boundary:** propose edits to YOUR file ONLY.',
+      '**Approval boundary (CEO):** refuse any proposal without an ACCEPTED',
+      'prompt-edit-gate verdict — plausible-sounding prose is not evidence.',
     ].join('\n');
 
     const payload = {

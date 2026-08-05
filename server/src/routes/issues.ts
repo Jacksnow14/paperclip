@@ -1194,6 +1194,29 @@ export function issueRoutes(
     return true;
   }
 
+  // Ownership-exempt routing fields (AUR-4120): a small, closed allowlist of
+  // fields that carry no ownership or work-state semantics — unlike status,
+  // assigneeAgentId, priority, or blockedByIssueIds, they don't express who
+  // owns the issue or what work it represents. A cross-agent PATCH whose
+  // body keys are entirely within this allowlist skips the assignee-
+  // ownership gate, so fleet-wide field migrations (e.g. AUR-3908) don't
+  // have to queue behind whichever agent happens to own each issue.
+  // Company-membership authz (assertCompanyAccess) still applies. This is a
+  // closed list: do not add status, assigneeAgentId, priority,
+  // blockedByIssueIds, or anything else expressing ownership/work state
+  // without CEO sign-off. A body touching any field outside the allowlist
+  // falls through to the ordinary gate for the whole request — subset
+  // semantics, no partial application. That all-or-nothing check is the
+  // entire security property of this exemption.
+  const OWNERSHIP_EXEMPT_ISSUE_FIELDS = new Set(["projectWorkspaceId", "executionWorkspacePreference"]);
+
+  function isOwnershipExemptFieldMutation(req: Request): boolean {
+    if (req.actor.type !== "agent") return false;
+    const bodyKeys = Object.keys(req.body ?? {});
+    if (bodyKeys.length === 0) return false;
+    return bodyKeys.every((key) => OWNERSHIP_EXEMPT_ISSUE_FIELDS.has(key));
+  }
+
   // Field-scoped author amendment (AUR-4002/AUR-4010): the agent that created an
   // issue may always amend what it said (description, blockers, priority), even
   // after assigning the issue away, but may never change what the assignee is
@@ -3131,9 +3154,17 @@ export function issueRoutes(
     assertCompanyAccess(req, existing.companyId);
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
     const authorAmendmentResult = await assertAgentAuthorAmendmentAllowed(req, res, existing);
-    if (authorAmendmentResult !== "handled") {
+    const ownershipExemptFieldMutation =
+      authorAmendmentResult !== "handled" && isOwnershipExemptFieldMutation(req);
+    if (authorAmendmentResult !== "handled" && !ownershipExemptFieldMutation) {
       if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
     }
+    const isCrossAgentOwnershipExemptWrite =
+      ownershipExemptFieldMutation &&
+      req.actor.type === "agent" &&
+      !!req.actor.agentId &&
+      existing.assigneeAgentId !== null &&
+      existing.assigneeAgentId !== req.actor.agentId;
 
     const actor = getActorInfo(req);
     const isClosed = isClosedIssueStatus(existing.status);
@@ -3552,6 +3583,14 @@ export function issueRoutes(
         ...(interruptedRunId ? { interruptedRunId } : {}),
         ...(cancelledStatusRunId ? { cancelledStatusRunId } : {}),
         ...(workspaceChange ? { workspaceChange } : {}),
+        ...(isCrossAgentOwnershipExemptWrite
+          ? {
+              ownershipExemptFieldMutation: true,
+              ownershipExemptFields: Object.keys(updateFields),
+              actorAgentId: actor.agentId,
+              assigneeAgentId: existing.assigneeAgentId,
+            }
+          : {}),
         _previous: hasFieldChanges ? previous : undefined,
         ...summarizeIssueReferenceActivityDetails(
           updateReferenceDiff

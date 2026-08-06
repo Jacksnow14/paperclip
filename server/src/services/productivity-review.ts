@@ -66,6 +66,23 @@ export const NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES = [
   "claude_auth_required",
 ] as const;
 
+// AUR-5008: scheduler-lifecycle cancellations -- a queued run that the control plane itself
+// decided not to run (issue cancelled/reached a terminal status/dependencies still blocked/
+// reassigned before the run could start). This is a DIFFERENT class from the provider-capacity
+// codes above: those die at the provider wall after being scheduled; these never leave the
+// scheduler at all. Kept in its own named list (not folded into
+// NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES) per that list's own "keep this narrow" doctrine, and
+// because the two classes have unrelated root causes and unrelated fixes. All four carry zero
+// tokens, zero cost, and no transcript -- strictly less signal about the agent than the
+// provider-capacity failures already excluded. See AUR-5008 for the amplification-storm
+// forensics (25 of 40 sampled runs on the flagged agent were scheduler cancellations).
+export const SCHEDULER_LIFECYCLE_NON_ATTRIBUTABLE_ERROR_CODES = [
+  "issue_cancelled",
+  "issue_terminal_status",
+  "issue_dependencies_blocked",
+  "issue_assignee_changed",
+] as const;
+
 // AUR-4513: codes for failures that are DETERMINISTIC -- re-running the same work
 // unchanged reproduces them. Unlike the provider-capacity codes above, nothing
 // external will ever clear these, so a run carrying one is real evidence that the
@@ -95,6 +112,14 @@ export type DeterministicCodesAreNotProviderCodes = AssertNever<
     (typeof NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES)[number]
   >
 >;
+// AUR-5008: same invariant, extended to the scheduler-lifecycle list -- a code must never be
+// both a deterministic-attributable failure and a non-attributable scheduler cancellation.
+export type DeterministicCodesAreNotSchedulerLifecycleCodes = AssertNever<
+  Extract<
+    (typeof DETERMINISTIC_ATTRIBUTABLE_ERROR_CODES)[number],
+    (typeof SCHEDULER_LIFECYCLE_NON_ATTRIBUTABLE_ERROR_CODES)[number]
+  >
+>;
 
 // AUR-4062: adapter-agnostic backstop for the *next* provider failure mode that isn't in
 // NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES yet. AUR-3943 forensics found a clean, bimodal split
@@ -122,6 +147,16 @@ function isZeroTokenBackstopRun(run: Pick<HeartbeatRunRow, "usageJson" | "logByt
   );
 }
 
+// AUR-5008: adapter-agnostic backstop for the *next* scheduler-lifecycle code nobody adds to
+// SCHEDULER_LIFECYCLE_NON_ATTRIBUTABLE_ERROR_CODES. A run that never left the scheduler queue
+// never spawned a process, so it has no log at all (logBytes null/0) -- distinct from
+// isZeroTokenBackstopRun above, which requires a *small but present* log (a process that did
+// start but died immediately). Fails closed: any terminal run with zero usage and no transcript
+// is treated as never-started regardless of errorCode.
+function isNeverStartedRun(run: Pick<HeartbeatRunRow, "usageJson" | "logBytes">) {
+  return hasZeroUsage(run.usageJson) && (run.logBytes == null || run.logBytes === 0);
+}
+
 function isInfraKilledRun(
   run: Pick<HeartbeatRunRow, "errorCode" | "error" | "usageJson" | "logBytes">,
 ) {
@@ -136,14 +171,22 @@ function isInfraKilledRun(
   return (
     (run.errorCode != null &&
       (NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES as readonly string[]).includes(run.errorCode)) ||
+    (run.errorCode != null &&
+      (SCHEDULER_LIFECYCLE_NON_ATTRIBUTABLE_ERROR_CODES as readonly string[]).includes(
+        run.errorCode,
+      )) ||
     Boolean(run.error?.startsWith("Process lost")) ||
-    isZeroTokenBackstopRun(run)
+    isZeroTokenBackstopRun(run) ||
+    isNeverStartedRun(run)
   );
 }
 
 function nonAttributableErrorCodeSqlList() {
   return sql.join(
-    NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES.map((code) => sql`${code}`),
+    [
+      ...NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES,
+      ...SCHEDULER_LIFECYCLE_NON_ATTRIBUTABLE_ERROR_CODES,
+    ].map((code) => sql`${code}`),
     sql`, `,
   );
 }
@@ -159,11 +202,21 @@ function zeroTokenBackstopSqlPredicate() {
   )`;
 }
 
+function neverStartedRunSqlPredicate() {
+  return sql`(
+    coalesce((${heartbeatRuns.usageJson} ->> 'inputTokens')::numeric, 0) = 0
+    and coalesce((${heartbeatRuns.usageJson} ->> 'outputTokens')::numeric, 0) = 0
+    and coalesce((${heartbeatRuns.usageJson} ->> 'costUsd')::numeric, 0) = 0
+    and (${heartbeatRuns.logBytes} is null or ${heartbeatRuns.logBytes} = 0)
+  )`;
+}
+
 function infraKilledRunSqlExclusion() {
   return sql`(
     coalesce(${heartbeatRuns.errorCode}, '') not in (${nonAttributableErrorCodeSqlList()})
     and (${heartbeatRuns.error} is null or ${heartbeatRuns.error} not like ${"Process lost%"})
     and not ${zeroTokenBackstopSqlPredicate()}
+    and not ${neverStartedRunSqlPredicate()}
   )`;
 }
 
@@ -172,6 +225,7 @@ function infraKilledRunSqlPredicate() {
     coalesce(${heartbeatRuns.errorCode}, '') in (${nonAttributableErrorCodeSqlList()})
     or ${heartbeatRuns.error} like ${"Process lost%"}
     or ${zeroTokenBackstopSqlPredicate()}
+    or ${neverStartedRunSqlPredicate()}
   )`;
 }
 
@@ -620,7 +674,11 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     for (const run of infraKilledTerminalRuns) {
       const key =
         run.errorCode ??
-        (isZeroTokenBackstopRun(run) ? "(zero-token/logBytes backstop)" : "(unlabeled Process lost)");
+        (isZeroTokenBackstopRun(run)
+          ? "(zero-token/logBytes backstop)"
+          : isNeverStartedRun(run)
+            ? "(never-started backstop)"
+            : "(unlabeled Process lost)");
       infraKilledTerminalRunBreakdownMap.set(key, (infraKilledTerminalRunBreakdownMap.get(key) ?? 0) + 1);
     }
     const infraKilledTerminalRunBreakdown = Array.from(
@@ -706,6 +764,39 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       assigneeRunCommentCountLastSixHours >= thresholds.highChurnSixHours;
     const trigger = choosePrimaryTrigger({ noComment, longActive, highChurn, stalled });
     if (!trigger) return null;
+
+    // AUR-5008: a detector that can articulate why its own finding is probably wrong should
+    // suppress the filing, not annotate it and file anyway. Zero cost across EVERY sampled
+    // attributable terminal run is not a caveat -- it is proof no billable work happened, which
+    // is the definition of non-attributable. This is a last-resort backstop for a scheduler/
+    // lifecycle cancellation shape that slipped past isInfraKilledRun under an errorCode not yet
+    // in either non-attributable list (the two lists above are the primary fix; this is the net
+    // under the net). Emit an audit event instead of filing so the suppression stays visible.
+    const zeroCostContradiction =
+      costRow.costCents === 0 &&
+      attributableTerminalRuns.length > 0 &&
+      attributableTerminalRuns.every((run) => hasZeroUsage(run.usageJson));
+    if (zeroCostContradiction) {
+      await logActivity(db, {
+        companyId: sourceIssue.companyId,
+        actorType: "system",
+        actorId: "system",
+        action: "issue.productivity_review_suppressed_zero_cost_contradiction",
+        entityType: "issue",
+        entityId: sourceIssue.id,
+        agentId: sourceAgent.id,
+        details: {
+          source: "productivity_review.collectEvidence",
+          trigger,
+          attributableTerminalRunCount: attributableTerminalRuns.length,
+          infraKilledTerminalRunCount: infraKilledTerminalRuns.length,
+          runCountLastHour,
+          runCountLastSixHours,
+          noCommentStreak,
+        },
+      });
+      return null;
+    }
 
     const triggerReasons: string[] = [];
     if (quotaPaused && activeQuotaPause) {

@@ -541,4 +541,178 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
     },
     20_000,
   );
+
+  it(
+    "converges migration 0101 against a hand-created gmail_outbound_records table drifted from the ORM shape (AUR-5015)",
+    async () => {
+      const connectionString = await createTempDatabase();
+
+      await applyPendingMigrations(connectionString);
+
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const gmailOutboundHash = await migrationHash("0099_gmail_outbound_records.sql");
+        const shapeDriftHash = await migrationHash(
+          "0101_gmail_outbound_records_shape_drift.sql",
+        );
+        await sql.unsafe(
+          `DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash IN ('${gmailOutboundHash}', '${shapeDriftHash}')`,
+        );
+
+        // Recreate the exact live drifted shape (AUR-5004/AUR-5015 2026-08-05
+        // inspection): hand-created before 0099 ever ran, with status/campaign/
+        // sent_by_agent_id/issue_id present, snippet missing, recipient NOT NULL.
+        await sql.unsafe(`DROP TABLE IF EXISTS "gmail_outbound_records" CASCADE`);
+        await sql.unsafe(`
+          CREATE TABLE "gmail_outbound_records" (
+            "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+            "company_id" uuid NOT NULL REFERENCES "companies"("id"),
+            "mailbox" text NOT NULL,
+            "gmail_thread_id" text NOT NULL,
+            "gmail_message_id" text NOT NULL,
+            "recipient" text NOT NULL,
+            "subject" text,
+            "status" text NOT NULL DEFAULT 'sent',
+            "campaign" text,
+            "sent_by_agent_id" uuid REFERENCES "agents"("id") ON DELETE SET NULL,
+            "issue_id" uuid REFERENCES "issues"("id") ON DELETE SET NULL,
+            "sent_at" timestamp with time zone,
+            "created_at" timestamp with time zone DEFAULT now() NOT NULL
+          )
+        `);
+        await sql.unsafe(`
+          CREATE UNIQUE INDEX "gmail_outbound_message_uq" ON "gmail_outbound_records"
+            USING btree ("company_id", "mailbox", "gmail_message_id")
+        `);
+        await sql.unsafe(`
+          CREATE INDEX "gmail_outbound_thread_idx" ON "gmail_outbound_records"
+            USING btree ("company_id", "mailbox", "gmail_thread_id")
+        `);
+
+        const preColumns = await sql.unsafe<{ column_name: string }[]>(
+          `
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'gmail_outbound_records'
+          `,
+        );
+        expect(preColumns.map((row) => row.column_name)).not.toContain("snippet");
+      } finally {
+        await sql.end();
+      }
+
+      const pendingState = await inspectMigrations(connectionString);
+      expect(pendingState).toMatchObject({
+        status: "needsMigrations",
+        pendingMigrations: [
+          "0099_gmail_outbound_records.sql",
+          "0101_gmail_outbound_records_shape_drift.sql",
+        ],
+        reason: "pending-migrations",
+      });
+
+      // FIRE: replay against the drifted live shape must not throw — 0099's
+      // CREATE TABLE IF NOT EXISTS no-ops against the pre-existing table, and
+      // 0101 must converge the missing snippet column without erroring on the
+      // columns/constraints that already exist.
+      await applyPendingMigrations(connectionString);
+
+      const finalState = await inspectMigrations(connectionString);
+      expect(finalState.status).toBe("upToDate");
+
+      const verifySql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const columns = await verifySql.unsafe<
+          { column_name: string; is_nullable: string; column_default: string | null }[]
+        >(
+          `
+            SELECT column_name, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'gmail_outbound_records'
+            ORDER BY column_name
+          `,
+        );
+        const byName = Object.fromEntries(columns.map((row) => [row.column_name, row]));
+        expect(Object.keys(byName).sort()).toEqual(
+          [
+            "campaign",
+            "company_id",
+            "created_at",
+            "gmail_message_id",
+            "gmail_thread_id",
+            "id",
+            "issue_id",
+            "mailbox",
+            "recipient",
+            "sent_at",
+            "sent_by_agent_id",
+            "snippet",
+            "status",
+            "subject",
+          ].sort(),
+        );
+        expect(byName.snippet.is_nullable).toBe("YES");
+        expect(byName.recipient.is_nullable).toBe("NO");
+        expect(byName.status.is_nullable).toBe("NO");
+        expect(byName.status.column_default).toContain("sent");
+
+        const constraints = await verifySql.unsafe<{ conname: string }[]>(
+          `
+            SELECT conname FROM pg_constraint
+            WHERE conrelid = 'gmail_outbound_records'::regclass AND contype = 'f'
+            ORDER BY conname
+          `,
+        );
+        expect(constraints.map((row) => row.conname)).toEqual(
+          expect.arrayContaining([
+            "gmail_outbound_records_company_id_companies_id_fk",
+            "gmail_outbound_records_issue_id_issues_id_fk",
+            "gmail_outbound_records_sent_by_agent_id_agents_id_fk",
+          ]),
+        );
+      } finally {
+        await verifySql.end();
+      }
+
+      // Idempotent replay: re-running against an already-converged table (the
+      // same "no provable journal row" scenario 0099/0101 both document) must
+      // still succeed with no pending migrations and no thrown error.
+      await applyPendingMigrations(connectionString);
+      const replayState = await inspectMigrations(connectionString);
+      expect(replayState.status).toBe("upToDate");
+    },
+    20_000,
+  );
+
+  it(
+    "applies migration 0101 cleanly on a fresh database built straight from 0099 (no live drift)",
+    async () => {
+      const connectionString = await createTempDatabase();
+
+      // PASS: the ordinary path — a brand-new DB has never seen the hand-created
+      // live shape, so 0099 creates the base table and 0101 must still apply
+      // cleanly, adding the extra columns fresh.
+      await applyPendingMigrations(connectionString);
+
+      const finalState = await inspectMigrations(connectionString);
+      expect(finalState.status).toBe("upToDate");
+
+      const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
+      try {
+        const columns = await sql.unsafe<{ column_name: string }[]>(
+          `
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'gmail_outbound_records'
+          `,
+        );
+        expect(columns.map((row) => row.column_name)).toEqual(
+          expect.arrayContaining(["snippet", "status", "campaign", "sent_by_agent_id", "issue_id"]),
+        );
+      } finally {
+        await sql.end();
+      }
+    },
+    20_000,
+  );
 });

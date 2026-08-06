@@ -5427,28 +5427,53 @@ export function issueService(db: Db) {
     },
 
     wasAgentMentionedInThread: async (companyId: string, issueId: string, agentId: string): Promise<boolean> => {
-      const issueRow = await db.select({ description: issues.description })
+      const issueRow = await db.select({
+        description: issues.description,
+        createdByAgentId: issues.createdByAgentId,
+        createdAt: issues.createdAt,
+      })
         .from(issues)
         .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
         .then((rows) => rows[0] ?? null);
       if (!issueRow) return false;
 
-      const commentRows = await db.select({ body: issueComments.body })
+      const commentRows = await db.select({
+        body: issueComments.body,
+        authorAgentId: issueComments.authorAgentId,
+        createdAt: issueComments.createdAt,
+      })
         .from(issueComments)
-        .where(and(eq(issueComments.issueId, issueId), eq(issueComments.companyId, companyId)));
+        .where(and(eq(issueComments.issueId, issueId), eq(issueComments.companyId, companyId)))
+        .orderBy(asc(issueComments.createdAt));
 
-      const allBodies = [issueRow.description ?? "", ...commentRows.map(r => r.body)];
-      const combinedText = allBodies.join("\n");
+      // A grant is consumable: once the actor has replied, only mentions
+      // posted after that reply still count. Replying spends prior mentions.
+      const actorLastCommentAt = commentRows
+        .filter((row) => row.authorAgentId === agentId)
+        .reduce<Date | null>((latest, row) => (!latest || row.createdAt > latest ? row.createdAt : latest), null);
 
-      const explicitIds = extractAgentMentionIds(combinedText);
-      if (explicitIds.includes(agentId)) return true;
+      const sources: Array<{ authorAgentId: string | null; body: string; at: Date }> = [
+        { authorAgentId: issueRow.createdByAgentId, body: issueRow.description ?? "", at: issueRow.createdAt },
+        ...commentRows.map((row) => ({ authorAgentId: row.authorAgentId, body: row.body, at: row.createdAt })),
+      ];
+
+      const eligibleSources = sources.filter((source) =>
+        source.authorAgentId !== agentId && (!actorLastCommentAt || source.at > actorLastCommentAt));
+      if (eligibleSources.length === 0) return false;
+
+      for (const source of eligibleSources) {
+        if (extractAgentMentionIds(source.body).includes(agentId)) return true;
+      }
 
       const re = /\B@([^\s@,!?.]+)/g;
       const tokens = new Set<string>();
-      let m: RegExpExecArray | null;
-      while ((m = re.exec(combinedText)) !== null) {
-        const normalized = normalizeAgentMentionToken(m[1]);
-        if (normalized) tokens.add(normalized.toLowerCase());
+      for (const source of eligibleSources) {
+        let m: RegExpExecArray | null;
+        re.lastIndex = 0;
+        while ((m = re.exec(source.body)) !== null) {
+          const normalized = normalizeAgentMentionToken(m[1]);
+          if (normalized) tokens.add(normalized.toLowerCase());
+        }
       }
       if (tokens.size === 0) return false;
 

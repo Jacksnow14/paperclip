@@ -11,6 +11,9 @@ const ownerRunId = "55555555-5555-4555-8555-555555555555";
 const authorAgentId = "77777777-1111-4111-8111-777777777777";
 const ceoAgentId = "88888888-2222-4222-8222-888888888888";
 const authorRunId = "99999999-3333-4333-8333-999999999999";
+const middleManagerAgentId = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+const unrelatedManagerAgentId = "bbbbbbbb-1111-4111-8111-bbbbbbbbbbbb";
+const cyclePartnerAgentId = "cccccccc-1111-4111-8111-cccccccccccc";
 
 const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
@@ -250,6 +253,17 @@ function boardActor() {
   };
 }
 
+function ceoActor(overrides: Record<string, unknown> = {}) {
+  return {
+    type: "agent",
+    agentId: ceoAgentId,
+    companyId,
+    source: "agent_key",
+    runId: "dddddddd-1111-4111-8111-dddddddddddd",
+    ...overrides,
+  };
+}
+
 describe("agent issue mutation checkout ownership", () => {
   beforeEach(() => {
     vi.resetModules();
@@ -473,6 +487,144 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).toHaveBeenCalled();
   });
 
+  // --- reporting-chain walk fallback (AUR-4135): exercised only when the actor
+  // holds no tasks:manage_active_checkouts grant and canCreateAgentsLegacy is false. ---
+
+  describe("reporting-chain checkout-management override (no grant)", () => {
+    it("grants the override when the assignee reports directly to the actor", async () => {
+      mockAgentService.list.mockResolvedValue([
+        makeAgent(ownerAgentId, { reportsTo: peerAgentId }),
+        makeAgent(peerAgentId),
+      ]);
+
+      const res = await request(await createApp(peerActor())).patch(`/api/issues/${issueId}`).send({ title: "Direct report update" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalled();
+    });
+
+    it("grants the override across a transitive (grandparent) reporting chain", async () => {
+      mockAgentService.list.mockResolvedValue([
+        makeAgent(ownerAgentId, { reportsTo: middleManagerAgentId }),
+        makeAgent(middleManagerAgentId, { reportsTo: peerAgentId }),
+        makeAgent(peerAgentId),
+      ]);
+
+      const res = await request(await createApp(peerActor())).patch(`/api/issues/${issueId}`).send({ title: "Grandparent manager update" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalled();
+    });
+
+    it("denies a peer whose reporting chain leads to someone other than the actor", async () => {
+      mockAgentService.list.mockResolvedValue([
+        makeAgent(ownerAgentId, { reportsTo: unrelatedManagerAgentId }),
+        makeAgent(unrelatedManagerAgentId, { reportsTo: null }),
+        makeAgent(peerAgentId),
+      ]);
+
+      const res = await request(await createApp(peerActor())).patch(`/api/issues/${issueId}`).send({ title: "Peer attempt" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("denies and terminates immediately when the assignee has no manager (reportsTo=null, e.g. CEO-owned issue)", async () => {
+      mockAgentService.list.mockResolvedValue([
+        makeAgent(ownerAgentId, { reportsTo: null }),
+        makeAgent(peerAgentId),
+      ]);
+
+      const res = await request(await createApp(peerActor())).patch(`/api/issues/${issueId}`).send({ title: "No-manager assignee attempt" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("terminates the walk under a reportsTo cycle instead of hanging, and denies", async () => {
+      mockAgentService.list.mockResolvedValue([
+        makeAgent(ownerAgentId, { reportsTo: cyclePartnerAgentId }),
+        makeAgent(cyclePartnerAgentId, { reportsTo: ownerAgentId }),
+        makeAgent(peerAgentId),
+      ]);
+
+      const res = await request(await createApp(peerActor())).patch(`/api/issues/${issueId}`).send({ title: "Cycle attempt" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+  });
+
+  // --- CEO permission migration (AUR-4135): canCreateAgentsLegacy /
+  // hasCrossIssueCommentPermission no longer bypass on role === "ceo" — the CEO
+  // must hold the same explicit grants any other principal would need. The
+  // migration (0093_ceo_legacy_permission_grants.sql) backfills those grants for
+  // every existing CEO agent, so these pairs prove the swap is behavior-preserving. ---
+
+  describe("CEO permission migration — role hardcode replaced by explicit grants", () => {
+    it("CEO with no grant can no longer override an active checkout via role alone", async () => {
+      const res = await request(await createApp(ceoActor())).patch(`/api/issues/${issueId}`).send({ title: "CEO attempt" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("CEO WITH tasks:manage_active_checkouts (post-migration grant) retains the override", async () => {
+      mockAccessService.hasPermission.mockImplementation(async (
+        _companyId: string,
+        _principalType: string,
+        principalId: string,
+        permissionKey: string,
+      ) => principalId === ceoAgentId && permissionKey === "tasks:manage_active_checkouts");
+
+      const res = await request(await createApp(ceoActor())).patch(`/api/issues/${issueId}`).send({ title: "CEO managed update" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalled();
+    });
+
+    it("CEO with no grant can no longer bypass cross-issue comment gating via role alone", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "done", assigneeAgentId: ownerAgentId }));
+      mockIssueService.wasAgentMentionedInThread.mockResolvedValue(false);
+      mockIssueService.wasAgentPriorParticipantInThread.mockResolvedValue(false);
+
+      const res = await request(await createApp(ceoActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "ceo coordination note" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    it("CEO WITH tasks:comment_cross_issue (post-migration grant) retains cross-issue comment capability", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "done", assigneeAgentId: ownerAgentId }));
+      mockIssueService.wasAgentMentionedInThread.mockResolvedValue(false);
+      mockIssueService.wasAgentPriorParticipantInThread.mockResolvedValue(false);
+      mockAccessService.hasPermission.mockImplementation(async (
+        _companyId: string,
+        _principalType: string,
+        principalId: string,
+        permissionKey: string,
+      ) => principalId === ceoAgentId && permissionKey === "tasks:comment_cross_issue");
+
+      const res = await request(await createApp(ceoActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "ceo coordination note" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalled();
+    });
+
+    it("CEO with no tasks:assign grant can no longer assign an issue at creation time via role alone", async () => {
+      const res = await request(await createApp(ceoActor()))
+        .post(`/api/companies/${companyId}/issues`)
+        .send({ title: "New assigned issue", assigneeAgentId: peerAgentId });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toBe("Missing permission: tasks:assign");
+    });
+  });
+
   it.each([
     ["todo", "patch", (app: express.Express) => request(app).patch(`/api/issues/${issueId}`).send({ title: "Todo update" })],
     ["todo", "comment", (app: express.Express) => request(app).post(`/api/issues/${issueId}/comments`).send({ body: "Todo noise" })],
@@ -694,7 +846,7 @@ describe("agent issue mutation checkout ownership", () => {
         expect.objectContaining({ authorType: "agent" }),
       );
       // Inert: no status mutation / no reopen. Wake of the current assignee is handled by the
-      // shared mentionReply path (see mention-scoped tests) since the same flag is reused.
+      // shared appendOnly path (see mention-scoped tests) since the same flag is reused.
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
@@ -852,6 +1004,92 @@ describe("agent issue mutation checkout ownership", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(403);
       expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
       expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    // Falsifiability controls (AUR-4135): the stranger-denial fixture above closes
+    // all 4 doors (author / ownership-or-checkout-override / mentioned / prior
+    // participant). Each control below relaxes exactly ONE door and must flip the
+    // outcome to allow — proving the base test discriminates instead of always
+    // returning 403 regardless of these mocks.
+    it("control: relaxing ONLY authorship flips the stranger-denial fixture to allow", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, createdByAgentId: peerAgentId }),
+      );
+      mockIssueService.wasAgentMentionedInThread.mockResolvedValue(false);
+      mockIssueService.wasAgentPriorParticipantInThread.mockResolvedValue(false);
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "author now" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalled();
+    });
+
+    it("control: relaxing ONLY assignee-ownership flips the stranger-denial fixture to allow", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "todo", assigneeAgentId: peerAgentId, createdByAgentId: authorAgentId }),
+      );
+      mockIssueService.wasAgentMentionedInThread.mockResolvedValue(false);
+      mockIssueService.wasAgentPriorParticipantInThread.mockResolvedValue(false);
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "now assignee" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalled();
+    });
+
+    it("control: relaxing ONLY the checkout-management override flips the stranger-denial fixture to allow", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, createdByAgentId: authorAgentId }),
+      );
+      mockIssueService.wasAgentMentionedInThread.mockResolvedValue(false);
+      mockIssueService.wasAgentPriorParticipantInThread.mockResolvedValue(false);
+      mockAccessService.hasPermission.mockImplementation(async (
+        _companyId: string,
+        _principalType: string,
+        principalId: string,
+        permissionKey: string,
+      ) => principalId === peerAgentId && permissionKey === "tasks:manage_active_checkouts");
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "override note" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalled();
+    });
+
+    it("control: relaxing ONLY the mention door flips the stranger-denial fixture to allow", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, createdByAgentId: authorAgentId }),
+      );
+      mockIssueService.wasAgentMentionedInThread.mockResolvedValue(true);
+      mockIssueService.wasAgentPriorParticipantInThread.mockResolvedValue(false);
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "mentioned now" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalled();
+    });
+
+    it("control: relaxing ONLY the prior-participant door flips the stranger-denial fixture to allow", async () => {
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "todo", assigneeAgentId: ownerAgentId, createdByAgentId: authorAgentId }),
+      );
+      mockIssueService.wasAgentMentionedInThread.mockResolvedValue(false);
+      mockIssueService.wasAgentPriorParticipantInThread.mockResolvedValue(true);
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "participant now" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.addComment).toHaveBeenCalled();
     });
 
     it("allows the author to amend description via PATCH and logs the brief-amended activity + comment", async () => {

@@ -1012,7 +1012,6 @@ export function issueRoutes(
   }
 
   function canCreateAgentsLegacy(agent: { permissions: Record<string, unknown> | null | undefined; role: string }) {
-    if (agent.role === "ceo") return true;
     if (!agent.permissions || typeof agent.permissions !== "object") return false;
     return Boolean((agent.permissions as Record<string, unknown>).canCreateAgents);
   }
@@ -1077,10 +1076,7 @@ export function issueRoutes(
   }
 
   async function hasCrossIssueCommentPermission(actorAgentId: string, companyId: string): Promise<boolean> {
-    const allowedByGrant = await access.hasPermission(companyId, "agent", actorAgentId, "tasks:comment_cross_issue");
-    if (allowedByGrant) return true;
-    const actorAgent = await agentsSvc.getById(actorAgentId);
-    return actorAgent !== null && actorAgent.role === "ceo" && actorAgent.companyId === companyId;
+    return access.hasPermission(companyId, "agent", actorAgentId, "tasks:comment_cross_issue");
   }
 
   async function wouldOwnershipGateReject(
@@ -1257,8 +1253,8 @@ export function issueRoutes(
     req: Request,
     res: Response,
     issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null; createdByAgentId: string | null },
-  ): Promise<{ ok: true; mentionReply: boolean } | false> {
-    if (req.actor.type !== "agent") return { ok: true, mentionReply: false };
+  ): Promise<{ ok: true; appendOnly: boolean } | false> {
+    if (req.actor.type !== "agent") return { ok: true, appendOnly: false };
     const actorAgentId = req.actor.agentId;
     if (!actorAgentId) {
       res.status(403).json({ error: "Agent authentication required" });
@@ -1281,7 +1277,7 @@ export function issueRoutes(
             actorAgentId,
           },
         });
-        return { ok: true, mentionReply: true };
+        return { ok: true, appendOnly: true };
       }
       const isMentioned = await svc.wasAgentMentionedInThread(issue.companyId, issue.id, actorAgentId);
       if (isMentioned) {
@@ -1300,7 +1296,7 @@ export function issueRoutes(
             actorAgentId,
           },
         });
-        return { ok: true, mentionReply: true };
+        return { ok: true, appendOnly: true };
       }
       const isPriorParticipant = await svc.wasAgentPriorParticipantInThread(issue.companyId, issue.id, actorAgentId);
       if (isPriorParticipant) {
@@ -1319,12 +1315,12 @@ export function issueRoutes(
             actorAgentId,
           },
         });
-        return { ok: true, mentionReply: true };
+        return { ok: true, appendOnly: true };
       }
     }
     const allowed = await assertAgentIssueMutationAllowed(req, res, issue);
     if (!allowed) return false;
-    return { ok: true, mentionReply: false };
+    return { ok: true, appendOnly: false };
   }
 
   function assertStructuredCommentFieldsAllowed(
@@ -4913,7 +4909,7 @@ export function issueRoutes(
 
     const commentAuthResult = await assertAgentCommentAllowed(req, res, issue);
     if (!commentAuthResult) return;
-    const { mentionReply } = commentAuthResult;
+    const { appendOnly } = commentAuthResult;
     if (!assertStructuredCommentFieldsAllowed(req, res, {
       presentation: req.body.presentation,
       metadata: req.body.metadata,
@@ -4925,9 +4921,9 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
-    const reopenRequested = mentionReply ? false : req.body.reopen === true;
-    const resumeRequested = mentionReply ? false : req.body.resume === true;
-    const interruptRequested = mentionReply ? false : req.body.interrupt === true;
+    const reopenRequested = appendOnly ? false : req.body.reopen === true;
+    const resumeRequested = appendOnly ? false : req.body.resume === true;
+    const interruptRequested = appendOnly ? false : req.body.interrupt === true;
     if (resumeRequested === true && !(await assertExplicitResumeIntentAllowed(req, res, issue))) return;
     if (resumeRequested !== true && reopenRequested === true && req.actor.type === "agent") {
       if (!(await assertExplicitResumeIntentAllowed(req, res, issue))) return;
@@ -4936,7 +4932,7 @@ export function issueRoutes(
     const isBlocked = issue.status === "blocked";
     const explicitMoveToTodoRequested = reopenRequested || resumeRequested === true;
     const effectiveMoveToTodoRequested =
-      mentionReply
+      appendOnly
         ? false
         : explicitMoveToTodoRequested ||
           shouldImplicitlyMoveCommentedIssueToTodo({
@@ -5015,7 +5011,7 @@ export function issueRoutes(
       }
     }
 
-    const mentionReplyMetadata = mentionReply && actor.agentId
+    const mentionReplyMetadata = appendOnly && actor.agentId
       ? { version: 1 as const, mentionReply: true, mentionRepliedByAgentId: actor.agentId }
       : null;
     const comment = await svc.addComment(id, req.body.body, {
@@ -5086,7 +5082,7 @@ export function issueRoutes(
       const actorIsAgent = actor.actorType === "agent";
       const selfComment = actorIsAgent && actor.actorId === assigneeId;
       const skipWake = selfComment || isClosed;
-      if (assigneeId && (reopened || !skipWake || (mentionReply && isClosed))) {
+      if (assigneeId && (reopened || !skipWake || (appendOnly && isClosed))) {
         if (reopened) {
           wakeups.set(assigneeId, {
             source: "automation",

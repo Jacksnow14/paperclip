@@ -652,6 +652,13 @@
       "when": 1785018105584,
       "tag": "0092_memory_local_records_idempotency",
       "breakpoints": true
+    },
+    {
+      "idx": 93,
+      "version": "7",
+      "when": 1785018105585,
+      "tag": "0093_ceo_legacy_permission_grants",
+      "breakpoints": true
     }
   ]
 }

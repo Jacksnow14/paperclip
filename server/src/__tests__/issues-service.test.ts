@@ -30,7 +30,7 @@ import {
   ISSUE_LIST_MAX_LIMIT,
   issueService,
 } from "../services/issues.ts";
-import { buildProjectMentionHref, MAX_ISSUE_REQUEST_DEPTH } from "@paperclipai/shared";
+import { buildAgentMentionHref, buildProjectMentionHref, MAX_ISSUE_REQUEST_DEPTH } from "@paperclipai/shared";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -3222,5 +3222,235 @@ describeEmbeddedPostgres("issueService.wasAgentPriorParticipantInThread", () => 
     await expect(
       svc.wasAgentPriorParticipantInThread(companyId, otherIssueId, authorAgentId),
     ).resolves.toBe(false);
+  });
+});
+
+describeEmbeddedPostgres("issueService.wasAgentMentionedInThread", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-service-mentioned-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+    await ensureIssueRelationsTable(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issues);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedCompanyAndAgents() {
+    const companyId = randomUUID();
+    const ctoAgentId = randomUUID();
+    const thirdPartyAgentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values([
+      {
+        id: ctoAgentId,
+        companyId,
+        name: "CTO",
+        role: "cto",
+        status: "active",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: thirdPartyAgentId,
+        companyId,
+        name: "Alice",
+        role: "engineer",
+        status: "active",
+        adapterType: "claude_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+
+    return { companyId, ctoAgentId, thirdPartyAgentId };
+  }
+
+  async function seedIssue(companyId: string, createdByAgentId: string, createdAt: Date) {
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Mention scoping fixture",
+      status: "todo",
+      priority: "medium",
+      createdByAgentId,
+      createdAt,
+    });
+    return issueId;
+  }
+
+  it("(a) a third-party mention older than the actor's own subsequent comment does not grant", async () => {
+    const { companyId, ctoAgentId, thirdPartyAgentId } = await seedCompanyAndAgents();
+    const issueId = await seedIssue(companyId, thirdPartyAgentId, new Date("2026-01-01T00:00:00Z"));
+
+    await db.insert(issueComments).values([
+      {
+        companyId,
+        issueId,
+        authorAgentId: thirdPartyAgentId,
+        body: "I already told @CTO about this last week.",
+        createdAt: new Date("2026-01-01T01:00:00Z"),
+      },
+      {
+        companyId,
+        issueId,
+        authorAgentId: ctoAgentId,
+        body: "Got it, thanks.",
+        createdAt: new Date("2026-01-01T02:00:00Z"),
+      },
+    ]);
+
+    await expect(
+      svc.wasAgentMentionedInThread(companyId, issueId, ctoAgentId),
+    ).resolves.toBe(false);
+  });
+
+  it("(b) a self-authored @OwnName does not grant", async () => {
+    const { companyId, ctoAgentId, thirdPartyAgentId } = await seedCompanyAndAgents();
+    const issueId = await seedIssue(companyId, thirdPartyAgentId, new Date("2026-01-01T00:00:00Z"));
+
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: ctoAgentId,
+      body: "Note to self: @CTO should double check this.",
+      createdAt: new Date("2026-01-01T01:00:00Z"),
+    });
+
+    await expect(
+      svc.wasAgentMentionedInThread(companyId, issueId, ctoAgentId),
+    ).resolves.toBe(false);
+  });
+
+  it("(c) a genuine mention is consumed by the actor's subsequent reply and no longer grants", async () => {
+    const { companyId, ctoAgentId, thirdPartyAgentId } = await seedCompanyAndAgents();
+    const issueId = await seedIssue(companyId, thirdPartyAgentId, new Date("2026-01-01T00:00:00Z"));
+
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: thirdPartyAgentId,
+      body: "@CTO can you take a look?",
+      createdAt: new Date("2026-01-01T01:00:00Z"),
+    });
+
+    await expect(
+      svc.wasAgentMentionedInThread(companyId, issueId, ctoAgentId),
+    ).resolves.toBe(true);
+
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: ctoAgentId,
+      body: "Sure, on it.",
+      createdAt: new Date("2026-01-01T02:00:00Z"),
+    });
+
+    await expect(
+      svc.wasAgentMentionedInThread(companyId, issueId, ctoAgentId),
+    ).resolves.toBe(false);
+  });
+
+  it("(d) a genuine fresh third-party mention still grants when the actor has never commented (AUR-2825)", async () => {
+    const { companyId, ctoAgentId, thirdPartyAgentId } = await seedCompanyAndAgents();
+    const issueId = await seedIssue(companyId, thirdPartyAgentId, new Date("2026-01-01T00:00:00Z"));
+
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: thirdPartyAgentId,
+      body: "@CTO can you take a look?",
+      createdAt: new Date("2026-01-01T01:00:00Z"),
+    });
+
+    await expect(
+      svc.wasAgentMentionedInThread(companyId, issueId, ctoAgentId),
+    ).resolves.toBe(true);
+  });
+
+  it("applies the same author/recency scoping to explicit agent-link mentions", async () => {
+    const { companyId, ctoAgentId, thirdPartyAgentId } = await seedCompanyAndAgents();
+    const issueId = await seedIssue(companyId, thirdPartyAgentId, new Date("2026-01-01T00:00:00Z"));
+
+    await db.insert(issueComments).values([
+      {
+        companyId,
+        issueId,
+        authorAgentId: ctoAgentId,
+        body: `Self-mention via link: [CTO](${buildAgentMentionHref(ctoAgentId)})`,
+        createdAt: new Date("2026-01-01T01:00:00Z"),
+      },
+    ]);
+    await expect(
+      svc.wasAgentMentionedInThread(companyId, issueId, ctoAgentId),
+    ).resolves.toBe(false);
+
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: thirdPartyAgentId,
+      body: `Please see [CTO](${buildAgentMentionHref(ctoAgentId)})`,
+      createdAt: new Date("2026-01-01T02:00:00Z"),
+    });
+    await expect(
+      svc.wasAgentMentionedInThread(companyId, issueId, ctoAgentId),
+    ).resolves.toBe(true);
+  });
+
+  it("scopes description-level mentions via the issue's createdByAgentId", async () => {
+    const { companyId, ctoAgentId, thirdPartyAgentId } = await seedCompanyAndAgents();
+
+    const selfCreatedIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: selfCreatedIssueId,
+      companyId,
+      title: "Self-authored description mention",
+      description: "@CTO please review this brief.",
+      status: "todo",
+      priority: "medium",
+      createdByAgentId: ctoAgentId,
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+    });
+    await expect(
+      svc.wasAgentMentionedInThread(companyId, selfCreatedIssueId, ctoAgentId),
+    ).resolves.toBe(false);
+
+    const thirdPartyCreatedIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: thirdPartyCreatedIssueId,
+      companyId,
+      title: "Third-party description mention",
+      description: "@CTO please review this brief.",
+      status: "todo",
+      priority: "medium",
+      createdByAgentId: thirdPartyAgentId,
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+    });
+    await expect(
+      svc.wasAgentMentionedInThread(companyId, thirdPartyCreatedIssueId, ctoAgentId),
+    ).resolves.toBe(true);
   });
 });

@@ -162,6 +162,7 @@ export const updateAgentPermissionsSchema = z.object({
   // Optional so existing clients keep working; absent means "leave unchanged"
   // (the service merges the patch over the stored permissions record).
   canUpdateAgentMetadata: z.boolean().optional(),
+  canManageRoutines: z.boolean().optional(),
 });
 
 export type UpdateAgentPermissions = z.infer<typeof updateAgentPermissionsSchema>;

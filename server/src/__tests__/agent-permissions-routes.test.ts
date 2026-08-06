@@ -1373,6 +1373,105 @@ describe.sequential("agent permission routes", () => {
     expect(res.body.access.taskAssignSource).toBe("agent_creator");
   });
 
+  it("grants routines:manage when canManageRoutines is explicitly set to true", async () => {
+    mockAccessService.hasPermission.mockResolvedValue(true);
+    mockAccessService.listPrincipalGrants.mockResolvedValue([
+      {
+        id: "grant-routines-manage",
+        companyId,
+        principalType: "agent",
+        principalId: agentId,
+        permissionKey: "routines:manage",
+        scope: null,
+        grantedByUserId: "board-user",
+        createdAt: new Date("2026-03-19T00:00:00.000Z"),
+        updatedAt: new Date("2026-03-19T00:00:00.000Z"),
+      },
+    ]);
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}/permissions`)
+      .send({ canCreateAgents: false, canAssignTasks: false, canManageRoutines: true }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAccessService.setPrincipalPermission).toHaveBeenCalledWith(
+      companyId,
+      "agent",
+      agentId,
+      "routines:manage",
+      true,
+      "board-user",
+    );
+    expect(res.body.access.canManageRoutines).toBe(true);
+    expect(res.body.access.routineManageSource).toBe("explicit_grant");
+  });
+
+  it("revokes routines:manage when canManageRoutines is explicitly set to false", async () => {
+    mockAccessService.hasPermission.mockResolvedValue(false);
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}/permissions`)
+      .send({ canCreateAgents: false, canAssignTasks: false, canManageRoutines: false }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAccessService.setPrincipalPermission).toHaveBeenCalledWith(
+      companyId,
+      "agent",
+      agentId,
+      "routines:manage",
+      false,
+      "board-user",
+    );
+  });
+
+  it("does not touch the routines:manage grant when canManageRoutines is omitted from the permissions patch", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}/permissions`)
+      .send({ canCreateAgents: false, canAssignTasks: false }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAccessService.setPrincipalPermission).not.toHaveBeenCalledWith(
+      companyId,
+      "agent",
+      agentId,
+      "routines:manage",
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(mockAccessService.setPrincipalPermission).toHaveBeenCalledWith(
+      companyId,
+      "agent",
+      agentId,
+      "tasks:assign",
+      false,
+      "board-user",
+    );
+  });
+
   it("exposes a dedicated agent route for the inbox mine view", async () => {
     mockIssueService.list.mockResolvedValue([
       {

@@ -24,7 +24,7 @@ function darkRuns(agentId = 'a1') {
 test('newly dark agent: sends exactly one alert and patches metadata.darkLane', async () => {
   const sent = [];
   const patched = [];
-  const results = await tickCompany({
+  const { results, localState } = await tickCompany({
     agents: [makeAgent()],
     runs: darkRuns(),
     now: NOW,
@@ -46,6 +46,8 @@ test('newly dark agent: sends exactly one alert and patches metadata.darkLane', 
   assert.equal(results.length, 1);
   assert.equal(results[0].alert, 'opened');
   assert.equal(results[0].patched, true);
+  // AUR-5027: local state agrees with what was (successfully) patched.
+  assert.equal(localState.a1.alertedAt, NOW.toISOString());
 });
 
 test('AC2: still dark on the next tick sends zero further alerts and does not re-patch', async () => {
@@ -66,7 +68,7 @@ test('AC2: still dark on the next tick sends zero further alerts and does not re
   let sendCount = 0;
   let patchCount = 0;
   const later = new Date(NOW.getTime() + 15 * 60 * 1000);
-  const results = await tickCompany({
+  const { results } = await tickCompany({
     agents: [agent],
     runs: darkRuns(),
     now: later,
@@ -104,7 +106,7 @@ test('AC3: recovery sends exactly one alert and clears darkLane metadata', async
   const patched = [];
   // No runs at all this tick: the agent has live continuation again (nothing
   // scheduled_retry, nothing parked) — not dark.
-  const results = await tickCompany({
+  const { results, localState } = await tickCompany({
     agents: [agent],
     runs: [{ agentId: 'a1', status: 'succeeded', scheduledRetryAt: null }],
     now: new Date(NOW.getTime() + 30 * 60 * 1000),
@@ -124,12 +126,13 @@ test('AC3: recovery sends exactly one alert and clears darkLane metadata', async
   assert.equal(patched[0].metadata.darkLane, undefined);
   assert.equal(patched[0].metadata.unrelatedKey, 'keep-me');
   assert.equal(results[0].alert, 'recovered');
+  assert.equal(localState.a1, undefined);
 });
 
 test('AC4: rate-window refusal ("blocked") leaves the guard unset for retry, never re-sends same tick', async () => {
   let sendCalls = 0;
   const patched = [];
-  const results = await tickCompany({
+  const { results, localState } = await tickCompany({
     agents: [makeAgent()],
     runs: darkRuns(),
     now: NOW,
@@ -150,11 +153,15 @@ test('AC4: rate-window refusal ("blocked") leaves the guard unset for retry, nev
   assert.equal(patched.length, 1);
   assert.equal(patched[0].metadata.darkLane.alertedAt, null);
   assert.equal(patched[0].metadata.darkLane.active, true);
+  // AUR-5027 (AC8): the authoritative local state carries the same
+  // unconfirmed-so-unset guard — a blocked send must not read as suppressed.
+  assert.equal(localState.a1.alertedAt, null);
+  assert.equal(localState.a1.active, true);
 });
 
 test('a patchAgent failure (e.g. cross-agent write permission gate) is surfaced, not thrown, and does not block other agents', async () => {
   const sent = [];
-  const results = await tickCompany({
+  const { results } = await tickCompany({
     agents: [makeAgent({ id: 'a1', name: 'Dark One' }), makeAgent({ id: 'a2', name: 'Dark Two' })],
     runs: [...darkRuns('a1'), ...darkRuns('a2')],
     now: NOW,
@@ -179,7 +186,7 @@ test('a patchAgent failure (e.g. cross-agent write permission gate) is surfaced,
 });
 
 test('healthy idle agent with no metadata and no parked runs produces zero candidates', async () => {
-  const results = await tickCompany({
+  const { results } = await tickCompany({
     agents: [makeAgent()],
     runs: [{ agentId: 'a1', status: 'succeeded', scheduledRetryAt: null }],
     now: NOW,
@@ -193,7 +200,7 @@ test('healthy idle agent with no metadata and no parked runs produces zero candi
 });
 
 test('dry-run computes the plan but never calls sendAlert or patchAgent', async () => {
-  const results = await tickCompany({
+  const { results } = await tickCompany({
     agents: [makeAgent()],
     runs: darkRuns(),
     now: NOW,
@@ -210,6 +217,185 @@ test('dry-run computes the plan but never calls sendAlert or patchAgent', async 
   assert.equal(results[0].alert, 'opened');
   assert.equal(results[0].sendResult, null);
   assert.equal(results[0].patched, false);
+});
+
+// ── AUR-5027: AC2 dedup guard must survive a failed metadata PATCH ──────────
+
+function alwaysFailingPatchAgent() {
+  return async () => {
+    throw new Error('403 Forbidden');
+  };
+}
+
+test('AUR-5027 req6: two consecutive dark ticks with the metadata PATCH forced to fail still send exactly one alert', async () => {
+  const sent = [];
+  const patchAgent = alwaysFailingPatchAgent();
+
+  const tick1 = await tickCompany({
+    agents: [makeAgent()],
+    runs: darkRuns(),
+    now: NOW,
+    issuePrefix: 'aur',
+    sendAlert: async (msg) => {
+      sent.push(msg);
+      return 'confirmed';
+    },
+    patchAgent,
+  });
+
+  // The PATCH failed — the old implementation left agent.metadata.darkLane
+  // untouched, so a second tick reading only metadata would see prevState
+  // null again and re-plan the same "opened" alert. Feed the SAME
+  // (unpatched) agent metadata into tick 2, but carry the returned
+  // localState forward — that is the fix under test.
+  const tick2 = await tickCompany({
+    agents: [makeAgent()], // metadata still null: PATCH never landed
+    runs: darkRuns(),
+    now: new Date(NOW.getTime() + 15 * 60 * 1000),
+    issuePrefix: 'aur',
+    sendAlert: async (msg) => {
+      sent.push(msg);
+      return 'confirmed';
+    },
+    patchAgent,
+    localState: tick1.localState,
+  });
+
+  assert.equal(sent.length, 1, 'exactly one alert across two ticks despite every PATCH failing');
+  assert.equal(tick1.results[0].alert, 'opened');
+  assert.equal(tick2.results[0].alert, null);
+  assert.equal(tick1.results[0].patched, false);
+  assert.equal(tick2.results[0].patched, false);
+  assert.equal(tick1.localState.a1.alertedAt, NOW.toISOString());
+});
+
+test('AUR-5027 req5: a metadata PATCH failure is surfaced via patchError but never thrown', async () => {
+  const results = await tickCompany({
+    agents: [makeAgent()],
+    runs: darkRuns(),
+    now: NOW,
+    issuePrefix: 'aur',
+    sendAlert: async () => 'confirmed',
+    patchAgent: alwaysFailingPatchAgent(),
+  });
+  // Resolving (not rejecting) is the contract main() relies on to degrade
+  // this to a warning instead of an error exit.
+  assert.equal(results.results[0].patchError, '403 Forbidden');
+});
+
+test('AUR-5027 req7: dark -> recovered -> exactly one recovery alert, with the PATCH still failing throughout', async () => {
+  const sent = [];
+  const patchAgent = alwaysFailingPatchAgent();
+
+  const tick1 = await tickCompany({
+    agents: [makeAgent()],
+    runs: darkRuns(),
+    now: NOW,
+    issuePrefix: 'aur',
+    sendAlert: async (msg) => {
+      sent.push(msg);
+      return 'confirmed';
+    },
+    patchAgent,
+  });
+  assert.equal(tick1.results[0].alert, 'opened');
+
+  // Second tick: still dark, metadata PATCH never landed so metadata is
+  // still null — must rely on localState, not send again.
+  const tick2 = await tickCompany({
+    agents: [makeAgent()],
+    runs: darkRuns(),
+    now: new Date(NOW.getTime() + 15 * 60 * 1000),
+    issuePrefix: 'aur',
+    sendAlert: async (msg) => {
+      sent.push(msg);
+      return 'confirmed';
+    },
+    patchAgent,
+    localState: tick1.localState,
+  });
+  assert.equal(tick2.results[0].alert, null);
+
+  // Third tick: recovered (no parked runs at all).
+  const tick3 = await tickCompany({
+    agents: [makeAgent()],
+    runs: [{ agentId: 'a1', status: 'succeeded', scheduledRetryAt: null }],
+    now: new Date(NOW.getTime() + 30 * 60 * 1000),
+    issuePrefix: 'aur',
+    sendAlert: async (msg) => {
+      sent.push(msg);
+      return 'confirmed';
+    },
+    patchAgent,
+    localState: tick2.localState,
+  });
+
+  assert.equal(sent.length, 2, 'exactly one opened + one recovered alert');
+  assert.match(sent[1], /Lane recovered/);
+  assert.equal(tick3.results[0].alert, 'recovered');
+  assert.deepEqual(tick3.localState, {}, 'fully quiescent again once the recovery alert confirms');
+});
+
+test('AUR-5027 req8: send blocked by the rate window leaves the local guard unset so the next tick retries', async () => {
+  const sent = [];
+  let call = 0;
+  const sendAlert = async (msg) => {
+    call += 1;
+    sent.push(msg);
+    return call === 1 ? 'blocked' : 'confirmed';
+  };
+  const patchAgent = alwaysFailingPatchAgent();
+
+  const tick1 = await tickCompany({
+    agents: [makeAgent()],
+    runs: darkRuns(),
+    now: NOW,
+    issuePrefix: 'aur',
+    sendAlert,
+    patchAgent,
+  });
+  assert.equal(tick1.results[0].alert, 'opened');
+  assert.equal(tick1.results[0].sendResult, 'blocked');
+  assert.equal(tick1.localState.a1.alertedAt, null, 'unconfirmed send must not set the guard');
+
+  const tick2 = await tickCompany({
+    agents: [makeAgent()],
+    runs: darkRuns(),
+    now: new Date(NOW.getTime() + 15 * 60 * 1000),
+    issuePrefix: 'aur',
+    sendAlert,
+    patchAgent,
+    localState: tick1.localState,
+  });
+
+  assert.equal(sent.length, 2, 'the next tick legitimately retries the still-unconfirmed alert');
+  assert.equal(tick2.results[0].alert, 'opened');
+  assert.equal(tick2.results[0].sendResult, 'confirmed');
+  assert.equal(tick2.localState.a1.alertedAt, new Date(NOW.getTime() + 15 * 60 * 1000).toISOString());
+});
+
+test('AUR-5027: local state is authoritative even when agent.metadata.darkLane still shows the stale unpatched value', async () => {
+  // Simulates the real production shape: metadata never moved off null
+  // because every PATCH 403s, but localState correctly tracked the guard.
+  const alertedAt = NOW.toISOString();
+  let sendCalls = 0;
+  const { results } = await tickCompany({
+    agents: [makeAgent({ metadata: null })],
+    runs: darkRuns(),
+    now: new Date(NOW.getTime() + 60 * 60 * 1000),
+    issuePrefix: 'aur',
+    localState: {
+      a1: { ...DEFAULT_DARK_LANE_STATE, active: true, since: NOW.toISOString(), alertedAt },
+    },
+    sendAlert: async () => {
+      sendCalls += 1;
+      return 'confirmed';
+    },
+    patchAgent: alwaysFailingPatchAgent(),
+  });
+
+  assert.equal(sendCalls, 0, 'localState alertedAt suppresses the repeat alert even though metadata is still null');
+  assert.equal(results[0].alert, null);
 });
 
 // ── sendFounderAlert: real subprocess exec against fake notify_founder.sh stand-ins ──

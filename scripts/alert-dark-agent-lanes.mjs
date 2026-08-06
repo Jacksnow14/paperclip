@@ -64,10 +64,12 @@ import {
   finalizeDarkLaneState,
   darkLaneStatesEqual,
 } from './lib/dark-lane-transition.mjs';
+import { loadLocalState, saveLocalState } from './lib/dark-lane-local-state.mjs';
 
 const execFileAsync = promisify(execFile);
 
 const DEFAULT_NOTIFY_FOUNDER_CMD = path.join(homedir(), 'bot', 'notify_founder.sh');
+const DEFAULT_STATE_DIR = path.join(homedir(), 'paperclip-data', 'dark-lane-alert', 'state');
 
 /**
  * Send the founder alert and classify the outcome per the reachability
@@ -112,6 +114,15 @@ function buildAlertMessage({ kind, agent, state, issuePrefix }) {
  * dark-lane transition for every candidate agent. Injected functions make
  * this fully unit-testable without touching the network.
  *
+ * `localState` (AUR-5027) is the AUTHORITATIVE source for the AC2 dedup
+ * decision — a map of agentId -> persisted darkLane state, durable on the
+ * cron host independent of `agent.metadata`. `agent.metadata.darkLane` is
+ * consulted only as a bootstrap fallback when localState has no entry yet
+ * for an agent (e.g. a fresh cron host inheriting state a prior, working
+ * metadata PATCH already recorded), and is otherwise written best-effort as
+ * an observability projection (AC1): its PATCH failing degrades to a
+ * warning and never affects the alert decision or the returned localState.
+ *
  * @param {object} args
  * @param {Array<object>} args.agents - normalized agent rows (id, name, urlKey, adapterType, metadata)
  * @param {Array<object>} args.runs - heartbeat-runs census rows for this company
@@ -119,10 +130,14 @@ function buildAlertMessage({ kind, agent, state, issuePrefix }) {
  * @param {string} args.issuePrefix
  * @param {(message: string) => Promise<'confirmed'|'blocked'|'failed'>} args.sendAlert
  * @param {(agentId: string, metadata: object) => Promise<void>} args.patchAgent
+ * @param {Object<string, object>} [args.localState] - previous tick's authoritative state, keyed by agentId
  * @param {boolean} [args.dryRun]
- * @returns {Promise<Array<{agentId: string, name: string, alert: string|null, sendResult: string|null, patched: boolean}>>}
+ * @returns {Promise<{
+ *   results: Array<{agentId: string, name: string, alert: string|null, sendResult: string|null, patched: boolean, patchError: string|null}>,
+ *   localState: Object<string, object>,
+ * }>}
  */
-export async function tickCompany({ agents, runs, now, issuePrefix, sendAlert, patchAgent, dryRun = false }) {
+export async function tickCompany({ agents, runs, now, issuePrefix, sendAlert, patchAgent, localState = {}, dryRun = false }) {
   const nowIso = now.toISOString();
   const flagged = classifyParkedAgents(runs, { now });
   const flaggedByAgent = new Map(flagged.map((f) => [f.agentId, f.parkedRuns]));
@@ -130,16 +145,19 @@ export async function tickCompany({ agents, runs, now, issuePrefix, sendAlert, p
   const agentById = new Map(agents.map((a) => [a.id, a]));
   const candidateIds = new Set(flaggedByAgent.keys());
   for (const agent of agents) {
-    const existing = agent.metadata?.darkLane;
+    const existing = localState[agent.id] ?? agent.metadata?.darkLane;
     if (existing?.active || existing?.recoveryPending) candidateIds.add(agent.id);
   }
 
   const results = [];
+  const nextLocalState = { ...localState };
   for (const agentId of candidateIds) {
     const agent = agentById.get(agentId);
     if (!agent) continue; // stale run referencing a since-deleted agent
 
-    const prevState = agent.metadata?.darkLane ?? null;
+    // Local durable state wins whenever it has an opinion; metadata is only
+    // the bootstrap fallback for an agent localState has never seen.
+    const prevState = localState[agentId] ?? agent.metadata?.darkLane ?? null;
     const isDarkNow = flaggedByAgent.has(agentId);
     const parkedRuns = flaggedByAgent.get(agentId) ?? [];
     const detail = isDarkNow
@@ -158,9 +176,17 @@ export async function tickCompany({ agents, runs, now, issuePrefix, sendAlert, p
 
     const finalState = dryRun ? tentativeState : finalizeDarkLaneState(tentativeState, alert, confirmed, nowIso);
 
+    if (!dryRun) {
+      if (darkLaneStatesEqual(finalState, DEFAULT_DARK_LANE_STATE)) {
+        delete nextLocalState[agentId];
+      } else {
+        nextLocalState[agentId] = finalState;
+      }
+    }
+
     let patched = false;
     let patchError = null;
-    if (!dryRun && !darkLaneStatesEqual(finalState, prevState)) {
+    if (!dryRun && !darkLaneStatesEqual(finalState, agent.metadata?.darkLane ?? null)) {
       const nextMetadata = { ...(agent.metadata ?? {}) };
       if (darkLaneStatesEqual(finalState, DEFAULT_DARK_LANE_STATE)) {
         delete nextMetadata.darkLane;
@@ -168,13 +194,12 @@ export async function tickCompany({ agents, runs, now, issuePrefix, sendAlert, p
         nextMetadata.darkLane = finalState;
       }
       // A patch failure (e.g. a permission gate on cross-agent writes) must
-      // not crash the whole census: every other candidate in this company,
-      // and every other company, still needs to be evaluated and alerted on.
-      // It DOES mean this agent's alertedAt/recoveryPending guard never
-      // persisted, so the next tick will legitimately re-plan the same
-      // alert — that is a real repeat-alert risk, not swallowed silently:
-      // it is surfaced via `patchError` in the result and logged by the
-      // caller so an unresolved permission gate is loud, not quiet.
+      // not crash the whole census, and — unlike before AUR-5027 — must not
+      // put the AC2 dedup guard at risk either: `nextLocalState` above
+      // already carries the authoritative decision regardless of whether
+      // this PATCH succeeds. This is now purely the AC1 observability
+      // projection, so a failure here is surfaced via `patchError` for
+      // logging but degrades to a warning, never an error exit.
       try {
         await patchAgent(agentId, nextMetadata);
         patched = true;
@@ -193,7 +218,7 @@ export async function tickCompany({ agents, runs, now, issuePrefix, sendAlert, p
     });
   }
 
-  return results;
+  return { results, localState: nextLocalState };
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -229,6 +254,8 @@ async function main() {
     return res.json();
   }
 
+  const STATE_DIR = process.env.DARK_LANE_STATE_DIR || DEFAULT_STATE_DIR;
+
   let anyAlerted = false;
   let anyError = false;
 
@@ -236,13 +263,20 @@ async function main() {
     let runs;
     let agents;
     let company;
+    let localState;
     try {
       // No `limit`: only a limit-less read is a true census (see
       // check-parked-agents.mjs). live-runs is capped at 50 and unusable here.
       runs = await apiGet(`/api/companies/${companyId}/heartbeat-runs`);
       agents = await apiGet(`/api/companies/${companyId}/agents`);
       company = await apiGet(`/api/companies/${companyId}`).catch(() => null);
+      localState = await loadLocalState(STATE_DIR, companyId);
     } catch (err) {
+      // A census/API failure OR an unreadable local state file are both
+      // fatal for this company's tick: local state is now authoritative for
+      // AC2 (AUR-5027), so proceeding on a guess here would either silently
+      // swallow a real alert or reproduce a repeat-alert — loud skip, not a
+      // silent one, is the safe failure mode.
       console.error(`census fetch failed for company ${companyId}: ${err.message ?? err}`);
       anyError = true;
       continue;
@@ -255,15 +289,30 @@ async function main() {
 
     const issuePrefix = company?.issuePrefix ?? null;
 
-    const results = await tickCompany({
+    const { results, localState: nextLocalState } = await tickCompany({
       agents,
       runs,
       now: new Date(),
       issuePrefix,
       dryRun,
+      localState,
       sendAlert: (message) => sendFounderAlert(message),
       patchAgent: (agentId, metadata) => apiPatchAgent(agentId, metadata),
     });
+
+    if (!dryRun) {
+      try {
+        await saveLocalState(STATE_DIR, companyId, nextLocalState);
+      } catch (err) {
+        // The AC2 decision for THIS tick was already made and acted on
+        // correctly (alerts above reflect it); this only means a future
+        // tick may not see it. Still loud — a persistently broken state
+        // directory is a real repeat-alert risk again — but it must not
+        // discard the alerts/results this tick already produced.
+        console.error(`[${companyId}] failed to persist dark-lane local state — REPEAT-ALERT RISK until fixed: ${err.message ?? err}`);
+        anyError = true;
+      }
+    }
 
     for (const r of results) {
       if (r.alert) {
@@ -275,13 +324,12 @@ async function main() {
         console.log(`[${companyId}] ${r.name} (${r.agentId}): no alert this tick`);
       }
       if (r.patchError) {
-        // Loud on purpose: an unresolved write-permission gate here means the
-        // alertedAt guard never persists, so the SAME transition re-plans an
-        // alert on every future tick. This must page attention, not scroll by.
-        console.error(
-          `[${companyId}] ${r.name} (${r.agentId}): metadata.darkLane PATCH failed — REPEAT-ALERT RISK until fixed: ${r.patchError}`,
+        // AUR-5027: the AC2 dedup decision above is already durable in local
+        // state regardless of this PATCH, so a failure here is only a lost
+        // observability projection (AC1) — a warning, never a census error.
+        console.warn(
+          `[${companyId}] ${r.name} (${r.agentId}): metadata.darkLane PATCH failed (observability only, dedup guard is unaffected): ${r.patchError}`,
         );
-        anyError = true;
       }
     }
     if (results.length === 0) {

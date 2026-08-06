@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regression coverage for check-mem-watch-alert.sh (AUR-4025).
+# Regression coverage for check-mem-watch-alert.sh (AUR-4025 + AUR-4489).
 #
 # What this locks down: AUR-3924's sampler logged the 2026-07-25 16:02 UTC
 # breach correctly the whole time -- the bug was that nothing read the log, so
@@ -8,7 +8,17 @@
 # rate-limits instead of paging every 5 minutes, and never swallows a delivery
 # failure.
 #
-# Hermetic: fixture log, stub notifier, no network, no systemd, no /var.
+# AUR-4489 adds the owed-page cases: the 2026-07-29 11:52Z host OOM was
+# detected but its page was refused by the fleet-wide send-rate guard and never
+# retried -- the oom_5min trigger lives in exactly one sample, so the next tick
+# saw a healthy row and the event was unrecoverable. The new cases prove:
+# host-integrity breaches (oom/swap floor) bypass the guard via --override; a
+# refused/failed page is persisted as a pending record and delivered by a later
+# tick even after the breach left the latest sample; a deferred page exits 0;
+# exhausted retries escalate via the un-refusable override path and exit 1.
+#
+# Hermetic: fixture log, stub notifier, no network, no systemd, no /var, and
+# no shared /tmp paths (fallback files are redirected into the sandbox).
 # Run: bash scripts/deploy/check-mem-watch-alert.test.sh
 set -uo pipefail
 
@@ -21,13 +31,22 @@ trap 'rm -rf "$TMP"' EXIT
 
 LOG="$TMP/mem-watch.log"
 STATE="$TMP/alert-state"
-SINK="$TMP/alerts.txt"
+PENDINGF="$TMP/alert-pending"
+SINK="$TMP/alerts.txt"          # every notifier invocation (attempts)
+DELIVERED="$TMP/delivered.txt"  # only invocations that were accepted
 NOTIFY="$TMP/notify.sh"
 
+# Stub notifier speaking notify_founder.sh's contract: rc 0 = sent,
+# rc 1 = transport failure (NOTIFY_EXIT=1 forces it, even for --override),
+# rc 2 = refused by the shared send-rate guard (NOTIFY_RATE_REFUSE=1 refuses
+# every call EXCEPT --override ones -- the guard's real bypass semantics).
 cat > "$NOTIFY" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$NOTIFY_SINK"
-exit "${NOTIFY_EXIT:-0}"
+if [[ "${NOTIFY_EXIT:-0}" != "0" ]]; then exit "$NOTIFY_EXIT"; fi
+if [[ "${NOTIFY_RATE_REFUSE:-0}" == "1" && "$*" != *"--override"* ]]; then exit 2; fi
+printf '%s\n' "$*" >> "$NOTIFY_DELIVERED"
+exit 0
 STUB
 chmod +x "$NOTIFY"
 
@@ -35,11 +54,17 @@ HEADER="ts,mem_avail_mb,mem_used_mb,swap_used_mb,swap_free_mb,swap_total_mb,load
 
 run_check() {
   PAPERCLIP_MEM_WATCH_LOG="$LOG" \
-  PAPERCLIP_MEM_WATCH_ALERT_STATE="$STATE" \
+  PAPERCLIP_MEM_WATCH_ALERT_STATE="${STATE_OVERRIDE:-$STATE}" \
+  PAPERCLIP_MEM_WATCH_ALERT_STATE_FALLBACK="$TMP/state-fallback" \
+  PAPERCLIP_MEM_WATCH_ALERT_PENDING="$PENDINGF" \
+  PAPERCLIP_MEM_WATCH_ALERT_PENDING_FALLBACK="$TMP/pending-fallback" \
+  PAPERCLIP_MEM_WATCH_ALERT_MAX_RETRIES="${MAXR:-8}" \
   PAPERCLIP_MEM_WATCH_NOTIFY="$NOTIFY" \
   PAPERCLIP_MEM_WATCH_ALERT_COOLDOWN_SEC="${COOLDOWN:-1800}" \
   NOTIFY_SINK="$SINK" \
+  NOTIFY_DELIVERED="$DELIVERED" \
   NOTIFY_EXIT="${NOTIFY_EXIT:-0}" \
+  NOTIFY_RATE_REFUSE="${NOTIFY_RATE_REFUSE:-0}" \
     bash "$CHECK" 2>&1
 }
 
@@ -47,8 +72,13 @@ FAILURES=0
 ok()   { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n     %s\n' "$1" "$2"; FAILURES=$(( FAILURES + 1 )); }
 
-alerts() { [[ -f "$SINK" ]] && wc -l < "$SINK" | tr -d ' ' || echo 0; }
-reset()  { : > "$SINK"; rm -f "$STATE" /tmp/paperclip-mem-watch-alert.state; unset NOTIFY_EXIT COOLDOWN; }
+alerts()    { [[ -f "$SINK" ]] && wc -l < "$SINK" | tr -d ' ' || echo 0; }
+delivered() { [[ -f "$DELIVERED" ]] && wc -l < "$DELIVERED" | tr -d ' ' || echo 0; }
+reset() {
+  : > "$SINK"; : > "$DELIVERED"
+  rm -f "$STATE" "$PENDINGF" "$TMP/state-fallback" "$TMP/pending-fallback"
+  unset NOTIFY_EXIT COOLDOWN NOTIFY_RATE_REFUSE MAXR STATE_OVERRIDE
+}
 
 # --- cases -------------------------------------------------------------------
 
@@ -64,33 +94,39 @@ fi
 
 # 2. Real historical breach row from the live log (2026-07-25T16:25:39Z,
 #    mem_avail_mb=917 < 1500) pages the founder at SEV2 and names the reason.
+#    mem_avail is an early warning, NOT host-integrity class: no --override.
+#    First-attempt success must write success state and leave no pending record.
 reset
 printf '%s\n2026-07-25T16:25:39Z,917,6367,5598,2497,8095,9.55,0,14,4,4,3637,0,3752944,2026-07-25T16:06:23,-800,a99bd0d9375f,no\n' "$HEADER" > "$LOG"
 out=$(run_check); rc=$?
-if [[ "$(alerts)" == "1" ]] && grep -q "SEV2" "$SINK" && grep -q "mem_avail_mb=917" "$SINK"; then
-  ok "real historical mem_avail_mb breach (917 < 1500) pages the founder"
+if [[ "$(alerts)" == "1" ]] && grep -q "SEV2" "$SINK" && grep -q "mem_avail_mb=917" "$SINK" \
+   && ! grep -q -- "--override" "$SINK" && [[ ! -f "$PENDINGF" && -f "$STATE" ]]; then
+  ok "mem_avail breach pages without --override; success writes state, no pending"
 else
-  fail "real historical mem_avail_mb breach (917 < 1500) pages the founder" "rc=$rc alerts=$(alerts) sink=$(cat "$SINK" 2>/dev/null) out=$out"
+  fail "mem_avail breach pages without --override; success writes state, no pending" "rc=$rc alerts=$(alerts) pending=$([[ -f $PENDINGF ]] && cat "$PENDINGF") sink=$(cat "$SINK" 2>/dev/null) out=$out"
 fi
 
-# 3. Synthetic swap_free_mb breach pages.
+# 3. Synthetic swap_free_mb breach pages -- host-integrity class, so the page
+#    carries --override with a machine-readable reason (AUR-4489).
 reset
 printf '%s\n2026-07-25T21:00:00Z,5000,2000,6200,1800,8095,0.50,0,4,2,2,0,0,3859857,2026-07-25T16:30:26,-800,d5c37635bb00,yes\n' "$HEADER" > "$LOG"
 out=$(run_check)
-if [[ "$(alerts)" == "1" ]] && grep -q "swap_free_mb=1800" "$SINK"; then
-  ok "swap_free_mb breach (1800 < 2000) pages the founder"
+if [[ "$(alerts)" == "1" ]] && grep -q "swap_free_mb=1800" "$SINK" \
+   && grep -q -- "--override mem-watch-host-integrity:" "$SINK"; then
+  ok "swap_free_mb breach (1800 < 2000) pages with host-integrity --override"
 else
-  fail "swap_free_mb breach (1800 < 2000) pages the founder" "alerts=$(alerts) sink=$(cat "$SINK" 2>/dev/null) out=$out"
+  fail "swap_free_mb breach (1800 < 2000) pages with host-integrity --override" "alerts=$(alerts) sink=$(cat "$SINK" 2>/dev/null) out=$out"
 fi
 
-# 4. Synthetic oom_5min breach pages.
+# 4. Synthetic oom_5min breach pages -- host-integrity class, --override.
 reset
 printf '%s\n2026-07-25T21:05:00Z,5000,2000,2100,6000,8095,0.50,2,4,2,2,0,0,3859857,2026-07-25T16:30:26,-800,d5c37635bb00,yes\n' "$HEADER" > "$LOG"
 out=$(run_check)
-if [[ "$(alerts)" == "1" ]] && grep -q "oom_5min=2" "$SINK"; then
-  ok "oom_5min breach (2 > 0) pages the founder"
+if [[ "$(alerts)" == "1" ]] && grep -q "oom_5min=2" "$SINK" \
+   && grep -q -- "--override mem-watch-host-integrity:" "$SINK"; then
+  ok "oom_5min breach (2 > 0) pages with host-integrity --override"
 else
-  fail "oom_5min breach (2 > 0) pages the founder" "alerts=$(alerts) sink=$(cat "$SINK" 2>/dev/null) out=$out"
+  fail "oom_5min breach (2 > 0) pages with host-integrity --override" "alerts=$(alerts) sink=$(cat "$SINK" 2>/dev/null) out=$out"
 fi
 
 # 5. THE SPLIT-ROW DEFECT (real, observed in the live log since ~17:06 UTC):
@@ -110,7 +146,9 @@ else
 fi
 
 # 6. Rate limiting: a still-breaching next sample within the cooldown window
-#    does not re-page (alarm-fatigue guard, same lesson as AUR-3937).
+#    does not re-page (alarm-fatigue guard, same lesson as AUR-3937) -- and a
+#    cooldown-suppressed tick must NOT create a pending record (suppressed is
+#    not deferred).
 reset
 COOLDOWN=1800
 printf '%s\n2026-07-25T21:15:00Z,1000,7000,2100,6000,8095,0.50,0,4,2,2,0,0,3859857,2026-07-25T16:30:26,-800,d5c37635bb00,yes\n' "$HEADER" > "$LOG"
@@ -119,10 +157,10 @@ first=$(alerts)
 printf '2026-07-25T21:20:00Z,1000,7000,2100,6000,8095,0.50,0,4,2,2,0,0,3859857,2026-07-25T16:30:26,-800,d5c37635bb00,yes\n' >> "$LOG"
 run_check >/dev/null
 second=$(alerts)
-if [[ "$first" == "1" && "$second" == "1" ]]; then
-  ok "cooldown prevents re-paging on the next timer tick while still breaching"
+if [[ "$first" == "1" && "$second" == "1" && ! -f "$PENDINGF" ]]; then
+  ok "cooldown prevents re-paging on the next tick and creates no pending record"
 else
-  fail "cooldown prevents re-paging on the next timer tick while still breaching" "first=$first second=$second"
+  fail "cooldown prevents re-paging on the next tick and creates no pending record" "first=$first second=$second pending=$([[ -f $PENDINGF ]] && cat "$PENDINGF")"
 fi
 unset COOLDOWN
 
@@ -142,27 +180,114 @@ else
 fi
 unset COOLDOWN
 
-# 8. A page that fails to deliver is reported loudly (AUR-3930), never swallowed.
+# 8. AUR-4489 core: a page that fails to deliver is DEFERRED, not lost. The
+#    pending record is persisted, the unit exits 0 (deferred != failed), and a
+#    later tick retries and delivers even though the breach is no longer in
+#    the latest sample. Pending is cleared by the successful retry.
 reset
 printf '%s\n2026-07-25T21:35:00Z,900,7200,2100,6000,8095,0.50,0,4,2,2,0,0,3859857,2026-07-25T16:30:26,-800,d5c37635bb00,yes\n' "$HEADER" > "$LOG"
-out=$(NOTIFY_EXIT=1 run_check); rc=$?
-if grep -q "ESCALATION FAILED" <<<"$out" && [[ "$rc" == "1" ]]; then
-  ok "undelivered page is reported loudly, not swallowed"
+out1=$(NOTIFY_EXIT=1 run_check); rc1=$?
+cond1=0
+if [[ "$rc1" == "0" ]] && grep -q "ESCALATION DEFERRED" <<<"$out1" && [[ -f "$PENDINGF" ]] && [[ "$(delivered)" == "0" ]]; then
+  cond1=1
+fi
+# breach leaves the latest sample entirely -- the owed page must survive that
+printf '2026-07-25T21:40:00Z,4300,2800,2100,6000,8095,0.50,0,4,2,2,0,0,3859857,2026-07-25T16:30:26,-800,d5c37635bb00,yes\n' >> "$LOG"
+out2=$(NOTIFY_EXIT=1 run_check); rc2=$?
+cond2=0
+if [[ "$rc2" == "0" ]] && grep -q "attempt 2/8" <<<"$out2" && [[ "$(delivered)" == "0" ]]; then
+  cond2=1
+fi
+out3=$(run_check); rc3=$?
+cond3=0
+if [[ "$rc3" == "0" ]] && grep -q "delivered on retry 3" <<<"$out3" \
+   && [[ "$(delivered)" == "1" && ! -f "$PENDINGF" && -f "$STATE" ]] \
+   && grep -q "first detected at 2026-07-25T21:35:00Z" "$DELIVERED"; then
+  cond3=1
+fi
+if [[ "$cond1$cond2$cond3" == "111" ]]; then
+  ok "failed delivery defers (exit 0), persists pending, and a later tick delivers after the breach left the sample"
 else
-  fail "undelivered page is reported loudly, not swallowed" "rc=$rc out=$out"
+  fail "failed delivery defers (exit 0), persists pending, and a later tick delivers after the breach left the sample" "c1=$cond1 c2=$cond2 c3=$cond3 rc1=$rc1 rc2=$rc2 rc3=$rc3 out1=$out1 out2=$out2 out3=$out3 delivered=$(cat "$DELIVERED" 2>/dev/null)"
 fi
 
 # 9. An unwritable rate-limit state must never silence the page (only the
-#    rate-limiting itself may degrade).
+#    rate-limiting itself may degrade -- to the fallback path).
 reset
-printf '%s\n2026-07-25T21:40:00Z,900,7200,2100,6000,8095,0.50,0,4,2,2,0,0,3859857,2026-07-25T16:30:26,-800,d5c37635bb00,yes\n' "$HEADER" > "$LOG"
-out=$(PAPERCLIP_MEM_WATCH_ALERT_STATE=/nonexistent-dir/state run_check)
-if [[ "$(alerts)" == "1" ]]; then
-  ok "unwritable rate-limit state degrades to a page, never to silence"
+printf '%s\n2026-07-25T21:41:00Z,900,7200,2100,6000,8095,0.50,0,4,2,2,0,0,3859857,2026-07-25T16:30:26,-800,d5c37635bb00,yes\n' "$HEADER" > "$LOG"
+out=$(STATE_OVERRIDE=/nonexistent-dir/state run_check)
+if [[ "$(alerts)" == "1" && -f "$TMP/state-fallback" ]]; then
+  ok "unwritable rate-limit state degrades to the fallback file, never to silence"
 else
-  fail "unwritable rate-limit state degrades to a page, never to silence" "alerts=$(alerts) out=$out"
+  fail "unwritable rate-limit state degrades to the fallback file, never to silence" "alerts=$(alerts) fallback=$([[ -f $TMP/state-fallback ]] && echo yes || echo no) out=$out"
 fi
-rm -f /tmp/paperclip-mem-watch-alert.state
+
+# 10. THE 2026-07-29 INCIDENT SHAPE (AUR-4489 defect #3): an oom_5min breach
+#     while the fleet send-rate window is exhausted must page IMMEDIATELY via
+#     --override -- a host OOM does not queue behind business nudges.
+reset
+printf '%s\n2026-07-29T11:52:28Z,5243,2500,3300,4793,8095,1.20,1,4,2,2,0,0,3557726,2026-07-29T10:00:00,-800,d5c37635bb00,yes\n' "$HEADER" > "$LOG"
+out=$(NOTIFY_RATE_REFUSE=1 run_check); rc=$?
+if [[ "$rc" == "0" && "$(delivered)" == "1" && ! -f "$PENDINGF" ]] \
+   && grep -q -- "--override mem-watch-host-integrity:oom_5min=1" "$DELIVERED"; then
+  ok "oom breach during an exhausted rate window delivers first-attempt via --override (Jul-29 incident shape)"
+else
+  fail "oom breach during an exhausted rate window delivers first-attempt via --override (Jul-29 incident shape)" "rc=$rc delivered=$(delivered) sink=$(cat "$SINK" 2>/dev/null) out=$out"
+fi
+
+# 11. A mem_avail-only breach stays subject to the rate guard (no override
+#     widening): refused -> pending -> retried WITHOUT --override -> delivered
+#     once the window clears, even though the breach left the latest sample.
+reset
+printf '%s\n2026-07-25T21:45:00Z,900,7200,2100,6000,8095,0.50,0,4,2,2,0,0,3859857,2026-07-25T16:30:26,-800,d5c37635bb00,yes\n' "$HEADER" > "$LOG"
+out1=$(NOTIFY_RATE_REFUSE=1 run_check); rc1=$?
+printf '2026-07-25T21:50:00Z,4300,2800,2100,6000,8095,0.50,0,4,2,2,0,0,3859857,2026-07-25T16:30:26,-800,d5c37635bb00,yes\n' >> "$LOG"
+out2=$(NOTIFY_RATE_REFUSE=1 run_check); rc2=$?
+out3=$(run_check); rc3=$?
+if [[ "$rc1" == "0" && "$rc2" == "0" && "$rc3" == "0" && "$(delivered)" == "1" && ! -f "$PENDINGF" ]] \
+   && grep -q "ESCALATION DEFERRED" <<<"$out1" \
+   && ! grep -q -- "--override" "$SINK" \
+   && grep -q "first detected at 2026-07-25T21:45:00Z" "$DELIVERED"; then
+  ok "rate-refused mem_avail breach is persisted and delivered on a later tick, never via override"
+else
+  fail "rate-refused mem_avail breach is persisted and delivered on a later tick, never via override" "rc1=$rc1 rc2=$rc2 rc3=$rc3 delivered=$(delivered) sink=$(cat "$SINK" 2>/dev/null) out1=$out1 out2=$out2 out3=$out3"
+fi
+
+# 12. Exhausted retries flip to the un-refusable give-up path: after MAX_RETRIES
+#     failed attempts the unit exits 1 (a page is owed and undeliverable), each
+#     later tick attempts --override "mem-watch-retries-exhausted", the pending
+#     record survives, and the moment the transport recovers -- even with the
+#     rate window still jammed -- the page lands and the pending clears.
+reset
+printf '%s\n2026-07-25T22:00:00Z,900,7200,2100,6000,8095,0.50,0,4,2,2,0,0,3859857,2026-07-25T16:30:26,-800,d5c37635bb00,yes\n' "$HEADER" > "$LOG"
+out1=$(NOTIFY_EXIT=1 MAXR=2 run_check); rc1=$?
+out2=$(NOTIFY_EXIT=1 MAXR=2 run_check); rc2=$?
+out3=$(NOTIFY_EXIT=1 MAXR=2 run_check); rc3=$?
+out4=$(NOTIFY_RATE_REFUSE=1 MAXR=2 run_check); rc4=$?
+if [[ "$rc1" == "0" && "$rc2" == "1" && "$rc3" == "1" && "$rc4" == "0" ]] \
+   && grep -q "retries exhausted" <<<"$out2" \
+   && grep -q -- "--override mem-watch-retries-exhausted:" "$SINK" \
+   && [[ "$(delivered)" == "1" && ! -f "$PENDINGF" ]] \
+   && grep -q "mem-watch-retries-exhausted" "$DELIVERED"; then
+  ok "exhausted retries exit 1, keep the pending record, and the override give-up path delivers past a jammed rate window"
+else
+  fail "exhausted retries exit 1, keep the pending record, and the override give-up path delivers past a jammed rate window" "rc=$rc1/$rc2/$rc3/$rc4 delivered=$(delivered) pending=$([[ -f $PENDINGF ]] && cat "$PENDINGF") out2=$out2 out4=$out4 sink=$(cat "$SINK" 2>/dev/null)"
+fi
+
+# 13. Integrity upgrade: while a non-integrity page is pending behind a jammed
+#     rate window, a NEW oom breach must not wait its turn -- it goes out NOW
+#     via --override, and the delivered page covers (clears) the pending one.
+reset
+printf '%s\n2026-07-25T22:10:00Z,900,7200,2100,6000,8095,0.50,0,4,2,2,0,0,3859857,2026-07-25T16:30:26,-800,d5c37635bb00,yes\n' "$HEADER" > "$LOG"
+out1=$(NOTIFY_RATE_REFUSE=1 run_check); rc1=$?
+printf '2026-07-25T22:15:00Z,4300,2800,2100,6000,8095,0.50,1,4,2,2,0,0,3859857,2026-07-25T16:30:26,-800,d5c37635bb00,yes\n' >> "$LOG"
+out2=$(NOTIFY_RATE_REFUSE=1 run_check); rc2=$?
+if [[ "$rc1" == "0" && "$rc2" == "0" && "$(delivered)" == "1" && ! -f "$PENDINGF" ]] \
+   && grep -q -- "--override mem-watch-host-integrity:oom_5min=1" "$DELIVERED"; then
+  ok "a new oom breach behind a pending non-integrity page pages immediately via override and clears the pending"
+else
+  fail "a new oom breach behind a pending non-integrity page pages immediately via override and clears the pending" "rc1=$rc1 rc2=$rc2 delivered=$(delivered) pending=$([[ -f $PENDINGF ]] && cat "$PENDINGF") out1=$out1 out2=$out2 sink=$(cat "$SINK" 2>/dev/null)"
+fi
 
 echo
 if [[ "$FAILURES" -eq 0 ]]; then

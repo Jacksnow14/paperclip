@@ -15,6 +15,12 @@ sudo chown ievgen:ievgen /var/log/paperclip-mem-watch-alert.state
 # to rate-limit -- the same silent-disable failure install-drift-timer.sh guards
 # against.
 
+sudo touch /var/log/paperclip-mem-watch-alert.pending
+sudo chown ievgen:ievgen /var/log/paperclip-mem-watch-alert.pending
+# AUR-4489: the pending (owed-page) record needs the same treatment, or every
+# deferred page would silently degrade to the /tmp fallback and not survive a
+# reboot.
+
 sudo cp "$HERE/systemd/paperclip-mem-watch-alert.service" "$HERE/systemd/paperclip-mem-watch-alert.timer" /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now paperclip-mem-watch-alert.timer

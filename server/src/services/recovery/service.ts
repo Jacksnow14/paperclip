@@ -541,6 +541,46 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => Boolean(rows[0]));
   }
 
+  // AUR-5102: revalidate a recovery dispatch decision immediately before the
+  // enqueue. reconcileStrandedAssignedIssues decides off a candidates snapshot
+  // taken at sweep start; under backlog a pass runs for minutes, and the issue
+  // may have been cancelled, completed, reassigned, or handed a live execution
+  // path since the snapshot (and since the loop-level hasActiveExecutionPath
+  // check). On 2026-08-05 stale passes enqueued 18 issue_assignment_recovery
+  // wake-runs inside one minute for one issue that had been cancelled ten
+  // minutes earlier. Dropping a stale dispatch here is lossless: the reconciler
+  // is level-triggered, so if the issue is genuinely still stranded the next
+  // sweep re-derives the dispatch from a fresh snapshot.
+  async function isRecoveryDispatchStillValid(input: {
+    issueId: string;
+    agentId: string;
+    expectedStatus: "todo" | "in_progress";
+  }) {
+    const issue = await db
+      .select({
+        companyId: issues.companyId,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+      })
+      .from(issues)
+      .where(eq(issues.id, input.issueId))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!issue) return false;
+    if (issue.status !== input.expectedStatus) return false;
+    if (issue.assigneeUserId) return false;
+    if (issue.assigneeAgentId !== input.agentId) return false;
+    // Deliberately NOT hasQueuedIssueWake here: a queued wake *request* with no
+    // run behind it is a dead letter from a lost process, and recovery dispatch
+    // is exactly what revives the issue past it ("still re-enqueues stranded
+    // assigned todo recovery when an old queued wake exists"). A wake that is
+    // actually live shows up as a queued/running/scheduled_retry run or a
+    // deferred wake, which hasActiveExecutionPath covers.
+    if (await hasActiveExecutionPath(issue.companyId, input.issueId)) return false;
+    return true;
+  }
+
   async function enqueueStrandedIssueRecovery(input: {
     issueId: string;
     agentId: string;
@@ -549,6 +589,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     source: string;
     retryOfRunId?: string | null;
   }) {
+    const stillValid = await isRecoveryDispatchStillValid({
+      issueId: input.issueId,
+      agentId: input.agentId,
+      expectedStatus: input.reason === "issue_assignment_recovery" ? "todo" : "in_progress",
+    });
+    if (!stillValid) return null;
+
     const queued = await deps.enqueueWakeup(input.agentId, {
       source: "automation",
       triggerDetail: "system",
@@ -585,6 +632,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function enqueueInitialAssignedTodoDispatch(issue: typeof issues.$inferSelect, agentId: string) {
+    // AUR-5102: same stale-snapshot hazard as enqueueStrandedIssueRecovery —
+    // the caller's readiness checks ran against a sweep-start snapshot.
+    const stillValid = await isRecoveryDispatchStillValid({
+      issueId: issue.id,
+      agentId,
+      expectedStatus: "todo",
+    });
+    if (!stillValid) return null;
+
     return deps.enqueueWakeup(agentId, {
       source: "assignment",
       triggerDetail: "system",
@@ -4123,5 +4179,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileIssueGraphLiveness,
     readRecoveryTimerIntervalMs,
+    isRecoveryDispatchStillValid,
   };
 }

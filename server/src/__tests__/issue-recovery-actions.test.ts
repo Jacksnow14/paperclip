@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -1018,6 +1018,135 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       });
       expect(second).toEqual([]);
       expect((await readAction(action.id)).resolvedAt).toEqual(resolvedAt);
+    });
+  });
+
+  // AUR-5097: the AUR-4299 hooks cover every in-app writer, but the D+7 convergence control
+  // (AUR-4728) caught bulk closes written by out-of-band SQL directly against the database —
+  // one cohort landed while the API server was down entirely, so no application hook could
+  // ever have fired. Migration 0101 adds a row-level trigger on `issues` so the actions
+  // resolve no matter who writes the terminal status. These tests bypass the service layer
+  // on purpose: raw SQL is exactly the writer class the trigger exists for.
+  describe("terminal writes that bypass the application (AUR-5097)", () => {
+    async function seedActiveAction(companyId: string, sourceIssueId: string, ownerAgentId: string) {
+      return issueRecoveryActionService(db).upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId,
+        cause: "stranded_assigned_issue",
+        fingerprint: `stranded:${sourceIssueId}`,
+        nextAction: "Restore a live execution path.",
+      });
+    }
+
+    async function readAction(actionId: string) {
+      const [row] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, actionId));
+      return row!;
+    }
+
+    async function seedSecondIssue(companyId: string, prefix: string) {
+      const id = randomUUID();
+      await db.insert(issues).values({
+        id,
+        companyId,
+        title: "Second stranded issue",
+        status: "in_progress",
+        priority: "medium",
+        issueNumber: 2,
+        identifier: `${prefix}-2`,
+      });
+      return id;
+    }
+
+    it("resolves actions when one raw SQL statement bulk-cancels several source issues", async () => {
+      const { companyId, managerId, sourceIssueId, prefix } = await seedCompany();
+      const secondIssueId = await seedSecondIssue(companyId, prefix);
+      const first = await seedActiveAction(companyId, sourceIssueId, managerId);
+      const second = await seedActiveAction(companyId, secondIssueId, managerId);
+
+      // The production failure shape: one bulk statement, shared timestamp, no service call.
+      await db.execute(sql`
+        update issues set status = 'cancelled', cancelled_at = now(), updated_at = now()
+        where id in (${sourceIssueId}, ${secondIssueId})`);
+
+      for (const action of [first, second]) {
+        const row = await readAction(action.id);
+        expect(row.status).toBe("cancelled");
+        expect(row.outcome).toBe("cancelled");
+        expect(row.resolutionNote).toContain("(issues trigger)");
+        expect(row.resolvedAt).toBeInstanceOf(Date);
+      }
+    });
+
+    it("maps a raw done write to resolved/restored", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const action = await seedActiveAction(companyId, sourceIssueId, managerId);
+
+      await db.execute(sql`
+        update issues set status = 'done', completed_at = now(), updated_at = now()
+        where id = ${sourceIssueId}`);
+
+      const row = await readAction(action.id);
+      expect(row.status).toBe("resolved");
+      expect(row.outcome).toBe("restored");
+      expect(row.resolutionNote).toContain("(issues trigger)");
+    });
+
+    // Control: the trigger must discriminate, not resolve on any raw status write — an
+    // unconditional trigger would destroy every live recovery action.
+    it("leaves the action active for a raw non-terminal status write", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const action = await seedActiveAction(companyId, sourceIssueId, managerId);
+
+      await db.execute(sql`
+        update issues set status = 'blocked', updated_at = now() where id = ${sourceIssueId}`);
+
+      expect((await readAction(action.id)).status).toBe("active");
+    });
+
+    // The trigger deliberately has no OLD-vs-NEW transition predicate: a redundant terminal
+    // re-write (idempotent sweeps do this) must HEAL an orphan minted behind its back — for
+    // example by a detector racing the close — not skip it as a no-op transition.
+    it("heals an orphan minted after the close on a redundant terminal re-write", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      await db.execute(sql`
+        update issues set status = 'cancelled', cancelled_at = now(), updated_at = now()
+        where id = ${sourceIssueId}`);
+      const orphan = await seedActiveAction(companyId, sourceIssueId, managerId);
+      expect(orphan.status).toBe("active");
+
+      await db.execute(sql`
+        update issues set status = 'cancelled', updated_at = now() where id = ${sourceIssueId}`);
+
+      const row = await readAction(orphan.id);
+      expect(row.status).toBe("cancelled");
+      expect(row.outcome).toBe("cancelled");
+    });
+
+    // AUR-5097 hook hardening: issueService.update now gates on the status actually written
+    // (`updated.status`), not on whether the caller's patch included a status. A title-only
+    // patch on an already-done issue must heal a lingering orphan through the app hook — and
+    // the note proves it was the hook, not the trigger, because `status` never appeared in
+    // the UPDATE's SET list so the trigger cannot have fired.
+    it("issueService.update heals a lingering orphan even when the patch has no status field", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      await db.execute(sql`
+        update issues set status = 'done', completed_at = now(), updated_at = now()
+        where id = ${sourceIssueId}`);
+      const orphan = await seedActiveAction(companyId, sourceIssueId, managerId);
+      expect(orphan.status).toBe("active");
+
+      await issueService(db).update(sourceIssueId, { title: "Renamed after close" });
+
+      const row = await readAction(orphan.id);
+      expect(row.status).toBe("resolved");
+      expect(row.outcome).toBe("restored");
+      expect(row.resolutionNote).toBe("Source issue reached terminal status done.");
     });
   });
 });

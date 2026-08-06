@@ -39,14 +39,10 @@ async function findOpenDiskAlertIssue(
 }
 
 function isDiskAlertUniqueConflict(err: unknown): boolean {
-  return (
-    !!err &&
-    typeof err === "object" &&
-    "code" in err &&
-    (err as { code?: string }).code === "23505" &&
-    "constraint" in err &&
-    (err as { constraint?: string }).constraint === DISK_ALERT_UNIQUE_CONSTRAINT
-  );
+  if (!err || typeof err !== "object" || !("code" in err)) return false;
+  const { constraint, constraint_name } = err as { constraint?: string; constraint_name?: string };
+  const matched = constraint ?? constraint_name;
+  return (err as { code?: string }).code === "23505" && matched === DISK_ALERT_UNIQUE_CONSTRAINT;
 }
 
 export type DiskAlertActOutcome =

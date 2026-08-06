@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import postgres from "postgres";
 import {
   BackupProducerConflictError,
@@ -664,16 +664,23 @@ describe("pruneOldBackups — retention logic", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-prune-bytes-"));
     cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
 
-    // Must be real-clock-anchored, not a fixed past instant: AUR-4611's
-    // size-aware hourly count shrinks Tier 1 to 1 for this cap/size ratio,
-    // and the 2nd survivor is rescued by the daily tier's per-calendar-day
-    // dedup — which (see pruneOldBackups) only admits entries within
-    // `dailyDays` of the real wall clock, not of this fixture's own
-    // reference point. Anchored via safeNowForSpan (not raw Date.now()) so
-    // the 4-hour spread below can never straddle a UTC-midnight boundary,
-    // which would otherwise put the 2nd-newest entry on a different
-    // calendar day than the newest and change which tier "rescues" it.
-    const now = safeNowForSpan(4);
+    // Must be real Date.now(), not a fixed past instant: AUR-4611's size-aware
+    // hourly count shrinks Tier 1 to 1 for this cap/size ratio, and the 2nd
+    // survivor is rescued by the daily tier's per-calendar-day dedup — which
+    // (see pruneOldBackups) only admits entries within `dailyDays` of the real
+    // wall clock, not of this fixture's own reference point.
+    //
+    // What must NOT be assumed is *which* entry is the rescued 2nd survivor:
+    // the daily tier's bucket loop doesn't know the hourly tier already
+    // covers "today", so whenever this 4-hour-wide window straddles a real
+    // UTC midnight, it mints an extra day-bucket representative, tier-aware
+    // cap eviction then drops the newest of the two daily candidates (by
+    // design — it carries the least unique DR reach-back), and the
+    // *surviving* 2nd entry becomes whichever one represents the other
+    // calendar day instead of literally "1 hour ago" (AUR-5053). The kept
+    // *count* and "newest survives" are invariant regardless — see the sweep
+    // below, which pins the clock across all 24 UTC hours to prove it.
+    const now = Date.now();
     const MB = 1024 * 1024;
     // 5 files 1h apart, each 10 MiB → 50 MiB total, cap at 25 MiB → must keep 2
     const timestamps = Array.from({ length: 5 }, (_, i) => ({
@@ -692,12 +699,46 @@ describe("pruneOldBackups — retention logic", () => {
 
     const remaining = listBackupFiles(dir, "pc");
     expect(remaining.length).toBe(2); // 2×10 MiB = 20 MiB ≤ 25 MiB cap
-    // The 2 newest must survive
-    const sortedDesc = [...timestamps].sort((a, b) => b.iso.localeCompare(a.iso));
-    for (const ts of sortedDesc.slice(0, 2)) {
-      expect(remaining.some((f) => f.includes(keyPart(ts.iso)))).toBe(true);
-    }
+    const remainingBytes = remaining.reduce((sum, f) => sum + fs.statSync(path.join(dir, f)).size, 0);
+    expect(remainingBytes).toBeLessThanOrEqual(25 * MB);
+    // The single newest dump always survives (restore-latest floor).
+    const newest = timestamps.reduce((a, b) => (a.iso > b.iso ? a : b));
+    expect(remaining.some((f) => f.includes(keyPart(newest.iso)))).toBe(true);
   });
+
+  it.each(Array.from({ length: 24 }, (_, h) => h))(
+    "byte cap: kept count and newest-survives hold at every hour of day — pinned %i:00 UTC (AUR-5053 sweep)",
+    (hour) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), `pc-sweep-bytes-${hour}-`));
+      cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+      cleanups.push(() => {
+        vi.useRealTimers();
+      });
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(`2026-06-17T${String(hour).padStart(2, "0")}:00:00.000Z`));
+
+      const now = Date.now();
+      const MB = 1024 * 1024;
+      const timestamps = Array.from({ length: 5 }, (_, i) => ({
+        iso: new Date(now - i * 60 * 60 * 1000).toISOString(),
+        sizeBytes: 10 * MB,
+      }));
+      createBackupFiles(dir, "pc", timestamps);
+
+      pruneOldBackups(dir, {
+        dailyDays: 7,
+        weeklyWeeks: 2,
+        monthlyMonths: 1,
+        hourlyCount: 10,
+        maxBytes: 25 * MB,
+      }, "pc");
+
+      const remaining = listBackupFiles(dir, "pc");
+      expect(remaining.length).toBe(2);
+      const newest = timestamps.reduce((a, b) => (a.iso > b.iso ? a : b));
+      expect(remaining.some((f) => f.includes(keyPart(newest.iso)))).toBe(true);
+    },
+  );
 
   it("byte cap: always keeps at least 1 backup even if every file exceeds cap", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-prune-mincap-"));
@@ -775,13 +816,72 @@ describe("pruneOldBackups — retention logic", () => {
     for (const ago of anchorAgos) {
       expect(fs.existsSync(path.join(dir, fileNameFor(ago)))).toBe(true);
     }
-    // The evicted mass is the oldest hourlies; the newest two hourlies remain
+    // The newest dump always survives (restore-latest floor).
     expect(fs.existsSync(path.join(dir, fileNameFor(0)))).toBe(true);
-    expect(fs.existsSync(path.join(dir, fileNameFor(1 * HOUR)))).toBe(true);
-    for (const ago of hourlyAgos.slice(2)) {
-      expect(fs.existsSync(path.join(dir, fileNameFor(ago)))).toBe(false);
-    }
+    // Exactly one of the remaining 7 near-duplicate hourlies is rescued by
+    // the daily tier's per-calendar-day dedup. *Which* one depends on where
+    // the real wall clock's UTC midnight falls inside this 7-hour window —
+    // literally "1 hour ago" only when the whole window sits inside one
+    // calendar day; once it straddles midnight the daily tier mints a 2nd
+    // (today + yesterday) candidate and tier-aware cap eviction drops the
+    // newer of the two by design, so the survivor becomes whichever entry
+    // represents the other day instead (AUR-5053). The *count* — always
+    // exactly one rescued survivor — is what's invariant; see the sweep
+    // below, which pins the clock across all 24 UTC hours to prove it.
+    const rescuedCount = hourlyAgos
+      .slice(1)
+      .filter((ago) => fs.existsSync(path.join(dir, fileNameFor(ago)))).length;
+    expect(rescuedCount).toBe(1);
   });
+
+  it.each(Array.from({ length: 24 }, (_, h) => h))(
+    "byte cap eviction is tier-aware: aggregate counts hold at every hour of day — pinned %i:00 UTC (AUR-5053 sweep)",
+    (hour) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), `pc-sweep-tiercap-${hour}-`));
+      cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+      cleanups.push(() => {
+        vi.useRealTimers();
+      });
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(`2026-06-17T${String(hour).padStart(2, "0")}:00:00.000Z`));
+
+      const MB = 1024 * 1024;
+      const now = Date.now();
+      const HOUR = 60 * 60 * 1000;
+      const DAY = 24 * HOUR;
+      const at = (agoMs: number) => ({ iso: new Date(now - agoMs).toISOString(), sizeBytes: 10 * MB });
+      const fileNameFor = (agoMs: number) => {
+        const safe = new Date(now - agoMs).toISOString().replace(/[:-]/g, "").replace("T", "-").slice(0, 15);
+        return `pc-${safe}.sql.gz`;
+      };
+
+      const hourlyAgos = Array.from({ length: 8 }, (_, i) => i * HOUR);
+      const anchorAgos = [2 * DAY, 3 * DAY, 4 * DAY, 10 * DAY, 17 * DAY, 35 * DAY];
+      createBackupFiles(dir, "pc", [...hourlyAgos, ...anchorAgos].map(at));
+
+      const result = pruneOldBackups(dir, {
+        dailyDays: 7,
+        weeklyWeeks: 4,
+        monthlyMonths: 3,
+        hourlyCount: 8,
+        maxBytes: 80 * MB,
+      }, "pc");
+
+      const afterBytes = listBackupFiles(dir, "pc").reduce((sum, f) => sum + fs.statSync(path.join(dir, f)).size, 0);
+      expect(afterBytes).toBe(80 * MB);
+      expect(result.prunedBytes).toBe(60 * MB);
+      expect(result.prunedCount).toBe(6);
+      expect(result.keptBytes).toBe(afterBytes);
+      for (const ago of anchorAgos) {
+        expect(fs.existsSync(path.join(dir, fileNameFor(ago)))).toBe(true);
+      }
+      expect(fs.existsSync(path.join(dir, fileNameFor(0)))).toBe(true);
+      const rescuedCount = hourlyAgos
+        .slice(1)
+        .filter((ago) => fs.existsSync(path.join(dir, fileNameFor(ago)))).length;
+      expect(rescuedCount).toBe(1);
+    },
+  );
 
   it("size-aware hourly shrink keeps the full DR ladder under cap as dump size grows, with headroom (AUR-4611)", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-prune-sizeaware-"));

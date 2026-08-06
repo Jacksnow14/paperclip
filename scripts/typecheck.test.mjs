@@ -4,8 +4,14 @@ import test from "node:test";
 import {
   buildFilterArgs,
   clampNodeOptions,
+  computeCgroupHeadroomMB,
+  decideExecutionPlan,
   evaluateMemoryGate,
   mapChangedFilesToPackages,
+  parseCgroupMemoryCurrentMB,
+  parseCgroupMemoryMaxMB,
+  parseCgroupV1MemoryPath,
+  parseCgroupV2LeafPath,
   parseResolvedPackageDirs,
   parseWorkspaceGlobs,
   readMemAvailableMB,
@@ -41,6 +47,13 @@ test("evaluateMemoryGate: allows above the floor", () => {
   const gate = evaluateMemoryGate(4400, 3000);
   assert.equal(gate.ok, true);
   assert.equal(gate.message, null);
+});
+
+test("evaluateMemoryGate: changed-mode refusal does not advise re-running the command just run", () => {
+  const gate = evaluateMemoryGate(900, 1200, { mode: "changed" });
+  assert.equal(gate.ok, false);
+  assert.match(gate.message, /insufficient memory: 900 MB available, need 1200 MB\./);
+  assert.doesNotMatch(gate.message, /typecheck:changed/);
 });
 
 test("readMemAvailableMB: parses /proc/meminfo MemAvailable in kB to MB", () => {
@@ -160,4 +173,184 @@ test("parseWorkspaceGlobs: reads the packages: list from pnpm-workspace.yaml, ig
     "server",
     "ui",
   ]);
+});
+
+// --- cgroup awareness (AUR-5012) ---------------------------------------
+
+test("parseCgroupV2LeafPath: extracts the slice path from the '0::' line", () => {
+  const text = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/run-u37800.scope\n";
+  assert.equal(
+    parseCgroupV2LeafPath(text),
+    "/user.slice/user-1000.slice/user@1000.service/app.slice/run-u37800.scope",
+  );
+});
+
+test("parseCgroupV2LeafPath: returns null when there is no '0::' line (pure v1 host)", () => {
+  const text = "5:memory:/user.slice\n4:cpu,cpuacct:/user.slice\n";
+  assert.equal(parseCgroupV2LeafPath(text), null);
+});
+
+test("parseCgroupV1MemoryPath: finds the line whose controller list includes memory", () => {
+  const text = "11:pids:/user.slice\n5:memory,hugetlb:/user.slice/user-1000.slice\n1:name=systemd:/\n";
+  assert.equal(parseCgroupV1MemoryPath(text), "/user.slice/user-1000.slice");
+});
+
+test("parseCgroupV1MemoryPath: returns null when no controller line lists memory", () => {
+  const text = "11:pids:/user.slice\n1:name=systemd:/\n";
+  assert.equal(parseCgroupV1MemoryPath(text), null);
+});
+
+test("parseCgroupMemoryMaxMB: v2 numeric bytes convert to MB, floored", () => {
+  assert.equal(parseCgroupMemoryMaxMB("1224736768\n"), 1168);
+});
+
+test("parseCgroupMemoryMaxMB: v2 literal 'max' means unlimited (null)", () => {
+  assert.equal(parseCgroupMemoryMaxMB("max\n"), null);
+});
+
+test("parseCgroupMemoryMaxMB: v1 huge sentinel means unlimited (null)", () => {
+  assert.equal(parseCgroupMemoryMaxMB("9223372036854771712\n"), null);
+});
+
+test("parseCgroupMemoryMaxMB: missing/empty/garbage text is null, not a crash", () => {
+  assert.equal(parseCgroupMemoryMaxMB(""), null);
+  assert.equal(parseCgroupMemoryMaxMB(undefined), null);
+  assert.equal(parseCgroupMemoryMaxMB("not-a-number\n"), null);
+});
+
+test("parseCgroupMemoryCurrentMB: numeric bytes convert to MB, floored", () => {
+  assert.equal(parseCgroupMemoryCurrentMB("472846336\n"), 450);
+});
+
+test("parseCgroupMemoryCurrentMB: garbage text is null", () => {
+  assert.equal(parseCgroupMemoryCurrentMB("max\n"), null);
+});
+
+test("computeCgroupHeadroomMB: max minus current, floored at 0", () => {
+  assert.equal(computeCgroupHeadroomMB(1168, 450), 718);
+  assert.equal(computeCgroupHeadroomMB(1168, 1168), 0);
+  assert.equal(computeCgroupHeadroomMB(1168, 1300), 0);
+});
+
+test("computeCgroupHeadroomMB: either reading missing propagates null (no constraint), not a false 0", () => {
+  assert.equal(computeCgroupHeadroomMB(null, 450), null);
+  assert.equal(computeCgroupHeadroomMB(1168, null), null);
+});
+
+test("decideExecutionPlan: runs in-process when both host and cgroup clear the floor", () => {
+  const plan = decideExecutionPlan({
+    hostAvailableMB: 4400,
+    cgroupHeadroomMB: 5000,
+    floorMB: 1200,
+    alreadyScoped: false,
+    systemdAvailable: true,
+  });
+  assert.equal(plan.action, "run");
+  assert.equal(plan.effectiveAvailableMB, 4400);
+});
+
+test("decideExecutionPlan: no cgroup reading falls back to host-only behaviour (AUR-4064 parity)", () => {
+  const plan = decideExecutionPlan({
+    hostAvailableMB: 4400,
+    cgroupHeadroomMB: null,
+    floorMB: 3000,
+    alreadyScoped: false,
+    systemdAvailable: true,
+  });
+  assert.equal(plan.action, "run");
+  assert.equal(plan.effectiveAvailableMB, 4400);
+});
+
+test("decideExecutionPlan: relaunches into a sized scope when cgroup headroom is the binding constraint (AC1 shape)", () => {
+  const plan = decideExecutionPlan({
+    hostAvailableMB: 4400,
+    cgroupHeadroomMB: 718, // this host's measured headroom inside the 1168 MB memcg
+    floorMB: 3000,
+    alreadyScoped: false,
+    systemdAvailable: true,
+  });
+  assert.equal(plan.action, "relaunch");
+  assert.equal(plan.sizedMB, 3500);
+});
+
+test("decideExecutionPlan: caps the relaunch scope size at host MemAvailable, never exceeding it", () => {
+  const plan = decideExecutionPlan({
+    hostAvailableMB: 3200,
+    cgroupHeadroomMB: 718,
+    floorMB: 3000,
+    alreadyScoped: false,
+    systemdAvailable: true,
+  });
+  assert.equal(plan.action, "relaunch");
+  assert.equal(plan.sizedMB, 3200);
+});
+
+test("decideExecutionPlan: refuses without relaunching when host memory itself is the constraint (AC2-adjacent)", () => {
+  const plan = decideExecutionPlan({
+    hostAvailableMB: 2000,
+    cgroupHeadroomMB: 718,
+    floorMB: 3000,
+    alreadyScoped: false,
+    systemdAvailable: true,
+  });
+  assert.equal(plan.action, "refuse");
+  assert.equal(plan.reason, "host");
+});
+
+test("decideExecutionPlan: AC2 control — already-scoped sentinel refuses instead of recursing", () => {
+  const plan = decideExecutionPlan({
+    hostAvailableMB: 4400,
+    cgroupHeadroomMB: 718,
+    floorMB: 3000,
+    alreadyScoped: true,
+    systemdAvailable: true,
+  });
+  assert.equal(plan.action, "refuse");
+  assert.equal(plan.reason, "cgroup");
+});
+
+test("decideExecutionPlan: AC2 control — systemd-run unavailable refuses instead of relaunching", () => {
+  const plan = decideExecutionPlan({
+    hostAvailableMB: 4400,
+    cgroupHeadroomMB: 718,
+    floorMB: 3000,
+    alreadyScoped: false,
+    systemdAvailable: false,
+  });
+  assert.equal(plan.action, "refuse");
+  assert.equal(plan.reason, "cgroup");
+});
+
+test("decideExecutionPlan: AC4 — a small (non-server) changed set does not relaunch when cgroup headroom is ample", () => {
+  const smallSetPlan = decideExecutionPlan({
+    hostAvailableMB: 4400,
+    cgroupHeadroomMB: 1500, // a lighter/fresher run than this host's current session
+    floorMB: 1200, // CHANGED_MODE_MEMORY_FLOOR_MB
+    alreadyScoped: false,
+    systemdAvailable: true,
+  });
+  assert.equal(smallSetPlan.action, "run");
+
+  // Same headroom, but a server-inclusive (full) floor still can't clear it —
+  // proves the decision discriminates on the actual floor, not a blanket
+  // "small sets never relaunch" shortcut.
+  const fullSetPlan = decideExecutionPlan({
+    hostAvailableMB: 4400,
+    cgroupHeadroomMB: 1500,
+    floorMB: 3000,
+    alreadyScoped: false,
+    systemdAvailable: true,
+  });
+  assert.equal(fullSetPlan.action, "relaunch");
+});
+
+test("decideExecutionPlan: AC4 — a small changed set still relaunches (not refuses-silently) under genuinely tight cgroup headroom", () => {
+  const plan = decideExecutionPlan({
+    hostAvailableMB: 4400,
+    cgroupHeadroomMB: 718, // this host's actual measured headroom mid-session
+    floorMB: 1200,
+    alreadyScoped: false,
+    systemdAvailable: true,
+  });
+  assert.equal(plan.action, "relaunch");
 });

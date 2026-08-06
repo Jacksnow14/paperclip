@@ -477,6 +477,11 @@ export function agentRoutes(
     return Boolean((agent.permissions as Record<string, unknown>).canCreateAgents);
   }
 
+  function hasAgentMetadataUpdateGrant(agent: { permissions: Record<string, unknown> | null | undefined }) {
+    if (!agent.permissions || typeof agent.permissions !== "object") return false;
+    return (agent.permissions as Record<string, unknown>).canUpdateAgentMetadata === true;
+  }
+
   async function buildAgentAccessState(agent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>) {
     const membership = await access.getMembership(agent.companyId, "agent", agent.id);
     const grants = membership
@@ -680,11 +685,25 @@ export function agentRoutes(
     };
   }
 
-  async function assertCanUpdateAgent(req: Request, targetAgent: { id: string; companyId: string }) {
+  type AgentUpdateAdmission = {
+    via: "board" | "self" | "ceo_role" | "creator" | "metadata_grant";
+  };
+
+  async function assertCanUpdateAgent(
+    req: Request,
+    targetAgent: { id: string; companyId: string },
+    opts?: {
+      // Admit holders of the narrow `canUpdateAgentMetadata` permission flag.
+      // Only PATCH /agents/:id may set this, and only for a request body whose
+      // keys are a subset of { metadata } — the flag must never widen to any
+      // other field or route (AUR-5026).
+      allowAgentMetadataGrant?: boolean;
+    },
+  ): Promise<AgentUpdateAdmission> {
     assertCompanyAccess(req, targetAgent.companyId);
     if (req.actor.type === "board") {
       await assertBoardCanManageAgentsForCompany(req, targetAgent.companyId);
-      return;
+      return { via: "board" };
     }
     if (!req.actor.agentId) throw forbidden("Agent authentication required");
 
@@ -693,15 +712,18 @@ export function agentRoutes(
       throw forbidden("Agent key cannot access another company");
     }
 
-    if (actorAgent.id === targetAgent.id) return;
-    if (actorAgent.role === "ceo") return;
+    if (actorAgent.id === targetAgent.id) return { via: "self" };
+    if (actorAgent.role === "ceo") return { via: "ceo_role" };
     const allowedByGrant = await access.hasPermission(
       targetAgent.companyId,
       "agent",
       actorAgent.id,
       "agents:create",
     );
-    if (allowedByGrant || canCreateAgents(actorAgent)) return;
+    if (allowedByGrant || canCreateAgents(actorAgent)) return { via: "creator" };
+    if (opts?.allowAgentMetadataGrant && hasAgentMetadataUpdateGrant(actorAgent)) {
+      return { via: "metadata_grant" };
+    }
     throw forbidden("Only CEO or agent creators can modify other agents");
   }
 
@@ -2437,6 +2459,7 @@ export function agentRoutes(
       entityId: agent.id,
       details: {
         canCreateAgents: agent.permissions?.canCreateAgents ?? false,
+        canUpdateAgentMetadata: agent.permissions?.canUpdateAgentMetadata ?? false,
         canAssignTasks: effectiveCanAssignTasks,
       },
     });
@@ -2693,7 +2716,14 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    await assertCanUpdateAgent(req, existing);
+    // The validated body's own keys decide whether the narrow metadata grant
+    // may admit this request. A body mixing metadata with any other field is
+    // rejected outright for grant-only holders — never partially applied.
+    const bodyKeys = Object.keys(req.body as Record<string, unknown>);
+    const isMetadataOnlyPatch = bodyKeys.length > 0 && bodyKeys.every((key) => key === "metadata");
+    const admission = await assertCanUpdateAgent(req, existing, {
+      allowAgentMetadataGrant: isMetadataOnlyPatch,
+    });
 
     if (hasOwn(req.body as object, "permissions")) {
       res.status(422).json({ error: "Use /api/agents/:id/permissions for permission changes" });
@@ -2701,6 +2731,17 @@ export function agentRoutes(
     }
 
     const patchData = { ...(req.body as Record<string, unknown>) };
+    if (admission.via === "metadata_grant") {
+      const requestedMetadata = asRecord(patchData.metadata);
+      if (!requestedMetadata) {
+        res.status(422).json({ error: "metadata must be an object for metadata-scoped agent updates" });
+        return;
+      }
+      // The narrow grant merges at the top level so it cannot destroy
+      // unrelated metadata keys on the target agent. Wholesale replacement
+      // stays reserved for board/CEO/creator admissions.
+      patchData.metadata = { ...(asRecord(existing.metadata) ?? {}), ...requestedMetadata };
+    }
     const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
     delete patchData.replaceAdapterConfig;
     if (hasOwn(patchData, "adapterConfig")) {

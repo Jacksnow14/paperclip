@@ -52,7 +52,14 @@ export function routineRoutes(
 
   async function agentCanAdminRoutines(agentId: string, companyId: string): Promise<boolean> {
     const actorAgent = await agents.getById(agentId);
-    if (actorAgent && actorAgent.role === "ceo") return true;
+    // The CEO bypass must be company-scoped: agents.getById is a global lookup and
+    // `role` is a property of the agent row, not of a company membership. Without the
+    // companyId comparison this helper would authorize company A's CEO against
+    // company B's routines. Today every call site is downstream of
+    // assertCanManageExistingRoutine (which runs assertCompanyAccess first), so this
+    // is defense-in-depth rather than a live hole — but the helper takes a companyId
+    // and must actually honor it, or the next call site added inherits a cross-tenant bug.
+    if (actorAgent && actorAgent.role === "ceo" && actorAgent.companyId === companyId) return true;
     return agentHasRoutinesManage(agentId, companyId);
   }
 

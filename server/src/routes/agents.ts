@@ -2447,7 +2447,12 @@ export function agentRoutes(
         grantedByUserId,
       );
     }
-    const canManageRoutines = await access.hasPermission(agent.companyId, "agent", agent.id, "routines:manage");
+    // Mirror buildAgentAccessState: the CEO holds routine administration by role, so the
+    // audit trail must record the effective capability, not just the explicit grant row
+    // (hasPermission returns false for a CEO who was never granted routines:manage).
+    const canManageRoutines =
+      agent.role === "ceo" ||
+      (await access.hasPermission(agent.companyId, "agent", agent.id, "routines:manage"));
 
     const actor = getActorInfo(req);
     await logActivity(db, {

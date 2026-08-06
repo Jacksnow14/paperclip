@@ -112,13 +112,32 @@ export function resolveAgentTokenBudgetPolicy(agent: {
 // criterion that a breach must not become a second lane-wide wall.
 export async function findAgentTokenBudgetBreach(
   db: Db,
-  agent: { id: string; adapterType: string; adapterConfig: Record<string, unknown> | null | undefined },
+  agent: {
+    id: string;
+    companyId: string;
+    adapterType: string;
+    adapterConfig: Record<string, unknown> | null | undefined;
+  },
   now: Date,
 ): Promise<AgentTokenBudgetBreach | null> {
   const policy = resolveAgentTokenBudgetPolicy(agent);
   if (!policy) return null;
 
   const windowStart = new Date(now.getTime() - policy.windowMs);
+  // companyId leads the predicate because every index on heartbeat_runs is
+  // company_id-leading (0000 …company_agent_started, 0058, 0070, and 0100's
+  // hb_runs_company_agent_created_idx); there is no (agent_id, created_at) index. An
+  // agentId-only predicate does NOT seq-scan — measured on the live 67.5k-row table, the
+  // planner still reaches hb_runs_company_agent_created_idx via a skip scan — but it pays
+  // for it: 4 index searches plus a separate 57kB quicksort for the ORDER BY, 0.511ms vs
+  // 0.270ms for the company-scoped form, which gets 1 index search and its ordering free
+  // from the index. Naming the leading column matters more here than the absolute numbers
+  // suggest: this runs per candidate on every admission pass and selects usage_json (a
+  // TOASTed column on the table whose seq-scan traffic pinned the VPS at 100% CPU —
+  // migration 0100 / perf fix #234), and skip-scan cost grows with the number of distinct
+  // company_id values, so the agentId-only form degrades exactly as the fleet adds
+  // companies. Narrowing is result-equivalent: 0 of 67,564 live rows have a company_id
+  // that disagrees with their agent's.
   const rows = await db
     .select({
       id: heartbeatRuns.id,
@@ -126,7 +145,13 @@ export async function findAgentTokenBudgetBreach(
       usageJson: heartbeatRuns.usageJson,
     })
     .from(heartbeatRuns)
-    .where(and(eq(heartbeatRuns.agentId, agent.id), gte(heartbeatRuns.createdAt, windowStart)))
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, agent.companyId),
+        eq(heartbeatRuns.agentId, agent.id),
+        gte(heartbeatRuns.createdAt, windowStart),
+      ),
+    )
     .orderBy(heartbeatRuns.createdAt);
 
   let windowTokens = 0;

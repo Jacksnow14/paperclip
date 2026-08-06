@@ -7250,7 +7250,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (tokenBudgetBreachedAgentIds.has(candidate.agentId)) continue;
       const breach = await findAgentTokenBudgetBreach(
         db,
-        { id: candidate.agentId, adapterType: candidate.adapterType, adapterConfig: candidate.adapterConfig },
+        {
+          id: candidate.agentId,
+          companyId: candidate.companyId,
+          adapterType: candidate.adapterType,
+          adapterConfig: candidate.adapterConfig,
+        },
         now,
       );
       if (breach) tokenBudgetBreachedAgentIds.add(candidate.agentId);

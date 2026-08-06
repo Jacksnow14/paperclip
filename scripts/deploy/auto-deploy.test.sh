@@ -241,6 +241,80 @@ else
 fi
 
 # ================================================================================
+# C2. Quiescence deadline (AUR-5178): on a cap-saturated host running==0 is
+#     unsatisfiable, so the wait must TERMINATE. Three probes: no premature
+#     fire, deadline-forced restart (with the armed sha having CHANGED since
+#     the wait began — the clock must not reset per-sha), and the 0 opt-out.
+# C2a: running=4, wait just started, deadline far away -> no restart, and the
+#      state note names the pending deadline.
+set_master "$SHA_N"; point_current "$SHA_N"; set_counts 4 9
+ts0=$(unit_start_ts)
+run_tick PAPERCLIP_AUTO_RESTART_ENABLED=1 PAPERCLIP_DEPLOY_QUIESCE_DEADLINE_SEC=3600; rc=$?
+if [[ "$(unit_start_ts)" == "$ts0" && "$(health_sha)" == "$SHA_G" && "$rc" == 0 ]]; then
+  ok "C2a: saturated but within deadline — no restart"
+else
+  fail "C2a: saturated but within deadline — no restart" "rc=$rc sha=$(health_sha)"
+fi
+[[ "$(state_get phase)" == "awaiting-quiescence" ]] && state_get note | grep -q "force in" \
+  && ok "C2a: state note carries the remaining time to the forced restart" \
+  || fail "C2a: state note carries the remaining time to the forced restart" "$(cat "$STATE_DIR/auto-deploy.state" 2>/dev/null)"
+
+# C2b: the wait began 2h ago under a DIFFERENT armed sha; still saturated.
+#      Deadline 60s long passed -> the tick restarts anyway and the health
+#      gate confirms the armed sha. This is the saturated-cap termination case.
+cat > "$STATE_DIR/auto-deploy.state" <<EOF
+last_tick=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+phase=awaiting-quiescence
+armed_sha=$SHA_G
+running_sha=$SHA_G
+running_count=4
+queued_count=9
+stale_discounted=-
+waiting_since=$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+restart_enabled=1
+note=-
+EOF
+ts0=$(unit_start_ts)
+run_tick PAPERCLIP_AUTO_RESTART_ENABLED=1 PAPERCLIP_DEPLOY_QUIESCE_DEADLINE_SEC=60; rc=$?
+if [[ "$(unit_start_ts)" != "$ts0" ]] && wait_sha "$SHA_N" 5 && [[ "$rc" == 0 ]]; then
+  ok "C2b: deadline exceeded while saturated — restart forced, armed sha live ($N12)"
+else
+  fail "C2b: deadline exceeded while saturated — restart forced, armed sha live ($N12)" "rc=$rc sha=$(health_sha)"
+fi
+grep -q "quiescence deadline EXCEEDED" "$TMP/auto.log" \
+  && ok "C2b: the forced restart is named in the log (running count and wait included)" \
+  || fail "C2b: the forced restart is named in the log (running count and wait included)" "$(tail -3 "$TMP/auto.log" 2>/dev/null)"
+
+# C2c: NEGATIVE CONTROL — identical aged wait, deadline=0 (opt-out) -> the
+#      gate waits forever again. Without this, C2b proves only that a restart
+#      can happen, not that the deadline is what forced it.
+cat > "$STATE_DIR/auto-deploy.state" <<EOF
+last_tick=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+phase=awaiting-quiescence
+armed_sha=$SHA_N
+running_sha=$SHA_N
+running_count=4
+queued_count=9
+stale_discounted=-
+waiting_since=$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+restart_enabled=1
+note=-
+EOF
+set_master "$SHA_G"; point_current "$SHA_G"; set_counts 4 9
+ts0=$(unit_start_ts)
+run_tick PAPERCLIP_AUTO_RESTART_ENABLED=1 PAPERCLIP_DEPLOY_QUIESCE_DEADLINE_SEC=0; rc=$?
+if [[ "$(unit_start_ts)" == "$ts0" && "$rc" == 0 && "$(state_get phase)" == "awaiting-quiescence" ]]; then
+  ok "C2c: NEGATIVE CONTROL — deadline=0 keeps the pre-AUR-5178 wait-forever behavior"
+else
+  fail "C2c: NEGATIVE CONTROL — deadline=0 keeps the pre-AUR-5178 wait-forever behavior" "rc=$rc phase=$(state_get phase)"
+fi
+
+# restore the pre-D world: unit healthy on G (D asserts a rollback INTO G)
+set_master "$SHA_G"; point_current "$SHA_G"; set_counts 0 0
+systemctl --user restart "$UNIT"
+wait_sha "$SHA_G" 10 || { echo "FATAL: scratch unit did not return to $G12 after C2" >&2; exit 1; }
+
+# ================================================================================
 # D. Rollback: an unhealthy release -> the unit ends up running the PREVIOUS
 #    sha, healthy, and the bad sha is quarantined.
 set_master "$SHA_B"; point_current "$SHA_B"; set_counts 0 0; : > "$ALERTS"

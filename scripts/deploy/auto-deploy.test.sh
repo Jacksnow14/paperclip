@@ -510,6 +510,44 @@ else
     "rc=$rc current=$(readlink "$APP/current") gate_log=$(cat "$GATE_LOG" 2>/dev/null)"
 fi
 
+# J4: R3 — consecutive gate INFRA refusals page SEV2 (a silently dead deploy
+#     pipeline is the "channel that cannot report its own failure" class),
+#     while the build-failure strike ledger stays untouched, and a working
+#     gate resets the streak.
+SHA_P=$(fixture_commit "gate infra streak"); P12=${SHA_P:0:12}
+make_release "$SHA_P" ok
+set_master "$SHA_P"; : > "$ALERTS"
+rm -f "$GATE_LOG" "$STATE_DIR/auto-deploy.gate-infra-failures" "$STATE_DIR/auto-deploy.build-failures"
+GATE_CMD="$GATE_STUB 3" run_tick PAPERCLIP_DEPLOY_GATE_INFRA_ALERT_TICKS=3
+GATE_CMD="$GATE_STUB 3" run_tick PAPERCLIP_DEPLOY_GATE_INFRA_ALERT_TICKS=3
+[[ ! -s "$ALERTS" ]] \
+  && ok "J4: infra refusals below the threshold do not page" \
+  || fail "J4: infra refusals below the threshold do not page" "alerts=$(cat "$ALERTS")"
+GATE_CMD="$GATE_STUB 3" run_tick PAPERCLIP_DEPLOY_GATE_INFRA_ALERT_TICKS=3
+if grep -q "migration gate INFRA-FAILING: 3 consecutive" "$ALERTS" \
+   && [[ ! -s "$STATE_DIR/auto-deploy.build-failures" ]] \
+   && ! grep -q "^$SHA_P " "$STATE_DIR/auto-deploy.quarantine" 2>/dev/null \
+   && [[ "$(readlink "$APP/current")" != "releases/$P12" ]]; then
+  ok "J4: threshold-th consecutive infra refusal pages SEV2; build strikes 0, no quarantine, no flip"
+else
+  fail "J4: threshold-th consecutive infra refusal pages SEV2; build strikes 0, no quarantine, no flip" \
+    "alerts=$(cat "$ALERTS" 2>/dev/null) strikes=$(cat "$STATE_DIR/auto-deploy.build-failures" 2>/dev/null) current=$(readlink "$APP/current")"
+fi
+# A working gate resets the streak: a pass tick flips P, then a fresh sha's
+# single infra refusal starts from 1 — no page.
+GATE_CMD="$GATE_STUB 0" run_tick PAPERCLIP_DEPLOY_GATE_INFRA_ALERT_TICKS=3
+SHA_Q=$(fixture_commit "streak reset probe")
+make_release "$SHA_Q" ok
+set_master "$SHA_Q"; : > "$ALERTS"
+GATE_CMD="$GATE_STUB 3" run_tick PAPERCLIP_DEPLOY_GATE_INFRA_ALERT_TICKS=3
+if [[ "$(readlink "$APP/current")" == "releases/$P12" && ! -s "$ALERTS" ]] \
+   && [[ "$(cat "$STATE_DIR/auto-deploy.gate-infra-failures" 2>/dev/null)" == "1" ]]; then
+  ok "J4: a passing gate resets the infra streak (next refusal counts from 1)"
+else
+  fail "J4: a passing gate resets the infra streak (next refusal counts from 1)" \
+    "current=$(readlink "$APP/current") counter=$(cat "$STATE_DIR/auto-deploy.gate-infra-failures" 2>/dev/null) alerts=$(cat "$ALERTS" 2>/dev/null)"
+fi
+
 echo
 if [[ "$FAILURES" -eq 0 ]]; then
   echo "auto-deploy behavioural suite: all cases passed"

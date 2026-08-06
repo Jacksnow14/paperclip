@@ -63,6 +63,12 @@ RUN_COUNTS_CMD=${PAPERCLIP_DEPLOY_RUN_COUNTS_CMD:-${PAPERCLIP_DEPLOY_NODE:-/usr/
 # is the break-glass.
 MIGRATION_GATE_CMD=${PAPERCLIP_DEPLOY_MIGRATION_GATE_CMD:-${PAPERCLIP_DEPLOY_NODE:-/usr/bin/node} $HERE/migration-gate.mjs}
 MIGRATION_GATE_ENABLED=${PAPERCLIP_MIGRATION_GATE_ENABLED:-1}
+# AUR-5019 review R3: an infra-failing gate silently stops every deploy, and
+# the deploy is the thing that would ship the fix. No strike per failure (not
+# a property of the SHA), but after this many CONSECUTIVE infra refusals the
+# tick pages SEV2 — and keeps paging at each further multiple while the streak
+# lasts. Separate ledger from build failures; a working gate resets it.
+GATE_INFRA_ALERT_TICKS=${PAPERCLIP_DEPLOY_GATE_INFRA_ALERT_TICKS:-6}
 MEM_FLOOR_MB=${PAPERCLIP_DEPLOY_MEM_FLOOR_MB:-2500}
 RESTART_ENABLED=${PAPERCLIP_AUTO_RESTART_ENABLED:-0}
 ROLLBACK_ENABLED=${PAPERCLIP_AUTO_ROLLBACK_ENABLED:-1}
@@ -80,6 +86,7 @@ FAIL_FILE=$STATE_DIR/auto-deploy.build-failures
 HALT_FILE=$STATE_DIR/auto-deploy.halt
 BUILD_OUT=$STATE_DIR/auto-deploy.last-build.out
 GATE_OUT=$STATE_DIR/auto-deploy.last-migration-gate.out
+GATE_FAIL_FILE=$STATE_DIR/auto-deploy.gate-infra-failures
 
 log() {
   local line
@@ -311,6 +318,7 @@ else
       cat "$GATE_OUT" >> "$LOG_FILE" 2>/dev/null || true
       if (( gate_rc == 2 )); then
         gate_refused=1
+        rm -f "$GATE_FAIL_FILE"   # the gate RAN — its own channel is healthy
         quarantine "$master_sha" migration-gate-blocked
         PHASE=arm-blocked-migration-gate ARMED_SHA=$master_sha NOTE="migration gate BLOCKED (replay aborted) — see $GATE_OUT"
         write_state
@@ -318,10 +326,19 @@ else
         notify SEV2 "auto-deploy migration gate BLOCKED ${master_sha:0:12}: a pending migration aborts when replayed against a live-data snapshot — deploying it would crash-loop boot (AUR-5019). SHA quarantined; production unaffected (still on ${activated_sha:0:12}). Detail: $GATE_OUT"
       elif (( gate_rc != 0 )); then
         gate_refused=1
-        PHASE=arm-gate-infra-failed ARMED_SHA=$master_sha NOTE="migration gate could not run (exit $gate_rc) — failing closed, no flip; see $GATE_OUT"
+        gate_fails=$(( $(cat "$GATE_FAIL_FILE" 2>/dev/null || echo 0) + 1 ))
+        echo "$gate_fails" > "$GATE_FAIL_FILE"
+        PHASE=arm-gate-infra-failed ARMED_SHA=$master_sha NOTE="migration gate could not run (exit $gate_rc, consecutive $gate_fails) — failing closed, no flip; see $GATE_OUT"
         write_state
-        log "arm deferred: migration gate infra failure (exit $gate_rc) — no strike, retry next tick"
+        log "arm deferred: migration gate infra failure (exit $gate_rc, consecutive $gate_fails/$GATE_INFRA_ALERT_TICKS) — no strike, retry next tick"
+        if (( GATE_INFRA_ALERT_TICKS > 0 && gate_fails % GATE_INFRA_ALERT_TICKS == 0 )); then
+          # A channel that cannot report its own failure is more dangerous than
+          # one that is loudly broken: without this page the fleet learns the
+          # deploy pipeline is dead from the 24h dark-armed drift threshold.
+          notify SEV2 "auto-deploy migration gate INFRA-FAILING: $gate_fails consecutive ticks could not run the gate (latest exit $gate_rc). Deploys are failing closed — nothing arms until the gate runs again, including the fix for whatever broke it. Not a bad SHA (no quarantine). Detail: $GATE_OUT. https://paperclip/AUR/issues/AUR-5019"
+        fi
       else
+        rm -f "$GATE_FAIL_FILE"
         log "migration gate PASS for $rel12: $(tail -1 "$GATE_OUT" 2>/dev/null)"
       fi
     fi

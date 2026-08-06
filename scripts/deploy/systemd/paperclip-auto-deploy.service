@@ -25,7 +25,13 @@ ExecStart=/opt/paperclip/app/current/scripts/deploy/auto-deploy.sh
 Environment=PAPERCLIP_AUTO_RESTART_ENABLED=0
 # A tick can legitimately hold the lock for a full release build plus a
 # quiescence-gated restart; do not let systemd kill it mid-build.
-TimeoutStartSec=45min
+# AUR-5019: the migration gate adds up to PAPERCLIP_MIGRATION_GATE_TIMEOUT_SEC
+# (default 2400 s = 40 min) between build and flip. This value must stay ABOVE
+# worst-case build (~15 min, safe-deploy watchdogged) + gate cap (40 min) +
+# slack; the gate handles SIGTERM by cleaning up its scratch dir, but a unit
+# timeout mid-replay is still a wasted tick. 45min < 15+40 collided; 75min
+# does not.
+TimeoutStartSec=75min
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=paperclip-auto-deploy

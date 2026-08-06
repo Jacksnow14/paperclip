@@ -286,6 +286,36 @@ else
 fi
 
 # ================================================================================
+# R2 (review): the timeout watchdog must CLEAN UP, not just exit —
+# process.exit() skips finally blocks, so this asserts the explicit cleanup
+# path. And a workdir leaked by a SIGKILLed run must be swept at next start.
+FIX=$(make_fixture timeoutcase)
+printf '%s\n' "$MLR_BASE" > "$FIX/dist/migrations/0001_base.sql"
+printf 'CREATE TABLE "gate_timeout_probe" ("id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL);\n' > "$FIX/dist/migrations/0002_probe.sql"
+pgq "$ADMIN_URL" 'CREATE DATABASE timeoutcase'
+seed_journal timeoutcase "$(hash_of "$FIX/dist/migrations/0001_base.sql")"
+pgq "$(url_for timeoutcase)" "$MLR_BASE"
+WD="$TMP/wd-timeout"; mkdir -p "$WD"
+STALE="$WD/paperclip-migration-gate-STALELEAK"; mkdir -p "$STALE"
+touch -d '2 hours ago' "$STALE"
+# Timeout 0 = the watchdog fires at the first await, deterministically before
+# any real work completes (a small positive value raced the gate and lost on a
+# warm page cache). The workdir already exists by then, so the leak check is
+# meaningful.
+PAPERCLIP_MIGRATION_GATE_TIMEOUT_SEC=0 "$NODE" "$GATE" --release "$FIX" --db-dist "$FIX/dist" \
+  --live-url "$(url_for timeoutcase)" --work-dir "$WD" > "$TMP/gate.out" 2>&1; rc=$?
+leftovers=$(find "$WD" -maxdepth 1 -name 'paperclip-migration-gate-*' 2>/dev/null | wc -l)
+if [[ "$rc" == 3 ]] && grep -q "timed out after 0s" "$TMP/gate.out" && [[ "$leftovers" == 0 ]]; then
+  ok "R2: forced timeout exits 3 AND removes its workdir (no leak)"
+else
+  fail "R2: forced timeout exits 3 AND removes its workdir (no leak)" \
+    "rc=$rc leftovers=$leftovers out=$(tail -3 "$TMP/gate.out")"
+fi
+[[ ! -d "$STALE" ]] \
+  && ok "R2: stale workdir from a killed run is swept at gate start" \
+  || fail "R2: stale workdir from a killed run is swept at gate start" "$STALE survived the sweep"
+
+# ================================================================================
 # Armed-guard asserts (AUR-4187: a merged detector that watched nothing).
 # The call site must exist and PRECEDE the symlink flip in both deploy scripts.
 ad_gate=$(grep -n 'MIGRATION_GATE_CMD --release' "$SCRIPT_DIR/auto-deploy.sh" | head -1 | cut -d: -f1)

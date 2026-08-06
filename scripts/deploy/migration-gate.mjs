@@ -52,9 +52,20 @@
 //   PAPERCLIP_MIGRATION_GATE_DISK_FLOOR_MB    — min free disk (default 1024)
 //   PAPERCLIP_MIGRATION_GATE_TIMEOUT_SEC      — hard cap (default 2400: a
 //     pending migration touching a hub table drags the FK-ancestor closure in,
-//     measured ~3 GB of data and a ~20 min replay cycle on this host)
+//     measured ~3 GB of data and a ~11 min replay cycle on this host; 2400
+//     doubles that. The auto-deploy unit's TimeoutStartSec must stay above
+//     worst-case build + this cap — see paperclip-auto-deploy.service.)
+//
+// Cleanup discipline (AUR-5019 review R2): the temp workdir (snapshot + scratch
+// cluster, up to ~2× the kept data) is removed on EVERY exit path — normal
+// completion, the timeout watchdog, and SIGTERM/SIGINT. process.exit() skips
+// pending `finally` blocks, so the watchdog and signal paths run the cleanup
+// explicitly before exiting. And because a SIGKILL can still strand a workdir,
+// every gate start sweeps siblings matching our prefix that are older than the
+// hard cap — a leaked dir self-heals on the next tick instead of accreting on
+// a box that is already tight on disk.
 
-import { existsSync, mkdtempSync, rmSync, statfsSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, statSync, statfsSync } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { createServer } from "node:net";
@@ -68,6 +79,68 @@ const EXIT_INFRA = 3;
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] gate: ${msg}`);
+}
+
+const TIMEOUT_SEC = Number(process.env.PAPERCLIP_MIGRATION_GATE_TIMEOUT_SEC ?? 2400);
+
+// Cleanup must be reachable from every exit path, not just `finally`:
+// process.exit() abandons pending finally blocks (proven empirically on this
+// host during review), so the watchdog and signal handlers call it directly.
+const cleanupTarget = { workDir: null, scratch: null, keep: false, ran: false };
+
+async function runCleanup() {
+  if (cleanupTarget.ran) return;
+  cleanupTarget.ran = true;
+  if (cleanupTarget.scratch) {
+    // A hung postmaster must not turn cleanup into a second hang: race the
+    // stop against a short deadline, then remove the files regardless.
+    await Promise.race([
+      cleanupTarget.scratch.stop().catch(() => {}),
+      new Promise((resolveRace) => setTimeout(resolveRace, 8000)),
+    ]);
+  }
+  if (cleanupTarget.workDir && !cleanupTarget.keep) {
+    try {
+      rmSync(cleanupTarget.workDir, { recursive: true, force: true });
+    } catch {
+      // The start-of-run sweep reclaims anything this misses.
+    }
+  }
+}
+
+function dieInfra(reason) {
+  console.error(`MIGRATION-GATE: INFRA-FAIL (${reason})`);
+  // Backstop: if cleanup itself wedges, still exit within 15 s.
+  setTimeout(() => process.exit(EXIT_INFRA), 15000).unref();
+  void runCleanup().finally(() => process.exit(EXIT_INFRA));
+}
+
+process.on("SIGTERM", () => dieInfra("SIGTERM — killed externally (systemd unit timeout? check TimeoutStartSec headroom)"));
+process.on("SIGINT", () => dieInfra("SIGINT"));
+
+// A SIGKILLed or crashed gate cannot clean up after itself; the next run does.
+// Only dirs matching our own prefix AND older than the hard cap (+10 min
+// slack) are touched — nothing that old can belong to a live run.
+function sweepStaleWorkdirs(parent) {
+  let entries = [];
+  try {
+    entries = readdirSync(parent, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  const cutoffMs = Date.now() - (TIMEOUT_SEC + 600) * 1000;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith("paperclip-migration-gate-")) continue;
+    const stalePath = join(parent, entry.name);
+    try {
+      if (statSync(stalePath).mtimeMs < cutoffMs) {
+        rmSync(stalePath, { recursive: true, force: true });
+        log(`swept stale gate workdir ${stalePath} (leaked by a killed run)`);
+      }
+    } catch {
+      // Racing another sweep or a permissions oddity — leave it for next tick.
+    }
+  }
 }
 
 function parseArgs(argv) {
@@ -181,8 +254,9 @@ async function main() {
     throw new Error(`live DB migration state is ${liveState.reason} — gate cannot replay; boot would refuse too`);
   }
 
-  // ---- disk floor -----------------------------------------------------------
+  // ---- workdir hygiene + disk floor -----------------------------------------
   const workParent = args.workDir ?? process.env.TMPDIR ?? tmpdir();
+  sweepStaleWorkdirs(workParent);
   const stat = statfsSync(workParent);
   const freeMb = Math.floor((stat.bavail * stat.bsize) / (1024 * 1024));
   if (freeMb < diskFloorMb) {
@@ -190,12 +264,11 @@ async function main() {
   }
 
   const workDir = mkdtempSync(join(workParent, "paperclip-migration-gate-"));
-  let scratch = null;
-  const timeoutSec = Number(process.env.PAPERCLIP_MIGRATION_GATE_TIMEOUT_SEC ?? 900);
+  cleanupTarget.workDir = workDir;
+  cleanupTarget.keep = args.keep;
   const watchdog = setTimeout(() => {
-    console.error(`MIGRATION-GATE: INFRA-FAIL (timed out after ${timeoutSec}s)`);
-    process.exit(EXIT_INFRA);
-  }, timeoutSec * 1000);
+    dieInfra(`timed out after ${TIMEOUT_SEC}s`);
+  }, TIMEOUT_SEC * 1000);
 
   try {
     // ---- 2. scoped snapshot of the live DB ----------------------------------
@@ -288,7 +361,7 @@ async function main() {
     const scratchPort = await findFreePort(54990);
     const scratchDataDir = join(workDir, "scratch-pg");
     const clusterLogs = [];
-    scratch = new EmbeddedPostgres({
+    const scratch = new EmbeddedPostgres({
       databaseDir: scratchDataDir,
       user: "paperclip",
       password: "paperclip",
@@ -298,6 +371,7 @@ async function main() {
       onLog: (m) => clusterLogs.push(String(m)),
       onError: (m) => clusterLogs.push(String(m)),
     });
+    cleanupTarget.scratch = scratch;
     try {
       await scratch.initialise();
       await scratch.start();
@@ -356,18 +430,8 @@ async function main() {
     return EXIT_PASS;
   } finally {
     clearTimeout(watchdog);
-    if (scratch) {
-      try {
-        await scratch.stop();
-      } catch {
-        // The workdir removal below still reclaims the space.
-      }
-    }
-    if (args.keep) {
-      log(`--keep: leaving workdir ${workDir}`);
-    } else {
-      rmSync(workDir, { recursive: true, force: true });
-    }
+    if (args.keep) log(`--keep: leaving workdir ${workDir}`);
+    await runCleanup();
   }
 }
 

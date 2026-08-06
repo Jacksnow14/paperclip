@@ -91,11 +91,19 @@ export interface QuotaWallAnchor {
 
 export interface ClaudeAuthQuotaLaneHistory {
   /**
-   * Newest zero-usage quota-wall failure on the lane inside the lookback.
-   * Reclassified runs qualify too (they persist `claude_quota_exhausted`), so a
-   * long wall keeps its anchor chain alive past the last honest wording — safe,
-   * because a chain link is only ever created while the lane has no
-   * post-anchor success, and any success terminates the chain for good.
+   * Newest zero-usage quota-wall failure on the lane inside the lookback,
+   * EXCLUDING reclassified rows (AUR-5064). A reclassified run persists
+   * `claude_quota_exhausted` with zero usage, so letting it anchor later
+   * reclassifications made the chain self-sustaining: the 8-day lookback could
+   * never expire it, and a genuine credential expiry that started inside a wall
+   * window was latched as quota permanently — parked, adapter-paused, never
+   * escalated for credentials — because no success can occur to break the
+   * chain. Anchors are therefore required to carry independent wall evidence
+   * (no `resultJson.authRenderedQuotaWall` marker), so the chain expires
+   * `QUOTA_WALL_ANCHOR_LOOKBACK_MS` after the last REAL wall row. Live data
+   * shows real anchors are plentiful during any standing wall (5-hour
+   * session-limit rows run thousands per day), so a genuine wall keeps its
+   * chain alive without help from reclassified rows.
    */
   anchor: QuotaWallAnchor | null;
   /** Discriminator (b): an Anthropic-credential success after the anchor. */
@@ -174,9 +182,15 @@ function resolveAnchorResetAt(row: {
 }
 
 /**
- * Gather the lane history the discriminator needs. One cheap indexed lookup per
- * candidate run — and candidates are rare: the caller only reaches this for
- * failed runs already carrying `claude_auth_required` with zero usage.
+ * Gather the lane history the discriminator needs. Candidates are rare — the
+ * caller only reaches this for failed runs already carrying
+ * `claude_auth_required` with zero usage — but the anchor lookup fires exactly
+ * when the fleet is degraded (686 times on Aug 2 vs ~2/day steady state), so it
+ * must stay cheap under load. It scopes by `heartbeatRuns.companyId` (AUR-5064;
+ * the original `agents.companyId` scoping made every heartbeat_runs index
+ * unusable and planned as a 2-second scan of the 1.3 GB table) and is served by
+ * the partial index `hb_runs_quota_anchor_idx`, whose predicate mirrors the
+ * anchor conditions below — keep them in sync when either changes.
  */
 export async function gatherClaudeAuthQuotaLaneHistory(
   db: Db,
@@ -194,9 +208,9 @@ export async function gatherClaudeAuthQuotaLaneHistory(
     sql`coalesce((${heartbeatRuns.usageJson} ->> 'outputTokens')::numeric, 0) = 0`,
   );
   // Quota-wall evidence, most trustworthy first: the dedicated errorCode
-  // (AUR-4144 + reclassified rows), the structured metadata, then the honest
-  // prose — the prose branch additionally requires a claude-family errorCode so
-  // model-profile runs of OTHER providers on this adapterType (codex wording,
+  // (AUR-4144), the structured metadata, then the honest prose — the prose
+  // branch additionally requires a claude-family errorCode so model-profile
+  // runs of OTHER providers on this adapterType (codex wording,
   // `codex_transient_upstream`) can never anchor an Anthropic wall.
   const quotaEvidence = sql`(
     ${heartbeatRuns.errorCode} = ${CLAUDE_QUOTA_EXHAUSTED_ERROR_CODE}
@@ -205,6 +219,19 @@ export async function gatherClaudeAuthQuotaLaneHistory(
       ${heartbeatRuns.error} ~* ${QUOTA_SIGNATURE_RE.source}
       and (${heartbeatRuns.errorCode} is null or ${heartbeatRuns.errorCode} like 'claude%')
     )
+  )`;
+  // AUR-5064 latch bound: a reclassified row must not anchor further
+  // reclassifications, or the chain never expires (see ClaudeAuthQuotaLaneHistory).
+  const anchorIsNotItselfReclassified = sql`${heartbeatRuns.resultJson} -> 'authRenderedQuotaWall' is null`;
+  // AUR-5064 hardening: model-profile overrides run other providers under this
+  // adapterType, and their zero-usage failures can match the prose regex with a
+  // claude-family errorCode. `usageJson.provider` is populated on 44,111 of
+  // 44,497 zero-usage failed claude_local rows in a trailing 30d window (67 of
+  // them `openai`), so require anthropic-or-absent — strictly tighter than the
+  // errorCode family guard alone.
+  const anchorProviderIsAnthropicOrUnknown = sql`(
+    ${heartbeatRuns.usageJson} ->> 'provider' is null
+    or ${heartbeatRuns.usageJson} ->> 'provider' = ${ANTHROPIC_PROVIDER}
   )`;
 
   const anchorRow = await db
@@ -219,13 +246,18 @@ export async function gatherClaudeAuthQuotaLaneHistory(
     .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
     .where(
       and(
-        eq(agents.companyId, input.companyId),
+        // Scoping by heartbeatRuns.companyId (not agents.companyId) is what
+        // lets the planner use the heartbeat_runs indexes; the join survives
+        // only to check adapterType.
+        eq(heartbeatRuns.companyId, input.companyId),
         eq(agents.adapterType, input.adapterType),
         eq(heartbeatRuns.status, "failed"),
         ne(heartbeatRuns.id, input.excludeRunId),
         gte(heartbeatRuns.createdAt, lookbackStart),
         lt(heartbeatRuns.createdAt, input.now),
         quotaEvidence,
+        anchorIsNotItselfReclassified,
+        anchorProviderIsAnthropicOrUnknown,
         zeroUsage,
       ),
     )

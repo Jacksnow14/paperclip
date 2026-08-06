@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueRecoveryActions, issues } from "@paperclipai/db";
 import type {
@@ -335,6 +335,42 @@ export function issueRecoveryActionService(db: Db) {
   }
 
   /**
+   * Re-fire an existing active/escalated action: bump `attemptCount` and refresh
+   * `lastAttemptAt` without touching kind, owner, cause, fingerprint, or evidence.
+   *
+   * This exists for sweepers that retry a *dormant* action (AUR-4996): a mirror
+   * `upsertSourceScoped` call is the wrong tool there because the upsert nulls
+   * every field the caller does not reconstruct (`recoveryIssueId`, `wakePolicy`,
+   * ...), so a retry would silently rewrite the action it meant to repeat.
+   * Returns null when the action is no longer active (resolved/cancelled race).
+   */
+  async function rearmActiveForIssue(input: {
+    companyId: string;
+    sourceIssueId: string;
+    actionId: string;
+    lastAttemptAt?: Date;
+  }): Promise<IssueRecoveryAction | null> {
+    const now = new Date();
+    const [updated] = await db
+      .update(issueRecoveryActions)
+      .set({
+        attemptCount: sql`${issueRecoveryActions.attemptCount} + 1`,
+        lastAttemptAt: input.lastAttemptAt ?? now,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, input.companyId),
+          eq(issueRecoveryActions.sourceIssueId, input.sourceIssueId),
+          eq(issueRecoveryActions.id, input.actionId),
+          inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+        ),
+      )
+      .returning();
+    return updated ? toReadModel(updated) : null;
+  }
+
+  /**
    * Close out every active recovery action whose source issue just reached a terminal status.
    *
    * Idempotent: the status predicate means a second call matches zero rows. Callers pass the
@@ -440,6 +476,7 @@ export function issueRecoveryActionService(db: Db) {
   return {
     getActiveForIssue,
     listActiveForIssues,
+    rearmActiveForIssue,
     reconcileOrphanedTerminalActions,
     resolveActiveForIssue,
     resolveActiveForTerminalIssues,

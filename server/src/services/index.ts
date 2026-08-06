@@ -39,6 +39,12 @@ export {
   BUDGET_CARVEOUT_ROOT_IDENTIFIER,
   type WorkClassBudget,
 } from "./work-class-budget.js";
+export {
+  shipRatioGateService,
+  SHIP_RATIO_FLOOR,
+  type ShipRatioSnapshot,
+  type ShipRatioDisagreement,
+} from "./ship-ratio-gate.js";
 export { financeService } from "./finance.js";
 export { heartbeatService } from "./heartbeat.js";
 export {

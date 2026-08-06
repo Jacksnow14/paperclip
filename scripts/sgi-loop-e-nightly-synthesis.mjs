@@ -160,6 +160,43 @@ function workClassBudgetLine(budget) {
   return `self-improvement 7d: ${pct}% of ${totalTokens.toLocaleString()} tok (cap ${capPct}%)${budget.overCap ? ' ⚠️ over cap' : ''}`;
 }
 
+// AUR-5207: the second gate — rolling 7d merged-PR ratio (money-making:
+// self-improvement, floor 2:1) computed out-of-band by
+// scripts/sgi-ship-ratio-gate.mjs. Best-effort, same as the token-cap fetch
+// above: a missing/failed fetch omits the line rather than failing synthesis.
+async function fetchShipRatioSnapshot() {
+  try {
+    const snapshot = await apiFetch(`/api/companies/${COMPANY_ID}/ship-ratio-snapshot`);
+    return snapshot && !snapshot._notFound ? snapshot : null;
+  } catch (err) {
+    console.error(`[loop-e] could not fetch ship-ratio-snapshot: ${err.message}`);
+    return null;
+  }
+}
+
+function shipRatioLine(snapshot) {
+  if (!snapshot) return 'ship-ratio 7d: no snapshot yet (routine has not run)';
+  const ratio = Number(snapshot.ratio) || 0;
+  const floor = Number(snapshot.floorRatio) || 2;
+  return `ship-ratio 7d: ${ratio.toFixed(2)}:1 merged, ${snapshot.moneyMakingMerged} money-making vs ${snapshot.selfImprovementMerged} self-improvement (floor ${floor}:1)${snapshot.overCap ? ' ⚠️ under floor' : ''}`;
+}
+
+// The founder's requirement, verbatim: "report both numbers together, never
+// averaged into one green number... a period that passes the token cap but
+// fails the merge ratio must read as a FAILURE." This line is the single
+// AND'd compliance readout — it must never soften to "mostly compliant" when
+// exactly one gate trips.
+function admissionGateLine(budget, snapshot) {
+  const tokenOverCap = Boolean(budget && budget.overCap);
+  const ratioOverCap = Boolean(snapshot && snapshot.overCap);
+  if (!budget && !snapshot) return null;
+  if (tokenOverCap || ratioOverCap) {
+    const failed = [tokenOverCap ? 'token cap' : null, ratioOverCap ? 'merge ratio' : null].filter(Boolean).join(' AND ');
+    return `**Admission gate: ⚠️ FAILURE** (${failed} over cap — self-improvement admission sheds)`;
+  }
+  return '**Admission gate: ✅ COMPLIANT** (token cap and merge ratio both within floor)';
+}
+
 const cat = (r) => (r.metadata && r.metadata.category) || '';
 const dayOf = (r) => (r.createdAt || '').slice(0, 10);
 
@@ -330,7 +367,7 @@ function delta(metrics, prev) {
 // ---- Render ----------------------------------------------------------------
 
 function renderBody(s) {
-  const { date, failures, patterns, cost, deltaInfo, counts, wcbLine } = s;
+  const { date, failures, patterns, cost, deltaInfo, counts, wcbLine, srLine, gateLine } = s;
   // Section 1 is capped so a high-signal day can't push the record past the
   // 20k-char capture limit and silently amputate sections 3 and 4. The omitted
   // tail is reported, never dropped in silence.
@@ -358,7 +395,7 @@ function renderBody(s) {
   return `# Cross-Project Synthesis — ${date}
 
 _SGI Loop E · distilled from ${counts.inputs} signal record(s) dated ${date} (${counts.retros} retro, ${counts.toolGaps} tool-gap, ${counts.scorecards} scorecard, ${counts.adjusted} cost-adjusted, ${counts.efficiency} efficiency); scanned ${counts.pagesScanned ?? '?'} page(s) of memory${counts.scanTruncated ? ' — **scan hit the page cap, coverage incomplete**' : ''}.${counts.inputs === 0 ? ' No fresh signals today — sections reflect standing state only.' : ''}_
-${wcbLine ? `\n_${wcbLine}_\n` : ''}
+${wcbLine ? `\n_${wcbLine}_\n` : ''}${srLine ? `\n_${srLine}_\n` : ''}${gateLine ? `\n${gateLine}\n` : ''}
 ## 1. Recurring failure modes
 ${fail}
 
@@ -389,6 +426,9 @@ async function main() {
   const prev = findPreviousSynthesis(all);
   const workClassBudget = await fetchWorkClassBudget();
   const wcbLine = workClassBudgetLine(workClassBudget);
+  const shipRatioSnapshot = await fetchShipRatioSnapshot();
+  const srLine = shipRatioLine(shipRatioSnapshot);
+  const gateLine = admissionGateLine(workClassBudget, shipRatioSnapshot);
 
   const counts = {
     retros: today.filter(r => isRetro(r)).length,
@@ -410,7 +450,7 @@ async function main() {
   };
   const deltaInfo = delta(metrics, prev);
 
-  const body = renderBody({ date: TARGET_DATE, failures, patterns, cost, deltaInfo, counts, wcbLine });
+  const body = renderBody({ date: TARGET_DATE, failures, patterns, cost, deltaInfo, counts, wcbLine, srLine, gateLine });
 
   const title = `synthesis/${TARGET_DATE}`;
   const metadata = {
@@ -426,6 +466,12 @@ async function main() {
     prev_synthesis_date: deltaInfo.prevDate || null,
     // AUR-5168 AC4: the same 7d work-class split the admission gate reads.
     work_class_budget: workClassBudget,
+    // AUR-5207 AC4: the second gate, reported alongside — never averaged —
+    // with work_class_budget above. admission_gate_compliant is the single
+    // AND'd readout; a period passing one gate and failing the other is
+    // false here, not true.
+    ship_ratio_snapshot: shipRatioSnapshot,
+    admission_gate_compliant: !(workClassBudget && workClassBudget.overCap) && !(shipRatioSnapshot && shipRatioSnapshot.overCap),
   };
 
   if (DRY_RUN) {
@@ -458,7 +504,7 @@ async function main() {
 
   if (TASK_ID) {
     const link = recordId ? ` (memory record \`${recordId}\`)` : '';
-    await postComment(TASK_ID, `## SGI Loop E — Nightly Cross-Project Synthesis\n\nWrote \`${title}\`${link}, category \`synthesis\` (auto-accepted).\n\n- Recurring failure modes: **${metrics.failureModes}**\n- Strong patterns: **${metrics.strongPatterns}**\n- Cost outlier projects: **${metrics.costOutliers}**\n- Inputs synthesized: ${counts.inputs} (${counts.retros} retro · ${counts.toolGaps} tool-gap · ${counts.scorecards} scorecard · ${counts.adjusted} cost-adjusted)${wcbLine ? `\n- ${wcbLine}` : ''}\n- Delta basis: ${deltaInfo.prevDate ? `prior synthesis ${deltaInfo.prevDate}` : 'baseline (no prior synthesis)'}\n\n<details><summary>Synthesis record</summary>\n\n${body}\n</details>`);
+    await postComment(TASK_ID, `## SGI Loop E — Nightly Cross-Project Synthesis\n\nWrote \`${title}\`${link}, category \`synthesis\` (auto-accepted).\n\n- Recurring failure modes: **${metrics.failureModes}**\n- Strong patterns: **${metrics.strongPatterns}**\n- Cost outlier projects: **${metrics.costOutliers}**\n- Inputs synthesized: ${counts.inputs} (${counts.retros} retro · ${counts.toolGaps} tool-gap · ${counts.scorecards} scorecard · ${counts.adjusted} cost-adjusted)${wcbLine ? `\n- ${wcbLine}` : ''}${srLine ? `\n- ${srLine}` : ''}${gateLine ? `\n- ${gateLine}` : ''}\n- Delta basis: ${deltaInfo.prevDate ? `prior synthesis ${deltaInfo.prevDate}` : 'baseline (no prior synthesis)'}\n\n<details><summary>Synthesis record</summary>\n\n${body}\n</details>`);
   }
 
   return { title, recordId, supersededRecordIds: superseded, metrics, counts };

@@ -104,6 +104,35 @@ const mockBudgetService = vi.hoisted(() => ({
   upsertPolicy: vi.fn(),
   resolveIncident: vi.fn(),
 }));
+const mockWorkClassBudgetService = vi.hoisted(() => ({
+  computeBudget: vi.fn().mockResolvedValue({
+    companyId: "company-1",
+    windowStart: new Date("2026-08-01T00:00:00.000Z"),
+    windowEnd: new Date("2026-08-08T00:00:00.000Z"),
+    totalTokens: 0,
+    selfImprovementTokens: 0,
+    selfImprovementShare: 0,
+    overCap: false,
+  }),
+}));
+const mockShipRatioGateService = vi.hoisted(() => ({
+  getLatestSnapshot: vi.fn().mockResolvedValue(null),
+  recordSnapshot: vi.fn().mockResolvedValue({
+    id: "snapshot-1",
+    companyId: "company-1",
+    windowStart: new Date("2026-08-01T00:00:00.000Z"),
+    windowEnd: new Date("2026-08-08T00:00:00.000Z"),
+    moneyMakingMerged: 0,
+    selfImprovementMerged: 0,
+    moneyMakingClosedWithoutMerge: 0,
+    selfImprovementClosedWithoutMerge: 0,
+    ratio: 0,
+    floorRatio: 2,
+    overCap: true,
+    disagreements: [],
+    createdAt: new Date("2026-08-08T00:00:00.000Z"),
+  }),
+}));
 
 function registerModuleMocks() {
   vi.doMock("../services/index.js", () => ({
@@ -114,6 +143,8 @@ function registerModuleMocks() {
     agentService: () => mockAgentService,
     issueService: () => mockIssueService,
     heartbeatService: () => mockHeartbeatService,
+    workClassBudgetService: () => mockWorkClassBudgetService,
+    shipRatioGateService: () => mockShipRatioGateService,
     logActivity: mockLogActivity,
   }));
 

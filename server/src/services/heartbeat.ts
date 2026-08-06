@@ -95,6 +95,7 @@ import {
 } from "./workspace-runtime.js";
 import { issueService } from "./issues.js";
 import { workClassBudgetService, matchesBudgetCarveoutKeywords } from "./work-class-budget.js";
+import { shipRatioGateService } from "./ship-ratio-gate.js";
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
@@ -2543,6 +2544,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const companySkills = companySkillService(db);
   const issuesSvc = issueService(db);
   const workClassBudget = workClassBudgetService(db);
+  const shipRatioGate = shipRatioGateService(db);
   const treeControlSvc = issueTreeControlService(db);
   const executionWorkspacesSvc = executionWorkspaceService(db);
   const environmentsSvc = environmentService(db);
@@ -7689,16 +7691,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
 
     const diskPressure = checkDiskPressure();
-    // AUR-5168 AC3: only spend a budget query when a queued issue could
-    // actually be gated by it — most heartbeat cycles have no
+    // AUR-5168 AC3 / AUR-5207: only spend budget/ratio queries when a queued
+    // issue could actually be gated by them — most heartbeat cycles have no
     // self_improvement work queued at all.
     const hasQueuedSelfImprovementIssue = issueRows.some((row) => row.workClass === "self_improvement");
     const workClassBudgetSnapshot = hasQueuedSelfImprovementIssue
       ? await workClassBudget.computeBudget(agent.companyId)
       : null;
+    // AUR-5207: the two gates are AND'd for admission — self_improvement work
+    // is only admitted when BOTH the token-spend share is under cap AND the
+    // 7d merged-PR ratio is at/above its floor. Equivalently, shed if EITHER
+    // reports overCap. A missing snapshot (routine hasn't run yet) is treated
+    // as "not over cap" — fail open rather than starving every company's
+    // self-improvement work until the first out-of-band computation lands.
+    const shipRatioSnapshot = hasQueuedSelfImprovementIssue
+      ? await shipRatioGate.getLatestSnapshot(agent.companyId)
+      : null;
     const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
     let diskShedCount = 0;
     let budgetShedCount = 0;
+    let shipRatioShedCount = 0;
     for (const queuedRun of prioritizedRuns) {
       if (claimedRuns.length >= availableSlots) break;
       // Disk pressure gate: shed non-critical run admission until disk recovers.
@@ -7711,11 +7723,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           continue;
         }
       }
-      // AUR-5168 AC3: once the trailing-7d self-improvement token share hits
-      // the 10% cap, leave self_improvement runs queued (not failed) unless
-      // they fall under one of the founder-named hard carve-outs. Dispatch is
-      // FIFO, not priority-ordered, so this is the only enforcement point.
-      if (workClassBudgetSnapshot?.overCap) {
+      // AUR-5168 AC3 / AUR-5207: once EITHER the trailing-7d self-improvement
+      // token share hits the 10% cap OR the trailing-7d merged-PR ratio falls
+      // below its 2:1 floor, leave self_improvement runs queued (not failed)
+      // unless they fall under one of the founder-named hard carve-outs.
+      // Dispatch is FIFO, not priority-ordered, so this is the only
+      // enforcement point.
+      const tokenCapOverCap = workClassBudgetSnapshot?.overCap ?? false;
+      const shipRatioOverCap = shipRatioSnapshot?.overCap ?? false;
+      if (tokenCapOverCap || shipRatioOverCap) {
         const queuedIssueId = readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId);
         const queuedIssue = queuedIssueId ? issueById.get(queuedIssueId) : null;
         if (queuedIssue?.workClass === "self_improvement") {
@@ -7723,7 +7739,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             matchesBudgetCarveoutKeywords(queuedIssue.title, queuedIssue.description) ||
             (queuedIssueId ? await workClassBudget.isUnderBudgetCarveoutRoot(queuedIssueId) : false);
           if (!exempt) {
-            budgetShedCount += 1;
+            if (tokenCapOverCap) budgetShedCount += 1;
+            else shipRatioShedCount += 1;
             continue;
           }
         }
@@ -7751,6 +7768,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           capShare: workClassBudgetSnapshot.capShare,
         },
         `startNextQueuedRunForAgent: skipped ${budgetShedCount} self_improvement run(s), self-improvement 7d share ${(workClassBudgetSnapshot.selfImprovementShare * 100).toFixed(1)}% >= cap ${(workClassBudgetSnapshot.capShare * 100).toFixed(0)}%`,
+      );
+    }
+    if (shipRatioShedCount > 0 && shipRatioSnapshot) {
+      logger.info(
+        {
+          agentId,
+          shipRatioShedCount,
+          claimedCount: claimedRuns.length,
+          availableSlots,
+          ratio: shipRatioSnapshot.ratio,
+          floorRatio: shipRatioSnapshot.floorRatio,
+        },
+        `startNextQueuedRunForAgent: skipped ${shipRatioShedCount} self_improvement run(s), 7d merged-PR ratio ${shipRatioSnapshot.ratio.toFixed(2)}:1 < floor ${shipRatioSnapshot.floorRatio}:1`,
       );
     }
     if (claimedRuns.length === 0) return [];

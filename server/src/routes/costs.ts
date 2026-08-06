@@ -19,6 +19,7 @@ import {
   heartbeatService,
   logActivity,
   workClassBudgetService,
+  shipRatioGateService,
 } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { fetchAllQuotaWindows } from "../services/quota-windows.js";
@@ -63,6 +64,7 @@ export function costRoutes(
   const agents = agentService(db);
   const issues = issueService(db);
   const workClassBudget = workClassBudgetService(db);
+  const shipRatioGate = shipRatioGateService(db);
 
   async function resolveIssueByRef(rawId: string) {
     const identifier = normalizeIssueIdentifier(rawId);
@@ -167,6 +169,72 @@ export function costRoutes(
     assertCompanyAccess(req, companyId);
     const budget = await workClassBudget.computeBudget(companyId);
     res.json(budget);
+  });
+
+  // AUR-5207: latest rolling-7d merged-PR ratio snapshot. The server process
+  // has no GitHub credentials, so this is written by
+  // scripts/sgi-ship-ratio-gate.mjs (an agent-run daily routine) rather than
+  // computed inline -- read here by the heartbeat admission gate and the
+  // daily-brief synthesis.
+  router.get("/companies/:companyId/ship-ratio-snapshot", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const snapshot = await shipRatioGate.getLatestSnapshot(companyId);
+    res.json(snapshot);
+  });
+
+  router.post("/companies/:companyId/ship-ratio-snapshot", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+
+    const body = req.body ?? {};
+    const windowStart = new Date(body.windowStart);
+    const windowEnd = new Date(body.windowEnd);
+    if (isNaN(windowStart.getTime())) throw badRequest("invalid 'windowStart' date");
+    if (isNaN(windowEnd.getTime())) throw badRequest("invalid 'windowEnd' date");
+    const numericFields = [
+      "moneyMakingMerged",
+      "selfImprovementMerged",
+      "moneyMakingClosedWithoutMerge",
+      "selfImprovementClosedWithoutMerge",
+    ] as const;
+    for (const field of numericFields) {
+      if (body[field] == null) continue;
+      if (typeof body[field] !== "number" || !Number.isFinite(body[field]) || body[field] < 0) {
+        throw badRequest(`invalid '${field}' value`);
+      }
+    }
+    if (typeof body.moneyMakingMerged !== "number" || typeof body.selfImprovementMerged !== "number") {
+      throw badRequest("'moneyMakingMerged' and 'selfImprovementMerged' are required numbers");
+    }
+    if (body.disagreements != null && !Array.isArray(body.disagreements)) {
+      throw badRequest("'disagreements' must be an array");
+    }
+
+    const actor = getActorInfo(req);
+    const snapshot = await shipRatioGate.recordSnapshot(companyId, {
+      windowStart,
+      windowEnd,
+      moneyMakingMerged: body.moneyMakingMerged,
+      selfImprovementMerged: body.selfImprovementMerged,
+      moneyMakingClosedWithoutMerge: body.moneyMakingClosedWithoutMerge ?? 0,
+      selfImprovementClosedWithoutMerge: body.selfImprovementClosedWithoutMerge ?? 0,
+      disagreements: body.disagreements ?? [],
+      createdByRunId: actor.runId ?? null,
+    });
+
+    await logActivity(db, {
+      companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      action: "ship_ratio_snapshot.recorded",
+      entityType: "ship_ratio_snapshot",
+      entityId: snapshot.id,
+      details: { ratio: snapshot.ratio, overCap: snapshot.overCap },
+    });
+
+    res.status(201).json(snapshot);
   });
 
   router.get("/companies/:companyId/costs/by-agent-model", async (req, res) => {

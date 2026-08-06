@@ -98,6 +98,14 @@ type IssueGraphLivenessReconciliationSummary = {
   classBNudged?: number;
   classBEscalated?: number;
   classBBoardOnly?: number;
+  classBStrandedRearmed?: number;
+  /**
+   * Not a gate trigger on its own: the cap can only be hit on a run that also
+   * re-armed CLASS_B_STRANDED_REARM_PER_RUN_CAP rows, so classBStrandedRearmed
+   * already fires the gate whenever this is nonzero.
+   */
+  classBStrandedRearmDeferredCap?: number;
+  classBStrandedResolvedBlockerGoverned?: number;
   /**
    * Present in the payload (so the number is visible whenever the line is
    * logged) but deliberately NOT a gate trigger — see the gate below.
@@ -128,6 +136,8 @@ export function shouldLogIssueGraphLivenessReconciliation(
     (reconciled.classBNudged ?? 0) > 0 ||
     (reconciled.classBEscalated ?? 0) > 0 ||
     (reconciled.classBBoardOnly ?? 0) > 0 ||
+    (reconciled.classBStrandedRearmed ?? 0) > 0 ||
+    (reconciled.classBStrandedResolvedBlockerGoverned ?? 0) > 0 ||
     (reconciled.issueGraphRecoveryActionsResolved ?? 0) > 0 ||
     (reconciled.actionErrors ?? 0) > 0 ||
     (reconciled.openNonTerminalIssues ?? 0) > 0

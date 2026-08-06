@@ -73,6 +73,11 @@ MEM_FLOOR_MB=${PAPERCLIP_DEPLOY_MEM_FLOOR_MB:-2500}
 RESTART_ENABLED=${PAPERCLIP_AUTO_RESTART_ENABLED:-0}
 ROLLBACK_ENABLED=${PAPERCLIP_AUTO_ROLLBACK_ENABLED:-1}
 QUIESCE_INTERVAL=${PAPERCLIP_DEPLOY_QUIESCE_INTERVAL_SEC:-30}
+# AUR-5178: hard ceiling on how long stage 2 waits for running==0 before it
+# restarts anyway (process loss is designed-for: AUR-3929 retries interrupted
+# runs). On a cap-saturated host running==0 is unreachable, and without this
+# bound the fleet cannot ship its own repairs. 0 = wait forever (pre-AUR-5178).
+QUIESCE_DEADLINE=${PAPERCLIP_DEPLOY_QUIESCE_DEADLINE_SEC:-1800}
 HEALTH_TIMEOUT=${PAPERCLIP_DEPLOY_HEALTH_TIMEOUT_SEC:-120}
 HEALTH_POLL=${PAPERCLIP_DEPLOY_HEALTH_POLL_SEC:-3}
 MAX_BUILD_FAILURES=${PAPERCLIP_DEPLOY_MAX_BUILD_FAILURES:-3}
@@ -436,6 +441,21 @@ fi
 # apart. Queued NEVER blocks (AUR-4020 measurement): a queued run has no child
 # process; the row is picked up after boot. Stale running rows (helper bound,
 # default 2 h) do not block either, and are NAMED when discounted.
+#
+# AUR-5178: running == 0 alone is an UNSATISFIABLE bar on a host whose
+# concurrency cap is continuously saturated — a freed slot is refilled from the
+# queue inside the sampling window, so the armed release waits forever while
+# the backlog (and with it the refill rate) grows, and the fleet can no longer
+# ship its own repairs. Bounded deadline: once the gate has been continuously
+# awaiting quiescence for QUIESCE_DEADLINE seconds, restart anyway. An
+# interrupted run is retried, not lost (AUR-3929 process-loss retry — verified
+# against the running artifact before AUR-4032 armed this stage), and the
+# health gate + rollback below still guard the deploy itself. The deadline
+# clock deliberately survives armed-sha changes: keyed per-sha it would reset
+# every time master advances, which on an active repo makes the gate
+# non-terminating again. QUIESCE_DEADLINE=0 disables the deadline (waits
+# forever, pre-AUR-5178 behavior).
+forced_restart=0 waited=0
 sample=1
 while true; do
   if ! probe_runs; then
@@ -447,14 +467,22 @@ while true; do
   RUNNING_COUNT=$RUN_N QUEUED_COUNT=$QUEUE_N STALE_NAMED=$STALE_IDS
   [[ "$STALE_IDS" != "-" ]] && log "stale running rows discounted from quiescence gate: $STALE_IDS"
   if (( RUN_N > 0 )); then
-    if [[ "$PREV_PHASE" == "awaiting-quiescence" && "$PREV_ARMED" == "$activated_sha" && "$PREV_WAITING" != "-" ]]; then
+    if [[ "$PREV_PHASE" == "awaiting-quiescence" && "$PREV_WAITING" != "-" ]]; then
       WAITING_SINCE=$PREV_WAITING
     else
       WAITING_SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     fi
-    PHASE=awaiting-quiescence ARMED_SHA=$activated_sha NOTE="sample $sample: running=$RUN_N > 0"
+    # Unparseable waiting_since fails toward waiting (waited=0), never forcing.
+    waited=$(( $(date -u +%s) - $(date -u -d "$WAITING_SINCE" +%s 2>/dev/null || date -u +%s) ))
+    if (( QUIESCE_DEADLINE > 0 && waited >= QUIESCE_DEADLINE )); then
+      forced_restart=1
+      break
+    fi
+    deadline_note=""
+    (( QUIESCE_DEADLINE > 0 )) && deadline_note=", force in $(( QUIESCE_DEADLINE - waited ))s"
+    PHASE=awaiting-quiescence ARMED_SHA=$activated_sha NOTE="sample $sample: running=$RUN_N > 0$deadline_note"
     write_state
-    log "awaiting quiescence for ${activated_sha:0:12}: running=$RUN_N queued=$QUEUE_N (queued does not block) since $WAITING_SINCE"
+    log "awaiting quiescence for ${activated_sha:0:12}: running=$RUN_N queued=$QUEUE_N (queued does not block) since $WAITING_SINCE$deadline_note"
     exit 0
   fi
   (( sample >= 2 )) && break
@@ -462,8 +490,13 @@ while true; do
   sleep "$QUIESCE_INTERVAL"
 done
 
-log "quiescent: running=0 across 2 samples ${QUIESCE_INTERVAL}s apart (queued=$QUEUE_N, ignored) — restarting $UNIT: ${running_sha:0:12} -> ${activated_sha:0:12}"
-PHASE=restarting ARMED_SHA=$activated_sha WAITING_SINCE=- NOTE="rollback target releases/$rollback12"
+if (( forced_restart )); then
+  log "quiescence deadline EXCEEDED (waited ${waited}s >= ${QUIESCE_DEADLINE}s, running=$RUN_N queued=$QUEUE_N): forcing restart of $UNIT: ${running_sha:0:12} -> ${activated_sha:0:12} — interrupted runs are retried on boot (AUR-3929)"
+  PHASE=restarting ARMED_SHA=$activated_sha WAITING_SINCE=- NOTE="DEADLINE-FORCED after ${waited}s with running=$RUN_N; rollback target releases/$rollback12"
+else
+  log "quiescent: running=0 across 2 samples ${QUIESCE_INTERVAL}s apart (queued=$QUEUE_N, ignored) — restarting $UNIT: ${running_sha:0:12} -> ${activated_sha:0:12}"
+  PHASE=restarting ARMED_SHA=$activated_sha WAITING_SINCE=- NOTE="rollback target releases/$rollback12"
+fi
 write_state
 systemctl --user restart "$UNIT" 2>>"$LOG_FILE" || log "systemctl restart returned nonzero (health gate decides)"
 

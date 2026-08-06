@@ -14,6 +14,7 @@ import {
   issueComments,
   issueInboxArchives,
   issueReadStates,
+  issueRelations,
   issues,
   projectWorkspaces,
   projects,
@@ -220,8 +221,13 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(allRoutines.map((entry) => entry.id)).toEqual(expect.arrayContaining([routine.id, otherRoutine.id]));
   });
 
-  it("creates a fresh execution issue when the previous routine issue is open but idle", async () => {
-    const { companyId, issueSvc, routine, svc } = await seedFixture();
+  // AUR-5001: this used to mint a fresh duplicate umbrella every tick because
+  // findLiveExecutionIssue only recognizes an issue bound to a LIVE heartbeat run —
+  // an open-but-idle issue (no live run) fell through and got duplicated. Fixed:
+  // reuse + re-wake the idle issue instead of duplicating it (67 zombies in 3 days
+  // on the live fleet before this fix).
+  it("reuses the previous routine issue when it is open but idle instead of duplicating it", async () => {
+    const { companyId, issueSvc, routine, svc, wakeups } = await seedFixture();
     const previousRunId = randomUUID();
     const previousIssue = await issueSvc.create(companyId, {
       projectId: routine.projectId,
@@ -252,7 +258,8 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
     const run = await svc.runRoutine(routine.id, { source: "manual" });
     expect(run.status).toBe("issue_created");
-    expect(run.linkedIssueId).not.toBe(previousIssue.id);
+    expect(run.linkedIssueId).toBe(previousIssue.id);
+    expect(wakeups.some((w) => w.agentId === routine.assigneeAgentId)).toBe(true);
 
     const routineIssues = await db
       .select({
@@ -262,9 +269,189 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .from(issues)
       .where(eq(issues.originId, routine.id));
 
-    expect(routineIssues).toHaveLength(2);
-    expect(routineIssues.map((issue) => issue.id)).toContain(previousIssue.id);
-    expect(routineIssues.map((issue) => issue.id)).toContain(run.linkedIssueId);
+    expect(routineIssues).toHaveLength(1);
+    expect(routineIssues[0]?.id).toBe(previousIssue.id);
+  });
+
+  it("dispatches a fresh execution issue when no open routine issue exists (PASSES — fix does not make the routine inert)", async () => {
+    const { routine, svc } = await seedFixture();
+
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).toBeTruthy();
+
+    const routineIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.originId, routine.id));
+    expect(routineIssues).toHaveLength(1);
+    expect(routineIssues[0]?.id).toBe(run.linkedIssueId);
+  });
+
+  it("reuses a stranded blocked execution issue with no live run and reopens it to todo (FIRES, coalesce_if_active)", async () => {
+    const { companyId, issueSvc, routine, svc, wakeups } = await seedFixture();
+    const previousRunId = randomUUID();
+    const strandedIssue = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: routine.title,
+      description: routine.description,
+      status: "blocked",
+      priority: routine.priority,
+      assigneeAgentId: routine.assigneeAgentId,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: previousRunId,
+    });
+
+    await db.insert(routineRuns).values({
+      id: previousRunId,
+      companyId,
+      routineId: routine.id,
+      triggerId: null,
+      source: "schedule",
+      status: "failed",
+      triggeredAt: new Date("2026-03-20T12:00:00.000Z"),
+      linkedIssueId: strandedIssue.id,
+      completedAt: new Date("2026-03-20T12:00:00.000Z"),
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).toBe(strandedIssue.id);
+    expect(wakeups.some((w) => w.agentId === routine.assigneeAgentId)).toBe(true);
+
+    const [reopened] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, strandedIssue.id));
+    expect(reopened?.status).toBe("todo");
+
+    const allIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.originId, routine.id));
+    expect(allIssues).toHaveLength(1);
+  });
+
+  it("reuses a stranded blocked execution issue with no live run instead of silently skipping the tick (FIRES, skip_if_active)", async () => {
+    const { companyId, issueSvc, routine, svc, wakeups } = await seedFixture();
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "skip_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const strandedIssue = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: routine.title,
+      description: routine.description,
+      status: "blocked",
+      priority: routine.priority,
+      assigneeAgentId: routine.assigneeAgentId,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: randomUUID(),
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+    // Must re-wake, not silently skip — a stranded skip_if_active issue would
+    // otherwise permanently suppress the routine even after it could recover.
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).toBe(strandedIssue.id);
+    expect(wakeups.some((w) => w.agentId === routine.assigneeAgentId)).toBe(true);
+
+    const [reopened] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, strandedIssue.id));
+    expect(reopened?.status).toBe("todo");
+
+    const allIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.originId, routine.id));
+    expect(allIssues).toHaveLength(1);
+  });
+
+  // Guards the opposite failure mode from the two FIRES cases above: widening reuse must
+  // not convert a legitimately-blocked umbrella into a dispatched one. A real unresolved
+  // `blocks` edge still suppresses execution — we reuse the issue (so no duplicate is
+  // minted) but leave it `blocked` and do not wake it. The blocker going `done` is what
+  // releases it, which is exactly what a first-class blocker is for.
+  it("reuses but does NOT reopen or wake an execution issue held by a real unresolved blocker", async () => {
+    const { companyId, issueSvc, routine, svc, wakeups } = await seedFixture();
+    const blockerIssue = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: "real blocker",
+      description: "still open",
+      status: "todo",
+      priority: routine.priority,
+    });
+    const blockedIssue = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: routine.title,
+      description: routine.description,
+      status: "blocked",
+      priority: routine.priority,
+      assigneeAgentId: routine.assigneeAgentId,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: randomUUID(),
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssue.id,
+      relatedIssueId: blockedIssue.id,
+      type: "blocks",
+    });
+
+    const wakeupsBefore = wakeups.length;
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    // Reused, not duplicated.
+    expect(run.linkedIssueId).toBe(blockedIssue.id);
+    const allIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.originId, routine.id));
+    expect(allIssues).toHaveLength(1);
+
+    // ...but still suppressed: status untouched and no wake queued.
+    const [stillBlocked] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, blockedIssue.id));
+    expect(stillBlocked?.status).toBe("blocked");
+    expect(wakeups.length).toBe(wakeupsBefore);
+  });
+
+  it("always_enqueue keeps duplicating even when a stranded blocked issue exists (unchanged behaviour)", async () => {
+    const { companyId, issueSvc, routine, svc } = await seedFixture();
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "always_enqueue" })
+      .where(eq(routines.id, routine.id));
+
+    const strandedIssue = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: routine.title,
+      description: routine.description,
+      status: "blocked",
+      priority: routine.priority,
+      assigneeAgentId: routine.assigneeAgentId,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: randomUUID(),
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).not.toBe(strandedIssue.id);
+
+    const allIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.originId, routine.id));
+    expect(allIssues).toHaveLength(2);
   });
 
   it("threads a routine's assigneeAdapterOverrides onto its execution issue", async () => {

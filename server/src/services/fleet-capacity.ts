@@ -1,4 +1,7 @@
-import { extractClaudeRetryNotBefore } from "@paperclipai/adapter-claude-local/server";
+import {
+  CLAUDE_QUOTA_EXHAUSTED_ERROR_CODE,
+  extractClaudeRetryNotBefore,
+} from "@paperclipai/adapter-claude-local/server";
 import { extractCodexRetryNotBefore } from "@paperclipai/adapter-codex-local/server";
 
 /**
@@ -35,9 +38,23 @@ const CONSECUTIVE_FAILURE_THRESHOLD = 3;
  * adapters' transient-upstream regexes: 429/overloaded/high-demand are
  * transient upstream weather, not quota, and deterministic failures such as
  * "Prompt is too long" must never match (negative control in the tests).
+ *
+ * Exported (AUR-5038) as the single source of the quota wording for the
+ * auth-rendered-wall reclassifier, which also runs it inside Postgres (`~*`) —
+ * the pattern is deliberately kept POSIX/ARE-compatible (verified live).
  */
-const QUOTA_SIGNATURE_RE =
+export const QUOTA_SIGNATURE_RE =
   /(?:hit your (?:session|weekly|usage) limit|usage limit reached|usage cap reached|5[-\s]?hour limit reached|weekly limit reached|claude usage limit reached|out of extra usage|session limit reached)/i;
+
+/**
+ * AUR-5038: the run-failure classifier can now prove a quota wall from lane
+ * history even when the CLI's error text lies about it ("Not logged in ·
+ * Please run /login" during a weekly wall). Those rows carry the dedicated
+ * errorCode but NOT the quota wording, so keying on text alone would classify
+ * a reclassified tail as `consecutive_failures` and the lane-down rollup would
+ * never fire.
+ */
+const QUOTA_EXHAUSTED_ERROR_CODES = new Set<string>([CLAUDE_QUOTA_EXHAUSTED_ERROR_CODE]);
 
 export type FleetCapacityReason =
   | "ok"
@@ -53,6 +70,7 @@ export interface FleetCapacityRunInput {
   createdAt: Date | string | null;
   finishedAt?: Date | string | null;
   error?: string | null;
+  errorCode?: string | null;
 }
 
 export interface FleetCapacityAgentInput {
@@ -156,7 +174,11 @@ export function classifyAgentCapacity(
   }
 
   const newestFailureError = newestFailure?.error ?? "";
-  if (newestFailure && QUOTA_SIGNATURE_RE.test(newestFailureError)) {
+  const newestFailureIsQuota =
+    newestFailure != null &&
+    (QUOTA_EXHAUSTED_ERROR_CODES.has(newestFailure.errorCode ?? "") ||
+      QUOTA_SIGNATURE_RE.test(newestFailureError));
+  if (newestFailure && newestFailureIsQuota) {
     // Quota tail with no succeeded run after it (a success would have broken
     // the tail walk above).
     const failedAtTime =

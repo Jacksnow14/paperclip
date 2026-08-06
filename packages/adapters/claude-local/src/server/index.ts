@@ -10,6 +10,7 @@ export {
   isClaudeUnknownSessionError,
   isClaudeContextOverflowError,
   CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
+  CLAUDE_QUOTA_EXHAUSTED_ERROR_CODE,
 } from "./parse.js";
 export {
   getQuotaWindows,

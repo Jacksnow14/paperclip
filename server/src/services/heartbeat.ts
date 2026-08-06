@@ -173,6 +173,10 @@ import { environmentRuntimeService } from "./environment-runtime.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
 import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
 import { maybeEscalateOutOfCredits } from "./quota-founder-escalation.js";
+import {
+  claudeAuthQuotaReclassificationResultJson,
+  maybeReclassifyClaudeAuthFailureAsQuotaWall,
+} from "./quota-auth-reclassification.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
@@ -8665,6 +8669,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ? (adapterResult.errorCode ?? "adapter_failed")
               : null;
 
+      // AUR-5038: `claude_auth_required` is how the CLI renders a quota wall
+      // once it stops emitting the honest wording — 1,326 zero-token runs over
+      // Aug 2–5 said "Not logged in" for a wall that reset itself on the quota
+      // clock. The adapter cannot see lane history, so the reclassification
+      // happens here, where it can: a zero-usage auth failure on a lane whose
+      // last quota wall has seen no Anthropic-credential success since is the
+      // wall, not a credential problem. Errors keep the original classification
+      // (the pre-existing behaviour) rather than blocking run finalization.
+      const authQuotaReclassification =
+        outcome === "failed"
+          ? await maybeReclassifyClaudeAuthFailureAsQuotaWall(db, {
+              companyId: agent.companyId,
+              adapterType: agent.adapterType,
+              excludeRunId: run.id,
+              errorCode: runErrorCode,
+              usage: normalizedUsage ?? null,
+              now: new Date(),
+            }).catch((err) => {
+              logger.error(
+                { err, runId: run.id, agentId: agent.id },
+                "auth-as-quota reclassification failed; keeping the adapter's classification",
+              );
+              return null;
+            })
+          : null;
+      const effectiveRunErrorCode = authQuotaReclassification
+        ? authQuotaReclassification.errorCode
+        : runErrorCode;
+
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
       if (handle) {
         logSummary = await runLogStore.finalize(handle);
@@ -8714,13 +8747,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         mergeRunStopMetadataForAgent(agent, outcome, {
           resultJson: mergeModelProfileRunMetadata(
             mergeAdapterRecoveryMetadata({
-              resultJson: adapterResult.resultJson ?? null,
-              errorFamily: adapterResult.errorFamily ?? null,
-              retryNotBefore: adapterResult.retryNotBefore ?? null,
+              resultJson: authQuotaReclassification
+                ? {
+                    ...(adapterResult.resultJson ?? {}),
+                    ...claudeAuthQuotaReclassificationResultJson(authQuotaReclassification),
+                  }
+                : adapterResult.resultJson ?? null,
+              // A reclassified wall joins the AUR-4144 contract: family
+              // `transient_upstream` plus the anchor's reset instant, so the
+              // retry parks at the reset (AUR-4679) and the adapter-wide
+              // admission pause arms (AUR-4139) instead of the blind ladder
+              // slamming the wall — 197 of the Aug 2–5 runs were retries.
+              errorFamily: authQuotaReclassification
+                ? authQuotaReclassification.errorFamily
+                : adapterResult.errorFamily ?? null,
+              retryNotBefore: authQuotaReclassification
+                ? authQuotaReclassification.retryNotBefore?.toISOString() ??
+                  adapterResult.retryNotBefore ??
+                  null
+                : adapterResult.retryNotBefore ?? null,
             }),
             modelProfileApplication,
           ),
-          errorCode: runErrorCode,
+          errorCode: effectiveRunErrorCode,
           errorMessage: runErrorMessage,
         }),
         adapterResult.summary ?? null,
@@ -8729,7 +8778,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let persistedRun = await setRunStatus(run.id, status, {
         finishedAt: new Date(),
         error: runErrorMessage,
-        errorCode: runErrorCode,
+        errorCode: effectiveRunErrorCode,
         exitCode: adapterResult.exitCode,
         signal: adapterResult.signal,
         usageJson,
@@ -8762,6 +8811,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             exitCode: adapterResult.exitCode,
           },
         });
+        if (authQuotaReclassification) {
+          await appendRunEvent(finalizedRun, seq++, {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message:
+              "Auth-rendered quota wall reclassified (AUR-5038): the CLI said \"log in\" but the lane " +
+              "history proves a standing quota wall, so errorCode claude_auth_required was rewritten to " +
+              "claude_quota_exhausted. Do not treat this run as a credential problem.",
+            payload: {
+              originalErrorCode: "claude_auth_required",
+              errorCode: authQuotaReclassification.errorCode,
+              anchorRunId: authQuotaReclassification.anchorRunId,
+              anchorCreatedAt: authQuotaReclassification.anchorCreatedAt.toISOString(),
+              retryNotBefore: authQuotaReclassification.retryNotBefore?.toISOString() ?? null,
+            },
+          });
+        }
         if (resolvedOutcome.reclaimedFromStaleFailure) {
           await appendRunEvent(finalizedRun, seq++, {
             eventType: "lifecycle",

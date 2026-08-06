@@ -3347,6 +3347,9 @@ export function agentRoutes(
       createdAt: heartbeatRuns.createdAt,
       finishedAt: heartbeatRuns.finishedAt,
       error: heartbeatRuns.error,
+      // AUR-5038: auth-rendered quota walls are reclassified by errorCode; their
+      // error TEXT still reads "Not logged in" and matches no quota wording.
+      errorCode: heartbeatRuns.errorCode,
     };
     const runsByAgent = new Map<string, FleetCapacityRunInput[]>(
       await Promise.all(
@@ -3379,7 +3382,7 @@ export function agentRoutes(
             agent.id,
             [
               ...terminalRuns,
-              ...queuedRuns.map((run) => ({ ...run, finishedAt: null, error: null })),
+              ...queuedRuns.map((run) => ({ ...run, finishedAt: null, error: null, errorCode: null })),
             ],
           ] as [string, FleetCapacityRunInput[]];
         }),

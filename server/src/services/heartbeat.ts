@@ -6318,6 +6318,104 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(count ?? 0);
   }
 
+  // AUR-5102 (P1): the issue-scoped unclaimability gauntlet — tree-held,
+  // dependency-blocked, and stale queued runs — shared verbatim by admission
+  // (claimQueuedRun) and the periodic reapUnclaimableQueuedRuns sweep.
+  // Historically this ran only inside claimQueuedRun, i.e. only when admission
+  // had a slot to hand out; with the global cap saturated continuously the
+  // queue could never self-clean, and queued runs against cancelled/reassigned
+  // issues sat for days until an operator trimmed them by hand.
+  // Returns true when the run was cancelled as unclaimable.
+  async function reapQueuedRunIfUnclaimable(
+    run: typeof heartbeatRuns.$inferSelect,
+    context: Record<string, unknown>,
+    source: string,
+  ): Promise<boolean> {
+    const issueId = readNonEmptyString(context.issueId);
+    if (!issueId) return false;
+
+    const activePauseHold = await treeControlSvc.getActivePauseHoldGate(run.companyId, issueId);
+    const treeHoldInteractionWake = activePauseHold && await isVerifiedIssueTreeControlInteractionWake(db, {
+      companyId: run.companyId,
+      issueId,
+      agentId: run.agentId,
+      runId: run.id,
+      wakeupRequestId: run.wakeupRequestId,
+      contextSnapshot: context,
+    });
+    if (activePauseHold && !treeHoldInteractionWake) {
+      await cancelRunInternal(run.id, "Cancelled because issue is held by an active subtree pause hold");
+      await logActivity(db, {
+        companyId: run.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: run.agentId,
+        runId: run.id,
+        action: "issue.tree_hold_run_interrupted",
+        entityType: "heartbeat_run",
+        entityId: run.id,
+        details: {
+          issueId,
+          holdId: activePauseHold.holdId,
+          rootIssueId: activePauseHold.rootIssueId,
+          source,
+          securityPrinciples: ["Complete Mediation", "Fail Securely", "Secure Defaults"],
+        },
+      });
+      return true;
+    }
+
+    const dependencyReadiness = await issuesSvc.listDependencyReadiness(run.companyId, [issueId]);
+    const readiness = dependencyReadiness.get(issueId);
+    const unresolvedBlockerCount = readiness?.unresolvedBlockerCount ?? 0;
+    if (unresolvedBlockerCount > 0 && !allowsIssueInteractionWake(context)) {
+      await cancelQueuedRunForBlockedDependencies(run, issueId, readiness?.unresolvedBlockerIssueIds ?? []);
+      logger.info({ runId: run.id, issueId, unresolvedBlockerCount, source }, "cancelled blocked queued run");
+      return true;
+    }
+
+    const staleness = await evaluateQueuedRunStaleness(run, issueId, context);
+    if (staleness.stale) {
+      await cancelQueuedRunForStaleIssue(run, issueId, staleness);
+      logger.info(
+        { runId: run.id, issueId, errorCode: staleness.errorCode, source },
+        "cancelled stale queued run",
+      );
+      return true;
+    }
+
+    return false;
+  }
+
+  // AUR-5102 (P1): reap unclaimable queued runs on the periodic recovery sweep,
+  // independent of admission. Deliberately scoped to the same three classes the
+  // admission-time gauntlet cancels (tree-held, dependency-blocked, stale) so
+  // the sweep applies an identical policy, just on a clock instead of on a free
+  // slot. Agent-invokability and invocation-budget checks stay admission-only:
+  // both are transient states where a sweep-time cancel could destroy queued
+  // work that admission would later have run.
+  async function reapUnclaimableQueuedRuns() {
+    const queuedRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "queued"))
+      .orderBy(asc(heartbeatRuns.createdAt))
+      .limit(500);
+    const result = { scanned: queuedRuns.length, reaped: 0 };
+    for (const run of queuedRuns) {
+      const context = parseObject(run.contextSnapshot);
+      try {
+        if (await reapQueuedRunIfUnclaimable(run, context, "heartbeat.reap_unclaimable_queued_runs")) {
+          result.reaped += 1;
+        }
+      } catch (err) {
+        // One bad row must not stall the sweep for the rest of the queue.
+        logger.error({ err, runId: run.id }, "reapUnclaimableQueuedRuns: reap failed for queued run");
+      }
+    }
+    return result;
+  }
+
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
@@ -6340,57 +6438,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return null;
     }
 
-    const issueId = readNonEmptyString(context.issueId);
-    if (issueId) {
-      const activePauseHold = await treeControlSvc.getActivePauseHoldGate(run.companyId, issueId);
-      const treeHoldInteractionWake = activePauseHold && await isVerifiedIssueTreeControlInteractionWake(db, {
-        companyId: run.companyId,
-        issueId,
-        agentId: run.agentId,
-        runId: run.id,
-        wakeupRequestId: run.wakeupRequestId,
-        contextSnapshot: context,
-      });
-      if (activePauseHold && !treeHoldInteractionWake) {
-        await cancelRunInternal(run.id, "Cancelled because issue is held by an active subtree pause hold");
-        await logActivity(db, {
-          companyId: run.companyId,
-          actorType: "system",
-          actorId: "system",
-          agentId: run.agentId,
-          runId: run.id,
-          action: "issue.tree_hold_run_interrupted",
-          entityType: "heartbeat_run",
-          entityId: run.id,
-          details: {
-            issueId,
-            holdId: activePauseHold.holdId,
-            rootIssueId: activePauseHold.rootIssueId,
-            source: "heartbeat.claim_queued_run",
-            securityPrinciples: ["Complete Mediation", "Fail Securely", "Secure Defaults"],
-          },
-        });
-        return null;
-      }
-
-      const dependencyReadiness = await issuesSvc.listDependencyReadiness(run.companyId, [issueId]);
-      const readiness = dependencyReadiness.get(issueId);
-      const unresolvedBlockerCount = readiness?.unresolvedBlockerCount ?? 0;
-      if (unresolvedBlockerCount > 0 && !allowsIssueInteractionWake(context)) {
-        await cancelQueuedRunForBlockedDependencies(run, issueId, readiness?.unresolvedBlockerIssueIds ?? []);
-        logger.info({ runId: run.id, issueId, unresolvedBlockerCount }, "claimQueuedRun: cancelled blocked queued run");
-        return null;
-      }
-
-      const staleness = await evaluateQueuedRunStaleness(run, issueId, context);
-      if (staleness.stale) {
-        await cancelQueuedRunForStaleIssue(run, issueId, staleness);
-        logger.info(
-          { runId: run.id, issueId, errorCode: staleness.errorCode },
-          "claimQueuedRun: cancelled stale queued run",
-        );
-        return null;
-      }
+    if (await reapQueuedRunIfUnclaimable(run, context, "heartbeat.claim_queued_run")) {
+      return null;
     }
 
     const claimedAt = new Date();
@@ -11214,6 +11263,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     reapOrphanedRuns,
     reapStrandedDeferredWakes,
+    reapUnclaimableQueuedRuns,
 
     promoteDueScheduledRetries,
     retryScheduledRetryNow,

@@ -1101,58 +1101,117 @@ export async function startServer(): Promise<StartedServer> {
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager, isDiskPressureActive });
     const routines = routineService(db as any, { pluginWorkerManager });
   
+    // AUR-5102: the recovery sweep chain below used to be fired fire-and-forget
+    // from every scheduler tick with no overlap guard. reconcileStrandedAssignedIssues
+    // walks every agent-assigned todo/in_progress issue with several sequential
+    // queries per issue, so under backlog one pass takes minutes; 30s ticks kept
+    // stacking further concurrent passes, each deciding off a candidates snapshot
+    // that got staler as it ran. The overlapping stale passes burst-enqueued
+    // duplicate issue_assignment_recovery wakes (18 wake-runs inside one minute
+    // for a single already-cancelled issue on 2026-08-05) and were the dominant
+    // share — 140 of 303 arrivals in 24h — of the CTO queue divergence. The
+    // reconcilers are idempotent level-triggered sweeps: skipping a tick while
+    // one is still running loses nothing, because the next sweep re-derives the
+    // full candidate set fresh.
+    //
+    // The flag starts held so the first periodic ticks cannot overlap startup
+    // recovery; the startup path releases it when its sweep settles.
+    let recoverySweepActive = true;
+    let recoverySweepSkippedTicks = 0;
+    const runRecoverySweepChain = async (
+      phase: "startup" | "periodic",
+      opts?: { reapStaleThresholdMs?: number },
+    ) => {
+      // Orphan reaping is part of the guarded sweep on periodic passes; the
+      // startup path reaps before its first admission drive instead (while
+      // in-memory execution state is still empty) and passes no threshold here.
+      if (opts?.reapStaleThresholdMs !== undefined) {
+        await heartbeat.reapOrphanedRuns({ staleThresholdMs: opts.reapStaleThresholdMs });
+      }
+      // AUR-5102 (P1): reap tree-held / dependency-blocked / stale queued runs
+      // on the sweep, not only at admission — a saturated global cap means
+      // admission may not run the gauntlet for days.
+      const reapedQueued = await heartbeat.reapUnclaimableQueuedRuns();
+      if (reapedQueued.reaped > 0) {
+        logger.warn({ ...reapedQueued, phase }, "queued-run reaper cancelled unclaimable queued runs");
+      }
+      // Must precede the stranded sweep: a parked deferred wake counts as an active
+      // execution path, so an un-reaped dead letter hides the issue from that sweep.
+      const reapedWakes = await heartbeat.reapStrandedDeferredWakes();
+      if (reapedWakes.promoted > 0 || reapedWakes.retired > 0) {
+        logger.warn({ ...reapedWakes, phase }, "deferred-wake reaper drained stranded wakes");
+      }
+      const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
+      if (
+        reconciled.assignmentDispatched > 0 ||
+        reconciled.dispatchRequeued > 0 ||
+        reconciled.continuationRequeued > 0 ||
+        reconciled.successfulRunHandoffEscalated > 0 ||
+        reconciled.escalated > 0
+      ) {
+        logger.warn({ ...reconciled, phase }, "heartbeat recovery changed assigned issue state");
+      }
+      const livenessReconciled = await heartbeat.reconcileIssueGraphLiveness();
+      if (shouldLogIssueGraphLivenessReconciliation(livenessReconciled)) {
+        logger.warn(
+          { ...livenessReconciled, phase },
+          "issue-graph liveness reconciliation changed issue state or recorded action errors",
+        );
+      }
+      const scanned = await heartbeat.scanSilentActiveRuns();
+      if (scanned.created > 0 || scanned.escalated > 0) {
+        logger.warn({ ...scanned, phase }, "active-run output watchdog created review work");
+      }
+      const reviewed = await heartbeat.reconcileProductivityReviews();
+      if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
+        logger.warn({ ...reviewed, phase }, "productivity reconciliation created or updated review work");
+      }
+    };
+    const runGuardedRecoverySweep = async (opts: { reapStaleThresholdMs: number }) => {
+      if (recoverySweepActive) {
+        recoverySweepSkippedTicks += 1;
+        logger.info(
+          { skippedTicksWhileSweepActive: recoverySweepSkippedTicks },
+          "heartbeat recovery sweep still running; skipping this tick's sweep",
+        );
+        return;
+      }
+      recoverySweepActive = true;
+      recoverySweepSkippedTicks = 0;
+      try {
+        await runRecoverySweepChain("periodic", opts);
+      } finally {
+        recoverySweepActive = false;
+      }
+    };
+
+    // AUR-5102: admission driving stays outside the sweep guard — promoting due
+    // scheduled retries and resuming persisted queued runs is what hands freed
+    // slots to queued work, and must not wait behind a slow reconcile pass.
+    const driveAdmission = async (phase: "startup" | "periodic") => {
+      const promotion = await heartbeat.promoteDueScheduledRetries();
+      await heartbeat.resumeQueuedRuns();
+      if (promotion.promoted > 0) {
+        logger.info(
+          { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, phase },
+          "scheduled-retry promotion admitted queued work",
+        );
+      }
+    };
+
     // Reap orphaned running runs at startup while in-memory execution state is empty,
     // then resume any persisted queued runs that were waiting on the previous process.
-    void heartbeat
-      .reapOrphanedRuns()
-      .then(() => heartbeat.promoteDueScheduledRetries())
-      .then(async (promotion) => {
-        await heartbeat.resumeQueuedRuns();
-        // Must precede the stranded sweep: a parked deferred wake counts as an active
-        // execution path, so an un-reaped dead letter hides the issue from that sweep.
-        const reapedWakes = await heartbeat.reapStrandedDeferredWakes();
-        if (reapedWakes.promoted > 0 || reapedWakes.retired > 0) {
-          logger.warn({ ...reapedWakes }, "startup deferred-wake reaper drained stranded wakes");
-        }
-        const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
-        if (
-          promotion.promoted > 0 ||
-          reconciled.assignmentDispatched > 0 ||
-          reconciled.dispatchRequeued > 0 ||
-          reconciled.continuationRequeued > 0 ||
-          reconciled.successfulRunHandoffEscalated > 0 ||
-          reconciled.escalated > 0
-        ) {
-          logger.warn(
-            { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
-            "startup heartbeat recovery changed assigned issue state",
-          );
-        }
-      })
-      .then(async () => {
-        const reconciled = await heartbeat.reconcileIssueGraphLiveness();
-        if (shouldLogIssueGraphLivenessReconciliation(reconciled)) {
-          logger.warn(
-            { ...reconciled },
-            "startup issue-graph liveness reconciliation changed issue state or recorded action errors",
-          );
-        }
-      })
-      .then(async () => {
-        const scanned = await heartbeat.scanSilentActiveRuns();
-        if (scanned.created > 0 || scanned.escalated > 0) {
-          logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
-        }
-      })
-      .then(async () => {
-        const reviewed = await heartbeat.reconcileProductivityReviews();
-        if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
-          logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
-        }
-      })
-      .catch((err) => {
-        logger.error({ err }, "startup heartbeat recovery failed");
-      });
+    void (async () => {
+      try {
+        await heartbeat.reapOrphanedRuns();
+        await driveAdmission("startup");
+        await runRecoverySweepChain("startup");
+      } finally {
+        recoverySweepActive = false;
+      }
+    })().catch((err) => {
+      logger.error({ err }, "startup heartbeat recovery failed");
+    });
     setInterval(() => {
       void heartbeat
         .tickTimers(new Date())
@@ -1184,58 +1243,18 @@ export async function startServer(): Promise<StartedServer> {
         logger.error({ err }, "global-run-admission check failed");
       });
 
-      // Periodically reap orphaned runs (5-min staleness threshold) and make sure
-      // persisted queued work is still being driven forward.
-      void heartbeat
-        .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
-        .then(() => heartbeat.promoteDueScheduledRetries())
-        .then(async (promotion) => {
-          await heartbeat.resumeQueuedRuns();
-          // Must precede the stranded sweep: a parked deferred wake counts as an active
-          // execution path, so an un-reaped dead letter hides the issue from that sweep.
-          const reapedWakes = await heartbeat.reapStrandedDeferredWakes();
-          if (reapedWakes.promoted > 0 || reapedWakes.retired > 0) {
-            logger.warn({ ...reapedWakes }, "periodic deferred-wake reaper drained stranded wakes");
-          }
-          const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
-          if (
-            promotion.promoted > 0 ||
-            reconciled.assignmentDispatched > 0 ||
-            reconciled.dispatchRequeued > 0 ||
-            reconciled.continuationRequeued > 0 ||
-            reconciled.successfulRunHandoffEscalated > 0 ||
-            reconciled.escalated > 0
-          ) {
-            logger.warn(
-              { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
-              "periodic heartbeat recovery changed assigned issue state",
-            );
-          }
-        })
-        .then(async () => {
-          const reconciled = await heartbeat.reconcileIssueGraphLiveness();
-          if (shouldLogIssueGraphLivenessReconciliation(reconciled)) {
-            logger.warn(
-              { ...reconciled },
-              "periodic issue-graph liveness reconciliation changed issue state or recorded action errors",
-            );
-          }
-        })
-        .then(async () => {
-          const scanned = await heartbeat.scanSilentActiveRuns();
-          if (scanned.created > 0 || scanned.escalated > 0) {
-            logger.warn({ ...scanned }, "periodic active-run output watchdog created review work");
-          }
-        })
-        .then(async () => {
-          const reviewed = await heartbeat.reconcileProductivityReviews();
-          if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
-            logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
-          }
-        })
-        .catch((err) => {
-          logger.error({ err }, "periodic heartbeat recovery failed");
-        });
+      // Drive persisted queued work forward every tick, independent of the
+      // recovery sweep below (AUR-5102).
+      void driveAdmission("periodic").catch((err) => {
+        logger.error({ err }, "periodic heartbeat admission drive failed");
+      });
+
+      // Periodically reap orphaned runs (5-min staleness threshold) and run the
+      // recovery reconcilers — single-flight: a tick that lands while the
+      // previous sweep is still running skips instead of stacking (AUR-5102).
+      void runGuardedRecoverySweep({ reapStaleThresholdMs: 5 * 60 * 1000 }).catch((err) => {
+        logger.error({ err }, "periodic heartbeat recovery failed");
+      });
     }, config.heartbeatSchedulerIntervalMs);
   }
   

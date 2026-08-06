@@ -3419,4 +3419,293 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
     expect(issue?.status).toBe("in_progress");
   });
+
+  // AUR-5102 (P0b): reconcileStrandedAssignedIssues decides off a candidates
+  // snapshot taken at sweep start; under backlog a pass runs for minutes and the
+  // issue may be cancelled/reassigned/re-dispatched in the meantime. The
+  // at-enqueue revalidation must drop those stale dispatches (fire) without
+  // suppressing a legitimate one (pass).
+  describe("AUR-5102 recovery dispatch revalidation", () => {
+    it("validates a genuinely stranded todo issue (pass case)", async () => {
+      const { agentId, issueId } = await seedStrandedIssueFixture({
+        status: "todo",
+        runStatus: "failed",
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: (async () => null) as never });
+      await expect(
+        recovery.isRecoveryDispatchStillValid({ issueId, agentId, expectedStatus: "todo" }),
+      ).resolves.toBe(true);
+    });
+
+    it("refuses a dispatch when the issue reached a terminal status since the snapshot", async () => {
+      const { agentId, issueId } = await seedStrandedIssueFixture({
+        status: "todo",
+        runStatus: "failed",
+      });
+      await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, issueId));
+      const recovery = recoveryService(db, { enqueueWakeup: (async () => null) as never });
+      await expect(
+        recovery.isRecoveryDispatchStillValid({ issueId, agentId, expectedStatus: "todo" }),
+      ).resolves.toBe(false);
+    });
+
+    it("refuses a dispatch when the issue was reassigned since the snapshot", async () => {
+      const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+        status: "todo",
+        runStatus: "failed",
+      });
+      const newAssigneeId = randomUUID();
+      await db.insert(agents).values({
+        id: newAssigneeId,
+        companyId,
+        name: "NewOwner",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.update(issues).set({ assigneeAgentId: newAssigneeId }).where(eq(issues.id, issueId));
+      const recovery = recoveryService(db, { enqueueWakeup: (async () => null) as never });
+      await expect(
+        recovery.isRecoveryDispatchStillValid({ issueId, agentId, expectedStatus: "todo" }),
+      ).resolves.toBe(false);
+    });
+
+    it("refuses a dispatch when the issue already has a queued execution-path run", async () => {
+      const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+        status: "todo",
+        runStatus: "failed",
+      });
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assignment_recovery" },
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: (async () => null) as never });
+      await expect(
+        recovery.isRecoveryDispatchStillValid({ issueId, agentId, expectedStatus: "todo" }),
+      ).resolves.toBe(false);
+    });
+
+    // The 2026-08-05 incident shape: an issue is cancelled while a slow sweep is
+    // mid-pass, and the sweep then dispatches recovery for it off the stale
+    // candidates row (18 wake-runs in one minute for one cancelled issue).
+    // Simulated deterministically: two stranded issues in one company; when the
+    // sweep dispatches the first, the "operator" cancels the other; the sweep
+    // must then refuse the second dispatch instead of waking a cancelled issue.
+    it("drops a dispatch for an issue cancelled mid-sweep (fire case, via the public reconciler)", async () => {
+      const first = await seedStrandedIssueFixture({ status: "todo", runStatus: "failed" });
+      // Second stranded issue in the SAME company/agent so one sweep sees both.
+      const issueBId = randomUUID();
+      const runBId = randomUUID();
+      const issuePrefix = `T${first.companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+      await db.insert(issues).values({
+        id: issueBId,
+        companyId: first.companyId,
+        title: "Second stranded issue",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: first.agentId,
+        issueNumber: 90,
+        identifier: `${issuePrefix}-90`,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runBId,
+        companyId: first.companyId,
+        agentId: first.agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "failed",
+        contextSnapshot: { issueId: issueBId, taskId: issueBId, wakeReason: "issue_assigned" },
+        startedAt: new Date("2026-03-19T00:00:00.000Z"),
+        finishedAt: new Date("2026-03-19T00:05:00.000Z"),
+        errorCode: "process_lost",
+        error: "run failed before issue advanced",
+      });
+
+      const dispatched: string[] = [];
+      const recovery = recoveryService(db, {
+        enqueueWakeup: (async (_wakeAgentId: string, wake: any) => {
+          const wakeIssueId = String((wake?.payload as Record<string, unknown>)?.issueId ?? "");
+          dispatched.push(wakeIssueId);
+          if (dispatched.length === 1) {
+            // Concurrent actor cancels the OTHER stranded issue mid-sweep.
+            const otherId = wakeIssueId === first.issueId ? issueBId : first.issueId;
+            await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, otherId));
+          }
+          return { id: randomUUID() };
+        }) as never,
+      });
+
+      await recovery.reconcileStrandedAssignedIssues();
+
+      // Exactly one dispatch: the second issue was cancelled before its enqueue
+      // and the revalidation refused it.
+      expect(dispatched).toHaveLength(1);
+    });
+  });
+
+  // AUR-5102 (P1): the unclaimability gauntlet must run on the periodic sweep,
+  // not only at admission — with the global cap saturated 100% of the time,
+  // admission never ran it and stale queued runs sat until operator trims.
+  describe("AUR-5102 reapUnclaimableQueuedRuns", () => {
+    async function seedQueuedRunFixture(input: {
+      issueStatus: "todo" | "cancelled";
+      withUnresolvedBlocker?: boolean;
+    }) {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const issueId = randomUUID();
+      const runId = randomUUID();
+      const wakeupRequestId = randomUUID();
+      const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Queued work",
+        status: input.issueStatus,
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      });
+      if (input.withUnresolvedBlocker) {
+        const blockerIssueId = randomUUID();
+        await db.insert(issues).values({
+          id: blockerIssueId,
+          companyId,
+          title: "Unresolved prerequisite",
+          status: "todo",
+          priority: "medium",
+          issueNumber: 2,
+          identifier: `${issuePrefix}-2`,
+        });
+        await db.insert(issueRelations).values({
+          companyId,
+          issueId: blockerIssueId,
+          relatedIssueId: issueId,
+          type: "blocks",
+        });
+      }
+      await db.insert(agentWakeupRequests).values({
+        id: wakeupRequestId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId },
+        status: "queued",
+        runId,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId,
+        contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      });
+      return { companyId, agentId, issueId, runId, wakeupRequestId };
+    }
+
+    it("reaps a queued run against a terminal issue even while the global cap is saturated", async () => {
+      const fixture = await seedQueuedRunFixture({ issueStatus: "cancelled" });
+      // Saturate the global concurrency ceiling well past its 2..12 clamp so the
+      // admission path could never have run the gauntlet for this queued run.
+      const saturationRunIds: string[] = [];
+      for (let i = 0; i < 16; i += 1) {
+        const saturationRunId = randomUUID();
+        saturationRunIds.push(saturationRunId);
+        await db.insert(heartbeatRuns).values({
+          id: saturationRunId,
+          companyId: fixture.companyId,
+          agentId: fixture.agentId,
+          invocationSource: "automation",
+          triggerDetail: "system",
+          status: "running",
+          contextSnapshot: {},
+          startedAt: new Date(),
+        });
+      }
+      try {
+        const heartbeat = heartbeatService(db);
+        const result = await heartbeat.reapUnclaimableQueuedRuns();
+        expect(result.reaped).toBeGreaterThanOrEqual(1);
+
+        const run = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, fixture.runId))
+          .then((rows) => rows[0] ?? null);
+        expect(run?.status).toBe("cancelled");
+        expect(run?.errorCode).toBe("issue_terminal_status");
+
+        const wake = await db
+          .select()
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, fixture.wakeupRequestId))
+          .then((rows) => rows[0] ?? null);
+        expect(wake?.status).toBe("skipped");
+      } finally {
+        // Drop the synthetic saturation rows so afterEach idle-polling does not
+        // spend its budget cancelling them one by one.
+        await db.delete(heartbeatRuns).where(inArray(heartbeatRuns.id, saturationRunIds));
+      }
+    });
+
+    it("reaps a dependency-blocked queued run", async () => {
+      const fixture = await seedQueuedRunFixture({ issueStatus: "todo", withUnresolvedBlocker: true });
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.reapUnclaimableQueuedRuns();
+      expect(result.reaped).toBeGreaterThanOrEqual(1);
+
+      const run = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, fixture.runId))
+        .then((rows) => rows[0] ?? null);
+      expect(run?.status).toBe("cancelled");
+      expect(run?.errorCode).toBe("issue_dependencies_blocked");
+    });
+
+    it("leaves a healthy queued run untouched (pass case)", async () => {
+      const fixture = await seedQueuedRunFixture({ issueStatus: "todo" });
+      const heartbeat = heartbeatService(db);
+      await heartbeat.reapUnclaimableQueuedRuns();
+
+      const run = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, fixture.runId))
+        .then((rows) => rows[0] ?? null);
+      expect(run?.status).toBe("queued");
+    });
+  });
 });

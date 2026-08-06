@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 // Promotion admits the new run into the scheduler immediately. Stub the adapter so
@@ -34,6 +34,7 @@ import {
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
+  resetEmbeddedPostgresTestDatabase,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
@@ -87,43 +88,11 @@ describeEmbeddedPostgres("heartbeat stranded deferred-wake reaper", () => {
       if (active.length === 0) break;
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    // Cascade: promoted runs create runtime state and other company-scoped rows,
-    // so ordered deletes trip foreign keys. Everything here hangs off companies.
-    //
-    // AUR-4648: the drain above shrinks the deadlock window but cannot close
-    // it — a scheduler continuation can open a fresh transaction between the
-    // last `running` check and the truncate acquiring its cascade locks, and
-    // that session's RowShareLock cycles with the truncate's
-    // AccessExclusiveLock (40P01, observed across four branches on
-    // 2026-07-30, including with this suite running alone in a serialized
-    // shard — so the partner is this process's own machinery, not another
-    // suite). Postgres resolves the cycle by killing a victim; when the
-    // victim is us, back off and retry: the partner completes instantly
-    // against the stubbed adapter, so the next attempt has the field to
-    // itself. A permanent lock holder would still exhaust the retries and
-    // fail loudly here.
-    let truncateError: unknown;
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      try {
-        await db.execute(sql`truncate table companies cascade`);
-        truncateError = undefined;
-        break;
-      } catch (error) {
-        let code: string | undefined;
-        for (
-          let cause: unknown = error;
-          cause && typeof cause === "object";
-          cause = (cause as { cause?: unknown }).cause
-        ) {
-          code = (cause as { code?: string }).code;
-          if (code) break;
-        }
-        if (code !== "40P01") throw error;
-        truncateError = error;
-        await new Promise((resolve) => setTimeout(resolve, 250));
-      }
-    }
-    if (truncateError !== undefined) throw truncateError;
+    // The drain above shrinks the deadlock window but cannot close it
+    // (AUR-4648): a scheduler continuation can still open a fresh transaction
+    // before the wipe acquires its locks. The shared reset truncates all
+    // tables in one atomic statement and retries 40P01 deadlock victims.
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {

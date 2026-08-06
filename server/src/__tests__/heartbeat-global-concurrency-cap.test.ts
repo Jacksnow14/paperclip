@@ -2,22 +2,16 @@ import { randomUUID } from "node:crypto";
 import { and, eq, inArray, or } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  activityLog,
-  agentRuntimeState,
   agents,
   agentWakeupRequests,
   companies,
-  companySkills,
-  costEvents,
   createDb,
-  documents,
-  heartbeatRunEvents,
   heartbeatRuns,
-  issueComments,
   issues,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
+  resetEmbeddedPostgresTestDatabase,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { runningProcesses } from "../adapters/index.ts";
@@ -192,67 +186,10 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
-    await db.delete(activityLog);
-    await db.delete(costEvents);
-    await db.delete(heartbeatRunEvents);
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      // Releasing a hung adapter above lets its run complete asynchronously,
-      // which can post an issue_comments row (e.g. run-handoff/continuation
-      // comments) after this teardown has already started. Retry alongside
-      // heartbeat_runs below rather than deleting once, for the same reason.
-      await db.delete(issueComments);
-      try {
-        await db.delete(issues);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      // Re-clear every table that carries an FK to heartbeat_runs on each
-      // attempt, not just heartbeat_run_events. Runs admitted by a test keep
-      // executing while teardown starts, so they write fresh activity_log and
-      // cost_events rows *after* the bulk deletes above — leaving a permanent
-      // 23503 on activity_log_run_id_heartbeat_runs_id_fk that retrying the
-      // heartbeat_runs delete alone can never clear.
-      await db.delete(activityLog);
-      await db.delete(costEvents);
-      await db.delete(heartbeatRunEvents);
-      try {
-        await db.delete(heartbeatRuns);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    await db.delete(agentWakeupRequests);
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(agentRuntimeState);
-      try {
-        await db.delete(agents);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      // Deleting documents cascades to document_revisions and issue_documents,
-      // which otherwise block the companies delete below the same way
-      // issue_comments blocked issues above (async run completion writing a
-      // handoff document after teardown has already started).
-      await db.delete(documents);
-      await db.delete(companySkills);
-      try {
-        await db.delete(companies);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
+    // Runs released above can still write rows (comments, activity, cost
+    // events) between any two ordered deletes — the shared reset truncates
+    // every table in one atomic statement instead (AUR-5103).
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {

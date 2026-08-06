@@ -708,6 +708,13 @@
       "when": 1785931111132,
       "tag": "0100_heartbeat_runs_hot_path_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 101,
+      "version": "7",
+      "when": 1786024703437,
+      "tag": "0101_issue_terminal_status_resolves_recovery_actions",
+      "breakpoints": true
     }
   ]
 }

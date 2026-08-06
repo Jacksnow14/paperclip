@@ -4720,20 +4720,21 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
-        if (issueData.status !== undefined) {
-          // An active recovery action tracks a stranded issue. Once the issue reaches a terminal
-          // status the tracker is obsolete, so close it out in the same transaction as the status
-          // write — otherwise `activeRecoveryAction` accumulates orphans and stops being a usable
-          // signal (AUR-4299). No-ops for non-terminal statuses.
-          await recoveryActionsSvc.resolveActiveForTerminalIssues(
-            {
-              companyId: existing.companyId,
-              sourceIssueIds: [updated.id],
-              issueStatus: updated.status,
-            },
-            tx,
-          );
-        }
+        // An active recovery action tracks a stranded issue. Once the issue is in a terminal
+        // status the tracker is obsolete, so close it out in the same transaction — gated on the
+        // status actually written (`updated.status`), never on whether the caller's patch
+        // included one, so any update touching an already-terminal issue heals a lingering
+        // orphan instead of skipping it (AUR-4299, AUR-5097). No-ops in process for
+        // non-terminal statuses; the issues-table trigger from migration 0101 backstops
+        // writers that bypass this service entirely.
+        await recoveryActionsSvc.resolveActiveForTerminalIssues(
+          {
+            companyId: existing.companyId,
+            sourceIssueIds: [updated.id],
+            issueStatus: updated.status,
+          },
+          tx,
+        );
         if (nextLabelIds !== undefined) {
           await syncIssueLabels(updated.id, existing.companyId, nextLabelIds, tx);
         }

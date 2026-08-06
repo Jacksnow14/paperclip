@@ -42,6 +42,13 @@ const CONSECUTIVE_FAILURE_THRESHOLD = 3;
  * Exported (AUR-5038) as the single source of the quota wording for the
  * auth-rendered-wall reclassifier, which also runs it inside Postgres (`~*`) —
  * the pattern is deliberately kept POSIX/ARE-compatible (verified live).
+ *
+ * COUPLING (AUR-5064): this exact source text is baked into the partial-index
+ * predicate `hb_runs_quota_anchor_idx` (packages/db migration 0101). Postgres
+ * only serves the anchor lookup from that index while the query's regex
+ * provably matches the index's — edit this pattern and the lookup silently
+ * reverts from ~0.05 ms to ~850 ms. If you change it, recreate the index with
+ * the new text (CONCURRENTLY on live, plus a follow-up migration).
  */
 export const QUOTA_SIGNATURE_RE =
   /(?:hit your (?:session|weekly|usage) limit|usage limit reached|usage cap reached|5[-\s]?hour limit reached|weekly limit reached|claude usage limit reached|out of extra usage|session limit reached)/i;
@@ -54,6 +61,18 @@ export const QUOTA_SIGNATURE_RE =
  * a reclassified tail as `consecutive_failures` and the lane-down rollup would
  * never fire.
  */
+// AUR-5064: if the re-export chain behind this constant ever breaks (hit live
+// during the AUR-5038 review via stale module resolution), the import resolves
+// to `undefined`, the set silently becomes `Set([undefined])`, and every
+// quota-keyed classification reverts to `consecutive_failures` with no signal
+// beyond subtly wrong capacity rows. Fail at load instead.
+if (typeof (CLAUDE_QUOTA_EXHAUSTED_ERROR_CODE as unknown) !== "string" || CLAUDE_QUOTA_EXHAUSTED_ERROR_CODE.length === 0) {
+  throw new Error(
+    "fleet-capacity: CLAUDE_QUOTA_EXHAUSTED_ERROR_CODE resolved to a non-string — " +
+      "quota classification would silently degrade to consecutive_failures",
+  );
+}
+
 const QUOTA_EXHAUSTED_ERROR_CODES = new Set<string>([CLAUDE_QUOTA_EXHAUSTED_ERROR_CODE]);
 
 export type FleetCapacityReason =

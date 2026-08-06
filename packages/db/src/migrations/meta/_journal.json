@@ -708,6 +708,13 @@
       "when": 1785931111132,
       "tag": "0100_heartbeat_runs_hot_path_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 101,
+      "version": "7",
+      "when": 1785931111133,
+      "tag": "0101_quota_anchor_partial_index",
+      "breakpoints": true
     }
   ]
 }

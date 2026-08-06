@@ -13,7 +13,16 @@ export function firstNonEmptyLine(text: string): string {
 // cosmetic 256-color warning in production (AUR-4038) while the fatal
 // IneligibleTierError sat one line away, discarded. Skip known noise
 // prefixes and return the first line that isn't one, regardless of position.
-const STDERR_NOISE_LINE_PATTERN = /^(warning|warn|notice|info|deprecat(ed|ion))\b\W?/i;
+//
+// AUR-5165: gemini-cli's untrusted-folder banner is the same shape of trap.
+// "YOLO mode is enabled. All tool calls will be automatically approved."
+// starts with a capital letter and reads like a real log line, so it always
+// won the "first non-noise line" pick over the actual fatal line
+// ("Gemini CLI is not running in a trusted directory...") sitting two lines
+// below it. Every failed run in this shape read as a YOLO problem and the
+// real cause (untrusted cwd) never surfaced.
+const STDERR_NOISE_LINE_PATTERN =
+  /^(warning|warn|notice|info|deprecat(ed|ion)|yolo mode is enabled|approval mode overridden)\b\W?/i;
 // Terminal warnings wrap across lines (e.g. "Warning: 256-color support not
 // detected. Using a terminal with at least 256-color\nsupport is recommended
 // for..."). The continuation line doesn't start with a noise prefix on its

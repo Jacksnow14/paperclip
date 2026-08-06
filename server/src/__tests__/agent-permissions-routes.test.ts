@@ -1454,14 +1454,10 @@ describe.sequential("agent permission routes", () => {
       .send({ canCreateAgents: false, canAssignTasks: false }));
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(mockAccessService.setPrincipalPermission).not.toHaveBeenCalledWith(
-      companyId,
-      "agent",
-      agentId,
-      "routines:manage",
-      expect.anything(),
-      expect.anything(),
-    );
+    expect(
+      mockAccessService.setPrincipalPermission.mock.calls.some((c) => c[3] === "routines:manage"),
+      JSON.stringify(mockAccessService.setPrincipalPermission.mock.calls),
+    ).toBe(false);
     expect(mockAccessService.setPrincipalPermission).toHaveBeenCalledWith(
       companyId,
       "agent",

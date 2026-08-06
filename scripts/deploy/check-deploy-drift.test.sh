@@ -142,6 +142,7 @@ run_check() {
   PAPERCLIP_DRIFT_REPO="owner/repo" \
   PAPERCLIP_DRIFT_MERGE_DEBT_RECHECK_DELAY_SEC=0 \
   PAPERCLIP_DRIFT_CHECKOUTS="${PAPERCLIP_DRIFT_CHECKOUTS-}" \
+  PAPERCLIP_DRIFT_CHECKOUT_REFRESH="${PAPERCLIP_DRIFT_CHECKOUT_REFRESH-}" \
   FAKE_TIP_DATE="${FAKE_TIP_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
   FAKE_PR_DIR="${FAKE_PR_DIR:-$TMP/prs-none}" \
   NOTIFY_SINK="$SINK" \
@@ -469,9 +470,13 @@ else
 fi
 
 # 21. A checkout left behind origin/main for 3h is checkout-debt: below the 24h
-#     threshold, so it drifts (nonzero exit) but does not yet page.
+#     threshold, so it drifts (nonzero exit) but does not yet page. The fixture
+#     tree is made DIRTY here: since AUR-4984 a clean behind checkout self-heals
+#     (cases 26+), so the sustained-escalation path below is exactly the
+#     dirty-checkout population that still alarms in production.
 git -C "$CO_REMOTE" -c user.email=t@example.com -c user.name=t \
   commit -q --allow-empty -m "checkout fixture: advances past local"
+echo "uncommitted work another agent owns" > "$CO_LOCAL/wip.txt"
 reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
 : > "$CO_LOG"; : > "$CO_STATE"
 now=$(date -u +%s)
@@ -543,6 +548,173 @@ if [[ "$rc" == "0" && "$(alerts)" == "0" ]] && ! grep -q "checkout=" <<<"$out"; 
   ok "empty checkout list disables the axis entirely"
 else
   fail "empty checkout list disables the axis entirely" "rc=$rc alerts=$(alerts) out=$out"
+fi
+
+# --- AUR-4984: checkout self-healing refresher -------------------------------
+# The axis above DETECTS a behind checkout; these cases lock down the inline
+# refresher that HEALS the clean ones. Contract: only a clean, strictly-behind
+# tree is ever touched, the only primitive is `merge --ff-only` (never reset,
+# never checkout — paperclip-shared backs ~100 worktrees), and every checkout
+# line carries a refresh= field, whose absence means the refresher is dead.
+
+# One fresh fixture pair per case so states cannot leak between cases.
+mk_co() {
+  git init -q --initial-branch=main "$TMP/$1-remote"
+  git -C "$TMP/$1-remote" -c user.email=t@example.com -c user.name=t \
+    commit -q --allow-empty -m "base"
+  git clone -q "$TMP/$1-remote" "$TMP/$1"
+}
+advance_remote() {
+  git -C "$TMP/$1-remote" -c user.email=t@example.com -c user.name=t \
+    commit -q --allow-empty -m "upstream advance"
+}
+co_head()     { git -C "$TMP/$1" rev-parse HEAD; }
+remote_head() { git -C "$TMP/$1-remote" rev-parse HEAD; }
+
+# 26. THE HEAL. Clean + strictly behind: fast-forwarded in place, reports ok,
+#     and pages NO ONE even with a 30h seeded DRIFT backlog — the alarm is
+#     silenced by fixing the condition, not by suppressing the page.
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"; clear_ad_state
+mk_co ff26; advance_remote ff26
+before=$(co_head ff26); want=$(remote_head ff26)
+: > "$LOG.checkout-ff26"; : > "$STATE.checkout-ff26"
+stamp=$(date -u -d "@$(( $(date -u +%s) - 30 * 3600 ))" +%Y-%m-%dT%H:%M:%SZ)
+printf '%s checkout=ff26 local=%s remote=%s status=DRIFT reason=checkout-behind:ff26\n' \
+  "$stamp" "${before:0:12}" "${want:0:12}" >> "$LOG.checkout-ff26"
+out=$(PAPERCLIP_DRIFT_CHECKOUTS="ff26:$TMP/ff26:main" run_check); rc=$?
+after=$(co_head ff26)
+if [[ "$before" != "$want" && "$after" == "$want" && "$rc" == "0" && "$(alerts)" == "0" ]] \
+   && grep -q "checkout=ff26 local=${want:0:12} .*status=ok reason=- refresh=ff" <<<"$out"; then
+  ok "clean behind checkout heals: refresh=ff, post-merge sha logged, ok, zero pages"
+else
+  fail "clean behind checkout heals: refresh=ff, post-merge sha logged, ok, zero pages" \
+    "rc=$rc alerts=$(alerts) before=$before after=$after want=$want out=$out"
+fi
+
+# 27. Never touch a dirty tree (AUR-4187/AUR-4541). Behind + dirty: HEAD
+#     pinned, the dirty content byte-identical, still DRIFT — and 30h
+#     sustained still pages, because a dirty behind tree needs a human
+#     decision, not silence.
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+mk_co dirty27; advance_remote dirty27
+echo "unmerged agent work" > "$TMP/dirty27/wip.txt"
+before=$(co_head dirty27); sum_before=$(sha256sum "$TMP/dirty27/wip.txt")
+: > "$LOG.checkout-dirty27"; : > "$STATE.checkout-dirty27"
+stamp=$(date -u -d "@$(( $(date -u +%s) - 30 * 3600 ))" +%Y-%m-%dT%H:%M:%SZ)
+printf '%s checkout=dirty27 local=%s remote=deadbeefdead status=DRIFT reason=checkout-behind:dirty27\n' \
+  "$stamp" "${before:0:12}" >> "$LOG.checkout-dirty27"
+out=$(PAPERCLIP_DRIFT_CHECKOUTS="dirty27:$TMP/dirty27:main" run_check); rc=$?
+after=$(co_head dirty27); sum_after=$(sha256sum "$TMP/dirty27/wip.txt")
+if [[ "$after" == "$before" && "$sum_after" == "$sum_before" && "$rc" == "1" && "$(alerts)" == "1" ]] \
+   && grep -q "checkout=dirty27 .*status=DRIFT reason=checkout-behind:dirty27 refresh=skipped-dirty" <<<"$out" \
+   && grep -q "checkout-behind:dirty27" "$SINK"; then
+  ok "dirty behind checkout: untouched, refresh=skipped-dirty, still DRIFT, still pages at threshold"
+else
+  fail "dirty behind checkout: untouched, refresh=skipped-dirty, still DRIFT, still pages at threshold" \
+    "rc=$rc alerts=$(alerts) before=$before after=$after sums=$sum_before/$sum_after out=$out"
+fi
+
+# 28. Diverged (a local commit upstream does not have): only a true ancestor
+#     advance may be fast-forwarded. HEAD pinned, DRIFT.
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+mk_co div28; advance_remote div28
+git -C "$TMP/div28" -c user.email=t@example.com -c user.name=t \
+  commit -q --allow-empty -m "local-only commit"
+before=$(co_head div28)
+out=$(PAPERCLIP_DRIFT_CHECKOUTS="div28:$TMP/div28:main" run_check); rc=$?
+after=$(co_head div28)
+if [[ "$after" == "$before" && "$rc" == "1" ]] \
+   && grep -q "checkout=div28 .*status=DRIFT reason=checkout-behind:div28 refresh=skipped-diverged" <<<"$out"; then
+  ok "diverged checkout is never fast-forwarded: refresh=skipped-diverged, HEAD pinned, DRIFT"
+else
+  fail "diverged checkout is never fast-forwarded: refresh=skipped-diverged, HEAD pinned, DRIFT" \
+    "rc=$rc before=$before after=$after out=$out"
+fi
+
+# 29. Already current: refresh=noop-current and no merge is attempted at all —
+#     the reflog stays exactly as the clone left it.
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+mk_co cur29
+reflog_before=$(git -C "$TMP/cur29" reflog | wc -l)
+out=$(PAPERCLIP_DRIFT_CHECKOUTS="cur29:$TMP/cur29:main" run_check); rc=$?
+reflog_after=$(git -C "$TMP/cur29" reflog | wc -l)
+if [[ "$rc" == "0" && "$reflog_after" == "$reflog_before" ]] \
+   && grep -q "checkout=cur29 .*status=ok reason=- refresh=noop-current" <<<"$out"; then
+  ok "current checkout: refresh=noop-current, no merge attempted (reflog untouched)"
+else
+  fail "current checkout: refresh=noop-current, no merge attempted (reflog untouched)" \
+    "rc=$rc reflog=$reflog_before/$reflog_after out=$out"
+fi
+
+# 30. Detached HEAD, clean, behind — interop-bridge-runtime is live in this
+#     state today. Must not crash; a detached ancestor advance is still a pure
+#     fast-forward (no branch ref involved), so it heals like any other.
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+mk_co det30; git -C "$TMP/det30" checkout -q --detach HEAD; advance_remote det30
+want=$(remote_head det30)
+out=$(PAPERCLIP_DRIFT_CHECKOUTS="det30:$TMP/det30:main" run_check); rc=$?
+after=$(co_head det30)
+if [[ "$rc" == "0" && "$after" == "$want" ]] \
+   && grep -q "checkout=det30 local=${want:0:12} .*status=ok reason=- refresh=ff" <<<"$out"; then
+  ok "detached clean behind checkout heals without crashing (refresh=ff on detached HEAD)"
+else
+  fail "detached clean behind checkout heals without crashing (refresh=ff on detached HEAD)" \
+    "rc=$rc after=$after want=$want out=$out"
+fi
+
+# 31. Kill switch: PAPERCLIP_DRIFT_CHECKOUT_REFRESH=0 restores detect-only
+#     behaviour — refresh=disabled, HEAD pinned, DRIFT still reported.
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+mk_co kill31; advance_remote kill31
+before=$(co_head kill31)
+out=$(PAPERCLIP_DRIFT_CHECKOUT_REFRESH=0 \
+      PAPERCLIP_DRIFT_CHECKOUTS="kill31:$TMP/kill31:main" run_check); rc=$?
+after=$(co_head kill31)
+if [[ "$after" == "$before" && "$rc" == "1" ]] \
+   && grep -q "checkout=kill31 .*status=DRIFT reason=checkout-behind:kill31 refresh=disabled" <<<"$out"; then
+  ok "refresher kill switch: refresh=disabled, HEAD pinned, DRIFT still reported"
+else
+  fail "refresher kill switch: refresh=disabled, HEAD pinned, DRIFT still reported" \
+    "rc=$rc before=$before after=$after out=$out"
+fi
+
+# 32. Scope containment: an unwatched sibling checkout adjacent to a watched
+#     one — same remote, equally behind — is neither refreshed nor logged.
+#     The refresher structurally cannot leave the watch list.
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+mk_co watched32
+git clone -q "$TMP/watched32-remote" "$TMP/watched32-sibling"
+advance_remote watched32
+sib_before=$(git -C "$TMP/watched32-sibling" rev-parse HEAD)
+want=$(remote_head watched32)
+out=$(PAPERCLIP_DRIFT_CHECKOUTS="watched32:$TMP/watched32:main" run_check); rc=$?
+sib_after=$(git -C "$TMP/watched32-sibling" rev-parse HEAD)
+if [[ "$(co_head watched32)" == "$want" && "$sib_after" == "$sib_before" && "$sib_after" != "$want" ]] \
+   && ! grep -q "sibling" <<<"$out"; then
+  ok "unwatched sibling checkout is neither refreshed nor logged"
+else
+  fail "unwatched sibling checkout is neither refreshed nor logged" \
+    "rc=$rc sib=$sib_before/$sib_after want=$want out=$out"
+fi
+
+# 33. The liveness contract: EVERY emitted checkout= line carries a refresh=
+#     field, across heal/skip/noop outcomes in one run — a line without one
+#     is the signal that the refresher is dead.
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+mk_co all33a; advance_remote all33a                     # heals: ff
+mk_co all33b; advance_remote all33b
+echo wip > "$TMP/all33b/wip.txt"                        # skips: dirty
+mk_co all33c                                            # already current
+out=$(PAPERCLIP_DRIFT_CHECKOUTS="all33a:$TMP/all33a:main
+all33b:$TMP/all33b:main
+all33c:$TMP/all33c:main" run_check); rc=$?
+lines=$(grep -c "checkout=" <<<"$out")
+bare=$(grep "checkout=" <<<"$out" | grep -vc "refresh=")
+if [[ "$lines" == "3" && "$bare" == "0" ]]; then
+  ok "all 3 checkout lines carry a refresh= field (absence = refresher dead)"
+else
+  fail "all 3 checkout lines carry a refresh= field (absence = refresher dead)" \
+    "lines=$lines bare=$bare out=$out"
 fi
 
 echo

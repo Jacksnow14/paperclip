@@ -264,7 +264,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     executionTargetIsRemote,
     executionCwd: effectiveExecutionCwd,
   });
-  if (executionTargetIsRemote && typeof env.GEMINI_CLI_TRUST_WORKSPACE !== "string") {
+  // AUR-5165: gemini-cli only trusts folders listed in ~/.gemini/trustedFolders.json
+  // (just $HOME by default). Every local run executes inside a Paperclip workspace
+  // path, which is never in that list, so without this the CLI silently downgrades
+  // --approval-mode yolo to default and blocks on approval. This was previously
+  // gated on executionTargetIsRemote, which meant it only fired for remote targets
+  // and every local (the common case) run was left untrusted.
+  if (typeof env.GEMINI_CLI_TRUST_WORKSPACE !== "string") {
     env.GEMINI_CLI_TRUST_WORKSPACE = "true";
   }
   if (!hasExplicitApiKey && authToken) {
@@ -449,9 +455,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const commandNotes = (() => {
     const notes: string[] = ["Prompt is passed to Gemini via --prompt for non-interactive execution."];
     notes.push("Added --approval-mode yolo for unattended execution.");
-    if (executionTargetIsRemote) {
-      notes.push("Set GEMINI_CLI_TRUST_WORKSPACE=true for remote headless execution.");
-    }
+    notes.push("Set GEMINI_CLI_TRUST_WORKSPACE=true for unattended execution outside a trusted folder.");
     if (!instructionsFilePath) return notes;
     if (instructionsPrefix.length > 0) {
       notes.push(

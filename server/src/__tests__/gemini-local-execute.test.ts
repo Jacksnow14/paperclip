@@ -14,6 +14,7 @@ const payload = {
   paperclipEnvKeys: Object.keys(process.env)
     .filter((key) => key.startsWith("PAPERCLIP_"))
     .sort(),
+  geminiCliTrustWorkspace: process.env.GEMINI_CLI_TRUST_WORKSPACE ?? null,
 };
 if (capturePath) {
   fs.writeFileSync(capturePath, JSON.stringify(payload), "utf8");
@@ -71,6 +72,7 @@ process.exit(${exit});
 type CapturePayload = {
   argv: string[];
   paperclipEnvKeys: string[];
+  geminiCliTrustWorkspace: string | null;
 };
 
 describe("gemini execute", () => {
@@ -188,6 +190,102 @@ describe("gemini execute", () => {
       expect(capture.argv).not.toContain("--policy");
       expect(capture.argv).not.toContain("--allow-all");
       expect(capture.argv).not.toContain("--allow-read");
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = previousHome;
+      }
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  // AUR-5165 AC1/AC3: gemini-cli only trusts folders listed in
+  // ~/.gemini/trustedFolders.json (just $HOME by default). Every Paperclip
+  // workspace path is outside that list, so without GEMINI_CLI_TRUST_WORKSPACE
+  // the CLI silently downgrades --approval-mode yolo to default and blocks on
+  // approval. The env var used to be set only when executionTargetIsRemote was
+  // true, so every local run (the common case, and the one this issue
+  // reproduced) never got it. This assertion FAILS on that prior gating and
+  // PASSES with the fix, proving the guard both ways per the artifact
+  // provenance doctrine.
+  it("sets GEMINI_CLI_TRUST_WORKSPACE=true for local execution, not just remote targets", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-gemini-trust-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "gemini");
+    const capturePath = path.join(root, "capture.json");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeFakeGeminiCommand(commandPath);
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+
+    try {
+      await execute({
+        runId: "run-trust",
+        agent: { id: "a1", companyId: "c1", name: "G", adapterType: "gemini_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
+        },
+        context: {},
+        authToken: "t",
+        onLog: async () => {},
+      });
+
+      const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload;
+      expect(capture.geminiCliTrustWorkspace).toBe("true");
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = previousHome;
+      }
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  // AUR-5165 AC2: gemini-cli's untrusted-folder banner starts with a capital
+  // letter ("YOLO mode is enabled...") and reads like a real log line, so it
+  // used to win selectFatalStderrLine's "first non-noise line" pick over the
+  // actual fatal line ("Gemini CLI is not running in a trusted directory...")
+  // two lines below it. Every failure in this shape read as a YOLO problem and
+  // the real cause never surfaced. This is the exact stderr gemini-cli 0.54.0
+  // emits, reproduced verbatim from the issue.
+  it("surfaces the untrusted-directory failure instead of the harmless YOLO banner", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-gemini-untrusted-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "gemini");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeFailingGeminiCommand(commandPath, {
+      stderr: [
+        "YOLO mode is enabled. All tool calls will be automatically approved.",
+        'Approval mode overridden to "default" because the current folder is not trusted.',
+        "Gemini CLI is not running in a trusted directory. To proceed, either use `--skip-trust`,",
+        "set the `GEMINI_CLI_TRUST_WORKSPACE=true` environment variable, or trust this directory...",
+      ].join("\n"),
+      exitCode: 1,
+    });
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+
+    try {
+      const result = await execute({
+        runId: "run-untrusted",
+        agent: { id: "a1", companyId: "c1", name: "G", adapterType: "gemini_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { command: commandPath, cwd: workspace },
+        context: {},
+        authToken: "t",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorMessage).toContain("not running in a trusted directory");
+      expect(result.errorMessage).not.toContain("YOLO mode is enabled");
     } finally {
       if (previousHome === undefined) {
         delete process.env.HOME;

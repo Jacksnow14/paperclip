@@ -131,6 +131,9 @@ MERGE_DEBT_ISSUE_URL=${PAPERCLIP_DRIFT_MERGE_DEBT_ISSUE_URL:-https://paperclip/A
 CHECKOUTS=${PAPERCLIP_DRIFT_CHECKOUTS-}
 CHECKOUT_DEBT_THRESHOLD_SEC=${PAPERCLIP_DRIFT_CHECKOUT_DEBT_THRESHOLD_SEC:-86400}
 CHECKOUT_ISSUE_URL=${PAPERCLIP_DRIFT_CHECKOUT_ISSUE_URL:-https://paperclip/AUR/issues/AUR-4227}
+# Kill switch for the checkout self-healing refresher (AUR-4984). Default ON;
+# 0 restores detect-only behaviour (refresh=disabled on every checkout line).
+CHECKOUT_REFRESH=${PAPERCLIP_DRIFT_CHECKOUT_REFRESH:-1}
 
 ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -455,6 +458,9 @@ fi
 # log/state file pair so one drifting checkout can never mask or reset
 # another's sustained-duration clock, and a missing/unreachable checkout is
 # skipped (not alarmed) — this axis reports what it can prove.
+# Since AUR-4984 the axis also self-heals: a clean checkout that is strictly
+# behind is fast-forwarded in place, so only dirty or diverged checkouts —
+# the ones needing a human decision — still drift and page.
 while IFS=: read -r co_label co_path co_branch; do
   [[ -n "$co_label" ]] || continue
 
@@ -474,6 +480,39 @@ while IFS=: read -r co_label co_path co_branch; do
   co_local_head=$(git -C "$co_path" rev-parse HEAD 2>/dev/null || echo none)
   [[ "$co_fetch_head" != "none" && "$co_local_head" != "none" ]] || continue
 
+  # Self-healing refresher (AUR-4984): fast-forward a clean, strictly-behind
+  # checkout instead of paging daily for the expected post-merge lag.
+  # `merge --ff-only` is the only primitive allowed here — it refuses on
+  # divergence, refuses to clobber the working tree, and can never discard a
+  # commit; paperclip-shared backs ~100 linked worktrees where reset/checkout
+  # are forbidden outright. Lives inline in this loop deliberately: a sidecar
+  # could die silently, whereas here every checkout line must carry a
+  # refresh= field — a line without one means the refresher is dead.
+  if [[ "$CHECKOUT_REFRESH" != "1" ]]; then
+    co_refresh=disabled
+  elif git -C "$co_path" merge-base --is-ancestor "$co_fetch_head" "$co_local_head" 2>/dev/null; then
+    co_refresh=noop-current
+  else
+    # A tree whose status cannot be read is treated as dirty: never touch a
+    # tree not proven clean (AUR-4187: a watched tree held a diff that would
+    # have reverted three merged safety fixes; AUR-4541 destroyed a patch).
+    co_dirty=$(git -C "$co_path" status --porcelain 2>/dev/null || echo unreadable)
+    if [[ -n "$co_dirty" ]]; then
+      co_refresh=skipped-dirty
+    elif ! git -C "$co_path" merge-base --is-ancestor "$co_local_head" "$co_fetch_head" 2>/dev/null; then
+      # Local commits upstream does not have: only a true ancestor advance
+      # may be fast-forwarded.
+      co_refresh=skipped-diverged
+    elif timeout 15 git -C "$co_path" merge --ff-only FETCH_HEAD >/dev/null 2>&1; then
+      co_refresh=ff
+      # Re-read HEAD so the logged local= is the POST-merge sha — the line
+      # itself proves the advance happened.
+      co_local_head=$(git -C "$co_path" rev-parse HEAD 2>/dev/null || echo "$co_local_head")
+    else
+      co_refresh=failed-ff
+    fi
+  fi
+
   if git -C "$co_path" merge-base --is-ancestor "$co_fetch_head" "$co_local_head" 2>/dev/null; then
     co_status=ok
     co_reason=-
@@ -484,7 +523,7 @@ while IFS=: read -r co_label co_path co_branch; do
   fi
 
   co_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  co_line="$co_ts checkout=$co_label local=${co_local_head:0:12} remote=${co_fetch_head:0:12} status=$co_status reason=$co_reason"
+  co_line="$co_ts checkout=$co_label local=${co_local_head:0:12} remote=${co_fetch_head:0:12} status=$co_status reason=$co_reason refresh=$co_refresh"
   echo "$co_line"
   co_log="${DRIFT_LOG}.checkout-${co_label}"
   co_state="${ALERT_STATE}.checkout-${co_label}"

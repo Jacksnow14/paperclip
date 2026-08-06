@@ -58,6 +58,7 @@ import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
 import { findActiveAdapterQuotaPause, QUOTA_PAUSE_INELIGIBLE_AGENT_STATUSES } from "./quota-pause.js";
+import { findAgentTokenBudgetBreach } from "./agent-token-budget.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
@@ -1106,7 +1107,7 @@ interface WakeupOptions {
   contextSnapshot?: Record<string, unknown>;
 }
 
-type UsageTotals = {
+export type UsageTotals = {
   inputTokens: number;
   cachedInputTokens: number;
   outputTokens: number;
@@ -1542,7 +1543,13 @@ function normalizeUsageTotals(usage: UsageSummary | null | undefined): UsageTota
   };
 }
 
-function readRawUsageTotals(usageJson: unknown): UsageTotals | null {
+// AUR-4669: exported so agent-token-budget.ts reads token usage the same way the
+// (currently unreachable — see AUR-4212) session-rotation guard does. rawInputTokens
+// already includes cache-read tokens (rawCachedInputTokens is a subset breakdown, not
+// additive — confirmed against AUR-4693's CFO row: 11,584,256 cached of 11,832,302 raw
+// input); a second independent parser that got that wrong would double-count and either
+// over- or under-fire.
+export function readRawUsageTotals(usageJson: unknown): UsageTotals | null {
   const parsed = parseObject(usageJson);
   if (Object.keys(parsed).length === 0) return null;
 
@@ -7213,6 +7220,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         agentId: heartbeatRuns.agentId,
         companyId: agents.companyId,
         adapterType: agents.adapterType,
+        adapterConfig: agents.adapterConfig,
       })
       .from(heartbeatRuns)
       .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
@@ -7232,9 +7240,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const pause = await findActiveAdapterQuotaPause(db, companyId, adapterType, now);
       if (pause) pausedPairKeys.add(`${companyId}::${adapterType}`);
     }
+    // AUR-4669: same AUR-4620 fix, same reasoning, applied to the new per-agent token
+    // budget — a budget-breached agent can never be admitted (checkAgentAdmissionGate
+    // refuses it), so leaving it in the denominator would shrink every genuinely
+    // eligible agent's fair share for no reason, exactly the bug this function exists
+    // to avoid for adapter-wide quota pauses.
+    const tokenBudgetBreachedAgentIds = new Set<string>();
+    for (const candidate of candidates) {
+      if (tokenBudgetBreachedAgentIds.has(candidate.agentId)) continue;
+      const breach = await findAgentTokenBudgetBreach(
+        db,
+        {
+          id: candidate.agentId,
+          companyId: candidate.companyId,
+          adapterType: candidate.adapterType,
+          adapterConfig: candidate.adapterConfig,
+        },
+        now,
+      );
+      if (breach) tokenBudgetBreachedAgentIds.add(candidate.agentId);
+    }
     const eligibleAgentIds = new Set(
       candidates
-        .filter((row) => !pausedPairKeys.has(`${row.companyId}::${row.adapterType}`))
+        .filter(
+          (row) =>
+            !pausedPairKeys.has(`${row.companyId}::${row.adapterType}`) &&
+            !tokenBudgetBreachedAgentIds.has(row.agentId),
+        )
         .map((row) => row.agentId),
     );
     // Any agent reaching this point has queued rows of its own (callers with an
@@ -7461,16 +7493,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   // Shared admission gate for both entrypoints above: not admissible if the
-  // agent no longer exists, is in an inadmissible status, or its adapter is
+  // agent no longer exists, is in an inadmissible status, its adapter is
   // under an active cross-agent quota pause (AUR-4055/AUR-4139 — a
   // scheduled_retry row's parsed provider quota reset time hasn't passed yet,
   // so every run sharing that adapter's credential/account is guaranteed to
   // hit the same wall; session limits are scoped to the adapter's credential,
   // not to an individual agent, hence the (companyId, adapterType) lookup
-  // rather than agentId). Leave queued runs queued instead of admitting them
-  // into a known-dead attempt; they're picked up again as soon as this query
-  // stops matching (either the reset time passes, or promoteDueScheduledRetries
-  // promotes the retry itself).
+  // rather than agentId), or the agent itself has breached its own rolling
+  // token budget (AUR-4669 — a per-agent, per-adapter cap, deliberately
+  // scoped to agentId rather than the adapter-wide (companyId, adapterType)
+  // pause above: this is what stops one agent from ever *causing* that
+  // adapter-wide wall by suppressing only its own admission, leaving the
+  // other agents sharing the credential unaffected). Leave queued runs
+  // queued instead of admitting them into a known-dead attempt; they're
+  // picked up again as soon as the relevant query stops matching (the reset
+  // time passes / promoteDueScheduledRetries promotes the retry / the
+  // breaching run ages out of the token-budget window).
   async function checkAgentAdmissionGate(agentId: string) {
     const agent = await getAgent(agentId);
     if (!agent) return null;
@@ -7493,6 +7531,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             activeQuotaPause.parsedResetAt.getTime() > activeQuotaPause.scheduledRetryAt.getTime(),
         },
         "startNextQueuedRunForAgent: adapter quota pause active; run admission suppressed",
+      );
+      return null;
+    }
+    const tokenBudgetBreach = await findAgentTokenBudgetBreach(db, agent, new Date());
+    if (tokenBudgetBreach) {
+      logger.info(
+        {
+          agentId,
+          adapterType: agent.adapterType,
+          reason: tokenBudgetBreach.reason,
+          windowTokens: tokenBudgetBreach.windowTokens,
+          maxTokensPerWindow: tokenBudgetBreach.policy.maxTokensPerWindow,
+          maxTokensPerRun: tokenBudgetBreach.policy.maxTokensPerRun,
+          breachingRunId: tokenBudgetBreach.breachingRunId,
+          breachingRunTokens: tokenBudgetBreach.breachingRunTokens,
+          clearsAt: tokenBudgetBreach.clearsAt.toISOString(),
+        },
+        "startNextQueuedRunForAgent: agent token budget breached; run admission suppressed for this agent only",
       );
       return null;
     }

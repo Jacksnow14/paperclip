@@ -132,7 +132,11 @@ describe("handleDiskAlertAct — state-based dedup", () => {
     expect(openIssues).toHaveLength(1);
   });
 
-  it("falls back to commenting when it loses a create race to a concurrent check", async () => {
+  it("falls back to commenting when it loses a create race to a concurrent check (postgres.js constraint_name shape)", async () => {
+    // postgres.js (this repo's driver — packages/db/src/client.ts) surfaces
+    // the violated constraint as `constraint_name`, not `constraint`. A
+    // fixture that only sets `constraint` proves the code against a shape
+    // node-postgres throws, not the one production actually sees.
     const rows: FakeRow[] = [];
     const issuesSvc = makeFakeIssuesSvc(rows);
     const winningIssueId = "issue-raced";
@@ -149,10 +153,40 @@ describe("handleDiskAlertAct — state-based dedup", () => {
       });
       const err: any = new Error("duplicate key value violates unique constraint");
       err.code = "23505";
-      err.constraint = "issues_active_disk_alert_uq";
+      err.constraint_name = "issues_active_disk_alert_uq";
       throw err;
     };
     void realCreate;
+
+    const outcome = await handleDiskAlertAct({
+      companyId: COMPANY_ID,
+      result: makeResult(92),
+      assigneeAgentId: "ceo-agent",
+      readingBody: "reading",
+      issuesSvc,
+    });
+
+    expect(outcome).toEqual({ action: "commented_after_race", issueId: winningIssueId });
+    expect(rows).toHaveLength(1);
+  });
+
+  it("also falls back to commenting on the `constraint` shape (node-postgres), keeping the `??` fallback covered both ways", async () => {
+    const rows: FakeRow[] = [];
+    const issuesSvc = makeFakeIssuesSvc(rows);
+    const winningIssueId = "issue-raced-2";
+    issuesSvc.create = async (companyId, data) => {
+      rows.push({
+        id: winningIssueId,
+        companyId,
+        originKind: data.originKind as string,
+        originId: data.originId as string,
+        status: "todo",
+      });
+      const err: any = new Error("duplicate key value violates unique constraint");
+      err.code = "23505";
+      err.constraint = "issues_active_disk_alert_uq";
+      throw err;
+    };
 
     const outcome = await handleDiskAlertAct({
       companyId: COMPANY_ID,

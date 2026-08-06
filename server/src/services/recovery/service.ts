@@ -2006,6 +2006,72 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const keepDispatchable = blockerIds.length === 0 &&
       Boolean(recoveryAction.ownerAgentId) &&
       !attemptsExhausted;
+
+    // AUR-5001: a `routine_execution` issue has no human review workflow and the
+    // routine re-fires on its own schedule — a bare `blocked` with zero blocker
+    // edges here is always wrong (AUR-4250 doctrine): there is nothing to unblock
+    // it, and the umbrella just sits open forever (67 zombies in 3 days, measured).
+    // This only fires once `keepDispatchable` is false (no invokable owner, or
+    // attempts exhausted) AND there are no real blockers to attach — i.e. exactly
+    // the zero-edge-blocked case, never the "real unresolved blocker" case above.
+    if (!keepDispatchable && blockerIds.length === 0 && input.issue.originKind === "routine_execution") {
+      const cancelled = await issuesSvc.update(input.issue.id, { status: "cancelled" });
+      if (!cancelled) return null;
+      // Dedup marker must be UNIQUE TO THIS BRANCH, not the shared
+      // `Recovery action: \`<id>\`` line the ordinary escalation path also emits.
+      // Attempts 1..MAX go down that path first and post that line, so keying the
+      // cancellation notice on it means the notice is suppressed on essentially
+      // every real issue — the cancel would land SILENTLY, which is the failure
+      // mode this branch exists to avoid (retire explicitly, with a stated cause).
+      // Keyed on this branch's own marker, a repeat entry still says it once.
+      const cancelMarker = `routine-umbrella cancelled by recovery action \`${recoveryAction.id}\``;
+      const alreadyNoticed = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(and(eq(issueComments.issueId, input.issue.id), eq(issueComments.authorType, "system")))
+        .orderBy(desc(issueComments.createdAt))
+        .limit(50)
+        .then((rows) => rows.some((row) => (row.body ?? "").includes(cancelMarker)));
+      if (!alreadyNoticed) {
+        await issuesSvc.addComment(
+          input.issue.id,
+          [
+            input.comment ?? "",
+            "",
+            // Carries `cancelMarker` verbatim — this line is both the human-readable
+            // cause and the dedup key the re-entry check above matches on.
+            `- Cancelled: ${cancelMarker}.`,
+            "- This is a routine-dispatch umbrella with no live execution path and no invokable recovery owner (or recovery attempts exhausted). Cancelling instead of blocking: routine_execution issues have no dependency to unblock, and the routine re-fires on schedule — a bare `blocked` here would strand the umbrella indefinitely (AUR-5001).",
+            "- Next action: none. The routine's next scheduled/manual fire will dispatch a fresh issue (or reuse this one before it terminates, per AUR-5001).",
+          ].join("\n"),
+          {},
+          { authorType: "system" },
+        );
+      }
+      await logActivity(db, {
+        companyId: input.issue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: input.issue.id,
+        details: {
+          identifier: input.issue.identifier,
+          status: "cancelled",
+          previousStatus: input.previousStatus,
+          source: "recovery.reconcile_stranded_assigned_issue",
+          recoveryCause,
+          latestRunId: input.latestRun?.id ?? null,
+          latestRunStatus: input.latestRun?.status ?? null,
+          recoveryActionId: recoveryAction.id,
+          reason: "routine_execution_zero_edge_block_avoided",
+        },
+      });
+      return cancelled;
+    }
+
     const nextStatus = keepDispatchable ? "todo" as const : "blocked" as const;
     const updated = await issuesSvc.update(input.issue.id, {
       status: nextStatus,

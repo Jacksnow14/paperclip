@@ -379,6 +379,68 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  // AUR-5001 RECOVERY acceptance case: terminal recovery on a routine_execution issue
+  // must never leave it in zero-edge `blocked` (AUR-4250 doctrine applied to routine
+  // dispatch). A routine_execution umbrella has no human review workflow and the
+  // routine re-fires on schedule, so once recovery attempts are exhausted (>3, no real
+  // blockers) `blocked` would strand it forever — cancel it instead.
+  it("cancels a stranded routine_execution issue instead of zero-edge blocking it once recovery attempts are exhausted (RECOVERY)", async () => {
+    const { coderId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ originKind: "routine_execution", originId: randomUUID() })
+      .where(eq(issues.id, sourceIssueId));
+    const [routineIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+    } as const;
+
+    // Push attemptCount past MAX_DISPATCHABLE_STRANDED_RECOVERY_ATTEMPTS (3) so
+    // keepDispatchable flips false even though blockerIds stays empty the whole
+    // time — exactly the zero-edge-blocked case AUR-4250/AUR-5001 forbid.
+    for (let i = 0; i < 4; i++) {
+      await recovery.escalateStrandedAssignedIssue({
+        issue: routineIssue!,
+        previousStatus: "in_progress",
+        latestRun,
+        comment: "Automatic continuation recovery failed.",
+      });
+      await backdateRecoveryActionPastDormancy(routineIssue!.id);
+    }
+
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, routineIssue!.id));
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]?.attemptCount).toBeGreaterThan(3);
+
+    const [finalIssue] = await db.select().from(issues).where(eq(issues.id, routineIssue!.id));
+    expect(finalIssue?.status).toBe("cancelled");
+    expect(finalIssue?.status).not.toBe("blocked");
+
+    // The cancel must be LOUD, and this assertion is load-bearing: attempts 1..3 go
+    // down the ordinary escalation path first and post their own system comment. An
+    // earlier version of this branch deduped on that shared `Recovery action: <id>`
+    // line, so the cancellation notice was suppressed by the very escalation that
+    // preceded it — the issue was cancelled silently, with no stated cause. Keyed on
+    // this branch's own marker instead, so a prior escalation cannot mute it...
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, routineIssue!.id));
+    const notices = comments.filter((c) => (c.body ?? "").includes("Cancelling"));
+    expect(notices).toHaveLength(1);
+    // ...and it still names why, not just that.
+    expect(notices[0]?.body ?? "").toContain("routine-umbrella cancelled by recovery action");
+  });
+
   // The invariant here is the tail re-assert, not any particular constant: `enqueueWakeup` flips
   // the issue to `in_progress` mid-escalation (a wake claimed before escalation finished writing),
   // and escalation's own status decision must win that race rather than silently losing it.

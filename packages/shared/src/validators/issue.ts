@@ -25,6 +25,7 @@ import {
   ISSUE_THREAD_INTERACTION_KINDS,
   ISSUE_THREAD_INTERACTION_STATUSES,
   MODEL_PROFILE_KEYS,
+  WORK_CLASSES,
 } from "../constants.js";
 import { multilineTextSchema } from "./text.js";
 
@@ -376,6 +377,7 @@ const createIssueBaseSchema = z.object({
   status: z.enum(ISSUE_STATUSES),
   workMode: z.enum(ISSUE_WORK_MODES).optional().default("standard"),
   priority: z.enum(ISSUE_PRIORITIES).optional().default("medium"),
+  workClass: z.enum(WORK_CLASSES).optional().nullable(),
   assigneeAgentId: z.string().uuid().optional().nullable(),
   assigneeUserId: z.string().optional().nullable(),
   requestDepth: issueRequestDepthInputSchema.optional().default(0),

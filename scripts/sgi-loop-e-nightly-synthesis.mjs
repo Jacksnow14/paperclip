@@ -138,6 +138,28 @@ async function postComment(issueId, body) {
   });
 }
 
+// AUR-5168 AC4: surface the same rolling 7-day self-improvement-vs-revenue
+// share the AC3 admission gate reads, so the board sees it without a
+// separate dashboard. Best-effort — a fetch failure omits the line rather
+// than failing the whole nightly synthesis.
+async function fetchWorkClassBudget() {
+  try {
+    const budget = await apiFetch(`/api/companies/${COMPANY_ID}/work-class-budget`);
+    return budget && !budget._notFound ? budget : null;
+  } catch (err) {
+    console.error(`[loop-e] could not fetch work-class-budget: ${err.message}`);
+    return null;
+  }
+}
+
+function workClassBudgetLine(budget) {
+  if (!budget) return null;
+  const totalTokens = budget.revenueTokens + budget.selfImprovementTokens;
+  const pct = (budget.selfImprovementShare * 100).toFixed(1);
+  const capPct = (budget.capShare * 100).toFixed(0);
+  return `self-improvement 7d: ${pct}% of ${totalTokens.toLocaleString()} tok (cap ${capPct}%)${budget.overCap ? ' ⚠️ over cap' : ''}`;
+}
+
 const cat = (r) => (r.metadata && r.metadata.category) || '';
 const dayOf = (r) => (r.createdAt || '').slice(0, 10);
 
@@ -308,7 +330,7 @@ function delta(metrics, prev) {
 // ---- Render ----------------------------------------------------------------
 
 function renderBody(s) {
-  const { date, failures, patterns, cost, deltaInfo, counts } = s;
+  const { date, failures, patterns, cost, deltaInfo, counts, wcbLine } = s;
   // Section 1 is capped so a high-signal day can't push the record past the
   // 20k-char capture limit and silently amputate sections 3 and 4. The omitted
   // tail is reported, never dropped in silence.
@@ -336,7 +358,7 @@ function renderBody(s) {
   return `# Cross-Project Synthesis — ${date}
 
 _SGI Loop E · distilled from ${counts.inputs} signal record(s) dated ${date} (${counts.retros} retro, ${counts.toolGaps} tool-gap, ${counts.scorecards} scorecard, ${counts.adjusted} cost-adjusted, ${counts.efficiency} efficiency); scanned ${counts.pagesScanned ?? '?'} page(s) of memory${counts.scanTruncated ? ' — **scan hit the page cap, coverage incomplete**' : ''}.${counts.inputs === 0 ? ' No fresh signals today — sections reflect standing state only.' : ''}_
-
+${wcbLine ? `\n_${wcbLine}_\n` : ''}
 ## 1. Recurring failure modes
 ${fail}
 
@@ -365,6 +387,8 @@ async function main() {
   const patterns = strongPatterns(today);
   const cost = costOutliers(today, all);
   const prev = findPreviousSynthesis(all);
+  const workClassBudget = await fetchWorkClassBudget();
+  const wcbLine = workClassBudgetLine(workClassBudget);
 
   const counts = {
     retros: today.filter(r => isRetro(r)).length,
@@ -386,7 +410,7 @@ async function main() {
   };
   const deltaInfo = delta(metrics, prev);
 
-  const body = renderBody({ date: TARGET_DATE, failures, patterns, cost, deltaInfo, counts });
+  const body = renderBody({ date: TARGET_DATE, failures, patterns, cost, deltaInfo, counts, wcbLine });
 
   const title = `synthesis/${TARGET_DATE}`;
   const metadata = {
@@ -400,6 +424,8 @@ async function main() {
     failure_modes: failures.slice(0, 60).map(f => ({ label: f.label, count: f.count, recurring: f.recurring })),
     cost_outliers: cost.projectOutliers,
     prev_synthesis_date: deltaInfo.prevDate || null,
+    // AUR-5168 AC4: the same 7d work-class split the admission gate reads.
+    work_class_budget: workClassBudget,
   };
 
   if (DRY_RUN) {
@@ -432,7 +458,7 @@ async function main() {
 
   if (TASK_ID) {
     const link = recordId ? ` (memory record \`${recordId}\`)` : '';
-    await postComment(TASK_ID, `## SGI Loop E — Nightly Cross-Project Synthesis\n\nWrote \`${title}\`${link}, category \`synthesis\` (auto-accepted).\n\n- Recurring failure modes: **${metrics.failureModes}**\n- Strong patterns: **${metrics.strongPatterns}**\n- Cost outlier projects: **${metrics.costOutliers}**\n- Inputs synthesized: ${counts.inputs} (${counts.retros} retro · ${counts.toolGaps} tool-gap · ${counts.scorecards} scorecard · ${counts.adjusted} cost-adjusted)\n- Delta basis: ${deltaInfo.prevDate ? `prior synthesis ${deltaInfo.prevDate}` : 'baseline (no prior synthesis)'}\n\n<details><summary>Synthesis record</summary>\n\n${body}\n</details>`);
+    await postComment(TASK_ID, `## SGI Loop E — Nightly Cross-Project Synthesis\n\nWrote \`${title}\`${link}, category \`synthesis\` (auto-accepted).\n\n- Recurring failure modes: **${metrics.failureModes}**\n- Strong patterns: **${metrics.strongPatterns}**\n- Cost outlier projects: **${metrics.costOutliers}**\n- Inputs synthesized: ${counts.inputs} (${counts.retros} retro · ${counts.toolGaps} tool-gap · ${counts.scorecards} scorecard · ${counts.adjusted} cost-adjusted)${wcbLine ? `\n- ${wcbLine}` : ''}\n- Delta basis: ${deltaInfo.prevDate ? `prior synthesis ${deltaInfo.prevDate}` : 'baseline (no prior synthesis)'}\n\n<details><summary>Synthesis record</summary>\n\n${body}\n</details>`);
   }
 
   return { title, recordId, supersededRecordIds: superseded, metrics, counts };

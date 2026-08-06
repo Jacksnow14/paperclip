@@ -32,6 +32,11 @@ export const issues = pgTable(
     status: text("status").notNull().default("backlog"),
     workMode: text("work_mode").notNull().default("standard"),
     priority: text("priority").notNull().default("medium"),
+    // 'revenue' | 'self_improvement'. Nullable = not yet derived; derivation
+    // (exec.work_class token > projectId map > paperclip-repo heuristic >
+    // default revenue) always resolves a value at read time, so null only
+    // means "never computed," never "unknown forever." See AUR-5168.
+    workClass: text("work_class"),
     assigneeAgentId: uuid("assignee_agent_id").references(() => agents.id),
     assigneeUserId: text("assignee_user_id"),
     checkoutRunId: uuid("checkout_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),

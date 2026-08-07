@@ -85,6 +85,8 @@ export interface Config {
   feedbackExportBackendToken: string | undefined;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
+  productivityReviewSweepEnabled: boolean;
+  silentRunWatchdogEnabled: boolean;
   gmailIntakePollerEnabled: boolean;
   gmailIntakePollerIntervalMs: number;
   artifactRetentionProdDefault: boolean;
@@ -334,6 +336,15 @@ export function loadConfig(): Config {
     feedbackExportBackendToken,
     heartbeatSchedulerEnabled: process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
+    // Both sweeps below only ever MINT meta-issues ("Review productivity for X",
+    // stale-active-run evaluations); neither repairs run or issue state, so turning
+    // them off costs no recovery capability. Under a constrained model quota they
+    // crowd the queue with self-referential work faster than the fleet can clear it,
+    // and the only existing lever -- HEARTBEAT_SCHEDULER_ENABLED -- also stops the
+    // sweep that drives real queued work forward. `enableIssueGraphLivenessAutoRecovery`
+    // in instance settings is the equivalent switch for liveness-escalation minting.
+    productivityReviewSweepEnabled: process.env.PRODUCTIVITY_REVIEW_SWEEP_ENABLED !== "false",
+    silentRunWatchdogEnabled: process.env.SILENT_RUN_WATCHDOG_ENABLED !== "false",
     gmailIntakePollerEnabled: process.env.GMAIL_INTAKE_POLLER_ENABLED !== "false",
     gmailIntakePollerIntervalMs: Math.max(60_000, Number(process.env.GMAIL_INTAKE_POLLER_INTERVAL_MS) || 10 * 60 * 1000),
     // AUR-1735: opt-in switch that activates the AUR-1722 artifact-retention

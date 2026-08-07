@@ -32,6 +32,13 @@ export { budgetService } from "./budgets.js";
 export { secretService } from "./secrets.js";
 export { routineService } from "./routines.js";
 export { costService } from "./costs.js";
+export {
+  workClassBudgetService,
+  matchesBudgetCarveoutKeywords,
+  WORK_CLASS_CAP_SHARE,
+  BUDGET_CARVEOUT_ROOT_IDENTIFIER,
+  type WorkClassBudget,
+} from "./work-class-budget.js";
 export { financeService } from "./finance.js";
 export { heartbeatService } from "./heartbeat.js";
 export {

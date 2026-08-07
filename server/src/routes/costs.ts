@@ -18,6 +18,7 @@ import {
   issueService,
   heartbeatService,
   logActivity,
+  workClassBudgetService,
 } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { fetchAllQuotaWindows } from "../services/quota-windows.js";
@@ -61,6 +62,7 @@ export function costRoutes(
   const companies = companyService(db);
   const agents = agentService(db);
   const issues = issueService(db);
+  const workClassBudget = workClassBudgetService(db);
 
   async function resolveIssueByRef(rawId: string) {
     const identifier = normalizeIssueIdentifier(rawId);
@@ -156,6 +158,15 @@ export function costRoutes(
     const range = parseCostDateRange(req.query);
     const rows = await costs.byAgent(companyId, range);
     res.json(rows);
+  });
+
+  // AUR-5168 AC2: rolling 7-day self-improvement-vs-revenue token split, the
+  // number the AC3 admission gate and the AC4 daily-brief line both read.
+  router.get("/companies/:companyId/work-class-budget", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const budget = await workClassBudget.computeBudget(companyId);
+    res.json(budget);
   });
 
   router.get("/companies/:companyId/costs/by-agent-model", async (req, res) => {

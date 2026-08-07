@@ -80,6 +80,7 @@ import {
 import { parseIssueGraphLivenessIncidentKey } from "./recovery/origins.js";
 import { classifyIssueGraphLiveness, externalWaitFromDescription, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
 import { recoveryActionDormancyCutoff } from "./issue-recovery-actions.js";
+import { deriveWorkClass } from "./work-class.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -1660,6 +1661,7 @@ const issueListSelect = {
   status: issues.status,
   workMode: issues.workMode,
   priority: issues.priority,
+  workClass: issues.workClass,
   assigneeAgentId: issues.assigneeAgentId,
   assigneeUserId: issues.assigneeUserId,
   checkoutRunId: issues.checkoutRunId,
@@ -4408,8 +4410,28 @@ export function issueService(db: Db) {
         const issueNumber = company.issueCounter;
         const identifier = `${company.issuePrefix}-${issueNumber}`;
 
+        // AUR-5168: resolve the repo behind the issue's workspace so the
+        // paperclip-repo heuristic can fire; a null projectWorkspaceId (no
+        // project, or one without any workspace) just falls through to the
+        // derivation's own default.
+        const workClassWorkspaceRepoUrl = projectWorkspaceId
+          ? await tx
+              .select({ repoUrl: projectWorkspaces.repoUrl })
+              .from(projectWorkspaces)
+              .where(eq(projectWorkspaces.id, projectWorkspaceId))
+              .then((rows) => rows[0]?.repoUrl ?? null)
+          : null;
+        const workClass =
+          issueData.workClass ??
+          deriveWorkClass({
+            description: issueData.description,
+            projectId: issueData.projectId,
+            workspaceRepoUrl: workClassWorkspaceRepoUrl,
+          });
+
         const values = {
           ...issueData,
+          workClass,
           requestDepth: clampIssueRequestDepth(issueData.requestDepth),
           originKind: issueData.originKind ?? "manual",
           goalId: resolveIssueGoalId({

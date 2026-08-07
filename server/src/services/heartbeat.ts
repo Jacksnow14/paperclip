@@ -94,6 +94,8 @@ import {
   sanitizeRuntimeServiceBaseEnv,
 } from "./workspace-runtime.js";
 import { issueService } from "./issues.js";
+import { workClassBudgetService, matchesBudgetCarveoutKeywords } from "./work-class-budget.js";
+import { deriveWorkClass } from "./work-class.js";
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
@@ -2541,6 +2543,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const secretsSvc = secretService(db);
   const companySkills = companySkillService(db);
   const issuesSvc = issueService(db);
+  const workClassBudget = workClassBudgetService(db);
   const treeControlSvc = issueTreeControlService(db);
   const executionWorkspacesSvc = executionWorkspaceService(db);
   const environmentsSvc = environmentService(db);
@@ -7657,6 +7660,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         id: issues.id,
         status: issues.status,
         priority: issues.priority,
+        workClass: issues.workClass,
+        title: issues.title,
+        description: issues.description,
+        projectId: issues.projectId,
+        projectWorkspaceId: issues.projectWorkspaceId,
       })
       .from(issues)
       .where(
@@ -7665,6 +7673,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           : sql`false`,
       );
     const issueById = new Map(issueRows.map((row) => [row.id, row]));
+    // AUR-5168 AC3: the gate must agree with computeBudget()'s fallback —
+    // re-derive workClass for rows where the backfill hasn't reached the
+    // column yet, instead of treating null as "not self_improvement".
+    const queuedWorkspaceIds = [
+      ...new Set(issueRows.map((row) => row.projectWorkspaceId).filter((id): id is string => !!id)),
+    ];
+    const queuedRepoUrlByWorkspaceId = new Map<string, string | null>();
+    if (queuedWorkspaceIds.length > 0) {
+      const workspaceRows = await db
+        .select({ id: projectWorkspaces.id, repoUrl: projectWorkspaces.repoUrl })
+        .from(projectWorkspaces)
+        .where(inArray(projectWorkspaces.id, queuedWorkspaceIds));
+      for (const workspace of workspaceRows) {
+        queuedRepoUrlByWorkspaceId.set(workspace.id, workspace.repoUrl);
+      }
+    }
+    const effectiveWorkClassById = new Map(
+      issueRows.map((row) => [
+        row.id,
+        row.workClass ??
+          deriveWorkClass({
+            description: row.description,
+            projectId: row.projectId,
+            workspaceRepoUrl: row.projectWorkspaceId
+              ? queuedRepoUrlByWorkspaceId.get(row.projectWorkspaceId) ?? null
+              : null,
+          }),
+      ]),
+    );
     const prioritizedRuns = [...queuedRuns].sort((left, right) => {
       const leftIssueId = readNonEmptyString(parseObject(left.contextSnapshot).issueId);
       const rightIssueId = readNonEmptyString(parseObject(right.contextSnapshot).issueId);
@@ -7684,8 +7721,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
 
     const diskPressure = checkDiskPressure();
+    // AUR-5168 AC3: only spend a budget query when a queued issue could
+    // actually be gated by it — most heartbeat cycles have no
+    // self_improvement work queued at all.
+    const hasQueuedSelfImprovementIssue = issueRows.some(
+      (row) => effectiveWorkClassById.get(row.id) === "self_improvement",
+    );
+    const workClassBudgetSnapshot = hasQueuedSelfImprovementIssue
+      ? await workClassBudget.computeBudget(agent.companyId)
+      : null;
     const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
     let diskShedCount = 0;
+    let budgetShedCount = 0;
     for (const queuedRun of prioritizedRuns) {
       if (claimedRuns.length >= availableSlots) break;
       // Disk pressure gate: shed non-critical run admission until disk recovers.
@@ -7698,6 +7745,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           continue;
         }
       }
+      // AUR-5168 AC3: once the trailing-7d self-improvement token share hits
+      // the 10% cap, leave self_improvement runs queued (not failed) unless
+      // they fall under one of the founder-named hard carve-outs. Dispatch is
+      // FIFO, not priority-ordered, so this is the only enforcement point.
+      if (workClassBudgetSnapshot?.overCap) {
+        const queuedIssueId = readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId);
+        const queuedIssue = queuedIssueId ? issueById.get(queuedIssueId) : null;
+        if (queuedIssue && effectiveWorkClassById.get(queuedIssue.id) === "self_improvement") {
+          const exempt =
+            matchesBudgetCarveoutKeywords(queuedIssue.title) ||
+            (queuedIssueId ? await workClassBudget.isUnderBudgetCarveoutRoot(queuedIssueId) : false);
+          if (!exempt) {
+            budgetShedCount += 1;
+            continue;
+          }
+        }
+      }
       const claimed = await claimQueuedRun(queuedRun);
       if (claimed) claimedRuns.push(claimed);
     }
@@ -7708,6 +7772,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       logger.info(
         { agentId, diskShedCount, claimedCount: claimedRuns.length, availableSlots },
         "startNextQueuedRunForAgent: disk pressure shed non-critical queued runs",
+      );
+    }
+    if (budgetShedCount > 0 && workClassBudgetSnapshot) {
+      logger.info(
+        {
+          agentId,
+          budgetShedCount,
+          claimedCount: claimedRuns.length,
+          availableSlots,
+          selfImprovementShare: workClassBudgetSnapshot.selfImprovementShare,
+          capShare: workClassBudgetSnapshot.capShare,
+        },
+        `startNextQueuedRunForAgent: skipped ${budgetShedCount} self_improvement run(s), self-improvement 7d share ${(workClassBudgetSnapshot.selfImprovementShare * 100).toFixed(1)}% >= cap ${(workClassBudgetSnapshot.capShare * 100).toFixed(0)}%`,
       );
     }
     if (claimedRuns.length === 0) return [];

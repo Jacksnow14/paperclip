@@ -20,6 +20,15 @@
 # the one channel proven to work (Telegram, see /home/ievgen/bot/notify_founder.sh
 # and AUR-3930) — but GRADED, because the drift classes are not the same event.
 #
+# SEVERITY (AUR-5355, 2026-08-07): deploy-debt and checkout-debt are
+# fleet-internal telemetry the founder cannot act on directly — they were
+# saturating his Telegram window (~14 SEV2s in 13h, mostly this + the
+# dark-lane watchdog) and burying the one message that actually needed a
+# founder click. Both now escalate at INFO (stays in the audit log, never
+# reaches the phone). provenance / quiescence-wait / dark-armed / merge-debt
+# are unchanged at SEV2 — none of them were part of the observed noise, and
+# each names a state the fleet cannot silently self-recover from.
+#
 # RETUNED for auto-deploy (AUR-4028): once the arm automation exists, a
 # threshold tuned for the manual world is wrong. The daemon writes a state file
 # (armed SHA, waiting-since, running count, last tick); this check reads it and
@@ -423,16 +432,22 @@ else:
         % (hours, klass, reason, extra, os.environ["RUNNING_SHA"], os.environ["MASTER_SHA"],
            os.environ["ISSUE_URL"], note)
     )
-print("ALERT\t%s" % text)
+# AUR-5355: deploy-debt/checkout-debt are fleet-internal noise the founder
+# cannot act on and are demoted to INFO (logged, never delivered); every
+# other klass keeps paging at SEV2.
+severity = "INFO" if klass in ("deploy-debt", "checkout-debt") else "SEV2"
+print("ALERT\t%s\t%s" % (severity, text))
 ' 2>/dev/null || printf 'QUIET\tescalation-gate-failed'
   )
 
   local verdict=${decision%%$'\t'*}
-  local detail=${decision#*$'\t'}
+  local rest=${decision#*$'\t'}
+  local severity=${rest%%$'\t'*}
+  local detail=${rest#*$'\t'}
 
   if [[ "$verdict" == "ALERT" ]]; then
-    if [[ -x "$NOTIFY" ]] && "$NOTIFY" SEV2 "$detail"; then
-      echo "paperclip deploy drift: escalated to founder (SEV2): $detail" >&2
+    if [[ -x "$NOTIFY" ]] && "$NOTIFY" "$severity" "$detail"; then
+      echo "paperclip deploy drift: escalated to founder ($severity): $detail" >&2
     else
       # Never swallow a delivery failure — that is the exact failure shape
       # AUR-3930 documents. A missed page must be visible in the journal.

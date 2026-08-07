@@ -12,6 +12,9 @@ import type {
 
 export interface AgentPermissions {
   canCreateAgents: boolean;
+  // Narrow grant: metadata-only PATCH /api/agents/:id on other agents
+  // (AUR-5026). Optional so existing literal constructors stay valid.
+  canUpdateAgentMetadata?: boolean;
 }
 
 export interface AgentModelProfileConfig {

@@ -5,10 +5,8 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   activityLog,
   agents,
-  agentRuntimeState,
   agentWakeupRequests,
   budgetPolicies,
-  companySkills,
   companies,
   costEvents,
   createDb,
@@ -16,19 +14,18 @@ import {
   documents,
   environmentLeases,
   environments,
-  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueDocuments,
   issueRecoveryActions,
   issueRelations,
-  issueTreeHoldMembers,
   issueTreeHolds,
   issueWorkProducts,
   issues,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
+  resetEmbeddedPostgresTestDatabase,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { runningProcesses } from "../adapters/index.ts";
@@ -320,47 +317,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     await waitForHeartbeatIdle(db, 5_000);
     await new Promise((resolve) => setTimeout(resolve, 100));
-    // Background recovery work (settling runs, deferred wakes, work-product writes) can
-    // still insert rows between any two deletes below despite the idle-waits above, which
-    // surfaces as a 23503 FK violation partway through the cascade. Retrying only the
-    // single failing delete cannot recover (its dependents were re-inserted upstream), so
-    // retry the whole ordered cascade until it completes cleanly.
-    const cascadeDelete = async () => {
-      await db.delete(activityLog);
-      await db.delete(agentRuntimeState);
-      await db.delete(companySkills);
-      await db.delete(costEvents);
-      await db.delete(environmentLeases);
-      await db.delete(environments);
-      await db.delete(issueWorkProducts);
-      await db.delete(issueComments);
-      await db.delete(issueDocuments);
-      await db.delete(documentRevisions);
-      await db.delete(documents);
-      await db.delete(issueRelations);
-      await db.delete(issueRecoveryActions);
-      await db.delete(issueTreeHoldMembers);
-      await db.delete(issueTreeHolds);
-      await db.delete(issues);
-      await db.delete(activityLog);
-      await db.delete(heartbeatRunEvents);
-      await db.delete(heartbeatRuns);
-      await db.delete(agentWakeupRequests);
-      await db.delete(budgetPolicies);
-      await db.delete(agentRuntimeState);
-      await db.delete(agents);
-      await db.delete(companySkills);
-      await db.delete(companies);
-    };
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      try {
-        await cascadeDelete();
-        break;
-      } catch (error) {
-        if (attempt === 9) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
-    }
+    // Background recovery work (settling runs, deferred wakes, work-product
+    // writes) can still insert rows during teardown despite the idle-waits
+    // above — the shared reset truncates every table in one atomic statement
+    // so there is no between-deletes window to race (AUR-5103).
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {

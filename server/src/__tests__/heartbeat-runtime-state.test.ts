@@ -1,17 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import {
-  agents,
-  agentRuntimeState,
-  agentWakeupRequests,
-  companies,
-  createDb,
-  heartbeatRunEvents,
-  heartbeatRuns,
-} from "@paperclipai/db";
+import { agents, agentRuntimeState, companies, createDb } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
+  resetEmbeddedPostgresTestDatabase,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
@@ -35,12 +28,7 @@ describeEmbeddedPostgres("heartbeat runtime state deduplication", () => {
   }, 20_000);
 
   afterEach(async () => {
-    await db.delete(heartbeatRunEvents);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(agents);
-    await db.delete(companies);
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {

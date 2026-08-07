@@ -2,26 +2,22 @@ import { randomUUID } from "node:crypto";
 import { eq, inArray, or, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  activityLog,
   agents,
-  agentRuntimeState,
   agentWakeupRequests,
   companies,
-  companySkills,
   createDb,
   documentRevisions,
   documents,
-  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueDocuments,
   issueRelations,
-  issueTreeHolds,
   issues,
 } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
+  resetEmbeddedPostgresTestDatabase,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import {
@@ -101,36 +97,7 @@ async function cleanupHeartbeatInvalidationFixture(db: ReturnType<typeof createD
     .set({ status: "cancelled", finishedAt: new Date(), updatedAt: new Date() })
     .where(or(eq(heartbeatRuns.status, "queued"), eq(heartbeatRuns.status, "running")));
 
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    try {
-      await db.delete(companySkills);
-      await db.delete(issueComments);
-      await db.delete(issueDocuments);
-      await db.delete(documentRevisions);
-      await db.delete(documents);
-      await db.delete(issueRelations);
-      await db.delete(issueTreeHolds);
-      await db.delete(issues);
-      await db.delete(heartbeatRunEvents);
-      await db.delete(activityLog);
-      await db.delete(heartbeatRuns);
-      await db.delete(agentWakeupRequests);
-      await db.delete(agentRuntimeState);
-      await db.delete(agents);
-      await db.delete(companies);
-      return;
-    } catch (error) {
-      const isFkViolation =
-        error instanceof Error && error.message.includes("23503");
-      if (!isFkViolation || attempt === 4) {
-        throw error;
-      }
-
-      // Heartbeat completion can lazily re-insert child rows (issue comments,
-      // company skills) after the first delete sweep. Re-clear and retry.
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-  }
+  await resetEmbeddedPostgresTestDatabase(db);
 }
 
 type SeedOptions = {

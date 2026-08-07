@@ -29,6 +29,17 @@ export const resubmitApprovalSchema = z.object({
 
 export type ResubmitApproval = z.infer<typeof resubmitApprovalSchema>;
 
+// AUR-5344. Withdrawal is monotonic by construction: it can only remove a
+// request from the queue, never redefine what a board member is about to
+// authorize. `supersededByApprovalId` points forward at the replacement so a
+// retired duplicate is visibly linked to the row that took its place.
+export const withdrawApprovalSchema = z.object({
+  reason: multilineTextSchema.optional().nullable(),
+  supersededByApprovalId: z.string().uuid().optional().nullable(),
+});
+
+export type WithdrawApproval = z.infer<typeof withdrawApprovalSchema>;
+
 export const addApprovalCommentSchema = z.object({
   body: multilineTextSchema.pipe(z.string().min(1)),
 });

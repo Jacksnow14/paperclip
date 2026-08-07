@@ -11,6 +11,11 @@ export interface Approval {
   decisionNote: string | null;
   decidedByUserId: string | null;
   decidedAt: Date | null;
+  withdrawnAt: Date | null;
+  withdrawnByAgentId: string | null;
+  withdrawnByUserId: string | null;
+  withdrawalReason: string | null;
+  supersededByApprovalId: string | null;
   createdAt: Date;
   updatedAt: Date;
 }

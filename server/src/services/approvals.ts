@@ -208,6 +208,68 @@ export function approvalService(db: Db) {
         .then((rows) => rows[0]);
     },
 
+    // AUR-5344. A requester that discovers its own approval is defective must be
+    // able to retire it. Deliberately NOT modelled as a resubmit: mutating a
+    // pending row in place lets a board member read v1, click approve, and
+    // authorize v2. Withdrawal is monotonic — it can only remove authority, so
+    // the worst case for a mid-read board member is a fail-closed 422.
+    withdraw: async (
+      id: string,
+      actor: { agentId?: string | null; userId?: string | null },
+      options: { reason?: string | null; supersededByApprovalId?: string | null } = {},
+    ): Promise<ResolutionResult> => {
+      const existing = await getExistingApproval(id);
+      if (existing.status === "withdrawn") {
+        return { approval: existing, applied: false };
+      }
+      if (!canResolveStatuses.has(existing.status)) {
+        throw unprocessable("Only pending or revision requested approvals can be withdrawn");
+      }
+
+      const supersededBy = options.supersededByApprovalId ?? null;
+      if (supersededBy) {
+        if (supersededBy === id) {
+          throw unprocessable("An approval cannot supersede itself");
+        }
+        const replacement = await db
+          .select({ id: approvals.id, companyId: approvals.companyId })
+          .from(approvals)
+          .where(eq(approvals.id, supersededBy))
+          .then((rows) => rows[0] ?? null);
+        if (!replacement || replacement.companyId !== existing.companyId) {
+          throw unprocessable("Superseding approval not found in this company");
+        }
+      }
+
+      const now = new Date();
+      const updated = await db
+        .update(approvals)
+        .set({
+          status: "withdrawn",
+          withdrawnAt: now,
+          withdrawnByAgentId: actor.agentId ?? null,
+          withdrawnByUserId: actor.userId ?? null,
+          withdrawalReason: options.reason ?? null,
+          supersededByApprovalId: supersededBy,
+          updatedAt: now,
+        })
+        .where(and(eq(approvals.id, id), inArray(approvals.status, resolvableStatuses)))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      if (updated) {
+        return { approval: updated, applied: true };
+      }
+
+      // Lost the race against a concurrent board decision (or another
+      // withdrawal). Re-read and fail closed unless it is already withdrawn.
+      const latest = await getExistingApproval(id);
+      if (latest.status === "withdrawn") {
+        return { approval: latest, applied: false };
+      }
+      throw unprocessable("Only pending or revision requested approvals can be withdrawn");
+    },
+
     resubmit: async (id: string, payload?: Record<string, unknown>) => {
       const existing = await getExistingApproval(id);
       if (existing.status !== "revision_requested") {

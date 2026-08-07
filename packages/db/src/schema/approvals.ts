@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, jsonb, index } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, jsonb, index, type AnyPgColumn } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 
@@ -15,6 +15,16 @@ export const approvals = pgTable(
     decisionNote: text("decision_note"),
     decidedByUserId: text("decided_by_user_id"),
     decidedAt: timestamp("decided_at", { withTimezone: true }),
+    // Withdrawal (AUR-5344) is deliberately kept off the decided_* columns: a
+    // requester retiring its own defective row must never be mistakable for a
+    // board decision.
+    withdrawnAt: timestamp("withdrawn_at", { withTimezone: true }),
+    withdrawnByAgentId: uuid("withdrawn_by_agent_id").references(() => agents.id),
+    withdrawnByUserId: text("withdrawn_by_user_id"),
+    withdrawalReason: text("withdrawal_reason"),
+    supersededByApprovalId: uuid("superseded_by_approval_id").references(
+      (): AnyPgColumn => approvals.id,
+    ),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

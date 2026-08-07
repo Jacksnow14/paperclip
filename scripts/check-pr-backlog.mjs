@@ -19,16 +19,37 @@
  *   - One issue per repo#PR@sha7. A new push to the PR re-arms dispatch for
  *     the new sha; the state file remembers the last filed sha per (repo, PR).
  *   - Draft PRs are skipped (author explicitly opted out of review).
+ *   - Self-healing after a purge (AUR-5370): a `filedSha` match alone no
+ *     longer means "handled" — filing an issue is not the same as it being
+ *     reviewed. Each sweep resolves the previously-filed issue's terminal
+ *     state: `cancelled` or not-found re-files (a cancelled review is
+ *     unreviewed work, not finished work); `done` while the PR is STILL OPEN
+ *     is logged loudly as a pipeline defect and re-files; any open status
+ *     skips, as before. Re-files are capped at 3 per (PR, sha) — the 4th
+ *     would-be re-file escalates as a pipeline alarm instead of filing a
+ *     5th issue, so a permanently-broken PR pages instead of looping forever.
+ *   - Reviewer fan-out (AUR-5370): --reviewers "Name A,Name B" (or the
+ *     single-name --reviewer alias) names candidate lanes. A lane is dropped
+ *     if unhealthy — `status: idle` proves nothing; a quota-starved lane
+ *     also reports idle — so health is read from its own recent runs
+ *     (GET /api/agents/{id}/runs), not its status field. Among healthy
+ *     lanes, PRs are distributed least-loaded-first by queued run count, so
+ *     one lane never again absorbs the whole backlog. Fails loud (exit 2) if
+ *     zero lanes are healthy — never files unassigned issues.
+ *   - Author exclusion (AUR-5370): every PR here is authored by the same
+ *     GitHub machine account, so GitHub author metadata can't discriminate.
+ *     The AUR-NNNN token in the PR title is looked up; that issue's
+ *     assignee is excluded from the candidate set for that PR (falls back
+ *     to the full set if exclusion would empty it). No token → no exclusion.
+ *   - Per-run cap (AUR-5370): --max-file N (default 6) caps how many review
+ *     issues one sweep files, across all repos combined, prioritizing
+ *     safety/guardrail PRs and then oldest-first. Every PR the cap drops is
+ *     logged — a silent truncation reads as "backlog handled" when it isn't.
  *   - PRs still open past --stale-hours (default 72) escalate via the alert
  *     command (Telegram) as ONE batched message per repo per run, rate-limited
  *     to once per 24h per PR. Escalation is an alarm about the PIPELINE
  *     (reviewer not landing work), never a request for the founder to review
  *     code — and a backlog of N stale PRs is one alarm, not N pages.
- *   - Reviewer resolution: --reviewer name (default "Claude Code Max"),
- *     matched against /agents by exact name; instances in error/terminated
- *     status are ignored; prefer running > idle. Fail LOUD (exit 2) if no
- *     usable instance — a dispatcher that silently files unassigned issues
- *     reads as "backlog handled" while nothing executes.
  *   - Liveness contract (AUR-5111): every sweep prints one summary line per
  *     repo (`repo=... open=N to-file=M ...`) BEFORE doing anything else with
  *     the result, and a repo whose PRs cannot be enumerated logs FATAL and
@@ -47,7 +68,9 @@
  *   node scripts/check-pr-backlog.mjs --dry-run      # sweep, print, file nothing
  *   --repo owner/name[,owner/name...]   (repeatable; default sweeps
  *                                        Jacksnow14/paperclip AND Jacksnow14/Auranode)
- *   --reviewer NAME      (default "Claude Code Max")
+ *   --reviewers "Name A,Name B"   (default "Claude Code Max,Claude Code Fast")
+ *   --reviewer NAME               (single-name alias for --reviewers NAME)
+ *   --max-file N         (default 6 — cap on review issues filed per run)
  *   --stale-hours H      (default 72)
  *   --state-dir DIR      (default $HOME/.paperclip/pr-review-dispatch)
  *   --alert-cmd PATH     (default /home/ievgen/bot/telegram-alert.sh)
@@ -62,6 +85,9 @@ import process from 'node:process';
 
 const HOUR_MS = 60 * 60 * 1000;
 const ESCALATION_INTERVAL_MS = 24 * HOUR_MS;
+const REFILE_CAP = 3;
+const DEFAULT_REVIEWERS = ['Claude Code Max', 'Claude Code Fast'];
+const STARVATION_PATTERN = /quota|usage limit|session limit/i;
 
 export const DEFAULT_REPOS = ['Jacksnow14/paperclip', 'Jacksnow14/Auranode'];
 
@@ -82,18 +108,56 @@ export function migrateState(state) {
   return { version: 2, prs };
 }
 
-/** Pure: decide which PRs need a review issue filed and which escalate. */
-export function decideActions({ repo, prs, state, nowMs, staleHours }) {
+/**
+ * Pure: decide which PRs need a review issue filed, which need a fresh
+ * re-file because the previously-filed issue died without the PR landing,
+ * which have hit the re-file cap and escalate instead, and which are stale.
+ *
+ * `issueStatuses` maps filedIssueId -> Paperclip issue status string, or
+ * `null` for "looked up, not found". An entry whose filedSha matches the PR
+ * but has no filedIssueId (legacy state) is left alone — there is nothing
+ * to verify. An id present in state but absent from issueStatuses means the
+ * caller chose not to look it up (e.g. no API creds in --dry-run); that is
+ * treated the same as "not found" so re-file lookups fail SAFE toward
+ * re-checking, never toward silently trusting a stale filedSha forever.
+ */
+export function decideActions({ repo, prs, state, nowMs, staleHours, issueStatuses = {} }) {
   const file = [];
   const escalate = [];
+  const refileCapped = [];
   for (const pr of prs) {
     if (pr.draft) continue;
     const sha7 = (pr.headSha ?? '').slice(0, 7);
     if (!sha7) continue;
-    const entry = state.prs?.[stateKey(repo, pr.number)] ?? {};
+    const key = stateKey(repo, pr.number);
+    const entry = state.prs?.[key] ?? {};
+
     if (entry.filedSha !== sha7) {
-      file.push({ number: pr.number, sha7, title: pr.title });
+      file.push({ number: pr.number, sha7, title: pr.title, createdAt: pr.createdAt });
+    } else if (entry.filedIssueId) {
+      const status = issueStatuses[entry.filedIssueId];
+      let reason = null;
+      if (status === 'cancelled') reason = 'cancelled';
+      else if (status === undefined || status === null) reason = 'not-found';
+      else if (status === 'done') reason = 'done-but-open';
+
+      if (reason) {
+        const refileCount = entry.refileCount ?? 0;
+        if (refileCount < REFILE_CAP) {
+          file.push({
+            number: pr.number,
+            sha7,
+            title: pr.title,
+            createdAt: pr.createdAt,
+            refileReason: reason,
+            refileCount: refileCount + 1,
+          });
+        } else {
+          refileCapped.push({ number: pr.number, title: pr.title, refileCount, reason });
+        }
+      }
     }
+
     const ageMs = nowMs - Date.parse(pr.createdAt ?? '');
     const lastEsc = entry.escalatedAt ? Date.parse(entry.escalatedAt) : 0;
     if (
@@ -104,16 +168,83 @@ export function decideActions({ repo, prs, state, nowMs, staleHours }) {
       escalate.push({ number: pr.number, ageHours: Math.floor(ageMs / HOUR_MS), title: pr.title });
     }
   }
-  return { file, escalate };
+  return { file, escalate, refileCapped };
 }
 
-/** Pure: pick the reviewer agent instance. running > idle; never error/terminated. */
+/** Pure: does this PR's title read as safety/guardrail-critical? Files before chores under the cap. */
+export function isSafetyCritical(title) {
+  return /safety|guardrail/i.test(title ?? '');
+}
+
+/** Pure: cap the combined (multi-repo) file list, safety/guardrail first, then oldest-first. */
+export function applyFileCap(items, maxFile) {
+  const sorted = [...items].sort((a, b) => {
+    const pa = isSafetyCritical(a.title) ? 0 : 1;
+    const pb = isSafetyCritical(b.title) ? 0 : 1;
+    if (pa !== pb) return pa - pb;
+    return (Date.parse(a.createdAt ?? '') || 0) - (Date.parse(b.createdAt ?? '') || 0);
+  });
+  return { kept: sorted.slice(0, maxFile), dropped: sorted.slice(maxFile) };
+}
+
+/** Pure: the quota-starved-run signature — failed, quota-flavored message, no tokens billed. */
+export function isStarvedRun(run) {
+  if (run?.status !== 'failed') return false;
+  const text = String(run.error ?? '');
+  if (!STARVATION_PATTERN.test(text)) return false;
+  const tokens = (run.usageJson?.inputTokens ?? 0) + (run.usageJson?.outputTokens ?? 0);
+  return tokens === 0;
+}
+
+/**
+ * Pure: lane health from its own recent runs, never its `status` field —
+ * `status: idle` is reported identically by a healthy lane and a
+ * quota-starved one. Unhealthy iff the MOST RECENT run is a starved
+ * failure (an older starved run the lane has since recovered from must not
+ * permanently disqualify it).
+ */
+export function assessLaneHealth(runs) {
+  const list = Array.isArray(runs) ? runs : [];
+  const queuedCount = list.filter((r) => r.status === 'queued').length;
+  const mostRecent = list[0];
+  const healthy = !mostRecent || !isStarvedRun(mostRecent);
+  return { healthy, queuedCount };
+}
+
+/** Pure: pick the reviewer agent instance for a lane name. running > idle; never error/terminated. */
 export function pickReviewer(agents, name) {
   const usable = agents.filter(
     (a) => a.name === name && !['error', 'terminated'].includes(a.status ?? ''),
   );
   usable.sort((a, b) => (a.status === 'running' ? -1 : 1) - (b.status === 'running' ? -1 : 1));
   return usable[0] ?? null;
+}
+
+/** Pure: extract the AUR-NNNN token from a PR title, or null. */
+export function extractAurToken(title) {
+  const m = /AUR-(\d+)/.exec(title ?? '');
+  return m ? `AUR-${m[1]}` : null;
+}
+
+/**
+ * Pure: least-loaded-first distribution of file items across healthy
+ * candidate lanes. Each candidate is `{ id, name, queuedCount }`. An item
+ * may carry `excludeAgentId` (the PR's own AUR-token assignee) — skipped for
+ * that item unless excluding it would empty the pool, in which case the
+ * exclusion is dropped for that one item rather than leaving it unassigned.
+ */
+export function distributeReviewers(items, candidates) {
+  const counters = candidates.map((c) => ({ ...c, load: c.queuedCount ?? 0 }));
+  return items.map((item) => {
+    const allowed = item.excludeAgentId
+      ? counters.filter((c) => c.id !== item.excludeAgentId)
+      : counters;
+    const pool = allowed.length > 0 ? allowed : counters;
+    pool.sort((a, b) => a.load - b.load);
+    const chosen = pool[0];
+    chosen.load += 1;
+    return { ...item, reviewerId: chosen.id, reviewerName: chosen.name };
+  });
 }
 
 export function issueTitle(pr, repo) {
@@ -136,12 +267,30 @@ export function escalationMessage(repo, escalate, staleHours) {
   );
 }
 
+/** Pure: one alarm per repo when PRs hit the re-file cap — the dispatcher stopped looping, not gave up. */
+export function refileCapMessage(repo, capped) {
+  const shown = capped.map((c) => `#${c.number}(${c.refileCount}x ${c.reason})`).join(' ');
+  return (
+    `pr-backlog[${repo}]: ${capped.length} PR(s) hit the ${REFILE_CAP}-re-file cap without a ` +
+    `landing review — ${shown}. The review pipeline is repeatedly failing on these PRs; needs ` +
+    `manual intervention (this is a pipeline alarm, not a code-review request).`
+  );
+}
+
 export function issueBody(pr, repo) {
   return [
     `Filed automatically by scripts/check-pr-backlog.mjs — the PR-backlog dispatcher.`,
     '',
     `**PR:** https://github.com/${repo}/pull/${pr.number} — ${pr.title}`,
     `**Head:** \`${pr.sha7}\` (this issue covers exactly this head; a new push re-files).`,
+    ...(pr.refileReason
+      ? [
+          '',
+          `**Re-file (attempt ${pr.refileCount}/${REFILE_CAP}):** the previously-filed review issue ` +
+            `for this exact head ended in \`${pr.refileReason}\` without the PR landing. A ` +
+            'cancelled or missing review issue is unreviewed work, not finished work.',
+        ]
+      : []),
     '',
     '## Your mandate',
     '',
@@ -178,13 +327,16 @@ export function issueBody(pr, repo) {
     '',
     'When the work is finished this issue must be done and the PR must be either',
     'merged or closed — an open PR with a done review issue is a pipeline defect.',
+    'If you cancel this issue without landing or closing the PR, the next sweep',
+    'will re-file it — cancelling is not a way to make a PR disappear.',
   ].join('\n');
 }
 
 function parseArgs(argv) {
   const args = {
     repos: [],
-    reviewer: 'Claude Code Max',
+    reviewers: [],
+    maxFile: 6,
     staleHours: 72,
     stateDir: join(process.env.HOME ?? '/home/ievgen', '.paperclip', 'pr-review-dispatch'),
     alertCmd: '/home/ievgen/bot/telegram-alert.sh',
@@ -201,7 +353,15 @@ function parseArgs(argv) {
           .map((r) => r.trim())
           .filter(Boolean),
       );
-    } else if (a === '--reviewer') args.reviewer = argv[++i];
+    } else if (a === '--reviewers') {
+      args.reviewers.push(
+        ...String(argv[++i] ?? '')
+          .split(',')
+          .map((r) => r.trim())
+          .filter(Boolean),
+      );
+    } else if (a === '--reviewer') args.reviewers.push(argv[++i]);
+    else if (a === '--max-file') args.maxFile = Number(argv[++i]);
     else if (a === '--stale-hours') args.staleHours = Number(argv[++i]);
     else if (a === '--state-dir') args.stateDir = argv[++i];
     else if (a === '--alert-cmd') args.alertCmd = argv[++i];
@@ -209,6 +369,7 @@ function parseArgs(argv) {
     else throw new Error(`unknown argument: ${a}`);
   }
   if (args.repos.length === 0) args.repos = [...DEFAULT_REPOS];
+  if (args.reviewers.length === 0) args.reviewers = [...DEFAULT_REVIEWERS];
   return args;
 }
 
@@ -245,6 +406,68 @@ async function api(args, method, path, body) {
   return res.json();
 }
 
+/** Best-effort: fetch statuses for every filedIssueId that might need re-file verification. */
+async function fetchIssueStatuses(args, repo, prs, state) {
+  const ids = new Set();
+  for (const pr of prs) {
+    if (pr.draft) continue;
+    const sha7 = (pr.headSha ?? '').slice(0, 7);
+    if (!sha7) continue;
+    const entry = state.prs?.[stateKey(repo, pr.number)];
+    if (entry && entry.filedSha === sha7 && entry.filedIssueId) ids.add(entry.filedIssueId);
+  }
+  const statuses = {};
+  for (const id of ids) {
+    try {
+      const issue = await api(args, 'GET', `/api/issues/${id}`);
+      statuses[id] = issue.status ?? null;
+    } catch {
+      statuses[id] = null; // not found / unreachable — fail safe toward re-checking, per decideActions doc.
+    }
+  }
+  return statuses;
+}
+
+/** Best-effort: resolve the AUR-token issue's assignee, to exclude the PR's own author-issue owner. */
+async function resolveAuthorExclusion(args, title) {
+  const token = extractAurToken(title);
+  if (!token) return null;
+  try {
+    const issue = await api(args, 'GET', `/api/issues/${token}`);
+    return issue.assigneeAgentId ?? null;
+  } catch {
+    return null; // no exclusion signal — do not fail the dispatch over a lookup miss.
+  }
+}
+
+async function resolveHealthyLanes(args, companyId) {
+  const agents = await api(args, 'GET', `/api/companies/${companyId}/agents`);
+  const list = Array.isArray(agents) ? agents : agents.agents ?? [];
+  const lanes = [];
+  for (const name of args.reviewers) {
+    const instance = pickReviewer(list, name);
+    if (!instance) {
+      console.error(`lane "${name}": no usable agent instance — dropped.`);
+      continue;
+    }
+    let runs = [];
+    try {
+      runs = await api(args, 'GET', `/api/agents/${instance.id}/runs?limit=40`);
+    } catch (err) {
+      console.error(`lane "${name}": could not read runs (${err.message}) — treating as unhealthy.`);
+      continue;
+    }
+    const health = assessLaneHealth(Array.isArray(runs) ? runs : []);
+    if (!health.healthy) {
+      console.error(`lane "${name}": STARVED (most recent run is a quota failure) — dropped.`);
+      continue;
+    }
+    console.log(`lane "${name}": healthy, queued=${health.queuedCount}`);
+    lanes.push({ id: instance.id, name, queuedCount: health.queuedCount });
+  }
+  return lanes;
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   const apiKey = process.env.PAPERCLIP_API_KEY;
@@ -253,6 +476,7 @@ async function main() {
     console.error('FATAL: PAPERCLIP_API_KEY / PAPERCLIP_COMPANY_ID not set — cannot dispatch.');
     process.exit(2);
   }
+  const haveCreds = Boolean(apiKey && companyId);
 
   const state = loadState(args.stateDir);
   const sweeps = [];
@@ -273,63 +497,105 @@ async function main() {
       enumerationFailures += 1;
       continue;
     }
-    const { file, escalate } = decideActions({
+    // Re-file verification needs live issue status; skip gracefully without creds (e.g. dry-run).
+    const issueStatuses = haveCreds ? await fetchIssueStatuses(args, repo, openPrs, state) : {};
+    const { file, escalate, refileCapped } = decideActions({
       repo,
       prs: openPrs,
       state,
       nowMs: Date.now(),
       staleHours: args.staleHours,
+      issueStatuses,
     });
     // The liveness line: printed before anything else can fail, one per repo.
     console.log(
-      `repo=${repo} open=${openPrs.length} to-file=${file.length} to-escalate=${escalate.length} (reviewer: ${args.reviewer})`,
+      `repo=${repo} open=${openPrs.length} to-file=${file.length} to-escalate=${escalate.length} ` +
+        `refile-capped=${refileCapped.length} (reviewers: ${args.reviewers.join(', ')})`,
     );
-    sweeps.push({ repo, file, escalate });
+    for (const f of file) {
+      if (f.refileReason === 'done-but-open') {
+        console.error(
+          `PIPELINE DEFECT: repo=${repo} #${f.number}@${f.sha7} — filed issue was done but PR is ` +
+            'still open. Re-filing.',
+        );
+      } else if (f.refileReason) {
+        console.error(
+          `repo=${repo} #${f.number}@${f.sha7} — previous review issue ended ${f.refileReason}; ` +
+            `re-filing (attempt ${f.refileCount}/${REFILE_CAP}).`,
+        );
+      }
+    }
+    for (const c of refileCapped) {
+      console.error(
+        `repo=${repo} #${c.number} — hit the ${REFILE_CAP}-re-file cap (${c.reason}); escalating ` +
+          'instead of filing again.',
+      );
+    }
+    sweeps.push({ repo, file, escalate, refileCapped });
+  }
+
+  const combinedFile = sweeps.flatMap((s) => s.file.map((f) => ({ ...f, repo: s.repo })));
+  const { kept, dropped } = applyFileCap(combinedFile, args.maxFile);
+  if (dropped.length > 0) {
+    for (const d of dropped) {
+      console.error(`CAP: dropped ${d.repo}#${d.number}@${d.sha7} this run (--max-file ${args.maxFile}).`);
+    }
   }
 
   if (args.dryRun) {
+    for (const f of kept) console.log(`DRY-RUN: would file ${issueTitle(f, f.repo)}`);
     for (const s of sweeps) {
-      for (const f of s.file) console.log(`DRY-RUN: would file ${issueTitle(f, s.repo)}`);
       if (s.escalate.length > 0) {
         console.log(`DRY-RUN: would alert: ${escalationMessage(s.repo, s.escalate, args.staleHours)}`);
+      }
+      if (s.refileCapped.length > 0) {
+        console.log(`DRY-RUN: would alert: ${refileCapMessage(s.repo, s.refileCapped)}`);
       }
     }
     if (enumerationFailures > 0) process.exit(2);
     return;
   }
 
-  const totalToFile = sweeps.reduce((n, s) => n + s.file.length, 0);
-  let reviewer = null;
-  if (totalToFile > 0) {
-    const agents = await api(args, 'GET', `/api/companies/${companyId}/agents`);
-    reviewer = pickReviewer(Array.isArray(agents) ? agents : agents.agents ?? [], args.reviewer);
-    if (!reviewer) {
-      console.error(`FATAL: no usable instance of reviewer agent "${args.reviewer}".`);
+  let assigned = [];
+  if (kept.length > 0) {
+    const lanes = await resolveHealthyLanes(args, companyId);
+    if (lanes.length === 0) {
+      console.error(`FATAL: zero healthy reviewer lanes among [${args.reviewers.join(', ')}].`);
       process.exit(2);
     }
+    const withExclusions = [];
+    for (const f of kept) {
+      const excludeAgentId = await resolveAuthorExclusion(args, f.title);
+      withExclusions.push({ ...f, excludeAgentId });
+    }
+    assigned = distributeReviewers(withExclusions, lanes);
+  }
+
+  for (const f of assigned) {
+    const created = await api(args, 'POST', `/api/companies/${companyId}/issues`, {
+      title: issueTitle(f, f.repo),
+      description: issueBody(f, f.repo),
+      priority: 'high',
+      assigneeAgentId: f.reviewerId,
+    });
+    // 201 is not proof — read the row back before recording the dispatch.
+    await api(args, 'GET', `/api/issues/${created.id}`);
+    const key = stateKey(f.repo, f.number);
+    state.prs[key] = {
+      ...(state.prs[key] ?? {}),
+      filedSha: f.sha7,
+      filedAt: new Date().toISOString(),
+      filedIssueId: created.id,
+      issue: created.identifier ?? created.id,
+      refileCount: f.refileCount ?? 0,
+    };
+    saveState(args.stateDir, state);
+    console.log(
+      `filed ${created.identifier ?? created.id} for ${f.repo}#${f.number}@${f.sha7} -> ${f.reviewerName}`,
+    );
   }
 
   for (const s of sweeps) {
-    for (const f of s.file) {
-      const created = await api(args, 'POST', `/api/companies/${companyId}/issues`, {
-        title: issueTitle(f, s.repo),
-        description: issueBody(f, s.repo),
-        priority: 'high',
-        assigneeAgentId: reviewer.id,
-      });
-      // 201 is not proof — read the row back before recording the dispatch.
-      await api(args, 'GET', `/api/issues/${created.id}`);
-      const key = stateKey(s.repo, f.number);
-      state.prs[key] = {
-        ...(state.prs[key] ?? {}),
-        filedSha: f.sha7,
-        filedAt: new Date().toISOString(),
-        issue: created.identifier ?? created.id,
-      };
-      saveState(args.stateDir, state);
-      console.log(`filed ${created.identifier ?? created.id} for ${s.repo}#${f.number}@${f.sha7}`);
-    }
-
     if (s.escalate.length > 0) {
       try {
         execFileSync(args.alertCmd, ['SEV2', escalationMessage(s.repo, s.escalate, args.staleHours)]);
@@ -341,6 +607,13 @@ async function main() {
         saveState(args.stateDir, state);
       } catch (err) {
         console.error(`escalation for repo=${s.repo} failed: ${err.message}`);
+      }
+    }
+    if (s.refileCapped.length > 0) {
+      try {
+        execFileSync(args.alertCmd, ['SEV2', refileCapMessage(s.repo, s.refileCapped)]);
+      } catch (err) {
+        console.error(`refile-cap escalation for repo=${s.repo} failed: ${err.message}`);
       }
     }
   }

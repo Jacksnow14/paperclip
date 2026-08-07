@@ -236,6 +236,25 @@ export function ApprovalDetail() {
           {approval.decisionNote && (
             <p className="text-xs text-muted-foreground">Decision note: {approval.decisionNote}</p>
           )}
+          {approval.status === "withdrawn" && (
+            <p className="text-xs text-muted-foreground">
+              Withdrawn by the requester — not a board decision.
+              {approval.withdrawalReason ? ` ${approval.withdrawalReason}` : ""}
+              {approval.supersededByApprovalId && (
+                <>
+                  {" "}
+                  Superseded by{" "}
+                  <Link
+                    to={`/approvals/${approval.supersededByApprovalId}`}
+                    className="underline underline-offset-2"
+                  >
+                    {approval.supersededByApprovalId.slice(0, 8)}
+                  </Link>
+                  .
+                </>
+              )}
+            </p>
+          )}
         </div>
         {error && <p className="text-sm text-destructive">{error}</p>}
         {linkedIssues && linkedIssues.length > 0 && (

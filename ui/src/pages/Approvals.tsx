@@ -74,6 +74,17 @@ export function Approvals() {
     (a) => a.status === "pending" || a.status === "revision_requested",
   ).length;
 
+  // AUR-5344: reverse the supersededBy pointer so the live row can say what it
+  // replaces. Without this a replacement is indistinguishable from the stale
+  // duplicate it was created to retire.
+  const supersededBy = new Map<string, typeof filtered>();
+  for (const approval of data ?? []) {
+    if (!approval.supersededByApprovalId) continue;
+    const existing = supersededBy.get(approval.supersededByApprovalId) ?? [];
+    existing.push(approval);
+    supersededBy.set(approval.supersededByApprovalId, existing);
+  }
+
   if (!selectedCompanyId) {
     return <p className="text-sm text-muted-foreground">Select a company first.</p>;
   }
@@ -119,6 +130,7 @@ export function Approvals() {
               key={approval.id}
               approval={approval}
               requesterAgent={approval.requestedByAgentId ? (agents ?? []).find((a) => a.id === approval.requestedByAgentId) ?? null : null}
+              supersedes={supersededBy.get(approval.id) ?? []}
               onApprove={() => approveMutation.mutate(approval.id)}
               onReject={() => rejectMutation.mutate(approval.id)}
               detailLink={`/approvals/${approval.id}`}

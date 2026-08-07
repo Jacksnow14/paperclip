@@ -155,6 +155,32 @@ describe("Gmail outbound guard — route enforcement", () => {
       expect(mockMessagesSend).not.toHaveBeenCalled();
     });
 
+    // AUR-5344: a withdrawn approval must never satisfy the gate. Today this
+    // holds because verifyCeoApproval only accepts "approved"; the assertion
+    // exists so widening that predicate can't silently resurrect a row the
+    // requester already declared defective.
+    it("blocks a send whose approval was withdrawn by its requester", async () => {
+      approvalRow = {
+        id: "appr-withdrawn",
+        companyId: "company-1",
+        status: "withdrawn",
+        type: "request_board_approval",
+        supersededByApprovalId: "appr-ok",
+        payload: { gmailOutbound: { mailbox: "board", to: "report@bunq.com" } },
+      };
+      const app = await createApp();
+      const res = await request(app)
+        .post("/api/companies/company-1/gmail/mailboxes/board/messages")
+        .send({
+          to: "report@bunq.com",
+          subject: "URGENT fraud report",
+          body: "We are reporting an account takeover.",
+          ceoApprovalId: "appr-withdrawn",
+        });
+      expect(res.status).toBe(403);
+      expect(mockMessagesSend).not.toHaveBeenCalled();
+    });
+
     // AUR-3628: an approval that IS approved, but was granted for a different
     // recipient/mailbox (or isn't a gmail-outbound-scoped board approval at
     // all), must not satisfy the gate for THIS send.

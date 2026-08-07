@@ -17,6 +17,11 @@ export const approvalsApi = {
     api.post<Approval>(`/approvals/${id}/request-revision`, { decisionNote }),
   resubmit: (id: string, payload?: Record<string, unknown>) =>
     api.post<Approval>(`/approvals/${id}/resubmit`, { payload }),
+  withdraw: (id: string, options?: { reason?: string; supersededByApprovalId?: string }) =>
+    api.post<Approval>(`/approvals/${id}/withdraw`, {
+      reason: options?.reason,
+      supersededByApprovalId: options?.supersededByApprovalId,
+    }),
   listComments: (id: string) => api.get<ApprovalComment[]>(`/approvals/${id}/comments`),
   addComment: (id: string, body: string) =>
     api.post<ApprovalComment>(`/approvals/${id}/comments`, { body }),

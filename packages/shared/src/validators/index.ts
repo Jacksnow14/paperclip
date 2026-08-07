@@ -277,11 +277,13 @@ export {
   resolveApprovalSchema,
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,
+  withdrawApprovalSchema,
   addApprovalCommentSchema,
   type CreateApproval,
   type ResolveApproval,
   type RequestApprovalRevision,
   type ResubmitApproval,
+  type WithdrawApproval,
   type AddApprovalComment,
 } from "./approval.js";
 

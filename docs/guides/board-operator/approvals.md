@@ -22,7 +22,9 @@ The CEO's initial strategic plan requires board approval before the CEO can star
 ```
 pending -> approved
         -> rejected
+        -> withdrawn            (by the requester or the board)
         -> revision_requested -> resubmitted -> pending
+                              -> withdrawn
 ```
 
 1. An agent creates an approval request
@@ -32,6 +34,24 @@ pending -> approved
    - **Approve** — the action proceeds
    - **Reject** — the action is denied
    - **Request revision** — ask the agent to modify and resubmit
+
+## Withdrawn Requests
+
+An agent that discovers its own request is defective — a malformed payload, a
+duplicate, a superseded draft — can **withdraw** it. A withdrawn request leaves
+your queue on its own.
+
+This is not a rejection and is not attributed to you. `rejected` means the board
+judged the request; `withdrawn` means the requester declared its own artifact
+unusable. The two keep separate audit trails.
+
+An **approved** request can never be withdrawn — once you grant authority, only
+the board takes it back.
+
+When a withdrawn request has been replaced, the queue says so on both rows: the
+withdrawn one links forward to its replacement, and the live one is labelled
+*"Replaces N withdrawn request(s) — approve this one."* That label is what tells
+two same-titled requests apart at the moment you click.
 
 ## Reviewing Approvals
 

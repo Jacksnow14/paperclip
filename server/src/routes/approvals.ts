@@ -6,6 +6,7 @@ import {
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
   resubmitApprovalSchema,
+  withdrawApprovalSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { logger } from "../middleware/logger.js";
@@ -328,6 +329,61 @@ export function approvalRoutes(
       entityId: approval.id,
       details: { type: approval.type },
     });
+    res.json(redactApprovalPayload(approval));
+  });
+
+  // AUR-5344. The requesting agent (or the board) retires a request it knows is
+  // defective. Never another agent's row, and never a row the board already
+  // decided — once authority is granted only the board takes it back.
+  router.post("/approvals/:id/withdraw", validate(withdrawApprovalSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await svc.getById(id);
+    if (!existing) {
+      res.status(404).json({ error: "Approval not found" });
+      return;
+    }
+    assertCompanyAccess(req, existing.companyId);
+
+    if (req.actor.type === "agent") {
+      if (!existing.requestedByAgentId || req.actor.agentId !== existing.requestedByAgentId) {
+        res.status(403).json({ error: "Only the requesting agent can withdraw this approval" });
+        return;
+      }
+    } else {
+      assertBoard(req);
+    }
+
+    const actor = getActorInfo(req);
+    const { approval, applied } = await svc.withdraw(
+      id,
+      {
+        agentId: actor.agentId,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      },
+      {
+        reason: req.body.reason,
+        supersededByApprovalId: req.body.supersededByApprovalId,
+      },
+    );
+
+    if (applied) {
+      await logActivity(db, {
+        companyId: approval.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        action: "approval.withdrawn",
+        entityType: "approval",
+        entityId: approval.id,
+        details: {
+          type: approval.type,
+          requestedByAgentId: approval.requestedByAgentId,
+          supersededByApprovalId: approval.supersededByApprovalId,
+          reason: approval.withdrawalReason,
+        },
+      });
+    }
+
     res.json(redactApprovalPayload(approval));
   });
 

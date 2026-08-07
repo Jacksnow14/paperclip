@@ -11,6 +11,7 @@ import type {
   ProjectWorkspace,
 } from "@paperclipai/shared";
 import {
+  ACTIONABLE_APPROVAL_STATUSES,
   DEFAULT_INBOX_ISSUE_COLUMNS,
   buildGroupedInboxSections,
   buildInboxIssueGroupCreateDefaults,
@@ -83,6 +84,11 @@ function makeApproval(status: Approval["status"]): Approval {
     decisionNote: null,
     decidedByUserId: null,
     decidedAt: null,
+    withdrawnAt: null,
+    withdrawnByAgentId: null,
+    withdrawnByUserId: null,
+    withdrawalReason: null,
+    supersededByApprovalId: null,
     createdAt: new Date("2026-03-11T00:00:00.000Z"),
     updatedAt: new Date("2026-03-11T00:00:00.000Z"),
   };
@@ -307,6 +313,20 @@ const dashboard: DashboardSummary = {
 describe("inbox helpers", () => {
   beforeEach(() => {
     storage.clear();
+  });
+
+  // AUR-5344: a withdrawn approval has left the queue. Asserted in both
+  // directions so this can't pass by treating everything as non-actionable.
+  it("keeps withdrawn approvals out of the actionable queue but keeps pending ones in", () => {
+    expect(ACTIONABLE_APPROVAL_STATUSES.has("withdrawn")).toBe(false);
+    expect(ACTIONABLE_APPROVAL_STATUSES.has("pending")).toBe(true);
+
+    const unread = getApprovalsForTab(
+      [makeApproval("withdrawn"), makeApproval("pending")],
+      "unread",
+      "all",
+    );
+    expect(unread.map((approval) => approval.status)).toEqual(["pending"]);
   });
 
   it("counts the same inbox sources the badge uses", () => {

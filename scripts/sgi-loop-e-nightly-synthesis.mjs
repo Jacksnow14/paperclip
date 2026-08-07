@@ -156,15 +156,16 @@ async function fetchWorkClassBudget() {
 // projectWorkspaceId and default to `revenue` per AC1 (the safe direction —
 // the cap must never silently starve unclassified product work). That means
 // this token-share metric under-reports self-improvement's true share of
-// engineering effort; AUR-5207's merged-PR ratio is the compensating signal
-// for that gap and should be read alongside this line, not in place of it.
+// engineering effort. AUR-5207 would have been a compensating merged-PR-ratio
+// signal, but the founder cancelled it (2026-08-07) — no replacement measure
+// exists yet, so read this share as a floor, not a precise figure.
 function workClassBudgetLine(budget) {
   if (!budget) return null;
   const totalTokens = budget.revenueTokens + budget.selfImprovementTokens;
   const pct = (budget.selfImprovementShare * 100).toFixed(1);
   const capPct = (budget.capShare * 100).toFixed(0);
   const headline = `self-improvement 7d: ${pct}% of ${totalTokens.toLocaleString()} tok (cap ${capPct}%)${budget.overCap ? ' ⚠️ over cap' : ''}`;
-  return `${headline} — token-share only; most unclassified issues default to \`revenue\`, so this understates self-improvement's true share. See AUR-5207 (merged-PR ratio) for the compensating measure.`;
+  return `${headline} — token-share only; most unclassified issues default to \`revenue\`, so this understates self-improvement's true share (no compensating measure currently tracked).`;
 }
 
 const cat = (r) => (r.metadata && r.metadata.category) || '';

@@ -15,12 +15,18 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import {
   DEFAULT_REPOS,
+  applyFileCap,
+  assessLaneHealth,
   decideActions,
+  distributeReviewers,
   escalationMessage,
+  extractAurToken,
+  isStarvedRun,
   issueBody,
   issueTitle,
   migrateState,
   pickReviewer,
+  refileCapMessage,
   stateKey,
 } from './check-pr-backlog.mjs';
 
@@ -205,6 +211,241 @@ test('issue body forbids founder code review and demands loop closure', () => {
   assert.match(body, /never batch/i);
   assert.match(body, /merged or closed/);
   assert.match(body, /check-trunk-ci-red/);
+});
+
+// ---------------------------------------------------------------------------
+// Defect 4 (AUR-5370): a cancelled/missing review issue must not permanently
+// suppress a PR. filedSha matching is no longer sufficient — the previously
+// filed issue's terminal state decides.
+// ---------------------------------------------------------------------------
+
+test('a cancelled review issue causes the PR to be re-filed on the next sweep (FIRING case)', () => {
+  const filedIssueId = 'issue-uuid-1';
+  const { file } = decideActions({
+    repo: REPO,
+    prs: [pr(1)],
+    state: { prs: { [stateKey(REPO, 1)]: { filedSha: 'abcdef1', filedIssueId } } },
+    nowMs: NOW,
+    staleHours: 72,
+    issueStatuses: { [filedIssueId]: 'cancelled' },
+  });
+  assert.equal(file.length, 1);
+  assert.equal(file[0].number, 1);
+  assert.equal(file[0].refileReason, 'cancelled');
+  assert.equal(file[0].refileCount, 1);
+});
+
+test('an open review issue does NOT cause a re-file (PASSING case)', () => {
+  for (const status of ['todo', 'in_progress', 'in_review', 'blocked']) {
+    const filedIssueId = 'issue-uuid-2';
+    const { file } = decideActions({
+      repo: REPO,
+      prs: [pr(1)],
+      state: { prs: { [stateKey(REPO, 1)]: { filedSha: 'abcdef1', filedIssueId } } },
+      nowMs: NOW,
+      staleHours: 72,
+      issueStatuses: { [filedIssueId]: status },
+    });
+    assert.equal(file.length, 0, `status ${status} must not re-file`);
+  }
+});
+
+test('a missing (not found) review issue re-files, same as cancelled', () => {
+  const filedIssueId = 'issue-uuid-3';
+  const { file } = decideActions({
+    repo: REPO,
+    prs: [pr(1)],
+    state: { prs: { [stateKey(REPO, 1)]: { filedSha: 'abcdef1', filedIssueId } } },
+    nowMs: NOW,
+    staleHours: 72,
+    issueStatuses: {}, // looked up, absent from the map => not found
+  });
+  assert.equal(file.length, 1);
+  assert.equal(file[0].refileReason, 'not-found');
+});
+
+test('a done review issue while the PR is still open re-files as a pipeline defect', () => {
+  const filedIssueId = 'issue-uuid-4';
+  const { file } = decideActions({
+    repo: REPO,
+    prs: [pr(1)],
+    state: { prs: { [stateKey(REPO, 1)]: { filedSha: 'abcdef1', filedIssueId } } },
+    nowMs: NOW,
+    staleHours: 72,
+    issueStatuses: { [filedIssueId]: 'done' },
+  });
+  assert.equal(file.length, 1);
+  assert.equal(file[0].refileReason, 'done-but-open');
+});
+
+test('a legacy entry with no filedIssueId is left alone (nothing to verify)', () => {
+  const { file } = decideActions({
+    repo: REPO,
+    prs: [pr(1)],
+    state: { prs: { [stateKey(REPO, 1)]: { filedSha: 'abcdef1' } } },
+    nowMs: NOW,
+    staleHours: 72,
+    issueStatuses: {},
+  });
+  assert.equal(file.length, 0);
+});
+
+test('re-files are capped at 3; the 4th would-be re-file escalates instead of filing a 5th issue', () => {
+  const filedIssueId = 'issue-uuid-5';
+  const capped = decideActions({
+    repo: REPO,
+    prs: [pr(1)],
+    state: {
+      prs: { [stateKey(REPO, 1)]: { filedSha: 'abcdef1', filedIssueId, refileCount: 3 } },
+    },
+    nowMs: NOW,
+    staleHours: 72,
+    issueStatuses: { [filedIssueId]: 'cancelled' },
+  });
+  assert.equal(capped.file.length, 0);
+  assert.equal(capped.refileCapped.length, 1);
+  assert.equal(capped.refileCapped[0].number, 1);
+  assert.equal(capped.refileCapped[0].refileCount, 3);
+
+  const underCap = decideActions({
+    repo: REPO,
+    prs: [pr(1)],
+    state: {
+      prs: { [stateKey(REPO, 1)]: { filedSha: 'abcdef1', filedIssueId, refileCount: 2 } },
+    },
+    nowMs: NOW,
+    staleHours: 72,
+    issueStatuses: { [filedIssueId]: 'cancelled' },
+  });
+  assert.equal(underCap.file.length, 1);
+  assert.equal(underCap.refileCapped.length, 0);
+  assert.equal(underCap.file[0].refileCount, 3);
+});
+
+test('refileCapMessage names the PRs and their re-file counts', () => {
+  const msg = refileCapMessage('Jacksnow14/Auranode', [
+    { number: 9, refileCount: 3, reason: 'cancelled' },
+  ]);
+  assert.match(msg, /Jacksnow14\/Auranode/);
+  assert.match(msg, /#9\(3x cancelled\)/);
+  assert.match(msg, /pipeline alarm, not a code-review request/);
+});
+
+// ---------------------------------------------------------------------------
+// Defect 2 (AUR-5370): reviewer fan-out — lane health read from runs, not
+// the `status` field, and least-loaded distribution across healthy lanes.
+// ---------------------------------------------------------------------------
+
+test('isStarvedRun detects the quota-starved-failure signature', () => {
+  assert.equal(
+    isStarvedRun({
+      status: 'failed',
+      error: "You've hit your session limit for this billing period.",
+      usageJson: null,
+    }),
+    true,
+  );
+  assert.equal(
+    isStarvedRun({ status: 'failed', error: 'Process lost -- child pid gone', usageJson: null }),
+    false,
+  );
+  assert.equal(
+    isStarvedRun({
+      status: 'failed',
+      error: 'hit usage limit',
+      usageJson: { inputTokens: 100, outputTokens: 50 },
+    }),
+    false, // billed tokens => not a starved-before-it-ran failure
+  );
+});
+
+test('assessLaneHealth: most-recent starved failure marks the lane unhealthy (FIRING case)', () => {
+  const runs = [
+    { status: 'failed', error: 'hit your session limit', usageJson: null },
+    { status: 'succeeded', error: null, usageJson: { inputTokens: 1, outputTokens: 1 } },
+  ];
+  const health = assessLaneHealth(runs);
+  assert.equal(health.healthy, false);
+});
+
+test('assessLaneHealth: healthy lane with an older (recovered-from) starved run stays healthy (PASSING case)', () => {
+  const runs = [
+    { status: 'succeeded', error: null, usageJson: { inputTokens: 1, outputTokens: 1 } },
+    { status: 'failed', error: 'hit your session limit', usageJson: null },
+  ];
+  const health = assessLaneHealth(runs);
+  assert.equal(health.healthy, true);
+});
+
+test('assessLaneHealth counts queued runs for load-based distribution', () => {
+  const runs = [
+    { status: 'queued' },
+    { status: 'queued' },
+    { status: 'succeeded', usageJson: { inputTokens: 1, outputTokens: 1 } },
+  ];
+  assert.equal(assessLaneHealth(runs).queuedCount, 2);
+});
+
+test('distributeReviewers spreads items least-loaded-first across N healthy lanes', () => {
+  const items = [{ number: 1 }, { number: 2 }, { number: 3 }, { number: 4 }];
+  const candidates = [
+    { id: 'max', name: 'Claude Code Max', queuedCount: 0 },
+    { id: 'fast', name: 'Claude Code Fast', queuedCount: 2 },
+  ];
+  const assigned = distributeReviewers(items, candidates);
+  // max starts at 0 load, fast at 2: max should absorb more of the early items.
+  assert.deepEqual(
+    assigned.map((a) => a.reviewerId),
+    ['max', 'max', 'max', 'fast'],
+  );
+});
+
+test('distributeReviewers excludes the given agent per-item, but falls back if exclusion empties the pool', () => {
+  const candidates = [
+    { id: 'max', name: 'Claude Code Max', queuedCount: 0 },
+    { id: 'fast', name: 'Claude Code Fast', queuedCount: 0 },
+  ];
+  const withExclusion = distributeReviewers([{ number: 1, excludeAgentId: 'max' }], candidates);
+  assert.equal(withExclusion[0].reviewerId, 'fast');
+
+  // Excluding the only candidate must not leave the item unassigned.
+  const singleCandidate = [{ id: 'max', name: 'Claude Code Max', queuedCount: 0 }];
+  const fallback = distributeReviewers([{ number: 1, excludeAgentId: 'max' }], singleCandidate);
+  assert.equal(fallback[0].reviewerId, 'max');
+});
+
+// ---------------------------------------------------------------------------
+// Author exclusion (AUR-5370): AUR-NNNN token in the PR title is the only
+// usable signal since every PR shares one GitHub author.
+// ---------------------------------------------------------------------------
+
+test('extractAurToken finds the AUR-NNNN token in a PR title, or null', () => {
+  assert.equal(extractAurToken('fix(AUR-5370): harden the dispatcher'), 'AUR-5370');
+  assert.equal(extractAurToken('chore: bump deps'), null);
+  assert.equal(extractAurToken(undefined), null);
+});
+
+// ---------------------------------------------------------------------------
+// Defect 3 (AUR-5370): --max-file cap, safety/guardrail PRs prioritized,
+// overflow explicitly dropped (never silently truncated).
+// ---------------------------------------------------------------------------
+
+test('applyFileCap keeps safety/guardrail PRs first, then oldest-first, dropping the overflow', () => {
+  const items = [
+    { number: 1, title: 'chore: cleanup', createdAt: '2026-08-05T00:00:00Z' },
+    { number: 2, title: 'fix(AUR-1): email safety guardrail', createdAt: '2026-08-06T00:00:00Z' },
+    { number: 3, title: 'chore: older cleanup', createdAt: '2026-08-01T00:00:00Z' },
+  ];
+  const { kept, dropped } = applyFileCap(items, 2);
+  assert.deepEqual(kept.map((k) => k.number), [2, 3]); // safety-critical first, then oldest chore
+  assert.deepEqual(dropped.map((d) => d.number), [1]);
+});
+
+test('applyFileCap keeps everything when under the cap', () => {
+  const items = [{ number: 1, title: 't', createdAt: '2026-08-01T00:00:00Z' }];
+  const { kept, dropped } = applyFileCap(items, 6);
+  assert.equal(kept.length, 1);
+  assert.equal(dropped.length, 0);
 });
 
 test('entrypoint fires when invoked through a release symlink (AUR-5111)', () => {

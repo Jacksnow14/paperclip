@@ -120,6 +120,10 @@ const mockAccessService = vi.hoisted(() => ({
   hasPermission: vi.fn(),
 }));
 
+const mockAgentService = vi.hoisted(() => ({
+  getById: vi.fn(),
+}));
+
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockTrackRoutineCreated = vi.hoisted(() => vi.fn());
 const mockGetTelemetryClient = vi.hoisted(() => vi.fn());
@@ -140,6 +144,10 @@ function registerModuleMocks() {
     accessService: () => mockAccessService,
   }));
 
+  vi.doMock("../services/agents.js", () => ({
+    agentService: () => mockAgentService,
+  }));
+
   vi.doMock("../services/routines.js", () => ({
     routineService: () => mockRoutineService,
   }));
@@ -150,6 +158,7 @@ function registerModuleMocks() {
 
   vi.doMock("../services/index.js", () => ({
     accessService: () => mockAccessService,
+    agentService: () => mockAgentService,
     logActivity: mockLogActivity,
     routineService: () => mockRoutineService,
   }));
@@ -177,6 +186,7 @@ describe("routine routes", () => {
     vi.doUnmock("@paperclipai/shared/telemetry");
     vi.doUnmock("../telemetry.js");
     vi.doUnmock("../services/access.js");
+    vi.doUnmock("../services/agents.js");
     vi.doUnmock("../services/index.js");
     vi.doUnmock("../services/activity-log.js");
     vi.doUnmock("../services/routines.js");
@@ -206,6 +216,7 @@ describe("routine routes", () => {
     });
     mockAccessService.canUser.mockResolvedValue(false);
     mockAccessService.hasPermission.mockResolvedValue(false);
+    mockAgentService.getById.mockResolvedValue({ id: otherAgentId, companyId, role: "member" });
     mockLogActivity.mockResolvedValue(undefined);
   });
 
@@ -547,6 +558,7 @@ describe("routine routes", () => {
 
   it("blocks an agent without routines:manage from managing another agent's routine", async () => {
     mockAccessService.hasPermission.mockResolvedValue(false);
+    mockAgentService.getById.mockResolvedValue({ id: otherAgentId, companyId, role: "member" });
     const app = await createApp({
       type: "agent",
       agentId: otherAgentId,
@@ -558,6 +570,42 @@ describe("routine routes", () => {
       .send({ status: "paused" });
 
     expect(res.status).toBe(403);
+    expect(res.body.error).toBe("Agents can only manage routines assigned to themselves");
     expect(mockRoutineService.update).not.toHaveBeenCalled();
   });
+
+  it("allows a CEO-role agent to pause another agent's routine without any explicit routines:manage grant", async () => {
+    mockAccessService.hasPermission.mockResolvedValue(false);
+    mockAgentService.getById.mockResolvedValue({ id: otherAgentId, companyId, role: "ceo" });
+    const app = await createApp({
+      type: "agent",
+      agentId: otherAgentId,
+      companyId,
+    });
+
+    const res = await request(app)
+      .patch(`/api/routines/${routineId}`)
+      .send({ status: "paused" });
+
+    expect(res.status).toBe(200);
+    expect(mockRoutineService.update).toHaveBeenCalledWith(routineId, expect.objectContaining({ status: "paused" }), expect.anything());
+  });
+
+  it("allows a CEO-role agent to reassign another agent's routine without any explicit routines:manage grant", async () => {
+    mockAccessService.hasPermission.mockResolvedValue(false);
+    mockAgentService.getById.mockResolvedValue({ id: otherAgentId, companyId, role: "ceo" });
+    const app = await createApp({
+      type: "agent",
+      agentId: otherAgentId,
+      companyId,
+    });
+
+    const res = await request(app)
+      .patch(`/api/routines/${routineId}`)
+      .send({ assigneeAgentId: otherAgentId });
+
+    expect(res.status).toBe(200);
+    expect(mockRoutineService.update).toHaveBeenCalledWith(routineId, expect.objectContaining({ assigneeAgentId: otherAgentId }), expect.anything());
+  });
+
 });

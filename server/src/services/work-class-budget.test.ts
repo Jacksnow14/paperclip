@@ -12,15 +12,15 @@ import {
 } from "../__tests__/helpers/embedded-postgres.js";
 
 describe("matchesBudgetCarveoutKeywords", () => {
-  it("matches each of the four named carve-out categories", () => {
-    expect(matchesBudgetCarveoutKeywords("Trunk is red on main", null)).toBe(true);
-    expect(matchesBudgetCarveoutKeywords("Exposed credential in logs", null)).toBe(true);
-    expect(matchesBudgetCarveoutKeywords("Host disk exhaustion alert", null)).toBe(true);
-    expect(matchesBudgetCarveoutKeywords("Control-plane outage", null)).toBe(true);
+  it("matches each of the four named carve-out categories in the title", () => {
+    expect(matchesBudgetCarveoutKeywords("Trunk is red on main")).toBe(true);
+    expect(matchesBudgetCarveoutKeywords("Exposed credential in logs")).toBe(true);
+    expect(matchesBudgetCarveoutKeywords("Host disk exhaustion alert")).toBe(true);
+    expect(matchesBudgetCarveoutKeywords("Control-plane outage")).toBe(true);
   });
 
   it("does not match ordinary feature work", () => {
-    expect(matchesBudgetCarveoutKeywords("Add dark mode toggle", "Ship the new settings UI")).toBe(false);
+    expect(matchesBudgetCarveoutKeywords("Add dark mode toggle")).toBe(false);
   });
 });
 

@@ -117,8 +117,11 @@ export function workClassBudgetService(db: Db) {
 
 // AC3 hard carve-outs named by the founder: trunk-red CI, security/exposed
 // credential work, disk/host exhaustion, control-plane outages. Deliberately
-// four fixed patterns, not a taxonomy — matched against title+description so
-// an issue doesn't need a new field to get the exemption.
+// four fixed patterns, not a taxonomy — matched against the title only.
+// Descriptions are long agent prose that routinely *mentions* these words
+// (e.g. quoting this very spec) without being that kind of work; matching
+// title+description measured an 86% false-positive rate over the live open
+// issue set, including this issue exempting itself from its own cap.
 const CARVEOUT_KEYWORD_PATTERNS: RegExp[] = [
   /\btrunk[- ]?(?:is\s+)?red\b|\bci\s+(?:is\s+)?(?:red|failing|broken)\b|\bbroken\s+ci\b/i,
   /\bsecurity\b|\bexposed\s+(?:secret|credential|key)\b|\b(?:secret|credential)\s+leak(?:ed|age)?\b/i,
@@ -126,7 +129,6 @@ const CARVEOUT_KEYWORD_PATTERNS: RegExp[] = [
   /\bcontrol[- ]?plane\s+(?:outage|down|unreachable)\b/i,
 ];
 
-export function matchesBudgetCarveoutKeywords(title: string, description: string | null | undefined): boolean {
-  const text = `${title}\n${description ?? ""}`;
-  return CARVEOUT_KEYWORD_PATTERNS.some((pattern) => pattern.test(text));
+export function matchesBudgetCarveoutKeywords(title: string): boolean {
+  return CARVEOUT_KEYWORD_PATTERNS.some((pattern) => pattern.test(title));
 }

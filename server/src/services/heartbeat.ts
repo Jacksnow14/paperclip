@@ -95,6 +95,7 @@ import {
 } from "./workspace-runtime.js";
 import { issueService } from "./issues.js";
 import { workClassBudgetService, matchesBudgetCarveoutKeywords } from "./work-class-budget.js";
+import { deriveWorkClass } from "./work-class.js";
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
@@ -7662,6 +7663,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         workClass: issues.workClass,
         title: issues.title,
         description: issues.description,
+        projectId: issues.projectId,
+        projectWorkspaceId: issues.projectWorkspaceId,
       })
       .from(issues)
       .where(
@@ -7670,6 +7673,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           : sql`false`,
       );
     const issueById = new Map(issueRows.map((row) => [row.id, row]));
+    // AUR-5168 AC3: the gate must agree with computeBudget()'s fallback —
+    // re-derive workClass for rows where the backfill hasn't reached the
+    // column yet, instead of treating null as "not self_improvement".
+    const queuedWorkspaceIds = [
+      ...new Set(issueRows.map((row) => row.projectWorkspaceId).filter((id): id is string => !!id)),
+    ];
+    const queuedRepoUrlByWorkspaceId = new Map<string, string | null>();
+    if (queuedWorkspaceIds.length > 0) {
+      const workspaceRows = await db
+        .select({ id: projectWorkspaces.id, repoUrl: projectWorkspaces.repoUrl })
+        .from(projectWorkspaces)
+        .where(inArray(projectWorkspaces.id, queuedWorkspaceIds));
+      for (const workspace of workspaceRows) {
+        queuedRepoUrlByWorkspaceId.set(workspace.id, workspace.repoUrl);
+      }
+    }
+    const effectiveWorkClassById = new Map(
+      issueRows.map((row) => [
+        row.id,
+        row.workClass ??
+          deriveWorkClass({
+            description: row.description,
+            projectId: row.projectId,
+            workspaceRepoUrl: row.projectWorkspaceId
+              ? queuedRepoUrlByWorkspaceId.get(row.projectWorkspaceId) ?? null
+              : null,
+          }),
+      ]),
+    );
     const prioritizedRuns = [...queuedRuns].sort((left, right) => {
       const leftIssueId = readNonEmptyString(parseObject(left.contextSnapshot).issueId);
       const rightIssueId = readNonEmptyString(parseObject(right.contextSnapshot).issueId);
@@ -7692,7 +7724,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // AUR-5168 AC3: only spend a budget query when a queued issue could
     // actually be gated by it — most heartbeat cycles have no
     // self_improvement work queued at all.
-    const hasQueuedSelfImprovementIssue = issueRows.some((row) => row.workClass === "self_improvement");
+    const hasQueuedSelfImprovementIssue = issueRows.some(
+      (row) => effectiveWorkClassById.get(row.id) === "self_improvement",
+    );
     const workClassBudgetSnapshot = hasQueuedSelfImprovementIssue
       ? await workClassBudget.computeBudget(agent.companyId)
       : null;
@@ -7718,9 +7752,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (workClassBudgetSnapshot?.overCap) {
         const queuedIssueId = readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId);
         const queuedIssue = queuedIssueId ? issueById.get(queuedIssueId) : null;
-        if (queuedIssue?.workClass === "self_improvement") {
+        if (queuedIssue && effectiveWorkClassById.get(queuedIssue.id) === "self_improvement") {
           const exempt =
-            matchesBudgetCarveoutKeywords(queuedIssue.title, queuedIssue.description) ||
+            matchesBudgetCarveoutKeywords(queuedIssue.title) ||
             (queuedIssueId ? await workClassBudget.isUnderBudgetCarveoutRoot(queuedIssueId) : false);
           if (!exempt) {
             budgetShedCount += 1;

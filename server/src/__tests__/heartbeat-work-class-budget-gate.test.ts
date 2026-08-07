@@ -217,6 +217,7 @@ describeEmbeddedPostgres("AUR-5168 AC3: work-class budget admission gate", () =>
     opts: {
       workClass: "revenue" | "self_improvement" | null;
       title?: string;
+      description?: string | null;
       parentId?: string | null;
       assigneeAgentId?: string | null;
     },
@@ -227,6 +228,7 @@ describeEmbeddedPostgres("AUR-5168 AC3: work-class budget admission gate", () =>
       id: issueId,
       companyId,
       title: opts.title ?? `Test issue ${issueSeedCounter}`,
+      description: opts.description ?? null,
       status: "in_progress",
       priority: "medium",
       issueNumber: issueSeedCounter,
@@ -349,5 +351,68 @@ describeEmbeddedPostgres("AUR-5168 AC3: work-class budget admission gate", () =>
     expect((await heartbeat.getRun(revenueRun))?.status).toBe("running");
     expect((await heartbeat.getRun(outageRun))?.status).toBe("running");
     expect((await heartbeat.getRun(carveoutRun))?.status).toBe("running");
+  });
+
+  // Regression for review blocker 1: matching title+description exempted 6 of 7
+  // currently-open self_improvement issues wrongly, because agent-written
+  // descriptions routinely mention carve-out words without being that kind of
+  // work. The carve-out must only fire on the title.
+  it("does not exempt a self_improvement issue whose description (not title) mentions carve-out words, when over cap", async () => {
+    const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4 });
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId);
+
+    // 90% self-improvement share -- well over the 10% cap.
+    const priorRevenueIssueId = await seedIssue(companyId, { workClass: "revenue" });
+    await seedCostEvent(companyId, agentId, priorRevenueIssueId, 100);
+    const priorSelfImprovementIssueId = await seedIssue(companyId, { workClass: "self_improvement" });
+    await seedCostEvent(companyId, agentId, priorSelfImprovementIssueId, 900);
+
+    const gatedIssueId = await seedIssue(companyId, {
+      workClass: "self_improvement",
+      title: "Refactor fleet tooling",
+      description: "This touches security and disk exhaustion topics only in passing, not as the actual work.",
+      assigneeAgentId: agentId,
+    });
+    const gatedRun = await seedQueuedRun(companyId, agentId, gatedIssueId);
+
+    hangAdapterUntilReleased();
+    const admitted = await heartbeat.startNextQueuedRunForAgent(agentId);
+
+    expect(admitted).toHaveLength(0);
+    expect((await heartbeat.getRun(gatedRun))?.status).toBe("queued");
+  });
+
+  // Regression for review blocker 2: computeBudget() falls back to
+  // deriveWorkClass() for a null issues.workClass, but the admission gate was
+  // reading the raw column -- a self_improvement issue with a null workClass
+  // (i.e. every issue pre-backfill) inflated the share while staying immune to
+  // the cap it caused. The gate must derive workClass the same way the meter does.
+  it("gates a self_improvement issue with a null workClass the same as one with an explicit column value", async () => {
+    const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4 });
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId);
+
+    // 90% self-improvement share -- well over the 10% cap.
+    const priorRevenueIssueId = await seedIssue(companyId, { workClass: "revenue" });
+    await seedCostEvent(companyId, agentId, priorRevenueIssueId, 100);
+    const priorSelfImprovementIssueId = await seedIssue(companyId, { workClass: "self_improvement" });
+    await seedCostEvent(companyId, agentId, priorSelfImprovementIssueId, 900);
+
+    // workClass column is null; only the explicit exec.work_class: token in
+    // the description resolves it to self_improvement via deriveWorkClass().
+    const gatedIssueId = await seedIssue(companyId, {
+      workClass: null,
+      title: "Improve internal tooling",
+      description: "exec.work_class: self_improvement",
+      assigneeAgentId: agentId,
+    });
+    const gatedRun = await seedQueuedRun(companyId, agentId, gatedIssueId);
+
+    hangAdapterUntilReleased();
+    const admitted = await heartbeat.startNextQueuedRunForAgent(agentId);
+
+    expect(admitted).toHaveLength(0);
+    expect((await heartbeat.getRun(gatedRun))?.status).toBe("queued");
   });
 });

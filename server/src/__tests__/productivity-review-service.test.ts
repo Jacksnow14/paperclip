@@ -24,6 +24,7 @@ import {
   PRODUCTIVITY_REVIEW_ORIGIN_KIND,
   PROCESS_LOST_ERROR_CODE,
   NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES,
+  SCHEDULER_LIFECYCLE_NON_ATTRIBUTABLE_ERROR_CODES,
   DETERMINISTIC_ATTRIBUTABLE_ERROR_CODES,
   productivityReviewService,
 } from "../services/productivity-review.ts";
@@ -117,6 +118,13 @@ describeEmbeddedPostgres("productivity review service", () => {
     return { companyId, managerId, coderId, issueId, issuePrefix, createdAt };
   }
 
+  // AUR-5008: real work has real usage. Runs that don't explicitly override usageJson default
+  // to this non-zero shape so they represent genuine billable work and are exempt from both the
+  // never-started backstop (isNeverStartedRun) and the zero-cost-contradiction filing
+  // suppression -- both gate on hasZeroUsage(), which a real token count never satisfies. Tests
+  // that need to exercise those zero-usage paths pass an explicit usageJson (e.g. ZERO_USAGE).
+  const DEFAULT_ATTRIBUTABLE_USAGE = { inputTokens: 4200, outputTokens: 950, costUsd: 0.18 };
+
   async function insertRuns(input: {
     companyId: string;
     agentId: string;
@@ -150,7 +158,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         livenessState: input.status && input.status !== "succeeded" ? "failed" : "advanced",
         errorCode: input.errorCode ?? null,
         error: input.error ?? null,
-        usageJson: input.usageJson ?? null,
+        usageJson: input.usageJson ?? DEFAULT_ATTRIBUTABLE_USAGE,
         logBytes: input.logBytes ?? null,
         nextAction: "Continue processing the next batch.",
         createdAt,
@@ -990,6 +998,179 @@ describeEmbeddedPostgres("productivity review service", () => {
     });
   });
 
+  // AUR-5008: a queued run the control plane itself decided not to run (issue cancelled/reached a
+  // terminal status/dependencies still blocked/reassigned before it could start) carries zero
+  // signal about the assignee -- it never even reached the provider wall the AUR-4016 codes die
+  // at. A storm of these was being counted as churn (25 of 40 sampled runs on the flagged agent
+  // in the forensics that motivated this issue).
+  describe("AUR-5008 scheduler-lifecycle cancellation classification", () => {
+    it("does not trip high_churn on a burst of issue_cancelled runs (FIRES: exclusion works)", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+
+      // 15 scheduler-cancelled runs in the last hour -- well over the hourly high_churn
+      // threshold (10) if counted naively, and shaped exactly like a never-started run
+      // (zero usage, no transcript at all).
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 15,
+        now,
+        status: "cancelled",
+        errorCode: "issue_cancelled",
+        error: "Issue was cancelled before this run could start",
+        usageJson: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
+        logBytes: null,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(0);
+      expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+    });
+
+    it("still fires high_churn for genuine churn once scheduler-cancellation noise is excluded (PASSES: doesn't regress into uselessness)", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+
+      // Same scheduler-cancellation noise as above, sitting on top of 10 genuinely-completed,
+      // commented runs -- the noise must not mask real churn either.
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 15,
+        now,
+        status: "cancelled",
+        errorCode: "issue_dependencies_blocked",
+        error: "Issue is blocked on unresolved dependencies",
+        usageJson: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
+        logBytes: null,
+        startIndex: 0,
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 10,
+        now,
+        withRunComments: true,
+        startIndex: 15,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `high_churn`");
+      expect(review?.description).toContain(
+        "Excluded-run breakdown by errorCode: `issue_dependencies_blocked`: 15",
+      );
+    });
+
+    it("keeps the deterministic and scheduler-lifecycle code sets disjoint from the non-attributable provider set too", () => {
+      const providerAndScheduler = new Set<string>([
+        ...NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES,
+        ...SCHEDULER_LIFECYCLE_NON_ATTRIBUTABLE_ERROR_CODES,
+      ]);
+      expect(providerAndScheduler.size).toBe(
+        NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES.length + SCHEDULER_LIFECYCLE_NON_ATTRIBUTABLE_ERROR_CODES.length,
+      );
+    });
+  });
+
+  // AUR-5008: a run that never left the scheduler queue never spawned a process, so it has zero
+  // usage AND no transcript at all (logBytes null/0) -- distinct from the AUR-4062 zero-token
+  // backstop, which requires a *small but present* log. Fails closed on any errorCode, including
+  // one never added to SCHEDULER_LIFECYCLE_NON_ATTRIBUTABLE_ERROR_CODES.
+  describe("AUR-5008 never-started backstop classification", () => {
+    it("excludes a terminal run with zero usage and no log at all, even under an unrecognized errorCode", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 9,
+        now,
+        status: "cancelled",
+        errorCode: "some_future_scheduler_code",
+        error: "Cancelled by a scheduler code path that hasn't been enumerated yet",
+        usageJson: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
+        logBytes: null,
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+        startIndex: 9,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain(
+        "Excluded-run breakdown by errorCode: `some_future_scheduler_code`: 9",
+      );
+    });
+  });
+
+  // AUR-5008: a detector that can articulate why its own finding is probably wrong should
+  // suppress the filing, not annotate it and file anyway. Zero cost across EVERY sampled
+  // attributable terminal run is proof no billable work happened.
+  describe("AUR-5008 zero-cost-contradiction suppression", () => {
+    it("suppresses the filing and emits an audit event instead when every attributable terminal run has zero cost and zero tokens", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+        status: "failed",
+        errorCode: "an_error_code_no_list_has_ever_heard_of",
+        error: "Something went wrong before anything billable happened",
+        usageJson: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
+        // A real (non-null) log so this is NOT swept by the never-started or zero-token
+        // backstops -- it must reach the zero-cost-contradiction suppression on its own merits.
+        logBytes: 500_000,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(0);
+      expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+
+      const suppressionActivity = await db
+        .select()
+        .from(activityLog)
+        .where(
+          eq(activityLog.action, "issue.productivity_review_suppressed_zero_cost_contradiction"),
+        );
+      expect(suppressionActivity).toHaveLength(1);
+      expect(suppressionActivity[0]?.entityId).toBe(seeded.issueId);
+    });
+  });
+
   describe("AUR-4062 zero-token/logBytes backstop classification", () => {
     const ZERO_USAGE = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
     const STARVED_LOG_BYTES = 6_100; // AUR-3943 forensics: starved runs logged ~6.0-6.2 KB.
@@ -1081,11 +1262,13 @@ describeEmbeddedPostgres("productivity review service", () => {
       const now = new Date("2026-04-28T12:00:00.000Z");
       const seeded = await seedAssignedIssue();
 
-      // Same zero-usage shape as a starved run, but logBytes is in the "actually invoked
-      // the model" range -- e.g. the agent ran, produced a real transcript, and errored
-      // before any billable usage was recorded. This must stay attributable so a genuine
-      // $0 agent failure can't be swept under the backstop (the exact risk the issue
-      // description called out for keeping this separate from AUR-4016).
+      // Same zero-usage-*cost* shape as a starved run, but logBytes is in the "actually
+      // invoked the model" range -- e.g. the agent ran, produced a real transcript, and
+      // errored before any billable cost was recorded (some input tokens were still
+      // consumed). This must stay attributable so a genuine $0 agent failure can't be
+      // swept under the backstop (the exact risk the issue description called out for
+      // keeping this separate from AUR-4016), and it must not trip the unrelated AUR-5008
+      // zero-cost-contradiction suppression, which requires zero *tokens* too.
       await insertRuns({
         companyId: seeded.companyId,
         agentId: seeded.coderId,
@@ -1095,7 +1278,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         status: "failed",
         errorCode: null,
         error: "the agent's own code threw an unhandled exception after a full run",
-        usageJson: ZERO_USAGE,
+        usageJson: { inputTokens: 1200, outputTokens: 0, costUsd: 0 },
         logBytes: REAL_WORK_LOG_BYTES,
       });
 
@@ -1169,6 +1352,17 @@ describeEmbeddedPostgres("productivity review service", () => {
       const nonAttributable = new Set<string>(NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES);
       const overlap = (DETERMINISTIC_ATTRIBUTABLE_ERROR_CODES as readonly string[]).filter(
         (code) => nonAttributable.has(code),
+      );
+      expect(overlap).toEqual([]);
+    });
+
+    // AUR-5008: same invariant, extended to the scheduler-lifecycle list -- it has its
+    // own compile-time AssertNever guard (DeterministicCodesAreNotSchedulerLifecycleCodes)
+    // mirroring the provider-code guard above, so this is its runtime companion too.
+    it("keeps the deterministic and scheduler-lifecycle code sets disjoint", () => {
+      const schedulerLifecycle = new Set<string>(SCHEDULER_LIFECYCLE_NON_ATTRIBUTABLE_ERROR_CODES);
+      const overlap = (DETERMINISTIC_ATTRIBUTABLE_ERROR_CODES as readonly string[]).filter(
+        (code) => schedulerLifecycle.has(code),
       );
       expect(overlap).toEqual([]);
     });

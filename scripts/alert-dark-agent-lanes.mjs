@@ -25,23 +25,30 @@
  *      guard field unset so the NEXT tick retries instead of the alert being
  *      silently swallowed.
  *
- * Severity: INFO (AUR-5355, 2026-08-07; was SEV2). A dark lane is not a
- * "production outage the fleet cannot self-recover from" — the fleet's own
- * routing doctrine's answer to lane starvation is to route around it
- * (route cross-adapter / to a different agent), not to page the founder's
- * phone. "Lane dark"/"Lane recovered" alone accounted for ~5 of the ~14
- * founder Telegram SEV2s in one 13h window, none of them actionable by the
- * founder personally. Note this reverses the SEV2 rationale this comment
- * used to carry (pre-AUR-5355, the INFO-is-a-no-op concern below) — that
- * concern is now moot: notify_founder.sh's INFO path was fixed under the
- * same issue to log every filtered call to the audit trail, so INFO here is
- * "logged, never delivered," not "does nothing." State transitions (open/
- * recover) still fire the alert exactly once each via the state machine
- * below — only the delivery severity changed. If a dark lane persists long
- * enough to represent unrecoverable quota exhaustion with no fleet
- * workaround, that is escalated separately per the billing/quota carve-out
- * in the telegram-founder-channel doctrine, not via this per-transition
- * alert.
+ * Severity: graded (AUR-5355, 2026-08-07; was flat SEV2, briefly flat INFO).
+ * A single dark lane is not a "production outage the fleet cannot
+ * self-recover from" — the fleet's own routing doctrine's answer to one
+ * lane starving is to route around it (route cross-adapter / to a different
+ * agent), not to page the founder's phone. That case alerts at INFO: logged
+ * to the audit trail (notify_founder.sh's INFO path was fixed under the
+ * same issue to log every filtered call, so INFO here is "logged, never
+ * delivered," not "does nothing"), never delivered.
+ *
+ * But when EVERY agent sharing an adapterType is dark at once, that is not
+ * a single-lane hiccup the fleet can route around — it is that adapter's
+ * entire capacity gone, which per the telegram-founder-channel billing/
+ * quota carve-out IS founder-actionable (top up quota / re-auth the
+ * provider) and nothing else in the fleet is armed to page on it. That case
+ * alerts at SEV2. See `isFullAdapterOutage` below: computed fresh off the
+ * current census each tick (self + every other agent of the same
+ * adapterType currently flagged dark), not persisted, so it always reflects
+ * ground truth. A "recovered" event is graded off the same census-inclusive
+ * check but the recovering agent itself is by definition no longer dark at
+ * that instant, so a "recovered" alert can never grade SEV2 by this
+ * definition — recovery is good news and does not need to interrupt the
+ * founder urgently, regardless of whether sibling lanes are still down.
+ * State transitions (open/recover) still fire the alert exactly once each
+ * via the state machine below — only the delivery severity is graded.
  *
  * Usage:
  *   node scripts/alert-dark-agent-lanes.mjs [--dry-run]
@@ -90,9 +97,9 @@ const DEFAULT_STATE_DIR = path.join(homedir(), 'paperclip-data', 'dark-lane-aler
  *
  * @returns {Promise<'confirmed'|'blocked'|'failed'>}
  */
-export async function sendFounderAlert(message, { cmd = DEFAULT_NOTIFY_FOUNDER_CMD } = {}) {
+export async function sendFounderAlert(message, { cmd = DEFAULT_NOTIFY_FOUNDER_CMD, severity = 'INFO' } = {}) {
   try {
-    const { stdout } = await execFileAsync(cmd, ['INFO', message], { encoding: 'utf8' });
+    const { stdout } = await execFileAsync(cmd, [severity, message], { encoding: 'utf8' });
     return stdout.trim().toLowerCase().startsWith('sent') ? 'confirmed' : 'failed';
   } catch (err) {
     // notify_founder.sh exits 2 for a policy/rate-window refusal — treat
@@ -101,6 +108,31 @@ export async function sendFounderAlert(message, { cmd = DEFAULT_NOTIFY_FOUNDER_C
     if (err && err.code === 2) return 'blocked';
     return 'failed';
   }
+}
+
+/**
+ * Grade "is this dark event a whole-adapter outage" (AUR-5355). Computed
+ * fresh off this tick's census — never persisted — so it always reflects
+ * ground truth rather than a stale snapshot from when the state machine
+ * last wrote `agent.metadata.darkLane`.
+ *
+ * `flaggedByAgent` already reflects `isDarkNow` for every agent this tick
+ * (it is the exact map `isDarkNow` was derived from), including the
+ * candidate agent itself — so a recovering agent (no longer in
+ * `flaggedByAgent`) can never satisfy "every peer is dark," which is
+ * intentional: see the module doc comment on why "recovered" never grades
+ * SEV2 under this definition.
+ *
+ * @param {object} agent
+ * @param {Array<object>} agents - full company census
+ * @param {Map<string, unknown>} flaggedByAgent - agentId -> parkedRuns for agents dark THIS tick
+ * @returns {boolean}
+ */
+function isFullAdapterOutage({ agent, agents, flaggedByAgent }) {
+  const adapterType = agent.adapterType ?? null;
+  if (!adapterType) return false;
+  const peers = agents.filter((a) => a.adapterType === adapterType);
+  return peers.every((a) => flaggedByAgent.has(a.id));
 }
 
 function buildAgentUrl({ issuePrefix, agent }) {
@@ -139,12 +171,12 @@ function buildAlertMessage({ kind, agent, state, issuePrefix }) {
  * @param {Array<object>} args.runs - heartbeat-runs census rows for this company
  * @param {Date} args.now
  * @param {string} args.issuePrefix
- * @param {(message: string) => Promise<'confirmed'|'blocked'|'failed'>} args.sendAlert
+ * @param {(message: string, severity: 'INFO'|'SEV2') => Promise<'confirmed'|'blocked'|'failed'>} args.sendAlert
  * @param {(agentId: string, metadata: object) => Promise<void>} args.patchAgent
  * @param {Object<string, object>} [args.localState] - previous tick's authoritative state, keyed by agentId
  * @param {boolean} [args.dryRun]
  * @returns {Promise<{
- *   results: Array<{agentId: string, name: string, alert: string|null, sendResult: string|null, patched: boolean, patchError: string|null}>,
+ *   results: Array<{agentId: string, name: string, alert: string|null, severity: string|null, sendResult: string|null, patched: boolean, patchError: string|null}>,
  *   localState: Object<string, object>,
  * }>}
  */
@@ -177,11 +209,13 @@ export async function tickCompany({ agents, runs, now, issuePrefix, sendAlert, p
 
     const { tentativeState, alert } = planDarkLaneTransition({ prevState, isDarkNow, detail, nowIso });
 
+    const severity = alert ? (isFullAdapterOutage({ agent, agents, flaggedByAgent }) ? 'SEV2' : 'INFO') : null;
+
     let sendResult = null;
     let confirmed = false;
     if (alert && !dryRun) {
       const message = buildAlertMessage({ kind: alert.kind, agent, state: tentativeState, issuePrefix });
-      sendResult = await sendAlert(message);
+      sendResult = await sendAlert(message, severity);
       confirmed = sendResult === 'confirmed';
     }
 
@@ -223,6 +257,7 @@ export async function tickCompany({ agents, runs, now, issuePrefix, sendAlert, p
       agentId,
       name: agent.name ?? agentId,
       alert: alert?.kind ?? null,
+      severity,
       sendResult,
       patched,
       patchError,
@@ -307,7 +342,7 @@ async function main() {
       issuePrefix,
       dryRun,
       localState,
-      sendAlert: (message) => sendFounderAlert(message),
+      sendAlert: (message, severity) => sendFounderAlert(message, { severity }),
       patchAgent: (agentId, metadata) => apiPatchAgent(agentId, metadata),
     });
 
@@ -329,7 +364,7 @@ async function main() {
       if (r.alert) {
         anyAlerted = true;
         console.log(
-          `[${companyId}] ${r.name} (${r.agentId}): ${r.alert} alert — send=${dryRun ? 'dry-run' : r.sendResult} patched=${r.patched}`,
+          `[${companyId}] ${r.name} (${r.agentId}): ${r.alert} alert (${r.severity}) — send=${dryRun ? 'dry-run' : r.sendResult} patched=${r.patched}`,
         );
       } else if (dryRun) {
         console.log(`[${companyId}] ${r.name} (${r.agentId}): no alert this tick`);

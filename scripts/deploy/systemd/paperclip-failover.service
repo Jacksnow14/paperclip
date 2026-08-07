@@ -1,0 +1,20 @@
+[Unit]
+Description=Paperclip crash-loop failover — roll back to last-good release (AUR-5095)
+# Not WantedBy= anything: activated exclusively via OnFailure= on
+# paperclip.service (see paperclip-crashloop-bound.conf) or an explicit
+# systemctl --user start by a human. A start against a healthy fleet is a
+# no-op: the script refuses to act unless the unit is genuinely failed.
+
+[Service]
+Type=oneshot
+# The script must NOT live behind /opt/paperclip/app/current: at fire time
+# `current` points at the broken release, so nothing resolved through it can
+# be trusted to run the recovery. install-crash-loop-failover.sh copies it to
+# this stable, release-independent path.
+ExecStart=%h/.local/libexec/paperclip/crash-loop-failover.sh
+# Lock wait (300s) + health gate (300s) live inside this unit; the default
+# 90s oneshot timeout would kill a recovery mid-flip.
+TimeoutStartSec=900
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=paperclip-failover

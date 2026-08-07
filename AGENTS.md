@@ -144,6 +144,23 @@ serially and clamps the heap to 3072 MB (server `tsc --noEmit` measured at
 strips and clamps it regardless of what you pass; raising it is what caused
 the AUR-3924 OOM cluster.
 
+**Every agent run also executes inside a per-run memory cgroup** (AUR-4536):
+a transient `systemd --user` scope with a hard ceiling, derived as
+`floor((host total − 3072 MB reserve) / concurrency cap)` —
+**1168 MB on this 7747 MB host**. `server` `tsc --noEmit` peaks at ~2489-2529
+MB, so it only ever completes under a *bigger, separately-scoped* cgroup, not
+the run's own 1168 MB one. `scripts/typecheck.mjs` handles this automatically
+(AUR-5012): it reads `memory.max − memory.current` from `/sys/fs/cgroup`
+alongside host `MemAvailable`, and when the run's own cgroup headroom is the
+binding constraint (not host memory), it **self-relaunches** inside a fresh
+`systemd-run --user --scope -p MemoryMax=3500M -p MemorySwapMax=0` and
+re-execs itself there — you do not need to do this by hand, and you do not
+need to reach for `NODE_OPTIONS` to route around it. If the relaunch itself
+isn't possible (no `systemd-run` on PATH, or the run is already inside a
+relaunched scope), the runner refuses loudly, naming the cgroup ceiling and
+the escape command — it never proceeds into a run the kernel would silently
+reap.
+
 If anything cannot be run, explicitly report what was not run and why.
 
 ## 8. API and Auth Expectations

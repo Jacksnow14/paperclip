@@ -104,6 +104,17 @@ const mockBudgetService = vi.hoisted(() => ({
   upsertPolicy: vi.fn(),
   resolveIncident: vi.fn(),
 }));
+const mockWorkClassBudgetService = vi.hoisted(() => ({
+  computeBudget: vi.fn().mockResolvedValue({
+    windowStart: "2026-01-01T00:00:00.000Z",
+    windowEnd: "2026-01-08T00:00:00.000Z",
+    revenueTokens: 0,
+    selfImprovementTokens: 0,
+    selfImprovementShare: 0,
+    capShare: 0.1,
+    overCap: false,
+  }),
+}));
 
 function registerModuleMocks() {
   vi.doMock("../services/index.js", () => ({
@@ -114,6 +125,7 @@ function registerModuleMocks() {
     agentService: () => mockAgentService,
     issueService: () => mockIssueService,
     heartbeatService: () => mockHeartbeatService,
+    workClassBudgetService: () => mockWorkClassBudgetService,
     logActivity: mockLogActivity,
   }));
 

@@ -1158,13 +1158,21 @@ export async function startServer(): Promise<StartedServer> {
           "issue-graph liveness reconciliation changed issue state or recorded action errors",
         );
       }
-      const scanned = await heartbeat.scanSilentActiveRuns();
-      if (scanned.created > 0 || scanned.escalated > 0) {
-        logger.warn({ ...scanned, phase }, "active-run output watchdog created review work");
+      // The two sweeps below are the only ones in this chain that exist purely to
+      // MINT meta-issues; everything above repairs run/issue state. Skipping them
+      // therefore costs no recovery capability, which is what makes them safe to
+      // gate independently of HEARTBEAT_SCHEDULER_ENABLED. See config.ts.
+      if (config.silentRunWatchdogEnabled) {
+        const scanned = await heartbeat.scanSilentActiveRuns();
+        if (scanned.created > 0 || scanned.escalated > 0) {
+          logger.warn({ ...scanned, phase }, "active-run output watchdog created review work");
+        }
       }
-      const reviewed = await heartbeat.reconcileProductivityReviews();
-      if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
-        logger.warn({ ...reviewed, phase }, "productivity reconciliation created or updated review work");
+      if (config.productivityReviewSweepEnabled) {
+        const reviewed = await heartbeat.reconcileProductivityReviews();
+        if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
+          logger.warn({ ...reviewed, phase }, "productivity reconciliation created or updated review work");
+        }
       }
     };
     const runGuardedRecoverySweep = async (opts: { reapStaleThresholdMs: number }) => {

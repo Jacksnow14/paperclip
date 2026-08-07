@@ -41,10 +41,19 @@
  * A board action fires only on an *edge* into flag/profit_seeking versus the
  * prior ledger band, so a standing condition is not re-raised every day.
  *
+ * --- Board approvals are OPT-IN (AUR-5354) ---------------------------------
+ * This loop used to file a `request_board_approval` on every band crossing. Four
+ * of them ("Approve scaling investment in the profit-seeking project(s)") sat in
+ * the board queue for 11–47 days: an ROI digest is not a decision a human can
+ * execute in a click, and a self-refilling generator is what made the 27-deep
+ * queue unreadable. Band crossings are still reported — as the board-visible
+ * comment this script writes on its execution issue — but an approval row is
+ * only created when a human explicitly asks for one with `--file-approval`.
+ *
  * Usage:
- *   node scripts/sgi-loop-d-roi-ledger.mjs            # recompute + write + (edge) board action
- *   node scripts/sgi-loop-d-roi-ledger.mjs --dry-run  # print only, no writes/approval
- *   node scripts/sgi-loop-d-roi-ledger.mjs --no-approval  # write ledgers + comment, skip approval
+ *   node scripts/sgi-loop-d-roi-ledger.mjs                 # recompute + write + comment (NO approval)
+ *   node scripts/sgi-loop-d-roi-ledger.mjs --dry-run       # print only, no writes
+ *   node scripts/sgi-loop-d-roi-ledger.mjs --file-approval # also file a board approval on a crossing
  */
 
 import { resolveApiBase } from './lib/paperclip-api-base.mjs';
@@ -58,7 +67,9 @@ const TASK_ID = process.env.PAPERCLIP_TASK_ID;
 
 const argv = process.argv.slice(2);
 const DRY_RUN = argv.includes('--dry-run');
-const NO_APPROVAL = argv.includes('--no-approval');
+// Board approvals are opt-in (AUR-5354). The retired `--no-approval` flag is
+// accepted and ignored: it now describes the default.
+const FILE_APPROVAL = argv.includes('--file-approval');
 const NOW_ISO = new Date().toISOString();
 const TODAY = NOW_ISO.slice(0, 10);
 
@@ -360,7 +371,7 @@ async function main() {
   if (boardActions.length && !DRY_RUN) {
     const flags = boardActions.filter(a => a.kind === 'review_or_pause');
     const stars = boardActions.filter(a => a.kind === 'scale_up');
-    if (!NO_APPROVAL) {
+    if (FILE_APPROVAL) {
       const approval = await requestBoardApproval({
         title: `ROI threshold crossings — ${TODAY} (${flags.length} flag, ${stars.length} profit-seeking)`,
         summary: `SGI Loop D recomputed lifetime ROI across ${rows.length} project(s). ${boardActions.length} crossed a board-action threshold since the last ledger.\n\n` +
@@ -376,7 +387,7 @@ async function main() {
     if (TASK_ID) {
       const lines = boardActions.map(a => `- **${a.severity.toUpperCase()}** · \`${a.projectName || a.projectId}\` → **${a.band}** (${pct(a.roi)}): ${a.recommendation}`).join('\n');
       await postComment(TASK_ID,
-        `## SGI Loop D — ROI threshold crossings (${TODAY})\n\n${boardActions.length} project(s) crossed a board-action threshold since the last ledger:\n\n${lines}\n\n${approvalId ? `Board approval requested: \`${approvalId}\`. ` : NO_APPROVAL ? '_Approval suppressed (--no-approval)._ ' : ''}Per-project ledgers stored as \`roi/{projectId}/lifetime\` (category \`roi_ledger\`).\n\n_Edge-triggered: only newly-crossed bands are listed. ROI is a median-referenced value-efficiency score (0.5 = company median) pending revenue wiring ([AUR-1734](/AUR/issues/AUR-1734))._`);
+        `## SGI Loop D — ROI threshold crossings (${TODAY})\n\n${boardActions.length} project(s) crossed a board-action threshold since the last ledger:\n\n${lines}\n\n${approvalId ? `Board approval requested: \`${approvalId}\`. ` : '_This comment **is** the board-facing report — no approval row filed (AUR-5354; pass `--file-approval` to file one)._ '}Per-project ledgers stored as \`roi/{projectId}/lifetime\` (category \`roi_ledger\`).\n\n_Edge-triggered: only newly-crossed bands are listed. ROI is a median-referenced value-efficiency score (0.5 = company median) pending revenue wiring ([AUR-1734](/AUR/issues/AUR-1734))._`);
     }
   } else if (TASK_ID && !DRY_RUN) {
     const summary = rows.length

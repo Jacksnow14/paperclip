@@ -7,7 +7,20 @@
  * as memory records (category `experiment`, auto-accepted, project-scoped);
  * conclusions as `experiment_conclusion` (same scope).
  *
+ * --- Arming: gate verdict, not a board row (AUR-5354) -----------------------
+ * Loop H used to send every hypothesis to the board. Two of those rows sat in
+ * the queue for 8 and 24 days asking the founder to approve *prompt edits to
+ * agent instructions* — not a founder decision, and the fleet already has a
+ * stronger answer for it in scripts/prompt-edit-gate.mjs (bounded diff + blind
+ * A/B replay). A fleet-internal experiment (routing / prompt_edit / threshold /
+ * agent_assignment) now arms on an ACCEPTED gate verdict; only a genuine
+ * founder decision — money, credentials, legal, irreversible — still routes to
+ * the board. See scripts/sgi-loop-h-approval-route.mjs for the rule.
+ *
  * State machine:
+ *   proposed --gate ACCEPTED--> approved  --watchdog (1/agent ok)--> running
+ *   proposed --gate REJECTED--> rejected + conclusion(gate_rejected)
+ *   proposed --gate-routed, no verdict--> needs_gate (one gate-run issue filed)
  *   proposed --board approves--> approved --watchdog (1/agent ok)--> running
  *   running --no isolation key (AUR-3202)-----------------------> needs_scope (blocked; never adopted/rejected)
  *   running --cap mis-set (budget_cap < horizon×p95) ------------> recalibrate to ceil(reachable×1.5), stay running
@@ -70,6 +83,11 @@ import {
   measureExperimentScoped,
   filterScorecardsByScope,
 } from './sgi-loop-h-experiment-scope.mjs';
+import {
+  routeForExperiment,
+  decideGateArming,
+  decideActivationCredential,
+} from './sgi-loop-h-approval-route.mjs';
 import { resolveApiBase } from './lib/paperclip-api-base.mjs';
 
 let API_URL = '';
@@ -404,6 +422,73 @@ async function createLoopCIssue(exp) {
 }
 
 /**
+ * Ask the target agent to run the prompt-edit gate for a gate-routed
+ * experiment (AUR-5354). This is the liveness path that replaces the board
+ * row: without it a gate-routed hypothesis would park forever waiting for a
+ * verdict nobody was asked to produce. Filed at most once per experiment —
+ * the caller stamps `gate_issue_id` on success and never files again.
+ */
+async function createGateIssue(exp) {
+  const m = exp.metadata;
+  const id = m.id || exp.id;
+  const target = m.target_agent_id || AGENT_ID;
+  const description = [
+    '## Run the prompt-edit gate — SGI Loop H experiment',
+    '',
+    `**Experiment:** \`${id}\``,
+    `**Hypothesis:** ${m.hypothesis || '—'}`,
+    `**Proposed change:** ${m.change || '—'}`,
+    `**Change type:** ${m.change_type || '—'}`,
+    `**Metric:** ${m.expected_metric || 'quality_signal'} — expected **${m.expected_delta || '+10%'}**`,
+    '',
+    '---',
+    '',
+    'This experiment is fleet-internal, so it arms on a **measured gate verdict**,',
+    'not a board approval (AUR-5354). Produce the edit and let the gate judge it:',
+    '',
+    '1. Read your `AGENTS.md` (your agent `instructionsFilePath`).',
+    '2. Write a **bounded** proposed version implementing the change above to a',
+    '   scratch file — ≤60 changed lines and ≤35% of the file, or the gate rejects',
+    '   it before spending a token.',
+    '3. Run the gate:',
+    '   ```',
+    `   node scripts/prompt-edit-gate.mjs --agent-id ${target} --proposed /tmp/proposed-AGENTS.md`,
+    '   ```',
+    '4. Stamp the printed `diffHash` onto the experiment record so the watchdog can',
+    '   find your verdict:',
+    '   ```',
+    `   PATCH /api/companies/{companyId}/memory/records/${exp.id}`,
+    '   { "metadata": { "gate_diff_hash": "<diffHash from the gate output>" } }',
+    '   ```',
+    '',
+    'On an **ACCEPTED** verdict the nightly watchdog arms the experiment to `running`',
+    'by itself. On **REJECTED** it concludes the experiment — do not re-propose the',
+    'same diff, the gate refuses repeats.',
+    '',
+    '**Do not file a board approval for this.** The board only decides money,',
+    'credentials, legal, and irreversible changes.',
+  ].join('\n');
+
+  const payload = {
+    title: `Run the prompt-edit gate — ${m.change_type || 'prompt_edit'} experiment ${id}`,
+    description,
+    assigneeAgentId: target,
+    projectId: PROJECT_ID,
+    parentId: PARENT_ISSUE_ID,
+    priority: 'medium',
+  };
+  if (DRY_RUN) return { identifier: '(dry-run)', id: null };
+  try {
+    const res = await apiFetch(`/api/companies/${COMPANY_ID}/issues`, { method: 'POST', body: JSON.stringify(payload) });
+    const iss = res.issue || res;
+    return { identifier: iss.identifier || iss.id, id: iss.id };
+  } catch (err) {
+    console.error(`createGateIssue failed for ${id}:`, err.message);
+    return null;
+  }
+}
+
+/**
  * File the 7d escalation for a stale-pending approval as a
  * request_confirmation interaction on the routine's OWN execution issue —
  * never the CEO-owned parent issue (it 403s on any write, AUR-4124). Returns
@@ -481,11 +566,16 @@ async function main() {
   const perfScorecards = await fetchAllByPrefix('performance/');
   const adjScorecards = await fetchAllByPrefix('scorecard-adjusted/');
   const allScorecards = [...perfScorecards, ...adjScorecards];
+  // Prompt-edit gate verdicts (AUR-5354) — the arming credential for every
+  // fleet-internal experiment. Written org-wide by scripts/prompt-edit-gate.mjs.
+  const gateVerdicts = (await fetchAllByPrefix('prompt-edit-verdict/'))
+    .filter(r => fields(r).kind === 'prompt_edit_verdict');
 
   // Conclusions already written (dedup guard so we never double-conclude).
   const concludedIds = new Set(conclusionRecords.map(r => fields(r).experiment_id).filter(Boolean));
 
   const summary = { activated: [], contention: [], blocked: [], recalibrated: [], needsScope: [], measured: [], adopted: [], rejected: [], skipped: [] };
+  const gate = { armed: [], rejected: [], requested: [], awaiting: [] };
 
   // Normalize a working metadata object onto each experiment for convenience.
   for (const e of experiments) e.metadata = { ...(e.metadata || {}), ...fields(e) };
@@ -510,13 +600,65 @@ async function main() {
     }
   }
 
-  // 3) ACTIVATE approved -> running (accepted approval + 1-per-agent).
+  // 2b) ARM gate-routed experiments (AUR-5354). A fleet-internal experiment is
+  // armed by an ACCEPTED prompt-edit-gate verdict, never by a board row. Runs
+  // before ACTIVATE so a verdict that landed since the last fire arms AND
+  // activates in the same pass.
+  for (const e of experiments) {
+    const m = e.metadata;
+    if (m.status !== 'proposed' && m.status !== 'needs_gate') continue;
+    if (routeForExperiment(e).route !== 'gate') continue;
+    const id = m.id || e.id;
+    const decision = decideGateArming(e, gateVerdicts);
+
+    if (decision.action === 'arm') {
+      const next = { ...m, status: 'approved', armed_by: 'prompt_edit_gate', gate_verdict_record_id: decision.verdictRecordId, armed_at: NOW_ISO };
+      if (!DRY_RUN) await patchRecordMetadata(e.id, next);
+      e.metadata = next;
+      gate.armed.push({ id, reason: decision.reason });
+      continue;
+    }
+
+    if (decision.action === 'reject') {
+      const next = { ...m, status: 'rejected', rejected_at: NOW_ISO };
+      if (!DRY_RUN) await patchRecordMetadata(e.id, next);
+      e.metadata = next;
+      if (!concludedIds.has(id)) await writeConclusion(e, 'rejected', 'gate_rejected');
+      gate.rejected.push({ id, reason: decision.reason });
+      summary.rejected.push({ id, reason: 'gate_rejected' });
+      continue;
+    }
+
+    if (decision.action === 'needs_gate') {
+      const issue = await createGateIssue(e);
+      if (issue) {
+        const next = { ...m, status: 'needs_gate', gate_issue_id: issue.id || issue.identifier, gate_requested_at: NOW_ISO };
+        if (!DRY_RUN) await patchRecordMetadata(e.id, next);
+        e.metadata = next;
+        gate.requested.push({ id, issue: issue.identifier });
+      }
+      continue;
+    }
+
+    // awaiting_gate — a gate run is already requested; stay parked, stay counted.
+    if (m.status !== 'needs_gate') {
+      const next = { ...m, status: 'needs_gate' };
+      if (!DRY_RUN) await patchRecordMetadata(e.id, next);
+      e.metadata = next;
+    }
+    gate.awaiting.push({ id, reason: decision.reason });
+  }
+
+  // 3) ACTIVATE approved -> running (arming credential + 1-per-agent).
   for (const e of experiments) {
     const m = e.metadata;
     if (m.status !== 'approved') continue;
-    const status = await getApprovalStatus(m.board_approval_id);
-    if (!m.board_approval_id || !APPROVED.has(String(status || '').toLowerCase())) {
-      summary.blocked.push({ id: m.id || e.id, reason: `approval ${status || 'missing'}` });
+    // Only a board-routed experiment needs an approval lookup; a gate-armed one
+    // must not be held for a board row that will never be filed.
+    const status = m.armed_by === 'prompt_edit_gate' ? null : await getApprovalStatus(m.board_approval_id);
+    const credential = decideActivationCredential(e, status);
+    if (!credential.ok) {
+      summary.blocked.push({ id: m.id || e.id, reason: credential.reason });
       continue;
     }
     const agent = m.target_agent_id || '(unassigned)';
@@ -540,6 +682,10 @@ async function main() {
   for (const e of experiments) {
     const m = e.metadata;
     if (m.status !== 'proposed') continue;
+    // Gate-routed rows were handled in 2b — never age, escalate, or founder-alert
+    // a board approval for a change the board should not have been asked about
+    // (AUR-5354). This is what kept two prompt-edit rows in the queue for 8 and 24 days.
+    if (routeForExperiment(e).route !== 'board') continue;
     const id = m.id || e.id;
 
     const approval = m.board_approval_id ? await getApproval(m.board_approval_id) : null;
@@ -689,6 +835,10 @@ async function main() {
     adopted: summary.adopted.length,
     rejected: summary.rejected.length,
     pendingApproval: pendingApproval.details.length,
+    gateArmed: gate.armed.length,
+    gateRejected: gate.rejected.length,
+    gateRequested: gate.requested.length,
+    gateAwaiting: gate.awaiting.length,
   };
 
   // Mandatory pending-approval line (AUR-4124) — "no stalls" must be an
@@ -724,7 +874,12 @@ async function main() {
       if (summary.contention.length) lines.push('\n**Held (1-per-agent):**\n' + fmt(summary.contention, a => `- \`${a.id}\` (agent ${a.agent} already has a running experiment)`));
       if (summary.blocked.length) lines.push('\n**Awaiting board approval:**\n' + fmt(summary.blocked, a => `- \`${a.id}\` — ${a.reason}`));
     }
+    if (gate.armed.length) lines.push('\n**Armed by the prompt-edit gate (→ approved):**\n' + fmt(gate.armed, a => `- \`${a.id}\` — ${a.reason}`));
+    if (gate.rejected.length) lines.push('\n**Rejected by the prompt-edit gate:**\n' + fmt(gate.rejected, a => `- \`${a.id}\` — ${a.reason}`));
+    if (gate.requested.length) lines.push('\n**Gate run requested (fleet-internal — no board row filed, AUR-5354):**\n' + fmt(gate.requested, a => `- \`${a.id}\` → ${a.issue}`));
+    if (gate.awaiting.length) lines.push('\n**Awaiting a gate verdict:**\n' + fmt(gate.awaiting, a => `- \`${a.id}\` — ${a.reason}`));
     lines.push('');
+    lines.push(`Gate-routed (no board approval asked): **${counts.gateArmed + counts.gateRejected + counts.gateRequested + counts.gateAwaiting}**.`);
     lines.push(pendingLine);
     if (pendingApproval.unapproved.length) lines.push('\n**Unapproved (missing board_approval_id — a Drafter bug, never activated):**\n' + fmt(pendingApproval.unapproved, a => `- \`${a.id}\``));
     if (pendingApproval.escalated.length) lines.push('\n**Escalated (>=7d pending, board request_confirmation filed on this issue):**\n' + fmt(pendingApproval.escalated, a => `- \`${a.id}\` — ${a.ageDays}d`));
@@ -734,7 +889,7 @@ async function main() {
     await postComment(TASK_ID, lines.join('\n'));
   }
 
-  return { date: TODAY, dryRun: DRY_RUN, counts, summary, pendingApproval };
+  return { date: TODAY, dryRun: DRY_RUN, counts, summary, gate, pendingApproval };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

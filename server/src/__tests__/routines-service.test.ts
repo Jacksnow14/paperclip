@@ -26,6 +26,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { issueService } from "../services/issues.ts";
+import * as issuesModule from "../services/issues.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import * as providerRegistry from "../secrets/provider-registry.ts";
 import { routineService } from "../services/routines.ts";
@@ -681,7 +682,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     companyId: string;
     issueSvc: ReturnType<typeof issueService>;
     routine: { id: string; projectId: string | null; title: string; description: string | null; priority: string; assigneeAgentId: string | null };
-  }) {
+  }, opts?: { startedAt?: Date | null; createdAt?: Date; heartbeatStatus?: string }) {
     const previousRunId = randomUUID();
     const liveHeartbeatRunId = randomUUID();
     const previousIssue = await fixture.issueSvc.create(fixture.companyId, {
@@ -707,15 +708,23 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       linkedIssueId: previousIssue.id,
     });
 
+    // startedAt defaults to the historical fixture date. AUR-4543 tests override
+    // it with a `now`-relative age so the stale-active threshold is exercised
+    // deterministically, and pass startedAt: null to model a queued run that
+    // never launched (where only created_at can date the wedge).
+    const heartbeatStartedAt = opts?.startedAt === undefined
+      ? new Date("2026-03-20T12:01:00.000Z")
+      : opts.startedAt;
     await db.insert(heartbeatRuns).values({
       id: liveHeartbeatRunId,
       companyId: fixture.companyId,
       agentId: fixture.agentId,
       invocationSource: "assignment",
       triggerDetail: "system",
-      status: "running",
+      status: opts?.heartbeatStatus ?? "running",
       contextSnapshot: { issueId: previousIssue.id },
-      startedAt: new Date("2026-03-20T12:01:00.000Z"),
+      startedAt: heartbeatStartedAt,
+      ...(opts?.createdAt ? { createdAt: opts.createdAt } : {}),
     });
 
     await db
@@ -812,6 +821,462 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     const detail = await svc.getDetail(routine.id);
     expect(detail?.consecutiveCoalesceCount).toBe(0);
     expect(detail?.lastSuccessfulCompletionAt?.toISOString()).toBe(completedAt.toISOString());
+  });
+
+  // AUR-4543: stale-active reaping. Ages are `now`-relative because the service
+  // stamps triggeredAt from the wall clock; the schedule interval is read off the
+  // cron period (two consecutive ticks), so both sides of every threshold below
+  // are exact rather than dependent on when the suite happens to run.
+  const HOUR_MS = 3_600_000;
+  const MINUTE_MS = 60_000;
+
+  async function addScheduleTrigger(svc: Awaited<ReturnType<typeof seedFixture>>["svc"], routineId: string, cronExpression: string) {
+    const { trigger } = await svc.createTrigger(routineId, {
+      kind: "schedule",
+      label: "sched",
+      cronExpression,
+      timezone: "UTC",
+    }, {});
+    return trigger;
+  }
+
+  async function readStaleState(issueId: string, heartbeatRunId: string, routineRunId: string) {
+    const [issueRow] = await db
+      .select({ executionRunId: issues.executionRunId, status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const [heartbeatRow] = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, error: heartbeatRuns.error })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, heartbeatRunId));
+    const [routineRunRow] = await db
+      .select({ status: routineRuns.status, failureReason: routineRuns.failureReason })
+      .from(routineRuns)
+      .where(eq(routineRuns.id, routineRunId));
+    return { issue: issueRow, heartbeat: heartbeatRow, routineRun: routineRunRow };
+  }
+
+  it("reaps a stale scheduled run, detaches its issue, and dispatches fresh work", async () => {
+    const fixture = await seedFixture();
+    const { routine, svc } = fixture;
+    // Daily cron => a 24h schedule interval, so the threshold is 24h, not the 4h floor.
+    const trigger = await addScheduleTrigger(svc, routine.id, "0 10 * * *");
+    const { previousIssue, previousRunId, liveHeartbeatRunId } = await seedWedgedRoutineIssue(fixture, {
+      startedAt: new Date(Date.now() - 25 * HOUR_MS),
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule", triggerId: trigger.id });
+
+    // Fresh dispatch, not a fold.
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).not.toBe(previousIssue.id);
+    expect(run.coalescedIntoRunId).toBeNull();
+
+    const state = await readStaleState(previousIssue.id, liveHeartbeatRunId, previousRunId);
+    // The wedged heartbeat run drops out of the live statuses.
+    expect(state.heartbeat?.status).toBe("failed");
+    expect(state.heartbeat?.errorCode).toBe("routine_stale_active_timeout");
+    // The dispatch slot is freed by detaching, and the issue is NOT cancelled.
+    expect(state.issue?.executionRunId).toBeNull();
+    expect(state.issue?.status).toBe("in_progress");
+    // The predecessor stops reporting green.
+    expect(state.routineRun?.status).toBe("failed");
+    expect(state.routineRun?.failureReason).toContain("stale-active timeout");
+
+    // The new issue is genuinely fresh: distinct row, new originRunId.
+    const routineIssues = await db
+      .select({ id: issues.id, originRunId: issues.originRunId })
+      .from(issues)
+      .where(eq(issues.originId, routine.id));
+    expect(routineIssues).toHaveLength(2);
+    const freshIssue = routineIssues.find((row) => row.id !== previousIssue.id);
+    expect(freshIssue?.originRunId).toBe(run.id);
+    expect(freshIssue?.originRunId).not.toBe(previousRunId);
+
+    const staleLogs = await db
+      .select({ entityId: activityLog.entityId })
+      .from(activityLog)
+      .where(eq(activityLog.action, "routine.stale_active_timeout"));
+    expect(staleLogs).toHaveLength(1);
+    expect(staleLogs[0]?.entityId).toBe(previousIssue.id);
+
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, previousIssue.id));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("stale-active timeout");
+    expect(comments[0]?.body).toContain("detached");
+
+    // Discrimination: the fire immediately after the reap folds into the FRESH
+    // issue, whose run is young. The gate reaps wedges; it does not disable
+    // coalescing.
+    const followUp = await svc.runRoutine(routine.id, { source: "schedule", triggerId: trigger.id });
+    expect(followUp.status).toBe("coalesced");
+    expect(followUp.linkedIssueId).toBe(freshIssue?.id);
+  });
+
+  it("reaps a stale scheduled run that never started, dating it from created_at", async () => {
+    const fixture = await seedFixture();
+    const { routine, svc } = fixture;
+    const trigger = await addScheduleTrigger(svc, routine.id, "0 10 * * *");
+    // A queued run that never launched has startedAt NULL — keying staleness on
+    // started_at alone would miss exactly this wedge class.
+    const { previousIssue, liveHeartbeatRunId } = await seedWedgedRoutineIssue(fixture, {
+      startedAt: null,
+      createdAt: new Date(Date.now() - 25 * HOUR_MS),
+      heartbeatStatus: "queued",
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule", triggerId: trigger.id });
+
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).not.toBe(previousIssue.id);
+    const [heartbeatRow] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, liveHeartbeatRunId));
+    expect(heartbeatRow?.status).toBe("failed");
+  });
+
+  it("control: a scheduled fire does not reap a live run younger than the schedule interval", async () => {
+    const fixture = await seedFixture();
+    const { routine, svc } = fixture;
+    const trigger = await addScheduleTrigger(svc, routine.id, "0 10 * * *");
+    // 5h old: past the 4h floor, well inside the routine's own 24h interval.
+    // This is the case that proves the threshold tracks the schedule period
+    // rather than collapsing onto the floor.
+    const { previousIssue, previousRunId, liveHeartbeatRunId } = await seedWedgedRoutineIssue(fixture, {
+      startedAt: new Date(Date.now() - 5 * HOUR_MS),
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule", triggerId: trigger.id });
+
+    expect(run.status).toBe("coalesced");
+    expect(run.linkedIssueId).toBe(previousIssue.id);
+    const state = await readStaleState(previousIssue.id, liveHeartbeatRunId, previousRunId);
+    expect(state.heartbeat?.status).toBe("running");
+    expect(state.issue?.executionRunId).toBe(liveHeartbeatRunId);
+    expect(state.routineRun?.status).toBe("issue_created");
+
+    const staleLogs = await db
+      .select({ entityId: activityLog.entityId })
+      .from(activityLog)
+      .where(eq(activityLog.action, "routine.stale_active_timeout"));
+    expect(staleLogs).toHaveLength(0);
+  });
+
+  it("control: a manual fire never reaps a stale live run", async () => {
+    const fixture = await seedFixture();
+    const { routine, svc } = fixture;
+    const trigger = await addScheduleTrigger(svc, routine.id, "0 10 * * *");
+    const { previousIssue, previousRunId, liveHeartbeatRunId } = await seedWedgedRoutineIssue(fixture, {
+      startedAt: new Date(Date.now() - 25 * HOUR_MS),
+    });
+
+    // Same wedge as the reaping test, only the source differs.
+    const run = await svc.runRoutine(routine.id, { source: "manual", triggerId: trigger.id });
+
+    expect(run.status).toBe("coalesced");
+    expect(run.linkedIssueId).toBe(previousIssue.id);
+    const state = await readStaleState(previousIssue.id, liveHeartbeatRunId, previousRunId);
+    expect(state.heartbeat?.status).toBe("running");
+    expect(state.issue?.executionRunId).toBe(liveHeartbeatRunId);
+    expect(state.routineRun?.status).toBe("issue_created");
+
+    const staleLogs = await db
+      .select({ entityId: activityLog.entityId })
+      .from(activityLog)
+      .where(eq(activityLog.action, "routine.stale_active_timeout"));
+    expect(staleLogs).toHaveLength(0);
+  });
+
+  it("control: does not reap while one of the issue's live runs is still young", async () => {
+    // An issue can carry more than one live run — the execution-bound one plus
+    // any run holding it in a context snapshot. Reaping keys on the YOUNGEST of
+    // them, so a single fresh run means the issue is genuinely busy and the aged
+    // sibling must not be enough to kill it.
+    const fixture = await seedFixture();
+    const { routine, svc } = fixture;
+    const trigger = await addScheduleTrigger(svc, routine.id, "0 10 * * *");
+    const { previousIssue, previousRunId, liveHeartbeatRunId } = await seedWedgedRoutineIssue(fixture, {
+      startedAt: new Date(Date.now() - 25 * HOUR_MS),
+    });
+    const youngRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: youngRunId,
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: { issueId: previousIssue.id },
+      startedAt: new Date(Date.now() - 2 * MINUTE_MS),
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule", triggerId: trigger.id });
+
+    expect(run.status).toBe("coalesced");
+    expect(run.linkedIssueId).toBe(previousIssue.id);
+    const state = await readStaleState(previousIssue.id, liveHeartbeatRunId, previousRunId);
+    expect(state.heartbeat?.status).toBe("running");
+    expect(state.issue?.executionRunId).toBe(liveHeartbeatRunId);
+    expect(state.routineRun?.status).toBe("issue_created");
+    const [youngRow] = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, youngRunId));
+    expect(youngRow?.status).toBe("running");
+  });
+
+  it("reaps a stale run that takes the slot after the pre-create check (slot-conflict path)", async () => {
+    // The un-gated coalesce branch exists TWICE: once before issueSvc.create and
+    // again in the slot-conflict catch. This covers the second one, reachable
+    // only when a wedge occupies the dispatch slot after the first check has
+    // already passed. The spy widens that window deterministically — the
+    // constraint violation itself is a real issues_open_routine_execution_uq
+    // conflict, not a synthesized error.
+    //
+    // Note where that conflict actually comes from: issueSvc.create inserts with
+    // a null execution_run_id, so a fresh issue is outside the partial index and
+    // the INSERT cannot collide. The colliding write is the wakeup's
+    // execution_run_id binding, which is why the guard has to span both.
+    type IssueServiceFactory = typeof issuesModule.issueService;
+    const realIssueService: IssueServiceFactory = issuesModule.issueService;
+    let makeWedgeLive: (() => Promise<void>) | null = null;
+    const spy = vi.spyOn(issuesModule, "issueService").mockImplementation(((executor) => {
+      const real = realIssueService(executor);
+      return {
+        ...real,
+        create: async (companyId, payload) => {
+          if (makeWedgeLive) {
+            const hook = makeWedgeLive;
+            makeWedgeLive = null;
+            await hook();
+          }
+          return real.create(companyId, payload);
+        },
+      };
+    }) as IssueServiceFactory);
+
+    try {
+      const fixture = await seedFixture();
+      const { routine, svc } = fixture;
+      const trigger = await addScheduleTrigger(svc, routine.id, "0 10 * * *");
+
+      // Dispatch for real first, so the incumbent issue carries the same
+      // originFingerprint the next dispatch will compute. A hand-seeded issue
+      // has a NULL fingerprint, and NULLs are distinct in a unique index — it
+      // would never actually collide.
+      const firstRun = await svc.runRoutine(routine.id, { source: "schedule", triggerId: trigger.id });
+      expect(firstRun.status).toBe("issue_created");
+      const incumbentId = firstRun.linkedIssueId!;
+      const [incumbent] = await db
+        .select({ executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, incumbentId));
+      const wedgedRunId = incumbent!.executionRunId!;
+
+      // Age the run out, but park it in a non-live status so the pre-create
+      // check misses and the dispatch proceeds all the way to the slot write.
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "failed", startedAt: new Date(Date.now() - 25 * HOUR_MS) })
+        .where(eq(heartbeatRuns.id, wedgedRunId));
+      const detailBefore = await svc.getDetail(routine.id);
+      expect(detailBefore?.activeIssue ?? null).toBeNull();
+
+      // The race: the wedge becomes live after the check has already passed.
+      makeWedgeLive = async () => {
+        await db
+          .update(heartbeatRuns)
+          .set({ status: "running" })
+          .where(eq(heartbeatRuns.id, wedgedRunId));
+      };
+
+      const run = await svc.runRoutine(routine.id, { source: "schedule", triggerId: trigger.id });
+
+      // Reaped inside the slot-conflict catch and retried, rather than folded.
+      expect(run.status).toBe("issue_created");
+      expect(run.linkedIssueId).not.toBe(incumbentId);
+      const state = await readStaleState(incumbentId, wedgedRunId, firstRun.id);
+      expect(state.heartbeat?.status).toBe("failed");
+      expect(state.heartbeat?.errorCode).toBe("routine_stale_active_timeout");
+      expect(state.issue?.executionRunId).toBeNull();
+      // Detached, never cancelled.
+      expect(state.issue?.status).toBe("todo");
+      expect(state.routineRun?.status).toBe("failed");
+      // The retried issue really is bound to a fresh live run.
+      const [retried] = await db
+        .select({ executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, run.linkedIssueId!));
+      expect(retried?.executionRunId).toBeTruthy();
+      expect(retried?.executionRunId).not.toBe(wedgedRunId);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("control: folds and cleans up its own issue when the run taking the slot is not yet stale", async () => {
+    // Same race, non-stale incumbent. Proves the slot-conflict gate discriminates
+    // instead of reaping everything that collides, and that the losing dispatch
+    // does not leave the execution issue it had already created behind.
+    type IssueServiceFactory = typeof issuesModule.issueService;
+    const realIssueService: IssueServiceFactory = issuesModule.issueService;
+    let makeWedgeLive: (() => Promise<void>) | null = null;
+    const spy = vi.spyOn(issuesModule, "issueService").mockImplementation(((executor) => {
+      const real = realIssueService(executor);
+      return {
+        ...real,
+        create: async (companyId, payload) => {
+          if (makeWedgeLive) {
+            const hook = makeWedgeLive;
+            makeWedgeLive = null;
+            await hook();
+          }
+          return real.create(companyId, payload);
+        },
+      };
+    }) as IssueServiceFactory);
+
+    try {
+      const fixture = await seedFixture();
+      const { routine, svc } = fixture;
+      const trigger = await addScheduleTrigger(svc, routine.id, "0 10 * * *");
+
+      const firstRun = await svc.runRoutine(routine.id, { source: "schedule", triggerId: trigger.id });
+      const incumbentId = firstRun.linkedIssueId!;
+      const [incumbent] = await db
+        .select({ executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, incumbentId));
+      const liveRunId = incumbent!.executionRunId!;
+
+      // One hour old against a 24h interval — genuinely busy, not wedged.
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "failed", startedAt: new Date(Date.now() - 1 * HOUR_MS) })
+        .where(eq(heartbeatRuns.id, liveRunId));
+      makeWedgeLive = async () => {
+        await db
+          .update(heartbeatRuns)
+          .set({ status: "running" })
+          .where(eq(heartbeatRuns.id, liveRunId));
+      };
+
+      const run = await svc.runRoutine(routine.id, { source: "schedule", triggerId: trigger.id });
+
+      expect(run.status).toBe("coalesced");
+      expect(run.linkedIssueId).toBe(incumbentId);
+      const state = await readStaleState(incumbentId, liveRunId, firstRun.id);
+      expect(state.heartbeat?.status).toBe("running");
+      expect(state.heartbeat?.errorCode).toBeNull();
+      expect(state.issue?.executionRunId).toBe(liveRunId);
+      // The issue this dispatch created before losing the race is gone.
+      const remaining = await db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(eq(issues.originKind, "routine_execution"));
+      expect(remaining.map((row) => row.id)).toEqual([incumbentId]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("fails loudly rather than folding a slot conflict into the dispatch's own issue", async () => {
+    // The occupant holds the slot through a finished run: execution_run_id is
+    // still set (so the partial index is occupied) but the run is not live (so
+    // findLiveExecutionIssue's execution-bound join misses it). That combination
+    // drops the conflict lookup onto its context-snapshot fallback, where the
+    // only live run left in the company belongs to the issue THIS dispatch just
+    // created — via the heartbeat run its failed wakeup left behind.
+    //
+    // Folding or reaping there would have the dispatch act on itself. That state
+    // is an orphaned execution_run_id, a different defect from a stale-active
+    // run, so the honest outcome is to surface the conflict.
+    const fixture = await seedFixture();
+    const { routine, svc } = fixture;
+    const trigger = await addScheduleTrigger(svc, routine.id, "0 10 * * *");
+
+    const firstRun = await svc.runRoutine(routine.id, { source: "schedule", triggerId: trigger.id });
+    const incumbentId = firstRun.linkedIssueId!;
+    const [incumbent] = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, incumbentId));
+    const finishedRunId = incumbent!.executionRunId!;
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "completed", startedAt: new Date(Date.now() - 25 * HOUR_MS) })
+      .where(eq(heartbeatRuns.id, finishedRunId));
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule", triggerId: trigger.id });
+
+    expect(run.status).toBe("failed");
+    // Drizzle's wrapper message names the statement, not the constraint (the
+    // constraint lives on the wrapped cause) — so pin the slot-binding write.
+    expect(run.failureReason).toContain('update "issues" set "execution_run_id"');
+    // The occupant is left exactly as it was — no self-inflicted reap.
+    const state = await readStaleState(incumbentId, finishedRunId, firstRun.id);
+    expect(state.issue?.executionRunId).toBe(finishedRunId);
+    expect(state.heartbeat?.errorCode).toBeNull();
+    expect(state.routineRun?.status).toBe("issue_created");
+    const remaining = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.originKind, "routine_execution"));
+    expect(remaining.map((row) => row.id)).toEqual([incumbentId]);
+  });
+
+  it("raises a coalesce anomaly on the FIRST fold when the live run outlived one schedule interval", async () => {
+    const fixture = await seedFixture();
+    const { routine, svc } = fixture;
+    // 5-minute cron => 5m interval, but the 4h floor still protects the run from
+    // being reaped, so this genuinely exercises the age-based anomaly.
+    const trigger = await addScheduleTrigger(svc, routine.id, "*/5 * * * *");
+    const { previousIssue } = await seedWedgedRoutineIssue(fixture, {
+      startedAt: new Date(Date.now() - 30 * MINUTE_MS),
+    });
+
+    const first = await svc.runRoutine(routine.id, { source: "schedule", triggerId: trigger.id });
+    expect(first.status).toBe("coalesced");
+
+    const state = await readCoalesceState(routine.id, previousIssue.id);
+    expect(state.count).toBe(1);
+    expect(state.comments).toHaveLength(1);
+    expect(state.comments[0]?.body).toContain("longer than the routine's");
+    expect(state.comments[0]?.body).toContain("schedule interval");
+
+    const anomalyLogs = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(eq(activityLog.action, "routine.coalesce_anomaly"));
+    expect(anomalyLogs).toHaveLength(1);
+    expect((anomalyLogs[0]?.details as { raiseReason?: string })?.raiseReason).toBe("age");
+  });
+
+  it("control: stays silent on the first fold when the live run is younger than one schedule interval", async () => {
+    const fixture = await seedFixture();
+    const { routine, svc } = fixture;
+    const trigger = await addScheduleTrigger(svc, routine.id, "*/5 * * * *");
+    // 1 minute old against a 5-minute interval.
+    const { previousIssue } = await seedWedgedRoutineIssue(fixture, {
+      startedAt: new Date(Date.now() - 1 * MINUTE_MS),
+    });
+
+    const first = await svc.runRoutine(routine.id, { source: "schedule", triggerId: trigger.id });
+    expect(first.status).toBe("coalesced");
+
+    const state = await readCoalesceState(routine.id, previousIssue.id);
+    expect(state.count).toBe(1);
+    expect(state.comments).toHaveLength(0);
+
+    const anomalyLogs = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(eq(activityLog.action, "routine.coalesce_anomaly"));
+    expect(anomalyLogs).toHaveLength(0);
   });
 
   it("touches a coalesced routine issue for the manual runner's inbox", async () => {

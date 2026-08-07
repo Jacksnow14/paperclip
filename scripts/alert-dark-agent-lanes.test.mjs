@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, chmodSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -437,4 +437,18 @@ test('sendFounderAlert classifies exit code 1 as failed', async (t) => {
   const cmd = makeFakeScript(dir, 'notify-fail.sh', 'echo "usage error"\nexit 1');
   const result = await sendFounderAlert('test message', { cmd });
   assert.equal(result, 'failed');
+});
+
+test('sendFounderAlert invokes notify_founder.sh with INFO, not SEV2 (AUR-5355)', async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'aur4532-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const echoArgsPath = path.join(dir, 'first-arg.txt');
+  const cmd = makeFakeScript(
+    dir,
+    'notify-echo-args.sh',
+    `printf '%s' "$1" > "${echoArgsPath}"\necho "sent (info-logged)"\nexit 0`
+  );
+  const result = await sendFounderAlert('test message', { cmd });
+  assert.equal(result, 'confirmed');
+  assert.equal(readFileSync(echoArgsPath, 'utf8'), 'INFO');
 });

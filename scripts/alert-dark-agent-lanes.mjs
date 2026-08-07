@@ -25,12 +25,23 @@
  *      guard field unset so the NEXT tick retries instead of the alert being
  *      silently swallowed.
  *
- * Severity: SEV2, per notify_founder.sh's contract (INFO is filtered before
- * logging under the fleet's default TELEGRAM_MIN_SEVERITY=SEV2, so an INFO
- * call here would neither deliver nor log — indistinguishable from doing
- * nothing). A lane that silently absorbs every dispatch for days is exactly
- * the "production outage the fleet cannot self-recover from" case the
- * telegram-founder-channel doctrine carves out for SEV2.
+ * Severity: INFO (AUR-5355, 2026-08-07; was SEV2). A dark lane is not a
+ * "production outage the fleet cannot self-recover from" — the fleet's own
+ * routing doctrine's answer to lane starvation is to route around it
+ * (route cross-adapter / to a different agent), not to page the founder's
+ * phone. "Lane dark"/"Lane recovered" alone accounted for ~5 of the ~14
+ * founder Telegram SEV2s in one 13h window, none of them actionable by the
+ * founder personally. Note this reverses the SEV2 rationale this comment
+ * used to carry (pre-AUR-5355, the INFO-is-a-no-op concern below) — that
+ * concern is now moot: notify_founder.sh's INFO path was fixed under the
+ * same issue to log every filtered call to the audit trail, so INFO here is
+ * "logged, never delivered," not "does nothing." State transitions (open/
+ * recover) still fire the alert exactly once each via the state machine
+ * below — only the delivery severity changed. If a dark lane persists long
+ * enough to represent unrecoverable quota exhaustion with no fleet
+ * workaround, that is escalated separately per the billing/quota carve-out
+ * in the telegram-founder-channel doctrine, not via this per-transition
+ * alert.
  *
  * Usage:
  *   node scripts/alert-dark-agent-lanes.mjs [--dry-run]
@@ -81,7 +92,7 @@ const DEFAULT_STATE_DIR = path.join(homedir(), 'paperclip-data', 'dark-lane-aler
  */
 export async function sendFounderAlert(message, { cmd = DEFAULT_NOTIFY_FOUNDER_CMD } = {}) {
   try {
-    const { stdout } = await execFileAsync(cmd, ['SEV2', message], { encoding: 'utf8' });
+    const { stdout } = await execFileAsync(cmd, ['INFO', message], { encoding: 'utf8' });
     return stdout.trim().toLowerCase().startsWith('sent') ? 'confirmed' : 'failed';
   } catch (err) {
     // notify_founder.sh exits 2 for a policy/rate-window refusal — treat

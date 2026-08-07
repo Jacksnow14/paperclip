@@ -205,6 +205,14 @@ out=$(run_check)
   && ok "behind-origin-master sustained past 1h pages (arm automation broken)" \
   || fail "behind-origin-master sustained past 1h pages (arm automation broken)" "alerts=$(alerts) out=$out"
 
+# 4b. (AUR-5355) deploy-debt is fleet-internal noise the founder cannot act on
+#     directly — it must escalate at INFO (logged, never delivered), not SEV2.
+if grep -q "^INFO " "$SINK" && ! grep -q "^SEV2 " "$SINK"; then
+  ok "deploy-debt (behind-origin-master) escalates at INFO, not SEV2"
+else
+  fail "deploy-debt (behind-origin-master) escalates at INFO, not SEV2" "sink=$(cat "$SINK" 2>/dev/null)"
+fi
+
 # 5. Rate limiting: a still-broken provenance state does not re-page every tick.
 reset; rm -f "$HEALTH"; set_activated "$MASTER_SHA"
 seed_log "untracked-or-unreachable:unreachable" 5
@@ -488,6 +496,14 @@ if [[ "$(alerts)" == "1" ]] && grep -q "checkout-behind:fixture" "$SINK"; then
   ok "checkout behind origin/main for 30h pages, naming the checkout"
 else
   fail "checkout behind origin/main for 30h pages, naming the checkout" "rc=$rc alerts=$(alerts) sink=$(cat "$SINK" 2>/dev/null) out=$out"
+fi
+
+# 22b. (AUR-5355) checkout-debt is fleet-internal noise the founder cannot act
+#      on directly — it must escalate at INFO (logged, never delivered), not SEV2.
+if grep -q "^INFO .*checkout-behind:fixture" "$SINK" && ! grep -q "^SEV2 " "$SINK"; then
+  ok "checkout-debt (checkout-behind) escalates at INFO, not SEV2"
+else
+  fail "checkout-debt (checkout-behind) escalates at INFO, not SEV2" "sink=$(cat "$SINK" 2>/dev/null)"
 fi
 
 # 23. A checkout drift's sustained-duration clock is isolated from the primary

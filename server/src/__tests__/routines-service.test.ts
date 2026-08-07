@@ -1371,6 +1371,19 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     ).rejects.toThrow(/require defaults for required variables/i);
   });
 
+  it("computes a real nextRunAt for a midnight-hour schedule (regression: en-US hour12:false formats 00:00 as '24', never matching hour 0)", async () => {
+    const { routine, svc } = await seedFixture();
+    const { trigger } = await svc.createTrigger(routine.id, {
+      kind: "schedule",
+      label: "daily-midnight",
+      cronExpression: "30 0 * * *",
+      timezone: "UTC",
+    }, {});
+    expect(trigger.nextRunAt).not.toBeNull();
+    expect(trigger.nextRunAt!.getUTCHours()).toBe(0);
+    expect(trigger.nextRunAt!.getUTCMinutes()).toBe(30);
+  });
+
   it("serializes concurrent dispatches until the first execution issue is linked to a queued run", async () => {
     const { routine, svc } = await seedFixture({
       wakeup: async (wakeupAgentId, wakeupOpts) => {

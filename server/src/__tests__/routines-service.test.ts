@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -2200,5 +2200,165 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .from(issues)
       .where(eq(issues.originId, routine.id));
     expect(allIssues).toHaveLength(2);
+  });
+
+  async function readAlarmIssues(companyId: string, routineId: string) {
+    const alarmIssues = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "routine_coalesce_alarm"), eq(issues.originId, routineId)));
+    return alarmIssues;
+  }
+
+  // AUR-5387 Defect 2 (FIRES): a reuse_and_rewake umbrella that gets re-waked into
+  // a lane that never actually completes the work must still count toward the
+  // wedge counter — it used to reset to 0 on every rewake (isCoalesceAnomalyRaisePoint
+  // could never fire), which is exactly the AUR-3504 shape: 50 comments, 0 alarms,
+  // 25 dark days. This also exercises Defect 1: the alarm must land on a live agent,
+  // not just as a comment on the wedged issue itself.
+  it("reuse_and_rewake: repeated rewakes into a non-completing lane raise the wedge alarm on a live agent (AUR-5387 FIRES)", async () => {
+    const { companyId, agentId, projectId, svc, wakeups } = await seedFixture();
+    const ctoAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: ctoAgentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const rollingRoutine = await svc.create(
+      companyId,
+      {
+        projectId,
+        goalId: null,
+        parentIssueId: null,
+        title: "rolling watchdog that never completes",
+        description: null,
+        assigneeAgentId: agentId,
+        priority: "medium",
+        status: "active",
+        concurrencyPolicy: "reuse_and_rewake",
+        catchUpPolicy: "skip_missed",
+      },
+      {},
+    );
+
+    // Fire 1: no prior rolling issue — genuine dispatch, counter stays 0.
+    const run1 = await svc.runRoutine(rollingRoutine.id, { source: "schedule" });
+    expect(run1.status).toBe("issue_created");
+    const rollingIssueId = run1.linkedIssueId!;
+    let [routineRow] = await db.select().from(routines).where(eq(routines.id, rollingRoutine.id));
+    expect(routineRow?.consecutiveCoalesceCount).toBe(0);
+    expect(await readAlarmIssues(companyId, rollingRoutine.id)).toHaveLength(0);
+
+    // The wedged lane never completes the issue — it just re-wakes on every fire.
+    // Fire 2: fold #1, below the raise threshold.
+    const run2 = await svc.runRoutine(rollingRoutine.id, { source: "schedule" });
+    expect(run2.status).toBe("issue_created");
+    expect(run2.linkedIssueId).toBe(rollingIssueId);
+    [routineRow] = await db.select().from(routines).where(eq(routines.id, rollingRoutine.id));
+    expect(routineRow?.consecutiveCoalesceCount).toBe(1);
+    expect(await readAlarmIssues(companyId, rollingRoutine.id)).toHaveLength(0);
+
+    // Fire 3: fold #2 — raise point. This is the case that was previously
+    // unreachable for reuse_and_rewake, because the counter reset to 0 every time.
+    const run3 = await svc.runRoutine(rollingRoutine.id, { source: "schedule" });
+    expect(run3.status).toBe("issue_created");
+    [routineRow] = await db.select().from(routines).where(eq(routines.id, rollingRoutine.id));
+    expect(routineRow?.consecutiveCoalesceCount).toBe(2);
+
+    const wedgedComments = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, rollingIssueId));
+    expect(wedgedComments).toHaveLength(1);
+
+    const alarmsAfterFirstRaise = await readAlarmIssues(companyId, rollingRoutine.id);
+    expect(alarmsAfterFirstRaise).toHaveLength(1);
+    const alarmIssue = alarmsAfterFirstRaise[0]!;
+    expect(alarmIssue.assigneeAgentId).toBe(ctoAgentId);
+    expect(alarmIssue.priority).toBe("high");
+    expect(alarmIssue.status).toBe("todo");
+    expect(alarmIssue.description).toContain(rollingRoutine.title);
+
+    const ctoWakeups = wakeups.filter((w) => w.agentId === ctoAgentId);
+    expect(ctoWakeups.length).toBeGreaterThanOrEqual(1);
+    expect(ctoWakeups[0]?.opts.reason).toBe("routine_coalesce_anomaly");
+
+    // Fire 4: fold #3, not a doubling point — no new alarm issue or comment.
+    await svc.runRoutine(rollingRoutine.id, { source: "schedule" });
+    expect(await readAlarmIssues(companyId, rollingRoutine.id)).toHaveLength(1);
+
+    // Fire 5: fold #4 — second raise point. Must update the existing alarm issue
+    // (dedup), not mint a second one.
+    await svc.runRoutine(rollingRoutine.id, { source: "schedule" });
+    [routineRow] = await db.select().from(routines).where(eq(routines.id, rollingRoutine.id));
+    expect(routineRow?.consecutiveCoalesceCount).toBe(4);
+
+    const alarmsAfterSecondRaise = await readAlarmIssues(companyId, rollingRoutine.id);
+    expect(alarmsAfterSecondRaise).toHaveLength(1);
+    expect(alarmsAfterSecondRaise[0]?.id).toBe(alarmIssue.id);
+
+    const alarmComments = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, alarmIssue.id));
+    expect(alarmComments).toHaveLength(1);
+
+    const ctoWakeupsAfterSecondRaise = wakeups.filter((w) => w.agentId === ctoAgentId);
+    expect(ctoWakeupsAfterSecondRaise.length).toBeGreaterThanOrEqual(2);
+  });
+
+  // AUR-5387 (CLEARS): a healthy reuse_and_rewake routine whose issue is actually
+  // completed between fires never folds, so the counter must reset to 0 and no
+  // wedge alarm should ever be raised — even with a CTO/CEO agent available to
+  // receive one.
+  it("reuse_and_rewake: genuine dispatch between fires never alarms and keeps the counter at 0 (AUR-5387 CLEARS)", async () => {
+    const { companyId, agentId, projectId, svc } = await seedFixture();
+    const ctoAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: ctoAgentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const rollingRoutine = await svc.create(
+      companyId,
+      {
+        projectId,
+        goalId: null,
+        parentIssueId: null,
+        title: "rolling watchdog that completes cleanly",
+        description: null,
+        assigneeAgentId: agentId,
+        priority: "medium",
+        status: "active",
+        concurrencyPolicy: "reuse_and_rewake",
+        catchUpPolicy: "skip_missed",
+      },
+      {},
+    );
+
+    for (let i = 0; i < 4; i += 1) {
+      const run = await svc.runRoutine(rollingRoutine.id, { source: "schedule" });
+      expect(run.status).toBe("issue_created");
+      await db.update(issues).set({ status: "done", updatedAt: new Date() }).where(eq(issues.id, run.linkedIssueId!));
+
+      const [routineRow] = await db.select().from(routines).where(eq(routines.id, rollingRoutine.id));
+      expect(routineRow?.consecutiveCoalesceCount).toBe(0);
+    }
+
+    expect(await readAlarmIssues(companyId, rollingRoutine.id)).toHaveLength(0);
   });
 });

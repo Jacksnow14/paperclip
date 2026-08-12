@@ -7,7 +7,11 @@ import {
   LaneBreaker,
   type LaneClassificationLoader,
 } from "./lane-breaker.js";
-import type { FleetCapacityAgentInput, FleetCapacityRunInput } from "./fleet-capacity.js";
+import {
+  classifyAgentCapacity,
+  type FleetCapacityAgentInput,
+  type FleetCapacityRunInput,
+} from "./fleet-capacity.js";
 
 const T0 = Date.parse("2026-08-06T12:00:00Z");
 const COMPANY = "company-1";
@@ -244,5 +248,40 @@ describe("LaneBreaker — describeLanes read surface", () => {
     expect(lanes[0].trippedBy).toContain("error_stream");
     expect(lanes[0].reason).toBe("entitlement_revoked");
     expect(lanes[0].nextProbeEligibleAt).toBe(new Date(T0 + HALF_OPEN_PROBE_INTERVAL_MS).toISOString());
+  });
+
+  it("derives the same view from caller-supplied rows without touching the db", async () => {
+    // The route already classified every agent in the company; re-deriving the
+    // lane view with its own queries is what 500'd GET /fleet-capacity. This
+    // path must therefore be pure — the db here throws on any access.
+    const { breaker } = makeBreaker({ runs: REVOKED_RUNS });
+    (breaker as unknown as { db: unknown }).db = new Proxy(
+      {},
+      {
+        get() {
+          throw new Error("describeLanesFromRows must not query the database");
+        },
+      },
+    );
+    await breaker.evaluateAdmission(COMPANY, AGENT); // establish half-open bookkeeping
+
+    const revoked = classifyAgentCapacity(AGENT, REVOKED_RUNS, new Date(T0));
+    const healthy = classifyAgentCapacity(
+      { id: "agent-2", name: "CTO Ops", adapterType: "codex_local", pausedAt: null },
+      HEALTHY_RUNS,
+      new Date(T0),
+    );
+
+    const lanes = breaker.describeLanesFromRows(COMPANY, [revoked, healthy]);
+    const byLane = Object.fromEntries(lanes.map((lane) => [lane.lane, lane]));
+    // FIRE: the revoked lane is open with its trip source and reason.
+    expect(byLane.claude_local).toMatchObject({
+      state: "open",
+      trippedBy: ["error_stream"],
+      reason: "entitlement_revoked",
+      nextProbeEligibleAt: new Date(T0 + HALF_OPEN_PROBE_INTERVAL_MS).toISOString(),
+    });
+    // PASS: an unrelated healthy lane stays closed, so the view discriminates.
+    expect(byLane.codex_local).toMatchObject({ state: "closed", trippedBy: [], reason: null });
   });
 });

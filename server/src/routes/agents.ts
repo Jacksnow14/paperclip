@@ -3390,12 +3390,15 @@ export function agentRoutes(
       ),
     );
 
+    const capacity = computeFleetCapacity(capacityAgents, runsByAgent, new Date());
+
     // AUR-5464: the lane-breaker view is the board-visible "one durable state,
     // not N failures" surface — per-lane open/closed, trip sources, and the
-    // next half-open probe time.
-    const lanes = await laneBreakerForDb(db).describeLanes(companyId);
+    // next half-open probe time. Derived from the rows just classified above so
+    // this read route issues no additional queries.
+    const lanes = laneBreakerForDb(db).describeLanesFromRows(companyId, capacity.agents);
 
-    res.json({ companyId, lanes, ...computeFleetCapacity(capacityAgents, runsByAgent, new Date()) });
+    res.json({ companyId, lanes, ...capacity });
   });
 
   // AUR-5464: operator manual re-arm. Clears a provider-probe trip and makes

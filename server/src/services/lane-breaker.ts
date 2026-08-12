@@ -292,7 +292,35 @@ export class LaneBreaker {
     return { admit: false, halfOpenProbe: false, state: "open", trippedBy, reason, detail };
   }
 
-  /** Read surface for `GET /companies/:companyId/fleet-capacity`. */
+  /**
+   * Read surface for `GET /companies/:companyId/fleet-capacity`, derived from
+   * capacity rows the CALLER already classified. Pure w.r.t. the database on
+   * purpose: the route has just fetched and classified every agent in the
+   * company, so re-loading the same run history per lane would both double the
+   * query cost of a read-only route and make the route's fetch order depend on
+   * breaker internals.
+   */
+  describeLanesFromRows(companyId: string, rows: FleetCapacityRow[]): LaneBreakerLaneState[] {
+    const byLane = new Map<string, FleetCapacityRow[]>();
+    for (const row of rows) {
+      if (!row.lane) continue;
+      const existing = byLane.get(row.lane);
+      if (existing) existing.push(row);
+      else byLane.set(row.lane, [row]);
+    }
+    const out: LaneBreakerLaneState[] = [];
+    for (const [lane, laneRows] of byLane) {
+      let lastSuccessAtMs: number | null = null;
+      for (const row of laneRows) {
+        const t = toMs(row.lastSuccessfulRunAt);
+        if (t != null && (lastSuccessAtMs == null || t > lastSuccessAtMs)) lastSuccessAtMs = t;
+      }
+      out.push(this.buildLaneState(companyId, lane, laneRows, lastSuccessAtMs));
+    }
+    return out;
+  }
+
+  /** Db-loading variant (re-derives the lane snapshot itself). */
   async describeLanes(companyId: string): Promise<LaneBreakerLaneState[]> {
     const laneRows = await this.db
       .selectDistinct({ adapterType: agents.adapterType })
@@ -303,31 +331,40 @@ export class LaneBreaker {
     for (const { adapterType: lane } of laneRows) {
       if (!lane) continue;
       const snapshot = await this.getLaneSnapshot(companyId, lane, now);
-      const trippedRows = snapshot.rows.filter(
-        (r) => LANE_BREAKER_HARD_TRIP_REASONS.has(r.reason) || r.reason === "quota_reset_unverified",
-      );
-      const probeTrip = this.activeProbeTrip(lane, snapshot.lastSuccessAtMs);
-      const trippedBy: LaneBreakerTripSource[] = [];
-      if (trippedRows.length > 0) trippedBy.push("error_stream");
-      if (probeTrip) trippedBy.push("provider_probe");
-      const hs = this.halfOpen.get(this.key(companyId, lane));
-      const report = this.probeReports.get(lane) ?? null;
-      const manualRearmAt = this.manualRearms.get(lane) ?? null;
-      out.push({
-        lane,
-        state: trippedBy.length > 0 ? "open" : "closed",
-        trippedBy,
-        reason: trippedRows[0]?.reason ?? (probeTrip ? "provider_probe_unhealthy" : null),
-        detail: trippedRows[0]?.reasonDetail ?? probeTrip?.reason ?? null,
-        agents: snapshot.rows,
-        lastSuccessAt: snapshot.lastSuccessAtMs ? new Date(snapshot.lastSuccessAtMs).toISOString() : null,
-        nextProbeEligibleAt:
-          trippedBy.length > 0 && hs ? new Date(hs.nextProbeEligibleAt).toISOString() : null,
-        providerProbe: report ? { ...report, observedAt: report.observedAt.toISOString() } : null,
-        manualRearmAt: manualRearmAt ? manualRearmAt.toISOString() : null,
-      });
+      out.push(this.buildLaneState(companyId, lane, snapshot.rows, snapshot.lastSuccessAtMs));
     }
     return out;
+  }
+
+  private buildLaneState(
+    companyId: string,
+    lane: string,
+    rows: FleetCapacityRow[],
+    lastSuccessAtMs: number | null,
+  ): LaneBreakerLaneState {
+    const trippedRows = rows.filter(
+      (r) => LANE_BREAKER_HARD_TRIP_REASONS.has(r.reason) || r.reason === "quota_reset_unverified",
+    );
+    const probeTrip = this.activeProbeTrip(lane, lastSuccessAtMs);
+    const trippedBy: LaneBreakerTripSource[] = [];
+    if (trippedRows.length > 0) trippedBy.push("error_stream");
+    if (probeTrip) trippedBy.push("provider_probe");
+    const hs = this.halfOpen.get(this.key(companyId, lane));
+    const report = this.probeReports.get(lane) ?? null;
+    const manualRearmAt = this.manualRearms.get(lane) ?? null;
+    return {
+      lane,
+      state: trippedBy.length > 0 ? "open" : "closed",
+      trippedBy,
+      reason: trippedRows[0]?.reason ?? (probeTrip ? "provider_probe_unhealthy" : null),
+      detail: trippedRows[0]?.reasonDetail ?? probeTrip?.reason ?? null,
+      agents: rows,
+      lastSuccessAt: lastSuccessAtMs ? new Date(lastSuccessAtMs).toISOString() : null,
+      nextProbeEligibleAt:
+        trippedBy.length > 0 && hs ? new Date(hs.nextProbeEligibleAt).toISOString() : null,
+      providerProbe: report ? { ...report, observedAt: report.observedAt.toISOString() } : null,
+      manualRearmAt: manualRearmAt ? manualRearmAt.toISOString() : null,
+    };
   }
 
   private key(companyId: string, lane: string) {

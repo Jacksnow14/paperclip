@@ -57,7 +57,7 @@ import type {
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
-import { findActiveAdapterQuotaPause, QUOTA_PAUSE_INELIGIBLE_AGENT_STATUSES } from "./quota-pause.js";
+import { findActiveAdapterQuotaPause, HEARTBEAT_ADMISSION_INELIGIBLE_AGENT_STATUSES } from "./quota-pause.js";
 import { findAgentTokenBudgetBreach } from "./agent-token-budget.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
@@ -217,6 +217,10 @@ const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const execFile = promisify(execFileCallback);
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
+const HEARTBEAT_ADMISSION_INELIGIBLE_AGENT_STATUS_SET = new Set(HEARTBEAT_ADMISSION_INELIGIBLE_AGENT_STATUSES);
+const HEARTBEAT_SCHEDULED_RETRY_PROMOTION_INELIGIBLE_AGENT_STATUS_SET = new Set(
+  HEARTBEAT_ADMISSION_INELIGIBLE_AGENT_STATUSES.filter((status) => status !== "error"),
+);
 // Per-tick issue cap for the stranded deferred-wake reaper. Draining promotes runs,
 // so bound how much work a single sweep can start; the remainder drains next tick.
 const DEFERRED_WAKE_REAP_ISSUE_LIMIT = 25;
@@ -261,6 +265,12 @@ const PROCESS_LOST_RETRY_JITTER_RATIO = 0.5;
 export const PROCESS_LOST_RETRY_MAX_ATTEMPTS = PROCESS_LOST_RETRY_DELAYS_MS.length;
 export const PROCESS_LOST_RETRY_REASON = "process_lost";
 export const PROCESS_LOST_RETRY_WAKE_REASON = "process_lost_retry";
+function isHeartbeatAdmissionIneligibleAgentStatus(status: string): boolean {
+  return HEARTBEAT_ADMISSION_INELIGIBLE_AGENT_STATUS_SET.has(status);
+}
+function isHeartbeatScheduledRetryPromotionIneligibleAgentStatus(status: string): boolean {
+  return HEARTBEAT_SCHEDULED_RETRY_PROMOTION_INELIGIBLE_AGENT_STATUS_SET.has(status);
+}
 // AUR-3929 concurrency cap (GLOBAL_MAX_CONCURRENT_RUNS_ENV_VAR /
 // resolveGlobalMaxConcurrentRuns) now lives in
 // @paperclipai/adapter-utils/server-utils (imported above) — AUR-4536's
@@ -5149,7 +5159,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
+    if (isHeartbeatScheduledRetryPromotionIneligibleAgentStatus(agent.status)) {
       return {
         allowed: false,
         reason: "Scheduled retry suppressed because the agent is not invokable",
@@ -5448,6 +5458,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .returning()
       .then((rows) => rows[0] ?? null);
     if (!promoted) return { outcome: "not_promoted", run: null };
+
+    if (agent.status === "error") {
+      // AUR-4680: ordinary queued rows do not self-recover an `error` agent,
+      // but a due scheduled retry is an explicit system transition. Clear the
+      // last-failed status before the promoted retry re-enters admission, so
+      // bounded process-lost/transient retries keep working without making stale
+      // arbitrary queued work on a dead lane admissible.
+      await db
+        .update(agents)
+        .set({ status: "idle", updatedAt: now })
+        .where(and(eq(agents.id, agent.id), eq(agents.status, "error")));
+    }
 
     await appendRunEvent(promoted, await nextRunEventSeq(promoted.id), {
       eventType: "lifecycle",
@@ -6426,7 +6448,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await cancelRunInternal(run.id, "Cancelled because the agent no longer exists");
       return null;
     }
-    if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
+    if (isHeartbeatAdmissionIneligibleAgentStatus(agent.status)) {
       await cancelRunInternal(run.id, "Cancelled because the agent is not invokable");
       return null;
     }
@@ -7279,7 +7301,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(
         and(
           eq(heartbeatRuns.status, "queued"),
-          notInArray(agents.status, QUOTA_PAUSE_INELIGIBLE_AGENT_STATUSES),
+          notInArray(agents.status, HEARTBEAT_ADMISSION_INELIGIBLE_AGENT_STATUSES),
         ),
       );
     if (candidates.length === 0) return globalCap;
@@ -7378,9 +7400,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // but applied one more unit at a time. This cannot recreate the AUR-4143
     // monopoly: the fair-share pass above has already given every agent its
     // guaranteed floor before this loop lets anyone take more, and each round
-    // still visits agents in starvation order.
+    // still visits agents in starvation order. AUR-4680: bound this hot-path
+    // loop by the global cap; no useful redistribution can require more rounds
+    // than the maximum number of runnable slots.
     const redistributedAgentIds = new Set<string>();
-    for (;;) {
+    const maxRedistributionRounds = Math.max(1, resolveGlobalRunCap());
+    for (let round = 0; round < maxRedistributionRounds; round += 1) {
       const globalCap = resolveGlobalRunCap();
       if ((await countRunningRunsGlobal()) >= globalCap) break;
       const stillQueued = await listQueuedAgentsByStarvation(opts?.companyId);
@@ -7556,15 +7581,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // scoped to agentId rather than the adapter-wide (companyId, adapterType)
   // pause above: this is what stops one agent from ever *causing* that
   // adapter-wide wall by suppressing only its own admission, leaving the
-  // other agents sharing the credential unaffected). Leave queued runs
-  // queued instead of admitting them into a known-dead attempt; they're
-  // picked up again as soon as the relevant query stops matching (the reset
-  // time passes / promoteDueScheduledRetries promotes the retry / the
-  // breaching run ages out of the token-budget window).
+  // other agents sharing the credential unaffected). AUR-4680 decision:
+  // `error` is included in that inadmissible status set and needs an explicit
+  // operator/system transition before ordinary queued work is dispatched;
+  // otherwise stale queued rows on a dead adapter lane can both inflate the
+  // fair-share denominator and burn redistribution slots. A due scheduled retry
+  // is one such explicit system transition and clears `error` during promotion.
+  // Adapter quota-pause detection deliberately keeps its own narrower status
+  // set so an errored agent's scheduled_retry row can still prove a shared
+  // session-limit wall. Leave queued runs queued instead of admitting them into
+  // a known-dead attempt; they're picked up again as soon as the relevant
+  // condition clears (the agent leaves `error`, the reset time passes /
+  // promoteDueScheduledRetries promotes the retry / the breaching run ages out
+  // of the token-budget window).
   async function checkAgentAdmissionGate(agentId: string) {
     const agent = await getAgent(agentId);
     if (!agent) return null;
-    if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
+    if (isHeartbeatAdmissionIneligibleAgentStatus(agent.status)) {
       return null;
     }
     const activeQuotaPause = await findActiveAdapterQuotaPause(db, agent.companyId, agent.adapterType, new Date());
@@ -9353,9 +9386,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (
         !deferredAgent ||
         deferredAgent.companyId !== issue.companyId ||
-        deferredAgent.status === "paused" ||
-        deferredAgent.status === "terminated" ||
-        deferredAgent.status === "pending_approval"
+        isHeartbeatAdmissionIneligibleAgentStatus(deferredAgent.status)
       ) {
         await tx
           .update(agentWakeupRequests)
@@ -10140,11 +10171,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
     }
 
-    if (
-      agent.status === "paused" ||
-      agent.status === "terminated" ||
-      agent.status === "pending_approval"
-    ) {
+    if (isHeartbeatAdmissionIneligibleAgentStatus(agent.status)) {
       throw conflict("Agent is not invokable in its current state", { status: agent.status });
     }
 
@@ -11388,7 +11415,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let skipped = 0;
 
       for (const agent of allAgents) {
-        if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") continue;
+        if (isHeartbeatAdmissionIneligibleAgentStatus(agent.status)) continue;
         const policy = parseHeartbeatPolicy(agent);
         if (!policy.enabled || policy.intervalSec <= 0) continue;
 

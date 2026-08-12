@@ -14,13 +14,25 @@ export interface ActiveAdapterQuotaPause {
 
 export const MAX_ADAPTER_QUOTA_PAUSE_MS = 6 * 60 * 60 * 1000;
 
-// AUR-4139: agents in these states cannot clear a quota wall (admission already refuses
-// them in startNextQueuedRunForAgent), so a scheduled_retry row they own carries no live
-// signal about the shared credential and must not gate their siblings. Mirrors the
-// inadmissible set in heartbeat.ts. Exported (AUR-4620) so resolveContendedCeiling can
-// exclude the same agents from the fair-share contender count — an agent that can never
-// be admitted must not shrink everyone else's share of the global cap.
-export const QUOTA_PAUSE_INELIGIBLE_AGENT_STATUSES = ["paused", "terminated", "pending_approval"];
+// AUR-4139/AUR-4680: agents in these states cannot clear a quota wall, so a
+// scheduled_retry row they own carries no live signal about the shared
+// credential and must not gate their siblings. Deliberately narrower than
+// HEARTBEAT_ADMISSION_INELIGIBLE_AGENT_STATUSES: an agent in `error` is not
+// admitted as runnable work, but its scheduled_retry row can still be the only
+// live proof of an adapter-wide session-limit wall and must remain visible here.
+export const QUOTA_PAUSE_SIGNAL_INELIGIBLE_AGENT_STATUSES = ["paused", "terminated", "pending_approval"];
+
+// AUR-4680 decision: `error` is a non-runnable agent state until an explicit
+// operator/system transition clears it (for example a due scheduled retry,
+// resume, or config repair). Such agents are neither fair-share contenders nor
+// admission candidates for ordinary queued work; if they were counted, stale
+// queued rows on a dead adapter lane would shrink the guaranteed floor for live
+// agents and the redistribution pass could burn slots on work known not to
+// execute.
+export const HEARTBEAT_ADMISSION_INELIGIBLE_AGENT_STATUSES = [
+  ...QUOTA_PAUSE_SIGNAL_INELIGIBLE_AGENT_STATUSES,
+  "error",
+];
 
 // AUR-4139: provider session limits are scoped to the credential/account behind an
 // adapter (one CLI session, one subscription) — not to an individual Paperclip agent.
@@ -74,7 +86,7 @@ export async function findActiveAdapterQuotaPause(
       and(
         eq(agents.companyId, companyId),
         eq(agents.adapterType, adapterType),
-        notInArray(agents.status, QUOTA_PAUSE_INELIGIBLE_AGENT_STATUSES),
+        notInArray(agents.status, QUOTA_PAUSE_SIGNAL_INELIGIBLE_AGENT_STATUSES),
         eq(heartbeatRuns.status, "scheduled_retry"),
         isNotNull(heartbeatRuns.scheduledRetryAt),
         sql`${heartbeatRuns.contextSnapshot} ->> 'transientRetryNotBefore' is not null`,

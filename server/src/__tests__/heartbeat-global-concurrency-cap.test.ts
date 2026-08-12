@@ -208,14 +208,17 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
     return companyId;
   }
 
-  async function seedAgent(companyId: string, opts?: { maxConcurrentRuns?: number; adapterType?: string }) {
+  async function seedAgent(
+    companyId: string,
+    opts?: { maxConcurrentRuns?: number; adapterType?: string; status?: string },
+  ) {
     const agentId = randomUUID();
     await db.insert(agents).values({
       id: agentId,
       companyId,
       name: `Coder-${agentId.slice(0, 8)}`,
       role: "engineer",
-      status: "idle",
+      status: opts?.status ?? "idle",
       adapterType: opts?.adapterType ?? "codex_local",
       adapterConfig: {},
       runtimeConfig: {
@@ -709,6 +712,22 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
     },
   );
 
+  it("keeps error agents as adapter-wide quota-pause signal owners (AUR-4680)", async () => {
+    const companyId = await seedCompany();
+    const erroredAgentId = await seedAgent(companyId, { adapterType: "claude_local", status: "error" });
+    const resetAt = new Date(Date.now() + 60 * 60 * 1000);
+    await seedActiveQuotaPause(companyId, erroredAgentId, resetAt);
+
+    // AUR-4680 splits quota-pause signal eligibility from heartbeat admission:
+    // an error-status agent is not runnable work, but its scheduled_retry row can
+    // still be the only proof of a shared adapter session-limit wall.
+    const activePause = await findActiveAdapterQuotaPause(db, companyId, "claude_local", new Date());
+
+    expect(activePause).not.toBeNull();
+    expect(activePause?.agentId).toBe(erroredAgentId);
+    expect(activePause?.scheduledRetryAt.toISOString()).toBe(resetAt.toISOString());
+  });
+
   it("ignores terminated agents when resolving an adapter-wide quota pause (AUR-4139)", async () => {
     const companyId = await seedCompany();
     const terminatedAgentId = await seedAgent(companyId, { adapterType: "claude_local" });
@@ -969,6 +988,37 @@ describeEmbeddedPostgres("global concurrency ceiling and process-lost backoff", 
       .where(eq(heartbeatRuns.status, "running"))
       .then((rows) => rows.length);
     expect(globalRunning).toBe(4);
+  });
+
+  it("does not admit or count error-status agents with queued rows (AUR-4680)", async () => {
+    const heartbeat = heartbeatService(db, { globalMaxConcurrentRuns: 4 });
+    const companyId = await seedCompany();
+
+    const eligibleA = await seedAgent(companyId, { maxConcurrentRuns: 20, adapterType: "claude_local" });
+    const eligibleB = await seedAgent(companyId, { maxConcurrentRuns: 20, adapterType: "claude_local" });
+    const erroredAgent = await seedAgent(companyId, {
+      maxConcurrentRuns: 20,
+      adapterType: "codex_local",
+      status: "error",
+    });
+    for (let i = 0; i < 2; i += 1) {
+      await seedQueuedRun(companyId, eligibleA, { createdAt: new Date(Date.now() - 60_000 + i) });
+    }
+    await seedQueuedRun(companyId, eligibleB, { createdAt: new Date(Date.now() - 55_000) });
+    const erroredRun = await seedQueuedRun(companyId, erroredAgent, { createdAt: new Date(Date.now() - 70_000) });
+
+    hangAdapterUntilReleased();
+
+    // Admission side: `error` needs an explicit transition back to a runnable
+    // state before it can take work. The queued row remains for recovery tooling
+    // rather than burning a slot on a known-dead lane.
+    expect(await heartbeat.startNextQueuedRunForAgent(erroredAgent)).toHaveLength(0);
+    expect((await heartbeat.getRun(erroredRun))?.status).toBe("queued");
+
+    // Denominator side: with only eligibleA and eligibleB counted, cap=4 gives a
+    // fair-share ceiling of 2. If erroredAgent still counted as a contender, this
+    // direct admission path would claim only 1 before redistribution could help.
+    expect(await heartbeat.startNextQueuedRunForAgent(eligibleA)).toHaveLength(2);
   });
 
   // AUR-4620 F2 (CTO review of PR #185). Filtering ineligible contenders out

@@ -18,6 +18,12 @@ export {
   type EmbeddedPostgresTestSupport,
 } from "./test-embedded-postgres.js";
 export {
+  extractPostgresErrorCode,
+  resetEmbeddedPostgresTestDatabase,
+  type ResetEmbeddedPostgresTestDatabaseOptions,
+  type TestDatabaseResetTarget,
+} from "./test-reset.js";
+export {
   runDatabaseBackup,
   runDatabaseRestore,
   formatDatabaseBackupResult,

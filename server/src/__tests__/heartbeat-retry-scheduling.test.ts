@@ -3,12 +3,10 @@ import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
-  agentRuntimeState,
   agentWakeupRequests,
   budgetPolicies,
   companies,
   createDb,
-  environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
@@ -17,6 +15,7 @@ import {
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
+  resetEmbeddedPostgresTestDatabase,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import {
@@ -55,17 +54,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   }, 20_000);
 
   afterEach(async () => {
-    await db.delete(heartbeatRunEvents);
-    await db.delete(environmentLeases);
-    await db.delete(issueRelations);
-    await db.delete(issueComments);
-    await db.delete(issues);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(budgetPolicies);
-    await db.delete(agents);
-    await db.delete(companies);
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {
@@ -697,15 +686,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       issueId: budgetBlocked.issueId,
     });
 
-    await db.delete(budgetPolicies);
-    await db.delete(issueRelations);
-    await db.delete(issues);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(agents);
-    await db.delete(companies);
+    await resetEmbeddedPostgresTestDatabase(db);
 
     const dependencyBlocked = await seedMaxTurnFixture({ now: new Date("2026-04-20T17:00:00.000Z") });
     const blockerId = randomUUID();
@@ -1251,11 +1232,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         .then((rows) => rows[0] ?? null);
       expect((wakeupRequest?.payload as Record<string, unknown> | null)?.codexTransientFallbackMode).toBe(expectedMode);
 
-      await db.delete(heartbeatRunEvents);
-      await db.delete(heartbeatRuns);
-      await db.delete(agentWakeupRequests);
-      await db.delete(agents);
-      await db.delete(companies);
+      await resetEmbeddedPostgresTestDatabase(db);
     }
   });
 
@@ -2327,17 +2304,7 @@ describeEmbeddedPostgres("context overflow retry decision against real rows (AUR
   }, 20_000);
 
   afterEach(async () => {
-    await db.delete(heartbeatRunEvents);
-    await db.delete(environmentLeases);
-    await db.delete(issueRelations);
-    await db.delete(issueComments);
-    await db.delete(issues);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(budgetPolicies);
-    await db.delete(agents);
-    await db.delete(companies);
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {

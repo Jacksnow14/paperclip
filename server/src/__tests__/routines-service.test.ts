@@ -422,6 +422,65 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .where(eq(issues.id, blockedIssue.id));
     expect(stillBlocked?.status).toBe("blocked");
     expect(wakeups.length).toBe(wakeupsBefore);
+
+    // A tick that dispatched NOTHING must be recorded as a fold, not as a dispatch.
+    // Recording `issue_created` here would reset consecutiveCoalesceCount to 0 every
+    // tick and permanently disarm the AUR-4373 wedge guard for exactly the routines
+    // that are stranded — the routine would go dark with green telemetry.
+    expect(run.status).toBe("coalesced");
+    const [afterOne] = await db
+      .select({ count: routines.consecutiveCoalesceCount })
+      .from(routines)
+      .where(eq(routines.id, routine.id));
+    expect(afterOne?.count).toBe(1);
+
+    // ...and the counter must keep CLIMBING across ticks, which is what lets the
+    // wedge guard fire at 2 and each doubling.
+    const second = await svc.runRoutine(routine.id, { source: "schedule" });
+    expect(second.status).toBe("coalesced");
+    const [afterTwo] = await db
+      .select({ count: routines.consecutiveCoalesceCount })
+      .from(routines)
+      .where(eq(routines.id, routine.id));
+    expect(afterTwo?.count).toBe(2);
+  });
+
+  // The mirror of the `blocked` FIRES case, and the more dangerous one: `backlog` is
+  // also in OPEN_ISSUE_STATUSES so it is matched as a stranded umbrella, but
+  // queueIssueAssignmentWakeup hard-returns on `backlog` BEFORE queueing anything —
+  // so reopening only `blocked` left a backlog umbrella reused-but-never-woken on
+  // every tick, forever, with no wake, no throw and no error. Permanent suppression,
+  // silently. Reopening `backlog` too is what makes the re-wake actually reach it.
+  it("reuses a stranded backlog execution issue, reopens it to todo and wakes it (FIRES, backlog)", async () => {
+    const { companyId, issueSvc, routine, svc, wakeups } = await seedFixture();
+    const strandedIssue = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: routine.title,
+      description: routine.description,
+      status: "backlog",
+      priority: routine.priority,
+      assigneeAgentId: routine.assigneeAgentId,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: randomUUID(),
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.linkedIssueId).toBe(strandedIssue.id);
+    const [reopened] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, strandedIssue.id));
+    expect(reopened?.status).toBe("todo");
+    expect(wakeups.some((w) => w.agentId === routine.assigneeAgentId)).toBe(true);
+    expect(run.status).toBe("issue_created");
+
+    const allIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.originId, routine.id));
+    expect(allIssues).toHaveLength(1);
   });
 
   it("always_enqueue keeps duplicating even when a stranded blocked issue exists (unchanged behaviour)", async () => {

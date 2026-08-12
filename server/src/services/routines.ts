@@ -1447,16 +1447,24 @@ export function routineService(
             id: issueOriginId,
           });
           if (strandedIssue) {
-            // `blocked` issues are excluded from execution candidate selection
-            // (heartbeat.ts) even though they're in OPEN_ISSUE_STATUSES — reopen to
-            // `todo` so the wakeup below actually results in a dispatched run rather
-            // than silently re-stranding the same issue. But only for a ZERO-EDGE
-            // block: an umbrella held by a real unresolved blocker must stay blocked
-            // (reusing it without reopening still avoids the duplicate umbrella, and
-            // the blocker resolving is what releases it).
+            // An umbrella held by a real unresolved blocker must stay blocked (reusing it
+            // still avoids the duplicate umbrella, and the blocker resolving is what
+            // releases it). Everything else is the zero-edge stranded case this fix is for.
             const heldByRealBlocker = strandedIssue.status === "blocked" &&
               await hasUnresolvedBlockerEdge(input.routine.companyId, strandedIssue.id, txDb);
-            if (strandedIssue.status === "blocked" && !heldByRealBlocker) {
+
+            // Both `blocked` AND `backlog` are non-dispatchable, for two DIFFERENT reasons,
+            // and both must be reopened or the re-wake is a no-op that re-strands the issue:
+            //   - `blocked` is excluded from execution-candidate selection in heartbeat.ts.
+            //   - `backlog` is excluded one level earlier — queueIssueAssignmentWakeup
+            //     hard-returns on `issue.status === "backlog"` before queueing anything.
+            // The `backlog` case is the more dangerous of the two because it fails SILENTLY:
+            // no wake, no throw, no error. Reopening only `blocked` left a backlog umbrella
+            // reused-but-never-woken on every subsequent tick — a permanent suppressor,
+            // which is precisely what widening liveness must not create.
+            const needsReopen = !heldByRealBlocker &&
+              (strandedIssue.status === "blocked" || strandedIssue.status === "backlog");
+            if (needsReopen) {
               // Reopen outside the transaction (`db`, not `txDb`) so the row lock is
               // released before queueIssueAssignmentWakeup's wakeup callback updates
               // the same row (execution_run_id/execution_locked_at) on its own
@@ -1469,7 +1477,14 @@ export function routineService(
                 .where(eq(issues.id, strandedIssue.id));
               strandedIssue.status = "todo";
             }
-            if (!heldByRealBlocker) {
+
+            // Whether this tick actually dispatched anything. Mirrors
+            // queueIssueAssignmentWakeup's own guards: it silently returns without
+            // queueing when there is no assignee or the issue is still `backlog`.
+            const dispatched = !heldByRealBlocker &&
+              Boolean(strandedIssue.assigneeAgentId) &&
+              strandedIssue.status !== "backlog";
+            if (dispatched) {
               await queueIssueAssignmentWakeup({
                 heartbeat,
                 issue: strandedIssue,
@@ -1480,18 +1495,43 @@ export function routineService(
                 rethrowOnError: true,
               });
             }
+
+            // A tick that reused the umbrella WITHOUT dispatching is a fold, not a
+            // dispatch, and must be recorded as one. Recording `issue_created` here
+            // would set consecutiveCoalesceCount back to 0 on every tick, permanently
+            // disarming the AUR-4373 wedge guard for exactly the routines that are
+            // stranded — trading the loud old failure (a visible pile of duplicate
+            // umbrellas) for a silent one (routine dark, every dashboard green). The
+            // activeIssue branch above and the 23505 branch below both already record
+            // coalesced/skipped and raise the anomaly; this is the same situation.
+            const reuseStatus = dispatched
+              ? "issue_created" as const
+              : input.routine.concurrencyPolicy === "skip_if_active"
+                ? "skipped" as const
+                : "coalesced" as const;
             const updated = await finalizeRun(createdRun.id, {
-              status: "issue_created",
+              status: reuseStatus,
               linkedIssueId: strandedIssue.id,
+              ...(dispatched
+                ? {}
+                : { coalescedIntoRunId: strandedIssue.originRunId, completedAt: triggeredAt }),
             }, txDb);
-            await updateRoutineTouchedState({
+            const touched = await updateRoutineTouchedState({
               routineId: input.routine.id,
               triggerId: input.trigger?.id ?? null,
               triggeredAt,
-              status: "issue_created",
+              status: reuseStatus,
               issueId: strandedIssue.id,
               nextRunAt,
             }, txDb);
+            if (!dispatched) {
+              await maybeRaiseCoalesceAnomaly({
+                routine: input.routine,
+                targetIssue: strandedIssue,
+                consecutiveCoalesceCount: touched.consecutiveCoalesceCount,
+                triggeredAt,
+              }, txDb);
+            }
             return updated ?? createdRun;
           }
         }

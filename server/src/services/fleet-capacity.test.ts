@@ -351,3 +351,93 @@ describe("computeFleetCapacity — snapshot, rollup, and the all-same-value guar
     expect(reasons).toEqual(new Set(["ok", "quota_exhausted", "quota_reset_unverified", "no_recent_runs"]));
   });
 });
+
+// AUR-5464: entitlement revocation — the failure class the 2026-08-06 org
+// block proved missing. The positive fixture is the REAL error text from the
+// live DB (84 failed rows, all `errorCode: adapter_failed` — no dedicated
+// code exists, the text match is load-bearing).
+const ORG_BLOCK_0806 =
+  "Claude run failed: subtype=success: Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access";
+const TRANSIENT_429 = "Claude run failed: API Error: 429 Too Many Requests";
+
+describe("classifyAgentCapacity — entitlement_revoked (AUR-5464)", () => {
+  it("real 08-06 org-block text -> false/entitlement_revoked, even on a single failure", () => {
+    const history = [
+      run("failed", "2026-07-29T22:00:00Z", ORG_BLOCK_0806),
+      run("succeeded", "2026-07-29T10:00:00Z"),
+    ];
+    const row = classifyAgentCapacity(claudeCodeMax, history, NOW);
+    expect(row.canExecuteNow).toBe(false);
+    expect(row.reason).toBe("entitlement_revoked");
+    expect(row.reasonDetail).toContain("never auto-clears on a timer");
+  });
+
+  it("entitlement wins over quota when both appear in the tail (revocation has no reset boundary)", () => {
+    const history = [
+      run("failed", "2026-07-29T22:00:00Z", ORG_BLOCK_0806),
+      ...runSeries(3, "failed", "2026-07-29T20:00:00Z", CLAUDE_SESSION_LIMIT_RESET),
+      run("succeeded", "2026-07-29T10:00:00Z"),
+    ];
+    const row = classifyAgentCapacity(claudeCodeMax, history, NOW);
+    expect(row.reason).toBe("entitlement_revoked");
+  });
+
+  it("a succeeded run after the revocation clears it (the only legitimate re-arm)", () => {
+    const history = [
+      run("succeeded", "2026-07-29T23:00:00Z"),
+      run("failed", "2026-07-29T22:00:00Z", ORG_BLOCK_0806),
+    ];
+    const row = classifyAgentCapacity(claudeCodeMax, history, NOW);
+    expect(row.canExecuteNow).toBe(true);
+    expect(row.reason).toBe("ok");
+  });
+
+  it("negative control: 'Prompt is too long' is NOT entitlement_revoked", () => {
+    const history = [...runSeries(5, "failed", "2026-07-29T22:00:00Z", PROMPT_TOO_LONG)];
+    const row = classifyAgentCapacity(claudeCodeMax, history, NOW);
+    expect(row.reason).not.toBe("entitlement_revoked");
+    expect(row.reason).toBe("consecutive_failures");
+  });
+
+  it("negative control: a 429 is NOT entitlement_revoked (transient weather stays transient)", () => {
+    const history = [
+      ...runSeries(2, "failed", "2026-07-29T22:00:00Z", TRANSIENT_429),
+      run("succeeded", "2026-07-29T21:00:00Z"),
+    ];
+    const row = classifyAgentCapacity(claudeCodeMax, history, NOW);
+    expect(row.reason).not.toBe("entitlement_revoked");
+    expect(row.canExecuteNow).toBe(true);
+  });
+
+  it("rollup: entitlement-revoked agents (pure or mixed with quota) roll up to lane_down", () => {
+    const revA = classifyAgentCapacity(
+      agent("e1", "Claude A", "claude_local"),
+      [run("failed", "2026-07-29T22:00:00Z", ORG_BLOCK_0806), run("succeeded", "2026-07-29T10:00:00Z")],
+      NOW,
+    );
+    const quotaB = classifyAgentCapacity(agent("e2", "Claude B", "claude_local"), [
+      ...runSeries(3, "failed", "2026-07-28T09:00:00Z", CODEX_QUOTA_NO_RESET),
+      run("succeeded", "2026-07-26T05:05:00Z"),
+    ], NOW);
+    const rows = applyLaneDownRollup([revA, quotaB]);
+    expect(rows[0].reason).toBe("lane_down");
+    expect(rows[1].reason).toBe("lane_down");
+    expect(rows[0].reasonDetail).toContain("entitlement");
+  });
+
+  it("rollup control: one revoked + one healthy agent does NOT flag lane_down", () => {
+    const revA = classifyAgentCapacity(
+      agent("e1", "Claude A", "claude_local"),
+      [run("failed", "2026-07-29T22:00:00Z", ORG_BLOCK_0806)],
+      NOW,
+    );
+    const healthy = classifyAgentCapacity(
+      agent("e2", "Claude B", "claude_local"),
+      [run("succeeded", "2026-07-29T22:00:00Z")],
+      NOW,
+    );
+    const rows = applyLaneDownRollup([revA, healthy]);
+    expect(rows[0].reason).toBe("entitlement_revoked");
+    expect(rows[1].reason).toBe("ok");
+  });
+});

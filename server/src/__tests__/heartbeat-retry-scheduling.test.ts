@@ -2271,6 +2271,28 @@ describe("context overflow is never transient-retryable (AUR-4513)", () => {
     ).toBeNull();
   });
 
+  // AUR-5464 (verification, not a fix): admission suppression is the new
+  // breaker's job; retry suppression for provider-outage classes was ALREADY
+  // correct and must stay that way. The 08-06 outage's three failure shapes —
+  // auth-rendered walls, dedicated quota code, and the org-block text riding
+  // on `adapter_failed` — none may ever enter the bounded transient ladder.
+  it("provider-outage classes schedule no bounded retry (claude_auth_required / claude_quota_exhausted / 08-06 org block)", () => {
+    expect(
+      readTransientRecoveryContractFromRun({ errorCode: "claude_auth_required", resultJson: null }),
+    ).toBeNull();
+    expect(
+      readTransientRecoveryContractFromRun({ errorCode: "claude_quota_exhausted", resultJson: null }),
+    ).toBeNull();
+    expect(
+      readTransientRecoveryContractFromRun({
+        errorCode: "adapter_failed",
+        resultJson: null,
+        error:
+          "Claude run failed: subtype=success: Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access",
+      }),
+    ).toBeNull();
+  });
+
   // Controls: the genuinely transient codes must keep their retry ladder, otherwise
   // this change would be a blanket retry kill rather than a targeted one.
   it("still marks the transient upstream codes retryable", () => {

@@ -47,6 +47,25 @@ export const QUOTA_SIGNATURE_RE =
   /(?:hit your (?:session|weekly|usage) limit|usage limit reached|usage cap reached|5[-\s]?hour limit reached|weekly limit reached|claude usage limit reached|out of extra usage|session limit reached)/i;
 
 /**
+ * Entitlement revocation (AUR-5464). Live fixture from the 2026-08-06 org
+ * block (84 failed runs, all `errorCode: adapter_failed` — there is no
+ * dedicated error code, so this text match is load-bearing):
+ *
+ *   "Claude run failed: subtype=success: Your organization has disabled
+ *    Claude subscription access for Claude Code · Use an Anthropic API key
+ *    instead, or ask your admin to enable access"
+ *
+ * Distinct from `quota_exhausted` on purpose: a quota wall carries a parseable
+ * reset boundary and may become admissible when it passes; a revocation has no
+ * reset boundary and must never auto-clear on a timer — only a succeeded run
+ * strictly after the failure proves recovery. Same narrowness discipline as
+ * QUOTA_SIGNATURE_RE: 429/overloaded/high-demand stay transient weather and
+ * "Prompt is too long" must never match (negative controls in the tests).
+ */
+export const ENTITLEMENT_SIGNATURE_RE =
+  /organization has disabled claude subscription access/i;
+
+/**
  * AUR-5038: the run-failure classifier can now prove a quota wall from lane
  * history even when the CLI's error text lies about it ("Not logged in ·
  * Please run /login" during a weekly wall). Those rows carry the dedicated
@@ -61,6 +80,7 @@ export type FleetCapacityReason =
   | "paused"
   | "quota_exhausted"
   | "quota_reset_unverified"
+  | "entitlement_revoked"
   | "consecutive_failures"
   | "lane_down"
   | "no_recent_runs";
@@ -174,6 +194,23 @@ export function classifyAgentCapacity(
   }
 
   const newestFailureError = newestFailure?.error ?? "";
+
+  // AUR-5464: entitlement revocation is checked BEFORE quota on purpose — it
+  // has no reset boundary, so it must never reach the quota branch's
+  // reset-passed path. Only a succeeded run after the failure clears it.
+  if (newestFailure && ENTITLEMENT_SIGNATURE_RE.test(newestFailureError)) {
+    return {
+      ...base,
+      canExecuteNow: false,
+      reason: "entitlement_revoked",
+      reasonDetail:
+        `Provider reports subscription access disabled for the organization; ` +
+        `${consecutiveFailures} consecutive failure(s), newest at ` +
+        `${toIso(newestFailure.createdAt) ?? "unknown"}, no succeeded run since. ` +
+        `No reset boundary exists — never auto-clears on a timer; only a successful probe re-arms.`,
+    };
+  }
+
   const newestFailureIsQuota =
     newestFailure != null &&
     (QUOTA_EXHAUSTED_ERROR_CODES.has(newestFailure.errorCode ?? "") ||
@@ -235,10 +272,13 @@ export function classifyAgentCapacity(
 
 /**
  * Lane rollup: when a lane has >= 2 non-dormant agents and every one of them
- * is `quota_exhausted`, the lane itself is down (quota is per-adapter, so all
- * agents in a lane starve together). Overrides the per-agent reason;
- * `canExecuteNow` stays false.
+ * is starved by the provider (`quota_exhausted` or, since AUR-5464,
+ * `entitlement_revoked` — an org block starves every agent on the account at
+ * once, exactly like quota), the lane itself is down. Overrides the per-agent
+ * reason; `canExecuteNow` stays false.
  */
+const LANE_DOWN_ROLLUP_REASONS = new Set<FleetCapacityReason>(["quota_exhausted", "entitlement_revoked"]);
+
 export function applyLaneDownRollup(rows: FleetCapacityRow[]): FleetCapacityRow[] {
   const byLane = new Map<string, FleetCapacityRow[]>();
   for (const row of rows) {
@@ -248,10 +288,13 @@ export function applyLaneDownRollup(rows: FleetCapacityRow[]): FleetCapacityRow[
   }
   for (const [lane, laneRows] of byLane) {
     const active = laneRows.filter((row) => row.reason !== "no_recent_runs");
-    if (active.length >= 2 && active.every((row) => row.reason === "quota_exhausted")) {
+    if (active.length >= 2 && active.every((row) => LANE_DOWN_ROLLUP_REASONS.has(row.reason))) {
+      const anyEntitlement = active.some((row) => row.reason === "entitlement_revoked");
       for (const row of active) {
         row.reason = "lane_down";
-        row.reasonDetail = `Every non-dormant ${lane} agent is quota-exhausted — the lane is down, not just this agent.`;
+        row.reasonDetail = anyEntitlement
+          ? `Every non-dormant ${lane} agent is provider-starved (entitlement revoked and/or quota-exhausted) — the lane is down, not just this agent.`
+          : `Every non-dormant ${lane} agent is quota-exhausted — the lane is down, not just this agent.`;
       }
     }
   }

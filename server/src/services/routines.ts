@@ -12,6 +12,7 @@ import {
   issueComments,
   issueInboxArchives,
   issueReadStates,
+  issueRelations,
   issues,
   pluginManagedResources,
   plugins,
@@ -1014,6 +1015,69 @@ export function routineService(
       .then((rows) => rows[0]?.issues ?? null);
   }
 
+  // coalesce_if_active / skip_if_active: findLiveExecutionIssue already confirmed no
+  // issue is bound to a live heartbeat run. That does NOT mean no execution issue
+  // exists — a run can terminate without re-queueing (quota exhaustion, terminal
+  // failure, lost-run recovery) and leave the issue open (usually `blocked`) but
+  // un-joined to any live run. AUR-5001: without this check, every subsequent tick
+  // mints a brand-new umbrella instead of reusing the stranded one (67 zombies in 3
+  // days). Same origin + fingerprint match as findLiveExecutionIssue, minus the
+  // live-run join.
+  async function findOpenNonLiveExecutionIssue(
+    routine: typeof routines.$inferSelect,
+    executor: Db = db,
+    dispatchFingerprint?: string | null,
+    origin?: { kind: string; id: string | null },
+  ) {
+    const fingerprintCondition = routineExecutionFingerprintCondition(dispatchFingerprint);
+    const originKind = origin?.kind ?? "routine_execution";
+    const originId = origin?.id ?? routine.id;
+    return executor
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, routine.companyId),
+          eq(issues.originKind, originKind),
+          eq(issues.originId, originId),
+          inArray(issues.status, OPEN_ISSUE_STATUSES),
+          isNull(issues.hiddenAt),
+          ...(fingerprintCondition ? [fingerprintCondition] : []),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  // AUR-5001: distinguishes the two kinds of `blocked` an execution umbrella can be in.
+  // Zero-edge `blocked` (no `blocks` relation, or every blocker already `done`) is the
+  // stranded case this issue is about — nothing will ever unblock it, so the reuse path
+  // must reopen it. A `blocked` issue with a genuinely unresolved blocker is the opposite
+  // case: suppression there is correct and must be preserved. Mirrors the unresolved-
+  // blocker rule in issues.ts (`blockerStatus !== "done"` counts as unresolved; a
+  // cancelled blocker stays unresolved until an operator removes the edge).
+  async function hasUnresolvedBlockerEdge(
+    companyId: string,
+    issueId: string,
+    executor: Db = db,
+  ): Promise<boolean> {
+    const rows = await executor
+      .select({ blockerStatus: issues.status })
+      .from(issueRelations)
+      .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+      .where(
+        and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.type, "blocks"),
+          eq(issueRelations.relatedIssueId, issueId),
+          ne(issues.status, "done"),
+        ),
+      )
+      .limit(1);
+    return rows.length > 0;
+  }
+
   // For reuse_and_rewake: find the singleton issue regardless of status (open or closed).
   // Prefer a currently-open issue so that legacy churn (many stale closed execution
   // issues) can't cause us to reopen an old closed one while a live one already exists.
@@ -1371,6 +1435,105 @@ export function routineService(
             triggeredAt,
           }, txDb);
           return updated ?? createdRun;
+        }
+
+        // AUR-5001: no live-run-bound issue, but a stranded open one may still exist
+        // for coalesce_if_active/skip_if_active. Reuse + re-wake it instead of minting
+        // a duplicate umbrella. always_enqueue is intentionally excluded (matches the
+        // activeIssue branch above — every fire should dispatch fresh work).
+        if (input.routine.concurrencyPolicy !== "always_enqueue") {
+          const strandedIssue = await findOpenNonLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
+            kind: issueOriginKind,
+            id: issueOriginId,
+          });
+          if (strandedIssue) {
+            // An umbrella held by a real unresolved blocker must stay blocked (reusing it
+            // still avoids the duplicate umbrella, and the blocker resolving is what
+            // releases it). Everything else is the zero-edge stranded case this fix is for.
+            const heldByRealBlocker = strandedIssue.status === "blocked" &&
+              await hasUnresolvedBlockerEdge(input.routine.companyId, strandedIssue.id, txDb);
+
+            // Both `blocked` AND `backlog` are non-dispatchable, for two DIFFERENT reasons,
+            // and both must be reopened or the re-wake is a no-op that re-strands the issue:
+            //   - `blocked` is excluded from execution-candidate selection in heartbeat.ts.
+            //   - `backlog` is excluded one level earlier — queueIssueAssignmentWakeup
+            //     hard-returns on `issue.status === "backlog"` before queueing anything.
+            // The `backlog` case is the more dangerous of the two because it fails SILENTLY:
+            // no wake, no throw, no error. Reopening only `blocked` left a backlog umbrella
+            // reused-but-never-woken on every subsequent tick — a permanent suppressor,
+            // which is precisely what widening liveness must not create.
+            const needsReopen = !heldByRealBlocker &&
+              (strandedIssue.status === "blocked" || strandedIssue.status === "backlog");
+            if (needsReopen) {
+              // Reopen outside the transaction (`db`, not `txDb`) so the row lock is
+              // released before queueIssueAssignmentWakeup's wakeup callback updates
+              // the same row (execution_run_id/execution_locked_at) on its own
+              // connection. Using txDb here deadlocks: the outer tx waits on the
+              // wakeup, the wakeup waits on the row lock the outer tx still holds.
+              // Same rule, same reason as the reuse_and_rewake branch above.
+              await db
+                .update(issues)
+                .set({ status: "todo", updatedAt: new Date() })
+                .where(eq(issues.id, strandedIssue.id));
+              strandedIssue.status = "todo";
+            }
+
+            // Whether this tick actually dispatched anything. Mirrors
+            // queueIssueAssignmentWakeup's own guards: it silently returns without
+            // queueing when there is no assignee or the issue is still `backlog`.
+            const dispatched = !heldByRealBlocker &&
+              Boolean(strandedIssue.assigneeAgentId) &&
+              strandedIssue.status !== "backlog";
+            if (dispatched) {
+              await queueIssueAssignmentWakeup({
+                heartbeat,
+                issue: strandedIssue,
+                reason: "issue_assigned",
+                mutation: "update",
+                contextSource: "routine.dispatch",
+                requestedByActorType: input.source === "schedule" ? "system" : undefined,
+                rethrowOnError: true,
+              });
+            }
+
+            // A tick that reused the umbrella WITHOUT dispatching is a fold, not a
+            // dispatch, and must be recorded as one. Recording `issue_created` here
+            // would set consecutiveCoalesceCount back to 0 on every tick, permanently
+            // disarming the AUR-4373 wedge guard for exactly the routines that are
+            // stranded — trading the loud old failure (a visible pile of duplicate
+            // umbrellas) for a silent one (routine dark, every dashboard green). The
+            // activeIssue branch above and the 23505 branch below both already record
+            // coalesced/skipped and raise the anomaly; this is the same situation.
+            const reuseStatus = dispatched
+              ? "issue_created" as const
+              : input.routine.concurrencyPolicy === "skip_if_active"
+                ? "skipped" as const
+                : "coalesced" as const;
+            const updated = await finalizeRun(createdRun.id, {
+              status: reuseStatus,
+              linkedIssueId: strandedIssue.id,
+              ...(dispatched
+                ? {}
+                : { coalescedIntoRunId: strandedIssue.originRunId, completedAt: triggeredAt }),
+            }, txDb);
+            const touched = await updateRoutineTouchedState({
+              routineId: input.routine.id,
+              triggerId: input.trigger?.id ?? null,
+              triggeredAt,
+              status: reuseStatus,
+              issueId: strandedIssue.id,
+              nextRunAt,
+            }, txDb);
+            if (!dispatched) {
+              await maybeRaiseCoalesceAnomaly({
+                routine: input.routine,
+                targetIssue: strandedIssue,
+                consecutiveCoalesceCount: touched.consecutiveCoalesceCount,
+                triggeredAt,
+              }, txDb);
+            }
+            return updated ?? createdRun;
+          }
         }
 
         try {

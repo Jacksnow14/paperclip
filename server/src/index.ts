@@ -1158,6 +1158,17 @@ export async function startServer(): Promise<StartedServer> {
           "issue-graph liveness reconciliation changed issue state or recorded action errors",
         );
       }
+      // AUR-5465 backstop: closes any recovery action left `active`/`escalated` against
+      // an already-terminal source issue. Every known write path (and the DB trigger)
+      // already closes these synchronously, so this normally finds nothing; it only
+      // matters the day some new bulk path bypasses all of them, as the 08-06 one did.
+      const orphanedRecoveryActionsReconciled = await heartbeat.reconcileOrphanedRecoveryActions();
+      if (orphanedRecoveryActionsReconciled.resolvedCount > 0 || orphanedRecoveryActionsReconciled.cancelledCount > 0) {
+        logger.warn(
+          { ...orphanedRecoveryActionsReconciled, phase },
+          "orphaned recovery action reconciliation closed actions on terminal issues",
+        );
+      }
       // The two sweeps below are the only ones in this chain that exist purely to
       // MINT meta-issues; everything above repairs run/issue state. Skipping them
       // therefore costs no recovery capability, which is what makes them safe to

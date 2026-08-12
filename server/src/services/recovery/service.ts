@@ -4231,6 +4231,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
+  /**
+   * AUR-5465 backstop: the trigger and every known write path already close active
+   * recovery actions synchronously when their source issue lands terminal (AUR-4299).
+   * This sweep exists for the write path nobody has written yet — it finds zero rows
+   * under normal operation and only earns its keep the day something new bypasses the
+   * data-layer invariant.
+   */
+  async function reconcileOrphanedRecoveryActions() {
+    return recoveryActionsSvc.reconcileOrphanedTerminalActions();
+  }
+
   function readRecoveryTimerIntervalMs(raw: unknown, fallback: number) {
     return Math.max(1, Math.floor(asNumber(raw, fallback)));
   }
@@ -4244,6 +4255,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     reconcileStrandedAssignedIssues,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileIssueGraphLiveness,
+    reconcileOrphanedRecoveryActions,
     readRecoveryTimerIntervalMs,
     isRecoveryDispatchStillValid,
   };

@@ -1,6 +1,6 @@
 import { and, desc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueRecoveryActions } from "@paperclipai/db";
+import { issueRecoveryActions, issues } from "@paperclipai/db";
 import type {
   IssueRecoveryAction,
   IssueRecoveryActionKind,
@@ -373,9 +373,74 @@ export function issueRecoveryActionService(db: Db) {
     return updated.map(toReadModel);
   }
 
+  /**
+   * Backstop sweep: close any `active`/`escalated` recovery action whose source issue is
+   * already terminal, across every company. This exists for the write path nobody has
+   * written yet — the AUR-5465 trigger (`issues_resolve_recovery_actions_on_terminal`) and
+   * every known call site already close these synchronously, so under normal operation this
+   * finds zero rows. Deliberately unscoped by company: an orphan here is definitionally a
+   * gap in enforcement, not routine per-company traffic, so there is nothing to paginate.
+   */
+  async function reconcileOrphanedTerminalActions(): Promise<{
+    resolvedCount: number;
+    cancelledCount: number;
+    companyIds: string[];
+  }> {
+    const orphaned = await db
+      .select({
+        id: issueRecoveryActions.id,
+        companyId: issueRecoveryActions.companyId,
+        issueStatus: issues.status,
+      })
+      .from(issueRecoveryActions)
+      .innerJoin(issues, eq(issues.id, issueRecoveryActions.sourceIssueId))
+      .where(
+        and(
+          inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+          inArray(issues.status, ["done", "cancelled"]),
+        ),
+      );
+
+    if (orphaned.length === 0) return { resolvedCount: 0, cancelledCount: 0, companyIds: [] };
+
+    const now = new Date();
+    let resolvedCount = 0;
+    let cancelledCount = 0;
+    const companyIds = new Set<string>();
+    for (const row of orphaned) {
+      const resolution = terminalIssueRecoveryResolution(row.issueStatus);
+      if (!resolution) continue;
+      const [updated] = await db
+        .update(issueRecoveryActions)
+        .set({
+          status: resolution.status,
+          outcome: resolution.outcome,
+          resolutionNote: `Reconciled: source issue reached terminal status ${row.issueStatus}.`,
+          resolvedAt: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(issueRecoveryActions.id, row.id),
+            inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+          ),
+        )
+        .returning({ id: issueRecoveryActions.id });
+      if (!updated) continue;
+      companyIds.add(row.companyId);
+      if (resolution.status === "resolved") {
+        resolvedCount += 1;
+      } else {
+        cancelledCount += 1;
+      }
+    }
+    return { resolvedCount, cancelledCount, companyIds: [...companyIds] };
+  }
+
   return {
     getActiveForIssue,
     listActiveForIssues,
+    reconcileOrphanedTerminalActions,
     resolveActiveForIssue,
     resolveActiveForTerminalIssues,
     upsertSourceScoped,

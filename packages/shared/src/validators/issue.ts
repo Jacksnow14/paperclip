@@ -276,7 +276,7 @@ const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
 export const resolveIssueRecoveryActionSchema = z.object({
   actionId: z.string().uuid().optional(),
   outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
-  sourceIssueStatus: z.enum(["done", "in_review", "blocked"]),
+  sourceIssueStatus: z.enum(["done", "in_review", "blocked", "cancelled"]),
   resolutionNote: multilineTextSchema.optional().nullable(),
 }).strict().superRefine((value, ctx) => {
   if (value.outcome === "restored") {
@@ -301,14 +301,29 @@ export const resolveIssueRecoveryActionSchema = z.object({
     return;
   }
 
-  if (value.outcome === "false_positive" || value.outcome === "cancelled") {
+  if (value.outcome === "false_positive") {
     if (
       value.sourceIssueStatus !== "done" &&
       value.sourceIssueStatus !== "in_review"
     ) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: "This recovery outcome requires sourceIssueStatus to be done or in_review",
+        message: "False-positive recovery actions require sourceIssueStatus to be done or in_review",
+        path: ["sourceIssueStatus"],
+      });
+    }
+    return;
+  }
+
+  if (value.outcome === "cancelled") {
+    // AUR-5465 (C3): a cancelled recovery outcome exists to close the action against a
+    // source issue that is itself cancelled — the case that previously had no agent-
+    // reachable path at all. It is not an alternate spelling of "restored" or
+    // "false_positive", so it gets its own required end state instead of borrowing theirs.
+    if (value.sourceIssueStatus !== "cancelled") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Cancelled recovery actions must move the source issue to cancelled",
         path: ["sourceIssueStatus"],
       });
     }

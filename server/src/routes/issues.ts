@@ -2104,7 +2104,13 @@ export function issueRoutes(
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
 
     const { actionId, outcome, sourceIssueStatus, resolutionNote } = req.body;
-    if (outcome === "false_positive" || outcome === "cancelled") {
+    // AUR-5465 (C3): "false_positive" is always a judgment call and stays board-gated. A
+    // "cancelled" outcome against a source issue that is *already* cancelled is mechanical
+    // cleanup, not a decision — gating it behind assertBoard left no agent-reachable path to
+    // close a recovery action orphaned on an already-terminal issue (forced a 45-issue manual
+    // re-PATCH during AUR-5431). Cancelling a still-open issue through this endpoint remains
+    // board-gated, same as before.
+    if (outcome === "false_positive" || (outcome === "cancelled" && existing.status !== "cancelled")) {
       assertBoard(req);
     }
 

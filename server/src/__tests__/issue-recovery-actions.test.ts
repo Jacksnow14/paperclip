@@ -8,6 +8,7 @@ import {
   activityLog,
   companies,
   createDb,
+  heartbeatRuns,
   issueComments,
   issueRecoveryActions,
   issueRelations,
@@ -133,6 +134,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.delete(issueRecoveryActions);
     await db.delete(issueComments);
     await db.delete(activityLog);
+    await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companies);
@@ -866,6 +868,125 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(actionRow?.status).toBe("active");
   });
 
+  // AUR-5465 (C3): before this fix, no agent could clear a recovery action on a source issue
+  // that was already cancelled — outcome "cancelled" was unconditionally board-gated, and
+  // "cancelled" was not even a valid sourceIssueStatus value. That gap forced a 45-issue manual
+  // re-PATCH workaround during AUR-5431. This is the mechanical-cleanup path: the issue is
+  // already terminal, so there is no live-issue decision left for the agent to make.
+  it("lets an agent close a recovery action against an already-cancelled source issue", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: coderId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:orphaned-on-cancelled",
+      evidence: { latestIssueStatus: "cancelled" },
+      nextAction: "Close the recovery action; the source issue is already cancelled.",
+      wakePolicy: { type: "manual" },
+    });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "assignment",
+      status: "succeeded",
+    });
+    const app = createApp({
+      type: "agent",
+      agentId: coderId,
+      companyId,
+      runId,
+      source: "agent_jwt",
+    });
+
+    const resolved = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "cancelled",
+        sourceIssueStatus: "cancelled",
+        resolutionNote: "Source issue is already cancelled; closing the orphaned action.",
+      })
+      .expect(200);
+
+    expect(resolved.body.recoveryAction).toMatchObject({
+      id: action.id,
+      status: "cancelled",
+      outcome: "cancelled",
+    });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+  });
+
+  // Control: cancelling a still-*open* issue through this endpoint is a live-issue decision,
+  // not mechanical cleanup, and must stay board-gated exactly as before.
+  it("still requires board access for an agent to cancel a recovery action against a still-open source issue", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: coderId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:still-open",
+      evidence: { latestIssueStatus: "in_progress" },
+      nextAction: "Decide whether to cancel the source issue.",
+      wakePolicy: { type: "manual" },
+    });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "assignment",
+      status: "running",
+    });
+    const app = createApp({
+      type: "agent",
+      agentId: coderId,
+      companyId,
+      runId,
+      source: "agent_jwt",
+    });
+
+    await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "cancelled",
+        sourceIssueStatus: "cancelled",
+      })
+      .expect(403);
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow?.status).toBe("active");
+  });
+
+  // Validator control: "cancelled" must map to sourceIssueStatus "cancelled", not borrow
+  // "restored"'s done/in_review end states.
+  it("rejects a cancelled recovery outcome paired with a non-cancelled sourceIssueStatus", async () => {
+    const { sourceIssueId } = await seedCompany();
+    const app = createApp();
+
+    await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        outcome: "cancelled",
+        sourceIssueStatus: "done",
+      })
+      .expect(400);
+  });
+
   it("Class B durable-blocker sweep skips a durable blocked issue guarded by a fresh recovery action (AUR-4300)", async () => {
     const { companyId, prefix } = await seedCompany();
     const blockedIssueId = randomUUID();
@@ -1080,6 +1201,84 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       });
       expect(second).toEqual([]);
       expect((await readAction(action.id)).resolvedAt).toEqual(resolvedAt);
+    });
+
+    // AUR-5465 (C1): the app-level resolve calls above only prove the three known call
+    // sites (issueService.update, the tree-cancel bulk path, and the recovery-actions
+    // route) each remember to close the action. A raw ORM/SQL status write that goes
+    // through none of them — exactly how the 08-06 bulk-cancel path bypassed all three
+    // and left 47 orphans — must still be caught, because the invariant now lives in a
+    // DB trigger (`issues_resolve_recovery_actions_on_terminal`), not in any one call site.
+    it("closes the action via the DB trigger even when the status write bypasses every known service call site", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const action = await seedActiveAction(companyId, sourceIssueId, managerId);
+      expect(action.status).toBe("active");
+
+      await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, sourceIssueId));
+
+      const row = await readAction(action.id);
+      expect(row.status).toBe("cancelled");
+      expect(row.outcome).toBe("cancelled");
+      expect(row.resolvedAt).toBeInstanceOf(Date);
+    });
+
+    // Control: the trigger must discriminate on terminal status, not fire on every status
+    // write. Mirrors "leaves the action active for non-terminal status transitions" above,
+    // but through the same raw-update path used by the trigger test.
+    it("does not touch the action when a raw status write lands on a non-terminal status", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const action = await seedActiveAction(companyId, sourceIssueId, managerId);
+
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+
+      expect((await readAction(action.id)).status).toBe("active");
+    });
+
+    // AUR-5465 (C2): the reconciliation sweep is the backstop for whatever future write
+    // path still manages to bypass both the trigger and every known service call site. It
+    // has to be tested against a constructed orphan rather than live data, because live
+    // data has zero orphans by construction once (C1) ships — that is the point of (C1).
+    it("closes an already-orphaned active action via the reconciliation sweep", async () => {
+      const { companyId, managerId, prefix } = await seedCompany();
+      // Insert the issue already terminal, then attach an active action afterward. This
+      // never runs an `UPDATE OF status`, so the trigger never fires — the orphan is
+      // genuine, not just untested.
+      const orphanIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: orphanIssueId,
+        companyId,
+        title: "Already-cancelled issue with a stray recovery action",
+        status: "cancelled",
+        priority: "medium",
+        issueNumber: 99,
+        identifier: `${prefix}-99`,
+      });
+      const orphanAction = await seedActiveAction(companyId, orphanIssueId, managerId);
+      expect(orphanAction.status).toBe("active");
+
+      const result = await issueRecoveryActionService(db).reconcileOrphanedTerminalActions();
+      expect(result.cancelledCount).toBe(1);
+      expect(result.resolvedCount).toBe(0);
+      expect(result.companyIds).toEqual([companyId]);
+
+      const row = await readAction(orphanAction.id);
+      expect(row.status).toBe("cancelled");
+      expect(row.outcome).toBe("cancelled");
+      expect(row.resolvedAt).toBeInstanceOf(Date);
+
+      // Idempotent: a repeat sweep finds nothing left to do.
+      const second = await issueRecoveryActionService(db).reconcileOrphanedTerminalActions();
+      expect(second).toEqual({ resolvedCount: 0, cancelledCount: 0, companyIds: [] });
+    });
+
+    // Control: an active action on a still-open issue must survive the sweep untouched.
+    it("leaves an active action alone when its source issue is still open", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const action = await seedActiveAction(companyId, sourceIssueId, managerId);
+
+      const result = await issueRecoveryActionService(db).reconcileOrphanedTerminalActions();
+      expect(result).toEqual({ resolvedCount: 0, cancelledCount: 0, companyIds: [] });
+      expect((await readAction(action.id)).status).toBe("active");
     });
   });
 });

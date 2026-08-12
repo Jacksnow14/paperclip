@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, inArray, or, sql } from "drizzle-orm";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -11,6 +11,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueDocuments,
+  issueRecoveryActions,
   issueRelations,
   issues,
 } from "@paperclipai/db";
@@ -25,6 +26,7 @@ import {
   MAX_TURN_CONTINUATION_WAKE_REASON,
   heartbeatService,
 } from "../services/heartbeat.ts";
+import { issueRecoveryActionService } from "../services/issue-recovery-actions.ts";
 import { runningProcesses } from "../adapters/index.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -396,6 +398,162 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(run?.errorCode).toBe("issue_terminal_status");
     expect(wakeup?.status).toBe("skipped");
     expect(countExecuteCallsForRun(runId)).toBe(0);
+  });
+
+  // AUR-5465 (B) FIRE case: before this fix, a `wakeCommentId` in context (the exact shape a
+  // recovery-action re-wake carries) let a queued run on a cancelled issue slip past this guard
+  // and execute — this is how the 08-06 bulk-cancel queue kept draining. `cancelled` must have no
+  // resume hatch at all, unlike `done`.
+  it("still cancels a queued run on a cancelled issue even when a wakeCommentId is present", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    const commentId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Cancelled task with a stray comment-driven wake",
+      status: "cancelled",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      body: "A recovery-action re-wake comment.",
+    });
+
+    const { runId, wakeupRequestId } = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_commented",
+      wakeupCommentId: commentId,
+      contextExtras: { commentId, wakeCommentId: commentId },
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "cancelled";
+    });
+
+    const [run, wakeup] = await Promise.all([
+      db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId))
+        .then((rows) => rows[0] ?? null),
+    ]);
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("issue_terminal_status");
+    expect(wakeup?.status).toBe("skipped");
+    expect(countExecuteCallsForRun(runId)).toBe(0);
+  });
+
+  // AUR-5465 (B) FIRE case: an explicit `resumeIntent` must not revive a cancelled issue either.
+  // `done` legitimately honors resumeIntent (see the PASS case below); `cancelled` never does.
+  it("still cancels a queued run on a cancelled issue even when resumeIntent is set", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Cancelled task with an explicit resume intent",
+      status: "cancelled",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+
+    const { runId, wakeupRequestId } = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_assigned",
+      contextExtras: { resumeIntent: true },
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "cancelled";
+    });
+
+    const [run, wakeup] = await Promise.all([
+      db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId))
+        .then((rows) => rows[0] ?? null),
+    ]);
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("issue_terminal_status");
+    expect(wakeup?.status).toBe("skipped");
+    expect(countExecuteCallsForRun(runId)).toBe(0);
+  });
+
+  // PASS case (must not regress): `done` keeps its resume hatch. A deliberate `resumeIntent`
+  // follow-up on a completed issue is a real, supported flow and must still run.
+  it("still runs a queued run on a done issue when resumeIntent is set", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Completed task with a deliberate resume follow-up",
+      status: "done",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+
+    const { runId } = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_assigned",
+      contextExtras: { resumeIntent: true },
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded";
+    });
+
+    const run = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(run?.status).toBe("succeeded");
+    expect(run?.errorCode).toBeNull();
+    expect(countExecuteCallsForRun(runId)).toBe(1);
   });
 
   it("cancels queued max-turn continuations when the issue is no longer in_progress before the run starts", async () => {
@@ -1504,5 +1662,164 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       .update(heartbeatRuns)
       .set({ status: "cancelled", finishedAt: new Date() })
       .where(inArray(heartbeatRuns.id, [blockerRunId, ...(deferredWake?.runId ? [deferredWake.runId] : [])]));
+  });
+
+  // AUR-5465 end-to-end regression: replay the 08-06 sequence — an outage drives repeated
+  // run failures on a batch of in-flight issues, an operator bulk-cancels them with a single
+  // multi-row UPDATE (exactly the shape that bypassed all 3 known AUR-4299 call sites and left
+  // 47 orphaned recovery actions live), and then a wave of re-wake attempts (recovery-action
+  // comment wakes, resumeIntent follow-ups, plain reassignment wakes) hits the now-cancelled
+  // issues. B closes the resume hatch per run; C1's DB trigger closes the recovery actions
+  // synchronously on the bulk write, not per-call-site. Assert the queue reaches zero and,
+  // on a second independent drain pass plus the C2 reconciler sweep, stays zero.
+  it("replays the 08-06 org-block -> bulk-cancel -> re-wake sequence and drains the queue to zero and keeps it there", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "OutageCoder" });
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const issueCount = 5;
+    const issueIds = Array.from({ length: issueCount }, () => randomUUID());
+
+    for (const [index, issueId] of issueIds.entries()) {
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: `Org-block casualty ${index}`,
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+      });
+
+      // N failed runs per issue: the outage-era attempt history left behind by the adapter
+      // being unreachable, exactly as claim_queued_run would have recorded them.
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        await db.insert(heartbeatRuns).values({
+          id: randomUUID(),
+          companyId,
+          agentId,
+          invocationSource: "assignment",
+          status: "failed",
+          errorCode: "adapter_failed",
+          startedAt: new Date(),
+          finishedAt: new Date(),
+          contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+        });
+      }
+
+      // The escalation the repeated failures produced: a live wake_owner recovery action,
+      // still active at the moment the operator reaches for the bulk cancel.
+      await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId: issueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: agentId,
+        cause: "stranded_assigned_issue",
+        fingerprint: `org-block-replay:${issueId}`,
+        evidence: { failedAttempts: 3 },
+        nextAction: "Escalated during the org-block outage.",
+        wakePolicy: { type: "wake_owner" },
+      });
+    }
+
+    // The bulk cancel: a single multi-row UPDATE, not a loop over the service's update() call
+    // site — this is the exact shape that bypassed AUR-4299's 3 known call sites on 08-06.
+    await db.update(issues).set({ status: "cancelled" }).where(inArray(issues.id, issueIds));
+
+    // C1 must have closed every recovery action synchronously, in the same statement.
+    const closedActions = await db
+      .select({ sourceIssueId: issueRecoveryActions.sourceIssueId, status: issueRecoveryActions.status })
+      .from(issueRecoveryActions)
+      .where(inArray(issueRecoveryActions.sourceIssueId, issueIds));
+    expect(closedActions).toHaveLength(issueCount);
+    expect(closedActions.every((action) => action.status === "cancelled")).toBe(true);
+
+    // Re-wake attempts: a mix of the wake shapes that used to slip past the old guard.
+    const wakeRunIds: string[] = [];
+    for (const [index, issueId] of issueIds.entries()) {
+      const mode = index % 3;
+      if (mode === 0) {
+        const commentId = randomUUID();
+        await db.insert(issueComments).values({
+          id: commentId,
+          companyId,
+          issueId,
+          authorAgentId: agentId,
+          body: "Recovery-action re-wake comment carried over from the outage.",
+        });
+        const { runId } = await seedQueuedRun({
+          companyId,
+          agentId,
+          issueId,
+          wakeReason: "issue_commented",
+          wakeupCommentId: commentId,
+          contextExtras: { commentId, wakeCommentId: commentId },
+        });
+        wakeRunIds.push(runId);
+      } else if (mode === 1) {
+        const { runId } = await seedQueuedRun({
+          companyId,
+          agentId,
+          issueId,
+          wakeReason: "issue_assigned",
+          contextExtras: { resumeIntent: true },
+        });
+        wakeRunIds.push(runId);
+      } else {
+        const { runId } = await seedQueuedRun({
+          companyId,
+          agentId,
+          issueId,
+          wakeReason: "issue_assigned",
+        });
+        wakeRunIds.push(runId);
+      }
+    }
+
+    await heartbeat.resumeQueuedRuns();
+
+    await waitForCondition(async () => {
+      const runs = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, wakeRunIds));
+      return runs.every((run) => run.status === "cancelled");
+    });
+
+    const drainedRuns = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.id, wakeRunIds));
+    expect(drainedRuns).toHaveLength(issueCount);
+    for (const run of drainedRuns) {
+      expect(run.status).toBe("cancelled");
+      expect(run.errorCode).toBe("issue_terminal_status");
+    }
+    for (const runId of wakeRunIds) {
+      expect(countExecuteCallsForRun(runId)).toBe(0);
+    }
+
+    const queuedAfterFirstDrain = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "queued")));
+    expect(queuedAfterFirstDrain).toHaveLength(0);
+
+    // Stays zero: an independent second drain pass plus the C2 backstop sweep must both be
+    // no-ops. Nothing regenerates a queued run or reactivates a recovery action.
+    await heartbeat.resumeQueuedRuns();
+    const orphanSweep = await recoveryActionSvc.reconcileOrphanedTerminalActions();
+    expect(orphanSweep.resolvedCount).toBe(0);
+    expect(orphanSweep.cancelledCount).toBe(0);
+
+    const queuedAfterSecondPass = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "queued")));
+    expect(queuedAfterSecondPass).toHaveLength(0);
+
+    const activeActionsAfter = await db
+      .select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions)
+      .where(and(inArray(issueRecoveryActions.sourceIssueId, issueIds), eq(issueRecoveryActions.status, "active")));
+    expect(activeActionsAfter).toHaveLength(0);
   });
 });

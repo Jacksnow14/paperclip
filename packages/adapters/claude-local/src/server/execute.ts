@@ -1073,6 +1073,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const parsedIsError = asBoolean(parsed.is_error, false);
     const parsedSubtype = asString(parsed.subtype, "").trim().toLowerCase();
     const parsedSucceeded = parsedSubtype === "success" && !parsedIsError;
+    const dirtySuccessfulExit = parsedSucceeded && (proc.exitCode ?? 0) !== 0;
     const failed = !parsedSucceeded && ((proc.exitCode ?? 0) !== 0 || parsedIsError);
     // Validate-before-persist guard: never persist a sessionId whose transcript
     // is known-poisoned. The Claude CLI keeps an on-disk JSONL keyed by the
@@ -1169,6 +1170,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(providerQuota && transientRetryNotBefore ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
+      ...(dirtySuccessfulExit ? { dirtyExit: true, dirtyExitCode: proc.exitCode } : {}),
       ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
     };
 

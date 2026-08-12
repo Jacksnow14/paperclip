@@ -49,6 +49,29 @@ export function isDmarcAggregateReport(from: string, subject: string): boolean {
   return DMARC_REPORT_SUBJECT_RE.test(subject);
 }
 
+// Our own outbound mail is not correspondence (AUR-5473). The intake listing
+// query is a plain Gmail search, which matches SENT as well as received mail —
+// so every cold email the outreach sequence sends from alex@ was minting an
+// "Inbound email received" issue addressed to the prospect we had just written
+// to. AUR-5473 was one such phantom: our own pitch to a prospect, filed as a
+// revenue enquiry and assigned to the CMO.
+//
+// The sender address does NOT discriminate: alex@ legitimately receives mail
+// from alex@ (booking confirmations, internal verification sends), and those
+// are real deliveries that must keep minting issues. The Gmail label set does
+// discriminate — a message we sent to an external recipient carries SENT and
+// no INBOX, while anything actually delivered to this mailbox carries INBOX
+// (verified against live messages, both directions).
+//
+// Do NOT try to push this into the listing query as `-in:sent`: a message we
+// send to our own mailbox carries BOTH labels, so that filter would also drop
+// the self-addressed mail this guard is careful to keep. The label pair has to
+// be evaluated per message, here.
+export function isOwnOutboundCopy(labelIds: readonly string[] | null | undefined): boolean {
+  if (!labelIds) return false;
+  return labelIds.includes("SENT") && !labelIds.includes("INBOX");
+}
+
 // Gmail label names applied by the intake pipeline.
 export const INTAKE_LABELS = {
   TRIAGED: "paperclip/triaged",
@@ -70,6 +93,9 @@ interface ParsedMessage {
   // Auto-replies are low-signal; the dedupe logic skips creating a new issue
   // when a historical match (even closed) exists for the same sender+subject.
   isAutoReply: boolean;
+  // Gmail's own label set for this message. Used to tell mail delivered to this
+  // mailbox from our own SENT copies — see isOwnOutboundCopy (AUR-5473).
+  labelIds: string[];
 }
 
 function extractHeader(
@@ -148,6 +174,7 @@ function parseMessage(
   msg: {
     id?: string | null;
     threadId?: string | null;
+    labelIds?: string[] | null;
     payload?: {
       headers?: Array<{ name?: string | null; value?: string | null }> | null;
       mimeType?: string | null;
@@ -180,7 +207,16 @@ function parseMessage(
     autoSubmitted === "auto-generated" ||
     precedence === "bulk";
 
-  return { from, subject, dateMs, bodySnippet, gmailThreadId, gmailMessageId, isAutoReply };
+  return {
+    from,
+    subject,
+    dateMs,
+    bodySnippet,
+    gmailThreadId,
+    gmailMessageId,
+    isAutoReply,
+    labelIds: msg.labelIds ?? [],
+  };
 }
 
 // Strip leading Re:/Fwd:/Fw: prefixes (repeatedly), collapse whitespace, lowercase.
@@ -326,6 +362,24 @@ export function createGmailIntakeService(db: Db) {
       processed++;
 
       try {
+        // Our own SENT copies are not inbound correspondence (AUR-5473).
+        // Record the intake so the message is not refetched on every poll for
+        // the next 2 days, mint no issue, and leave the mail untouched — no
+        // triaged label on our own outbound. A later genuine reply arrives as
+        // a separate message carrying INBOX, and since this record has a null
+        // issueId the thread lookup will not fold the reply into nothing.
+        if (isOwnOutboundCopy(parsed.labelIds)) {
+          await db.insert(gmailIntakeRecords).values(
+            buildIntakeRecordValues(companyId, mailbox, parsed, null),
+          );
+          logger.info(
+            { mailbox, messageId: parsed.gmailMessageId, subject: parsed.subject },
+            "gmail-intake: suppressed own outbound copy (SENT without INBOX, no issue)",
+          );
+          skipped++;
+          continue;
+        }
+
         // DMARC aggregate reports are telemetry, not correspondence (AUR-4466).
         // Record the intake so the message is not reprocessed on later polls,
         // but mint no issue and leave the mail fully untouched — no label, no

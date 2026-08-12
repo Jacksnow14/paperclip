@@ -31,9 +31,13 @@ vi.mock("../services/issues.js", () => ({
   }),
 }));
 
-const { createGmailIntakeService, INTAKE_LABELS, repairUtf8Mojibake, isDmarcAggregateReport } = await import(
-  "../services/gmail-intake.js"
-);
+const {
+  createGmailIntakeService,
+  INTAKE_LABELS,
+  repairUtf8Mojibake,
+  isDmarcAggregateReport,
+  isOwnOutboundCopy,
+} = await import("../services/gmail-intake.js");
 
 // Minimal Drizzle-like db mock that supports select/insert chaining.
 // leftJoin and orderBy are added to support the cross-thread sender+subject
@@ -1000,5 +1004,121 @@ describe("repairUtf8Mojibake (LAR-570)", () => {
     const title = mockIssueCreate.mock.calls[0][1].title as string;
     expect(title).toContain(original);
     expect(title).not.toContain(mojibaked);
+  });
+});
+
+describe("own-outbound suppression (AUR-5473)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  // Label sets below are copied from live messages in the alex@ mailbox.
+  // Label_1 is paperclip/triaged.
+  function makeLabeledMessage(
+    id: string,
+    threadId: string,
+    labelIds: string[],
+    from: string,
+    subject: string,
+  ) {
+    const msg = makeMessage(id, threadId, subject) as ReturnType<typeof makeMessage> & {
+      labelIds?: string[];
+    };
+    msg.labelIds = labelIds;
+    msg.payload.headers[0].value = from;
+    return msg;
+  }
+
+  it("mints no issue for our own cold email to a prospect (the AUR-5473 phantom)", async () => {
+    // The exact message that produced AUR-5473: our outreach pitch to a
+    // prospect, filed as an inbound revenue enquiry and assigned to the CMO.
+    const msg = makeLabeledMessage(
+      "sent-cold-1",
+      "thread-sent-cold-1",
+      ["Label_1", "SENT"],
+      "alex@tryauranode.com",
+      "For Wayne Decker - covering after-hours HVAC calls (business enquiry, not a service request)",
+    );
+    mockListMessages.mockResolvedValue({ messages: [{ id: "sent-cold-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "should-not-exist" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "alex");
+
+    expect(mockIssueCreate).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+
+    // Intake is still recorded (issueId null) so the send is not refetched on
+    // every poll, and the outbound mail itself is left unlabeled.
+    const insertValues = (db as ReturnType<typeof buildDbMock>)._insertChain.values.mock
+      .calls[0][0] as Record<string, unknown>;
+    expect(insertValues.gmailMessageId).toBe("sent-cold-1");
+    expect(insertValues.issueId).toBeNull();
+    expect(mockModifyMessageLabels).not.toHaveBeenCalled();
+  });
+
+  it("still mints an issue for genuine self-addressed mail (SENT + INBOX)", async () => {
+    // alex@ really does receive mail from alex@ — booking confirmations and
+    // internal verification sends. Those carry INBOX and must keep working.
+    const msg = makeLabeledMessage(
+      "self-inbox-1",
+      "thread-self-inbox-1",
+      ["UNREAD", "Label_1", "INBOX"],
+      "alex@tryauranode.com",
+      "AUR-4065 AC4 env-scrub verification",
+    );
+    mockListMessages.mockResolvedValue({ messages: [{ id: "self-inbox-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-self-inbox-1" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "alex");
+
+    expect(mockIssueCreate).toHaveBeenCalledOnce();
+    expect(result.created).toBe(1);
+    expect(result.skipped).toBe(0);
+  });
+
+  it("still mints an issue for ordinary inbound mail with no label set at all", async () => {
+    const msg = makeMessage("plain-1", "thread-plain-1", "Interested in a pilot");
+    mockListMessages.mockResolvedValue({ messages: [{ id: "plain-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-plain-1" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "alex");
+
+    expect(mockIssueCreate).toHaveBeenCalledOnce();
+    expect(result.created).toBe(1);
+  });
+
+  it("classifier: SENT without INBOX only", () => {
+    // Positive — our own outbound copies.
+    expect(isOwnOutboundCopy(["Label_1", "SENT"])).toBe(true);
+    expect(isOwnOutboundCopy(["SENT"])).toBe(true);
+    // Negative — delivered to us, including self-addressed (both labels).
+    expect(isOwnOutboundCopy(["SENT", "INBOX"])).toBe(false);
+    expect(isOwnOutboundCopy(["UNREAD", "Label_1", "INBOX"])).toBe(false);
+    expect(isOwnOutboundCopy(["INBOX"])).toBe(false);
+    // Negative — archived inbound mail (e.g. filtered to a label) is not ours.
+    expect(isOwnOutboundCopy(["Label_2"])).toBe(false);
+    expect(isOwnOutboundCopy([])).toBe(false);
+    expect(isOwnOutboundCopy(null)).toBe(false);
+    expect(isOwnOutboundCopy(undefined)).toBe(false);
   });
 });

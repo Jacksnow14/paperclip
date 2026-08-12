@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, chmodSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -437,4 +437,128 @@ test('sendFounderAlert classifies exit code 1 as failed', async (t) => {
   const cmd = makeFakeScript(dir, 'notify-fail.sh', 'echo "usage error"\nexit 1');
   const result = await sendFounderAlert('test message', { cmd });
   assert.equal(result, 'failed');
+});
+
+test('sendFounderAlert invokes notify_founder.sh with INFO, not SEV2 (AUR-5355)', async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'aur4532-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const echoArgsPath = path.join(dir, 'first-arg.txt');
+  const cmd = makeFakeScript(
+    dir,
+    'notify-echo-args.sh',
+    `printf '%s' "$1" > "${echoArgsPath}"\necho "sent (info-logged)"\nexit 0`
+  );
+  const result = await sendFounderAlert('test message', { cmd });
+  assert.equal(result, 'confirmed');
+  assert.equal(readFileSync(echoArgsPath, 'utf8'), 'INFO');
+});
+
+test('sendFounderAlert forwards an explicit severity override to notify_founder.sh (AUR-5355)', async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'aur4532-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const echoArgsPath = path.join(dir, 'first-arg.txt');
+  const cmd = makeFakeScript(
+    dir,
+    'notify-echo-args.sh',
+    `printf '%s' "$1" > "${echoArgsPath}"\necho "sent"\nexit 0`
+  );
+  const result = await sendFounderAlert('test message', { cmd, severity: 'SEV2' });
+  assert.equal(result, 'confirmed');
+  assert.equal(readFileSync(echoArgsPath, 'utf8'), 'SEV2');
+});
+
+// ── AUR-5355: graded severity — single lane dark is INFO, whole-adapter dark is SEV2 ──
+
+test('a single dark lane (siblings healthy) grades INFO', async () => {
+  const { results } = await tickCompany({
+    agents: [makeAgent({ id: 'a1' }), makeAgent({ id: 'a2' })],
+    // a2 has live runs this tick — only a1 is dark.
+    runs: [...darkRuns('a1'), { agentId: 'a2', status: 'succeeded', scheduledRetryAt: null }],
+    now: NOW,
+    issuePrefix: 'aur',
+    sendAlert: async () => 'confirmed',
+    patchAgent: async () => {},
+  });
+  const a1 = results.find((r) => r.agentId === 'a1');
+  assert.equal(a1.alert, 'opened');
+  assert.equal(a1.severity, 'INFO');
+});
+
+test('every agent of an adapterType dark at once grades SEV2 (billing/quota carve-out)', async () => {
+  const { results } = await tickCompany({
+    agents: [makeAgent({ id: 'a1' }), makeAgent({ id: 'a2' })],
+    runs: [...darkRuns('a1'), ...darkRuns('a2')],
+    now: NOW,
+    issuePrefix: 'aur',
+    sendAlert: async () => 'confirmed',
+    patchAgent: async () => {},
+  });
+  const a1 = results.find((r) => r.agentId === 'a1');
+  const a2 = results.find((r) => r.agentId === 'a2');
+  assert.equal(a1.severity, 'SEV2');
+  assert.equal(a2.severity, 'SEV2');
+});
+
+test('a dark agent on an adapterType with a healthy codex sibling grades INFO, even though every agent of a DIFFERENT adapterType is also dark', async () => {
+  const { results } = await tickCompany({
+    agents: [
+      makeAgent({ id: 'a1', adapterType: 'codex' }),
+      makeAgent({ id: 'a1b', adapterType: 'codex' }), // healthy codex sibling — codex is NOT a full outage
+      makeAgent({ id: 'a2', adapterType: 'claude_local' }), // the only claude_local agent, also dark
+    ],
+    runs: [...darkRuns('a1'), { agentId: 'a1b', status: 'succeeded', scheduledRetryAt: null }, ...darkRuns('a2')],
+    now: NOW,
+    issuePrefix: 'aur',
+    sendAlert: async () => 'confirmed',
+    patchAgent: async () => {},
+  });
+  const a1 = results.find((r) => r.agentId === 'a1');
+  const a2 = results.find((r) => r.agentId === 'a2');
+  assert.equal(a1.severity, 'INFO', 'codex has a healthy sibling — not a full-adapter outage');
+  assert.equal(a2.severity, 'SEV2', 'claude_local is entirely dark — a full-adapter outage, unaffected by codex');
+});
+
+test('a recovery alert never grades SEV2, even if every sibling of the same adapterType is still dark', async () => {
+  const recovering = makeAgent({
+    id: 'a1',
+    metadata: {
+      darkLane: {
+        ...DEFAULT_DARK_LANE_STATE,
+        active: true,
+        since: NOW.toISOString(),
+        adapterType: 'codex',
+        alertedAt: NOW.toISOString(),
+      },
+    },
+  });
+  const stillDark = makeAgent({ id: 'a2' });
+  const { results } = await tickCompany({
+    agents: [recovering, stillDark],
+    // a1 has live continuation again; a2 is still parked.
+    runs: [{ agentId: 'a1', status: 'succeeded', scheduledRetryAt: null }, ...darkRuns('a2')],
+    now: new Date(NOW.getTime() + 30 * 60 * 1000),
+    issuePrefix: 'aur',
+    sendAlert: async () => 'confirmed',
+    patchAgent: async () => {},
+  });
+  const a1 = results.find((r) => r.agentId === 'a1');
+  assert.equal(a1.alert, 'recovered');
+  assert.equal(a1.severity, 'INFO');
+});
+
+test('the severity passed to sendAlert for a whole-adapter outage is SEV2, wired end to end', async () => {
+  const severities = [];
+  await tickCompany({
+    agents: [makeAgent({ id: 'a1' })],
+    runs: darkRuns('a1'),
+    now: NOW,
+    issuePrefix: 'aur',
+    sendAlert: async (msg, severity) => {
+      severities.push(severity);
+      return 'confirmed';
+    },
+    patchAgent: async () => {},
+  });
+  // Single agent IS the entirety of its adapterType's capacity — grades SEV2.
+  assert.deepEqual(severities, ['SEV2']);
 });

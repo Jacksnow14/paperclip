@@ -722,6 +722,13 @@
       "when": 1785931111134,
       "tag": "0102_approvals_withdrawal",
       "breakpoints": true
+    },
+    {
+      "idx": 103,
+      "version": "7",
+      "when": 1785931111135,
+      "tag": "0103_recovery_action_terminal_trigger",
+      "breakpoints": true
     }
   ]
 }

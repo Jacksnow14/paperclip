@@ -6686,7 +6686,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    if (issue.status === "done" || issue.status === "cancelled") {
+    // `done` keeps the resume/comment hatch: a deliberate `resume: true` follow-up
+    // or a genuine comment-derived wake on a completed issue is a real, supported
+    // flow. `cancelled` has no legitimate resume — a recovery-action re-wake carries
+    // a comment id too, so admitting the hatch here is exactly how a cancelled
+    // issue's queue kept draining through 08-06 (AUR-5465). No exceptions.
+    if (issue.status === "cancelled") {
+      return {
+        stale: true,
+        errorCode: "issue_terminal_status",
+        reason: `Cancelled because issue reached terminal status (${issue.status}) before the queued run could start`,
+        details: { issueId, currentStatus: issue.status },
+      };
+    }
+
+    if (issue.status === "done") {
       if (!resumeIntent && !wakeCommentId) {
         return {
           stale: true,
@@ -7450,6 +7464,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     lookbackHours?: number;
   }) {
     return recovery.reconcileIssueGraphLiveness(opts);
+  }
+
+  async function reconcileOrphanedRecoveryActions() {
+    return recovery.reconcileOrphanedRecoveryActions();
   }
 
   async function updateRuntimeState(
@@ -11374,6 +11392,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     buildIssueGraphLivenessAutoRecoveryPreview,
 
     reconcileIssueGraphLiveness,
+
+    reconcileOrphanedRecoveryActions,
 
     scanSilentActiveRuns,
 

@@ -2104,7 +2104,18 @@ export function issueRoutes(
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
 
     const { actionId, outcome, sourceIssueStatus, resolutionNote } = req.body;
-    if (outcome === "false_positive" || outcome === "cancelled") {
+    // AUR-5465 (C3): "false_positive" is always a judgment call and stays board-gated. The
+    // "cancelled" outcome is agent-reachable ONLY for the true no-op case — the source issue
+    // is already cancelled AND stays cancelled — which is mechanical cleanup of an orphaned
+    // recovery action, not a decision (this gap forced a 45-issue manual re-PATCH during
+    // AUR-5431). Gate on the WRITTEN status (sourceIssueStatus) as well as the current one:
+    // `resolveIssueRecoveryActionSchema` also allows "cancelled" outcome + sourceIssueStatus
+    // "done"/"in_review" (dismissing the action while restoring the issue), and svc.update has
+    // no transition guard of its own, so without this an agent could revive an already-cancelled
+    // issue via sourceIssueStatus: "in_review" with no board check — contradicting deliverable B.
+    const isMechanicalCancelledCleanup =
+      outcome === "cancelled" && existing.status === "cancelled" && sourceIssueStatus === "cancelled";
+    if (outcome === "false_positive" || (outcome === "cancelled" && !isMechanicalCancelledCleanup)) {
       assertBoard(req);
     }
 

@@ -105,7 +105,7 @@ function floorToMinute(date: Date) {
 function getZonedMinuteParts(date: Date, timeZone: string) {
   const formatter = new Intl.DateTimeFormat("en-US", {
     timeZone,
-    hour12: false,
+    hourCycle: "h23",
     year: "numeric",
     month: "numeric",
     day: "numeric",

@@ -316,14 +316,20 @@ export const resolveIssueRecoveryActionSchema = z.object({
   }
 
   if (value.outcome === "cancelled") {
-    // AUR-5465 (C3): a cancelled recovery outcome exists to close the action against a
-    // source issue that is itself cancelled — the case that previously had no agent-
-    // reachable path at all. It is not an alternate spelling of "restored" or
-    // "false_positive", so it gets its own required end state instead of borrowing theirs.
-    if (value.sourceIssueStatus !== "cancelled") {
+    // AUR-5465 (C3): "cancelled" keeps its original done|in_review resolutions (dismissing
+    // the recovery action while the issue itself is fine) and widens — not replaces — to
+    // also allow sourceIssueStatus: "cancelled", the case that previously had no agent-
+    // reachable path at all: closing the action against a source issue that is itself
+    // already cancelled. sourceIssueStatus is the status the route writes, not a
+    // description of the issue's current status, so this is additive.
+    if (
+      value.sourceIssueStatus !== "done" &&
+      value.sourceIssueStatus !== "in_review" &&
+      value.sourceIssueStatus !== "cancelled"
+    ) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: "Cancelled recovery actions must move the source issue to cancelled",
+        message: "Cancelled recovery actions must move the source issue to done, in_review, or cancelled",
         path: ["sourceIssueStatus"],
       });
     }

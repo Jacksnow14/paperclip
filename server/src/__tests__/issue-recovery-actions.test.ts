@@ -972,9 +972,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(actionRow?.status).toBe("active");
   });
 
-  // Validator control: "cancelled" must map to sourceIssueStatus "cancelled", not borrow
-  // "restored"'s done/in_review end states.
-  it("rejects a cancelled recovery outcome paired with a non-cancelled sourceIssueStatus", async () => {
+  // Validator control: "cancelled" widens to also accept "cancelled" as a sourceIssueStatus
+  // (the C3 mechanical-cleanup case) but must not accept an outcome/status pairing that was
+  // never valid for any recovery outcome, like "blocked".
+  it("rejects a cancelled recovery outcome paired with a sourceIssueStatus no recovery outcome allows", async () => {
     const { sourceIssueId } = await seedCompany();
     const app = createApp();
 
@@ -982,9 +983,67 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
       .send({
         outcome: "cancelled",
-        sourceIssueStatus: "done",
+        sourceIssueStatus: "blocked",
       })
       .expect(400);
+  });
+
+  // Interaction hazard the CTO review flagged: widening the schema to accept
+  // outcome: "cancelled" + sourceIssueStatus: "done"/"in_review" must NOT let an agent use
+  // that pairing as a side door to revive an already-cancelled issue. The route's
+  // agent-reachable exception is for the WRITTEN status ("cancelled") matching the current
+  // one, not just the current status being "cancelled" — svc.update has no transition guard
+  // of its own, so this must be enforced at the route's assertBoard gate.
+  it("still requires board access for an agent to revive an already-cancelled issue via a cancelled-outcome resolution", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "issue_graph_liveness",
+      ownerType: "agent",
+      ownerAgentId: coderId,
+      cause: "issue_graph_liveness",
+      fingerprint: "graph-liveness:revive-attempt",
+      evidence: { latestIssueStatus: "cancelled" },
+      nextAction: "Close the recovery action; the source issue is already cancelled.",
+      wakePolicy: { type: "manual" },
+    });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: coderId,
+      invocationSource: "assignment",
+      status: "running",
+    });
+    const app = createApp({
+      type: "agent",
+      agentId: coderId,
+      companyId,
+      runId,
+      source: "agent_jwt",
+    });
+
+    await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "cancelled",
+        sourceIssueStatus: "in_review",
+        resolutionNote: "Attempting to revive the cancelled issue without board access.",
+      })
+      .expect(403);
+
+    const [issueRow] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    expect(issueRow?.status).toBe("cancelled");
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow?.status).toBe("active");
   });
 
   it("Class B durable-blocker sweep skips a durable blocked issue guarded by a fresh recovery action (AUR-4300)", async () => {

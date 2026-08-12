@@ -98,6 +98,21 @@ describe("issue validators", () => {
     ).toBe(false);
   });
 
+  // AUR-5465 (C3): widened, not replaced — "cancelled" must keep the done/in_review pairing
+  // covered above AND accept sourceIssueStatus: "cancelled" for the previously-unreachable
+  // case of closing a recovery action against a source issue that is itself already cancelled.
+  it("also allows a cancelled recovery resolution to move the source issue to cancelled", () => {
+    expect(
+      resolveIssueRecoveryActionSchema.parse({
+        outcome: "cancelled",
+        sourceIssueStatus: "cancelled",
+      }),
+    ).toMatchObject({
+      outcome: "cancelled",
+      sourceIssueStatus: "cancelled",
+    });
+  });
+
   it("rejects recovery outcomes that are not supported by the source-scoped resolution endpoint", () => {
     expect(
       resolveIssueRecoveryActionSchema.safeParse({

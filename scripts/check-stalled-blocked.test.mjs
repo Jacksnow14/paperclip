@@ -562,6 +562,7 @@ function makeFetchStub(routes) {
 
 const BLOCKED_QUERY = `GET /api/companies/${COMPANY_ID}/issues?status=blocked&limit=500`;
 const ALL_QUERY = `GET /api/companies/${COMPANY_ID}/issues?status=${ISSUE_STATUS_FILTER}&limit=500`;
+const APPROVALS_PENDING_QUERY = `GET /api/companies/${COMPANY_ID}/approvals?status=pending`;
 const FILE_ISSUE_ROUTE = `POST /api/companies/${COMPANY_ID}/issues`;
 const UMBRELLA_FIND_QUERY =
   `GET /api/companies/${COMPANY_ID}/issues?q=${encodeURIComponent(UMBRELLA_FLAG_TITLE_PREFIX)}` +
@@ -600,6 +601,7 @@ test('main() FIRES: one genuine stalled-blocked issue (not own-output, not a rou
   const { fetchStub, calls } = makeFetchStub({
     [BLOCKED_QUERY]: [subject],
     [ALL_QUERY]: [subject],
+    [APPROVALS_PENDING_QUERY]: [],
     [FILE_ISSUE_ROUTE]: { id: 'flag1' },
   });
   global.fetch = fetchStub;
@@ -638,6 +640,7 @@ test('main() PASSES: a fixture containing ONLY the watchdog\'s own prior output 
   const { fetchStub, calls } = makeFetchStub({
     [BLOCKED_QUERY]: [umbrella, ownFlag],
     [ALL_QUERY]: [umbrella, ownFlag],
+    [APPROVALS_PENDING_QUERY]: [],
     'PATCH /api/issues/f1': { id: 'f1', status: 'cancelled' },
     'POST /api/issues/f1/comments': { id: 'comment1' },
   });
@@ -668,6 +671,7 @@ test('main() CAPS: MAX_FLAGS_PER_RUN + 3 genuine candidates files exactly the ca
   const { fetchStub, calls } = makeFetchStub({
     [BLOCKED_QUERY]: subjects,
     [ALL_QUERY]: subjects,
+    [APPROVALS_PENDING_QUERY]: [],
     [FILE_ISSUE_ROUTE]: { id: 'flagN' },
   });
   global.fetch = fetchStub;
@@ -706,6 +710,7 @@ test('main() GROUPS: 5 routine-execution umbrellas file ONE aggregate flag at pr
   const { fetchStub, calls } = makeFetchStub({
     [BLOCKED_QUERY]: umbrellas,
     [ALL_QUERY]: umbrellas,
+    [APPROVALS_PENDING_QUERY]: [],
     [UMBRELLA_FIND_QUERY]: [],
     [FILE_ISSUE_ROUTE]: { id: 'umbrella-flag-1' },
   });
@@ -737,6 +742,7 @@ test('main() GROUPS: comments on an existing open aggregate flag instead of refi
   const { fetchStub, calls } = makeFetchStub({
     [BLOCKED_QUERY]: umbrellas,
     [ALL_QUERY]: umbrellas,
+    [APPROVALS_PENDING_QUERY]: [],
     [UMBRELLA_FIND_QUERY]: [existingUmbrellaFlag],
     'POST /api/issues/ue1/comments': { id: 'comment1' },
   });
@@ -936,4 +942,164 @@ test('main() RESOLVES: auto-cancels a stranded-routine-execution flag once its t
   assert.equal(cancelled.body.status, 'cancelled');
   const filedAnyFlag = calls.some((c) => c.method === 'POST' && c.path === `/api/companies/${COMPANY_ID}/issues`);
   assert.equal(filedAnyFlag, false);
+});
+
+// ── Dead pending-approval detection (AUR-5353/AUR-5383) ──────────────────────
+
+function daysAgoIso(days) {
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+}
+
+test('daysSince: computes elapsed days against a fixed now', () => {
+  const now = new Date('2026-08-05T12:00:00Z');
+  assert.equal(daysSince('2026-07-22T12:00:00Z', now), 14);
+});
+
+test('isDeadPendingApproval: false when approval is not pending', () => {
+  const approval = { status: 'approved', createdAt: daysAgoIso(30) };
+  assert.equal(isDeadPendingApproval({
+    approval,
+    linkedIssues: [{ status: 'done' }],
+  }), false);
+});
+
+test('isDeadPendingApproval: false when younger than the age threshold', () => {
+  const approval = { status: 'pending', createdAt: daysAgoIso(1) };
+  assert.equal(isDeadPendingApproval({
+    approval,
+    linkedIssues: [{ status: 'done' }],
+  }), false);
+});
+
+test('isDeadPendingApproval: false when a linked issue is still open (>14d, one open)', () => {
+  const approval = { status: 'pending', createdAt: daysAgoIso(20) };
+  assert.equal(isDeadPendingApproval({
+    approval,
+    linkedIssues: [{ status: 'done' }, { status: 'in_progress' }],
+  }), false);
+});
+
+test('isDeadPendingApproval: false for ZERO linked issues — not "all closed" (the [].every trap)', () => {
+  const approval = { status: 'pending', createdAt: daysAgoIso(30) };
+  assert.equal(isDeadPendingApproval({ approval, linkedIssues: [] }), false);
+});
+
+test('isDeadPendingApproval: true when >14d and every linked issue is done/cancelled', () => {
+  const approval = { status: 'pending', createdAt: daysAgoIso(DEAD_APPROVAL_AGE_DAYS + 1) };
+  assert.equal(isDeadPendingApproval({
+    approval,
+    linkedIssues: [{ status: 'done' }, { status: 'cancelled' }],
+  }), true);
+});
+
+test('isDeadPendingApproval: handles a {issues: [...]} wrapper response shape', () => {
+  const approval = { status: 'pending', createdAt: daysAgoIso(20) };
+  assert.equal(isDeadPendingApproval({
+    approval,
+    linkedIssues: { issues: [{ status: 'done' }] },
+  }), true);
+});
+
+test('buildDeadApprovalComment: names the age, linked issues, and carries the idempotency marker', () => {
+  const now = new Date('2026-08-12T00:00:00Z');
+  const approval = { createdAt: '2026-07-20T00:00:00Z', payload: { title: 'Approve hosting spend' } };
+  const comment = buildDeadApprovalComment(approval, [
+    { identifier: 'AUR-1001', status: 'done' },
+    { identifier: 'AUR-1002', status: 'cancelled' },
+  ], now);
+  assert.match(comment, /Approve hosting spend/);
+  assert.match(comment, /AUR-1001 \(done\)/);
+  assert.match(comment, /AUR-1002 \(cancelled\)/);
+  assert.match(comment, /23 day\(s\)/);
+  assert.ok(comment.includes(DEAD_APPROVAL_COMMENT_MARKER));
+});
+
+test('hasDeadApprovalComment: true when a prior comment carries the marker', () => {
+  assert.equal(hasDeadApprovalComment([
+    { body: 'unrelated note' },
+    { body: `some preamble\n${DEAD_APPROVAL_COMMENT_MARKER}` },
+  ]), true);
+});
+
+test('hasDeadApprovalComment: false when no comment carries the marker', () => {
+  assert.equal(hasDeadApprovalComment([{ body: 'unrelated note' }]), false);
+});
+
+test('hasDeadApprovalComment: false for an empty comment list', () => {
+  assert.equal(hasDeadApprovalComment([]), false);
+});
+
+// ── main() Phase C integration (AUR-5353/AUR-5383) ────────────────────────────
+
+test('main() Phase C FIRES: a genuinely dead pending approval (>14d, all linked issues closed) gets commented exactly once', async () => {
+  const approval = { id: 'appr-1', status: 'pending', createdAt: daysAgoIso(20), payload: { title: 'Approve hosting spend' } };
+  const { fetchStub, calls } = makeFetchStub({
+    [BLOCKED_QUERY]: [],
+    [ALL_QUERY]: [],
+    [APPROVALS_PENDING_QUERY]: [approval],
+    'GET /api/approvals/appr-1/issues': [{ identifier: 'AUR-2001', status: 'done' }],
+    'GET /api/approvals/appr-1/comments': [],
+    'POST /api/approvals/appr-1/comments': { id: 'comment1' },
+  });
+  global.fetch = fetchStub;
+
+  const code = await main({ apply: true, apiUrl: API_URL, apiKey: 'key', companyId: COMPANY_ID, maxFlagsPerRun: 5 });
+
+  assert.equal(code, 0);
+  const commented = calls.filter((c) => c.method === 'POST' && c.path === '/api/approvals/appr-1/comments');
+  assert.equal(commented.length, 1, 'expected exactly one dead-approval comment');
+  assert.ok(commented[0].body.body.includes(DEAD_APPROVAL_COMMENT_MARKER));
+});
+
+test('main() Phase C PASSES: a fresh pending approval (<14d) is not flagged', async () => {
+  const approval = { id: 'appr-2', status: 'pending', createdAt: daysAgoIso(2), payload: { title: 'Approve X' } };
+  const { fetchStub, calls } = makeFetchStub({
+    [BLOCKED_QUERY]: [],
+    [ALL_QUERY]: [],
+    [APPROVALS_PENDING_QUERY]: [approval],
+  });
+  global.fetch = fetchStub;
+
+  const code = await main({ apply: true, apiUrl: API_URL, apiKey: 'key', companyId: COMPANY_ID, maxFlagsPerRun: 5 });
+
+  assert.equal(code, 0);
+  const commented = calls.some((c) => c.method === 'POST' && c.path === '/api/approvals/appr-2/comments');
+  assert.equal(commented, false, 'a fresh pending approval must not be flagged');
+  const fetchedIssues = calls.some((c) => c.path === '/api/approvals/appr-2/issues');
+  assert.equal(fetchedIssues, false, 'age filter should short-circuit before ever fetching linked issues');
+});
+
+test('main() Phase C PASSES: >14d approval with a still-open linked issue is not flagged', async () => {
+  const approval = { id: 'appr-3', status: 'pending', createdAt: daysAgoIso(30), payload: { title: 'Approve Y' } };
+  const { fetchStub, calls } = makeFetchStub({
+    [BLOCKED_QUERY]: [],
+    [ALL_QUERY]: [],
+    [APPROVALS_PENDING_QUERY]: [approval],
+    'GET /api/approvals/appr-3/issues': [{ identifier: 'AUR-3001', status: 'done' }, { identifier: 'AUR-3002', status: 'in_progress' }],
+  });
+  global.fetch = fetchStub;
+
+  const code = await main({ apply: true, apiUrl: API_URL, apiKey: 'key', companyId: COMPANY_ID, maxFlagsPerRun: 5 });
+
+  assert.equal(code, 0);
+  const commented = calls.some((c) => c.method === 'POST' && c.path === '/api/approvals/appr-3/comments');
+  assert.equal(commented, false, 'an approval with a still-open linked issue must not be flagged');
+});
+
+test('main() Phase C PASSES: a dead approval already carrying the marker comment is not re-flagged', async () => {
+  const approval = { id: 'appr-4', status: 'pending', createdAt: daysAgoIso(40), payload: { title: 'Approve Z' } };
+  const { fetchStub, calls } = makeFetchStub({
+    [BLOCKED_QUERY]: [],
+    [ALL_QUERY]: [],
+    [APPROVALS_PENDING_QUERY]: [approval],
+    'GET /api/approvals/appr-4/issues': [{ identifier: 'AUR-4001', status: 'cancelled' }],
+    'GET /api/approvals/appr-4/comments': [{ body: `already handled\n${DEAD_APPROVAL_COMMENT_MARKER}` }],
+  });
+  global.fetch = fetchStub;
+
+  const code = await main({ apply: true, apiUrl: API_URL, apiKey: 'key', companyId: COMPANY_ID, maxFlagsPerRun: 5 });
+
+  assert.equal(code, 0);
+  const commented = calls.some((c) => c.method === 'POST' && c.path === '/api/approvals/appr-4/comments');
+  assert.equal(commented, false, 'idempotency: an already-flagged dead approval must not be re-commented');
 });

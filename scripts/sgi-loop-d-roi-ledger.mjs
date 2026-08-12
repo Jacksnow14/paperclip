@@ -386,6 +386,14 @@ async function main() {
           : flags.length ? 'Review the flagged project(s) for re-scope, reprice, or pause.'
           : 'Approve scaling investment in the profit-seeking project(s).',
         risks: flags.map(a => `${a.projectName || a.projectId}: sustained low ROI burns budget if not re-scoped.`),
+        valueAtStake: boardActions
+          .map(a => `${a.projectName || a.projectId}: ${a.kind === 'scale_up' ? 'profit-seeking' : 'flagged'}, ROI ${pct(a.roi)}`)
+          .join('; '),
+        costOfInaction: flags.length && stars.length
+          ? 'Flagged project(s) keep burning token spend at sub-median value efficiency, and the profit-seeking project(s) miss their scale-up window, until the board decides.'
+          : flags.length
+          ? 'Flagged project(s) keep burning token spend at sub-median value efficiency until reviewed.'
+          : 'Profit-seeking project(s) miss the window to scale investment while ROI is proven.',
       }, TASK_ID ? [TASK_ID] : []);
       approvalId = approval && (approval.id || (approval.approval && approval.approval.id)) || null;
     }

@@ -31,6 +31,21 @@ vi.mock("../services/issues.js", () => ({
   }),
 }));
 
+// Spy on drizzle-orm's isNotNull while keeping its real behavior, so tests can
+// tell whether a given query actually built its where-clause with isNotNull
+// (AUR-5491 finding 2) rather than hardcoding what the mocked db should return.
+const { isNotNullCallCount } = vi.hoisted(() => ({ isNotNullCallCount: { count: 0 } }));
+vi.mock("drizzle-orm", async () => {
+  const actual = await vi.importActual<typeof import("drizzle-orm")>("drizzle-orm");
+  return {
+    ...actual,
+    isNotNull: (...args: Parameters<typeof actual.isNotNull>) => {
+      isNotNullCallCount.count++;
+      return actual.isNotNull(...args);
+    },
+  };
+});
+
 const {
   createGmailIntakeService,
   INTAKE_LABELS,
@@ -1070,7 +1085,7 @@ describe("own-outbound suppression (AUR-5473)", () => {
     const msg = makeLabeledMessage(
       "self-inbox-1",
       "thread-self-inbox-1",
-      ["UNREAD", "Label_1", "INBOX"],
+      ["UNREAD", "Label_1", "INBOX", "SENT"],
       "alex@tryauranode.com",
       "AUR-4065 AC4 env-scrub verification",
     );
@@ -1120,5 +1135,83 @@ describe("own-outbound suppression (AUR-5473)", () => {
     expect(isOwnOutboundCopy([])).toBe(false);
     expect(isOwnOutboundCopy(null)).toBe(false);
     expect(isOwnOutboundCopy(undefined)).toBe(false);
+  });
+});
+
+describe("thread lookup excludes null-issueId rows (AUR-5491)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    isNotNullCallCount.count = 0;
+  });
+
+  // Simulates the shadowing bug the where-clause fix addresses: a thread can
+  // carry a null-issueId record (DMARC/auto-reply/own-outbound suppression)
+  // alongside the real issueId record from the original inbound message. The
+  // fake db can't run real SQL, so it decides what the thread-lookup query
+  // (select call #2) returns based on whether `isNotNull` was actually
+  // invoked while that query's where-clause was built — i.e. whether the
+  // fix's filter is present, not a hardcoded "correct" answer.
+  it("a null-issueId row in the thread does not shadow the real issueId row", async () => {
+    const msg = makeMessage("reply-1", "thread-shadow-1", "Re: Interested in a pilot");
+    mockListMessages.mockResolvedValue({ messages: [{ id: "reply-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "should-not-be-created" });
+    mockAddComment.mockResolvedValue({});
+
+    let selectCallCount = 0;
+    const db = {
+      select: vi.fn(() => {
+        selectCallCount++;
+        if (selectCallCount === 1) {
+          // Message-level "already processed" dedup check — proceed.
+          return {
+            from: vi.fn().mockReturnThis(),
+            where: vi.fn().mockReturnThis(),
+            limit: vi.fn().mockResolvedValue([]),
+          };
+        }
+        if (selectCallCount === 2) {
+          // Thread lookup under test.
+          const isNotNullCountBeforeQuery = isNotNullCallCount.count;
+          return {
+            from: vi.fn().mockReturnThis(),
+            where: vi.fn().mockReturnThis(),
+            orderBy: vi.fn().mockReturnThis(),
+            limit: vi.fn().mockImplementation(() =>
+              Promise.resolve(
+                isNotNullCallCount.count > isNotNullCountBeforeQuery
+                  ? [{ issueId: "thread-real-issue-1" }]
+                  : [{ issueId: null }],
+              ),
+            ),
+          };
+        }
+        // Any further query (cross-thread sender+subj dedupe, agent lookup) — no match.
+        return {
+          from: vi.fn().mockReturnThis(),
+          leftJoin: vi.fn().mockReturnThis(),
+          where: vi.fn().mockReturnThis(),
+          orderBy: vi.fn().mockReturnThis(),
+          limit: vi.fn().mockResolvedValue([]),
+        };
+      }),
+      insert: vi.fn(() => ({ values: vi.fn().mockResolvedValue(undefined) })),
+    } as unknown as Db;
+
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockIssueCreate).not.toHaveBeenCalled();
+    expect(mockAddComment).toHaveBeenCalledOnce();
+    expect(mockAddComment).toHaveBeenCalledWith(
+      "thread-real-issue-1",
+      expect.any(String),
+      {},
+      expect.objectContaining({ authorType: "system" }),
+    );
+    expect(result.updated).toBe(1);
+    expect(result.created).toBe(0);
   });
 });

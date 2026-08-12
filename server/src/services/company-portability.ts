@@ -1113,7 +1113,7 @@ function readZonedDateParts(startsAt: string, timeZone: string) {
     if (Number.isNaN(date.getTime())) return null;
     const formatter = new Intl.DateTimeFormat("en-US", {
       timeZone,
-      hour12: false,
+      hourCycle: "h23",
       weekday: "long",
       month: "numeric",
       day: "numeric",

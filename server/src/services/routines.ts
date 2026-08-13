@@ -847,8 +847,13 @@ export function routineService(
     status: string;
     issueId?: string | null;
     nextRunAt?: Date | null;
+    // reuse_and_rewake reports "issue_created" for both a genuine dispatch and a
+    // fold into an already-open umbrella (there's no separate run status for it).
+    // foldedWithoutDispatch distinguishes the fold so it still counts toward the
+    // wedge counter instead of resetting it on every re-wake (AUR-5387).
+    foldedWithoutDispatch?: boolean;
   }, executor: Db = db): Promise<{ consecutiveCoalesceCount: number }> {
-    const coalesced = input.status === "skipped" || input.status === "coalesced";
+    const coalesced = input.status === "skipped" || input.status === "coalesced" || input.foldedWithoutDispatch === true;
     const [touched] = await executor
       .update(routines)
       .set({
@@ -907,6 +912,123 @@ export function routineService(
     return count >= 2 && (count & (count - 1)) === 0;
   }
 
+  // The comment posted on the wedged umbrella lands on an issue whose assignee is
+  // by construction not executing (AUR-5387). This is a second, deduplicated
+  // delivery aimed at an agent that can actually act on it.
+  const COALESCE_ALARM_ORIGIN_KIND = "routine_coalesce_alarm";
+
+  function isAgentInvokable(agent: typeof agents.$inferSelect | null | undefined) {
+    return Boolean(agent && !["paused", "terminated", "pending_approval"].includes(agent.status));
+  }
+
+  // Mirrors the escalation order already used by resolveStaleRunOwnerAgentId
+  // (recovery/service.ts) and resolveReviewOwnerAgentId (productivity-review.ts):
+  // prefer escalating to the wedged assignee's own manager, then fall back to the
+  // company's CTO/CEO. Never resolves to the wedged routine's own assignee — it is
+  // by definition the agent that is not executing.
+  async function resolveCoalesceAlarmOwnerAgentId(
+    routine: Pick<RoutineRow, "companyId" | "assigneeAgentId">,
+    executor: Db,
+  ): Promise<string | null> {
+    const candidateIds: string[] = [];
+    if (routine.assigneeAgentId) {
+      const [wedgedAssignee] = await executor.select().from(agents).where(eq(agents.id, routine.assigneeAgentId)).limit(1);
+      if (wedgedAssignee?.reportsTo) candidateIds.push(wedgedAssignee.reportsTo);
+    }
+    const roleCandidates = await executor
+      .select()
+      .from(agents)
+      .where(and(eq(agents.companyId, routine.companyId), inArray(agents.role, ["cto", "ceo"])))
+      .orderBy(sql`case when ${agents.role} = 'cto' then 0 else 1 end`, asc(agents.createdAt));
+    candidateIds.push(...roleCandidates.map((candidate) => candidate.id));
+
+    const seen = new Set<string>();
+    for (const agentId of candidateIds) {
+      if (seen.has(agentId) || agentId === routine.assigneeAgentId) continue;
+      seen.add(agentId);
+      const [candidate] = await executor.select().from(agents).where(eq(agents.id, agentId)).limit(1);
+      if (!candidate || candidate.companyId !== routine.companyId) continue;
+      if (isAgentInvokable(candidate)) return candidate.id;
+    }
+    return null;
+  }
+
+  async function findOpenCoalesceAlarmIssue(routine: Pick<RoutineRow, "id" | "companyId">, executor: Db) {
+    const [row] = await executor
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, routine.companyId),
+          eq(issues.originKind, COALESCE_ALARM_ORIGIN_KIND),
+          eq(issues.originId, routine.id),
+          inArray(issues.status, OPEN_ISSUE_STATUSES),
+          isNull(issues.hiddenAt),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt))
+      .limit(1);
+    return row ?? null;
+  }
+
+  // Delivers the wedge alarm somewhere a live agent will actually read it, in
+  // addition to the in-issue comment below (AUR-5387). Deduplicated: one open
+  // alarm issue per routine, updated with a comment on repeat raises rather than
+  // re-filed, or every doubling floods a fresh issue.
+  async function raiseLiveCoalesceAlarm(input: {
+    routine: RoutineRow;
+    targetIssue: { id: string; identifier: string | null };
+    count: number;
+    triggeredAt: Date;
+    lastCompletion: Date | null;
+  }, executor: Db) {
+    const ownerAgentId = await resolveCoalesceAlarmOwnerAgentId(input.routine, executor);
+    if (!ownerAgentId) return;
+    const targetLabel = input.targetIssue.identifier ?? input.targetIssue.id;
+    const alarmBody = [
+      `Routine "${input.routine.title}" (\`${input.routine.id}\`) has folded ${input.count} consecutive fires into ${targetLabel} instead of dispatching new work.`,
+      "",
+      `Last successful completion of a run of this routine: ${input.lastCompletion ? input.lastCompletion.toISOString() : "none on record"}. Most recent fold: ${input.triggeredAt.toISOString()}.`,
+      "",
+      `Check ${targetLabel}: if it is wedged rather than legitimately busy (e.g. its assignee is paused or quota-dead), unblock or close it so the next fire can dispatch.`,
+    ].join("\n");
+
+    const existingAlarm = await findOpenCoalesceAlarmIssue(input.routine, executor);
+    if (existingAlarm) {
+      await executor.insert(issueComments).values({
+        companyId: input.routine.companyId,
+        issueId: existingAlarm.id,
+        authorType: "system",
+        body: alarmBody,
+      });
+      await queueIssueAssignmentWakeup({
+        heartbeat,
+        issue: existingAlarm,
+        reason: "routine_coalesce_anomaly",
+        mutation: "update",
+        contextSource: "routine.coalesce_anomaly",
+      });
+      return;
+    }
+
+    const alarmIssue = await issueSvc.create(input.routine.companyId, {
+      title: `Routine wedge suspected: "${input.routine.title}" folding into ${targetLabel}`,
+      description: alarmBody,
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: ownerAgentId,
+      originKind: COALESCE_ALARM_ORIGIN_KIND,
+      originId: input.routine.id,
+    });
+    await queueIssueAssignmentWakeup({
+      heartbeat,
+      issue: alarmIssue,
+      reason: "routine_coalesce_anomaly",
+      mutation: "create",
+      contextSource: "routine.coalesce_anomaly",
+    });
+  }
+
   async function maybeRaiseCoalesceAnomaly(input: {
     routine: RoutineRow;
     targetIssue: { id: string; identifier: string | null };
@@ -943,6 +1065,13 @@ export function routineService(
         lastSuccessfulCompletionAt: lastCompletion ? lastCompletion.toISOString() : null,
       },
     });
+    await raiseLiveCoalesceAlarm({
+      routine: input.routine,
+      targetIssue: input.targetIssue,
+      count,
+      triggeredAt: input.triggeredAt,
+      lastCompletion,
+    }, executor);
   }
 
   function routineExecutionFingerprintCondition(dispatchFingerprint?: string | null) {
@@ -1432,8 +1561,13 @@ export function routineService(
         if (input.routine.concurrencyPolicy === "reuse_and_rewake") {
           const rollingIssue = await findRollingExecutionIssue(input.routine, txDb);
           if (rollingIssue) {
-            const isOpen = OPEN_ISSUE_STATUSES.includes(rollingIssue.status as typeof OPEN_ISSUE_STATUSES[number]);
-            if (!isOpen) {
+            // Captured BEFORE any reopen below: re-waking an issue that was ALREADY
+            // open is a fold (the routine's execution slot never released), while
+            // reopening a genuinely closed issue is a real dispatch (AUR-5387). Only
+            // the fold case should count toward the wedge counter — see
+            // updateRoutineTouchedState's foldedWithoutDispatch.
+            const wasAlreadyOpen = OPEN_ISSUE_STATUSES.includes(rollingIssue.status as typeof OPEN_ISSUE_STATUSES[number]);
+            if (!wasAlreadyOpen) {
               // Reopen outside the transaction so the row lock is released before
               // queueIssueAssignmentWakeup's wakeup callback can update the same row.
               await db
@@ -1455,14 +1589,23 @@ export function routineService(
               status: "issue_created",
               linkedIssueId: rollingIssue.id,
             }, txDb);
-            await updateRoutineTouchedState({
+            const touched = await updateRoutineTouchedState({
               routineId: input.routine.id,
               triggerId: input.trigger?.id ?? null,
               triggeredAt,
               status: "issue_created",
               issueId: rollingIssue.id,
               nextRunAt,
+              foldedWithoutDispatch: wasAlreadyOpen,
             }, txDb);
+            if (wasAlreadyOpen) {
+              await maybeRaiseCoalesceAnomaly({
+                routine: input.routine,
+                targetIssue: rollingIssue,
+                consecutiveCoalesceCount: touched.consecutiveCoalesceCount,
+                triggeredAt,
+              }, txDb);
+            }
             return updated ?? createdRun;
           }
           // No prior issue — fall through to create one fresh (first fire).

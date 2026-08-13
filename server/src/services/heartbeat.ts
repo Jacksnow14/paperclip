@@ -6651,6 +6651,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         id: issues.id,
         status: issues.status,
         assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
         executionRunId: issues.executionRunId,
         executionState: issues.executionState,
       })
@@ -6717,7 +6718,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
-    if (issue.assigneeAgentId !== run.agentId && !isVerifiedMentionReplyWake) {
+    // AUR-5595: the "new owner will be woken instead" promise only holds when the new
+    // owner is an agent. A user assignee is not wakeable — cancelling here would
+    // silently destroy the only carrier of whatever triggered this run (e.g. an
+    // interaction answer) with no successor ever created. Let the queued run proceed
+    // under its original agent instead; it still holds the context that queued it.
+    const newAssigneeIsUserOnly = !issue.assigneeAgentId && !!issue.assigneeUserId;
+    if (issue.assigneeAgentId !== run.agentId && !isVerifiedMentionReplyWake && !newAssigneeIsUserOnly) {
       return {
         stale: true,
         errorCode: "issue_assignee_changed",
@@ -6729,6 +6736,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           currentAssigneeAgentId: issue.assigneeAgentId,
         },
       };
+    }
+    if (issue.assigneeAgentId !== run.agentId && !isVerifiedMentionReplyWake && newAssigneeIsUserOnly) {
+      logger.info(
+        {
+          runId: run.id,
+          issueId,
+          previousAssigneeAgentId: run.agentId,
+          currentAssigneeUserId: issue.assigneeUserId,
+        },
+        "evaluateQueuedRunStaleness: issue assignee changed to a user; letting queued run proceed instead of cancelling (no agent to re-wake)",
+      );
     }
 
     // `done` keeps the resume/comment hatch: a deliberate `resume: true` follow-up

@@ -37,6 +37,21 @@ import { resolveApiBase } from './lib/paperclip-api-base.mjs';
 export const DEFAULT_MIN_CHARS = 2000;
 
 /**
+ * Mirrors packages/shared/src/validators/text.ts normalizeEscapedLineBreaks.
+ * multilineTextSchema applies this to every comment body server-side (AUR-5577),
+ * so the stored body legitimately differs from what was posted whenever the
+ * body contains a literal backslash-n / backslash-r / backslash-r-backslash-n
+ * sequence. Duplicated here (not imported) because this script runs under
+ * plain node, which cannot load the shared package's .ts source directly.
+ */
+function normalizeEscapedLineBreaks(value) {
+  return value
+    .replace(/\\r\\n/g, '\n')
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\n');
+}
+
+/**
  * Locate the posted comment in the comments-list response and check the
  * body survived intact. Pure — used in tests.
  * @returns {{ ok: true, length: number } | { ok: false, reason: string }}
@@ -46,10 +61,11 @@ export function verifyReadBack(comments, commentId, expectedBody) {
   if (!found) {
     return { ok: false, reason: `comment ${commentId} not returned by the comments list read path` };
   }
-  if (found.body !== expectedBody) {
+  const normalizedExpected = normalizeEscapedLineBreaks(expectedBody);
+  if (found.body !== normalizedExpected) {
     return {
       ok: false,
-      reason: `comment ${commentId} came back with a different body (${(found.body ?? '').length} chars vs ${expectedBody.length} posted)`,
+      reason: `comment ${commentId} came back with a different body (${(found.body ?? '').length} chars vs ${normalizedExpected.length} posted)`,
     };
   }
   return { ok: true, length: found.body.length };

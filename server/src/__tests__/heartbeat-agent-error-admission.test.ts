@@ -17,7 +17,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agents, agentWakeupRequests, companies, createDb } from "@paperclipai/db";
+import { agents, agentWakeupRequests, companies, createDb, issues } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   resetEmbeddedPostgresTestDatabase,
@@ -54,13 +54,29 @@ describeEmbeddedPostgres("agent status=error admission (AUR-5644)", () => {
 
   async function seedCompany() {
     const companyId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      issuePrefix,
       requireBoardApprovalForNewAgents: false,
     });
-    return companyId;
+    return { companyId, issuePrefix };
+  }
+
+  async function seedIssue(companyId: string, issuePrefix: string, agentId: string) {
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "AUR-5644 self-heal test issue",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    return issueId;
   }
 
   async function seedAgent(companyId: string, status: string) {
@@ -94,7 +110,7 @@ describeEmbeddedPostgres("agent status=error admission (AUR-5644)", () => {
   }
 
   it("FIRE: a refused wake against an error agent writes a skipped row before throwing", async () => {
-    const companyId = await seedCompany();
+    const { companyId } = await seedCompany();
     const agentId = await seedAgent(companyId, "error");
     const heartbeat = heartbeatService(db);
 
@@ -116,7 +132,7 @@ describeEmbeddedPostgres("agent status=error admission (AUR-5644)", () => {
   });
 
   it("PASS: a healthy wake still produces a normal (non-skipped) row", async () => {
-    const companyId = await seedCompany();
+    const { companyId } = await seedCompany();
     const agentId = await seedAgent(companyId, "idle");
     const heartbeat = heartbeatService(db);
 
@@ -133,15 +149,16 @@ describeEmbeddedPostgres("agent status=error admission (AUR-5644)", () => {
   });
 
   it("B/FIRE: a genuine new-assignment wake self-heals an error agent and proceeds", async () => {
-    const companyId = await seedCompany();
+    const { companyId, issuePrefix } = await seedCompany();
     const agentId = await seedAgent(companyId, "error");
+    const issueId = await seedIssue(companyId, issuePrefix, agentId);
     const heartbeat = heartbeatService(db);
 
     const run = await heartbeat.wakeup(agentId, {
       source: "assignment",
       triggerDetail: "system",
       reason: "issue_assigned",
-      payload: { issueId: randomUUID(), mutation: "create" },
+      payload: { issueId, mutation: "create" },
     });
 
     expect(run).not.toBeNull();
@@ -152,7 +169,7 @@ describeEmbeddedPostgres("agent status=error admission (AUR-5644)", () => {
   });
 
   it("B/CLEARING: an ordinary on_demand wake does NOT self-heal an error agent (no dead-lane re-flood)", async () => {
-    const companyId = await seedCompany();
+    const { companyId } = await seedCompany();
     const agentId = await seedAgent(companyId, "error");
     const heartbeat = heartbeatService(db);
 
@@ -168,7 +185,7 @@ describeEmbeddedPostgres("agent status=error admission (AUR-5644)", () => {
   });
 
   it("B/CLEARING: a timer wake does NOT self-heal an error agent", async () => {
-    const companyId = await seedCompany();
+    const { companyId } = await seedCompany();
     const agentId = await seedAgent(companyId, "error");
     const heartbeat = heartbeatService(db);
 

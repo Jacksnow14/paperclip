@@ -351,6 +351,63 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(countExecuteCallsForRun(runId)).toBe(0);
   });
 
+  // AUR-5595 FIRE case (regression): pre-fix, this queued run was cancelled with
+  // errorCode issue_assignee_changed and its error text promised "the new owner will
+  // be woken instead" -- a promise that cannot be kept because a user is not
+  // wakeable. That is exactly how a founder's answer to a pending ask_user_questions
+  // interaction on AUR-4237 was silently dropped for ~1h. Post-fix the run must be
+  // left to run under its original agent instead of being cancelled into the void.
+  it("does not cancel a queued run when the issue assignee changes to a user (AUR-5595)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "InteractionCreator" });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Interaction answered, issue now owned by a human reviewer",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: null,
+      assigneeUserId: "founder-user-id",
+    });
+
+    const { runId, wakeupRequestId } = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_interaction_resolved",
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "succeeded";
+    });
+
+    const [run, wakeup] = await Promise.all([
+      db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId))
+        .then((rows) => rows[0] ?? null),
+    ]);
+
+    expect(run?.status).toBe("succeeded");
+    expect(run?.errorCode).toBeNull();
+    expect(countExecuteCallsForRun(runId)).toBe(1);
+    expect(wakeup?.status).not.toBe("skipped");
+  });
+
   it("cancels queued runs when the issue reaches a terminal status before the run starts", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();

@@ -66,6 +66,16 @@ const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blo
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
+// AUR-4543: floor for the stale-active-run threshold. A heartbeat run that has
+// stayed in a live status this long is wedged whatever the routine's period; it
+// matches the fleet sandbox wall-clock backstop (cc17f29e7). The floor is what
+// stops a high-frequency routine from reaping its own healthy in-flight work: a
+// 5-minute routine still gets 4h of grace, not 5 minutes.
+const STALE_ACTIVE_RUN_FLOOR_MS = 4 * 60 * 60 * 1000;
+const STALE_ACTIVE_RUN_ERROR_CODE = "routine_stale_active_timeout";
+// Partial unique index guarding the one open execution issue per routine
+// dispatch fingerprint (packages/db/src/schema/issues.ts).
+const OPEN_EXECUTION_SLOT_CONSTRAINT = "issues_open_routine_execution_uq";
 const MAX_ROUTINE_REVISIONS = 100;
 const WEEKDAY_INDEX: Record<string, number> = {
   Sun: 0,
@@ -160,6 +170,106 @@ function nextCronTickInTimeZone(expression: string, timeZone: string, after: Dat
     cursor.setUTCMinutes(cursor.getUTCMinutes() + 1);
   }
   return null;
+}
+
+function formatApproxDuration(ms: number) {
+  if (ms < 60_000) return `${Math.max(0, Math.round(ms / 1000))}s`;
+  const minutes = ms / 60_000;
+  if (minutes < 60) return `${Math.round(minutes)}m`;
+  const hours = ms / 3_600_000;
+  if (hours < 48) return `${Math.round(hours * 10) / 10}h`;
+  return `${Math.round((ms / 86_400_000) * 10) / 10}d`;
+}
+
+// True when this error — or anything it wraps — is a collision on the partial
+// unique index that guards the open routine-execution slot.
+//
+// The cause chain matters: the conflict can surface raw from a direct query, or
+// wrapped in a DrizzleQueryError when it comes back through the heartbeat
+// wakeup, and only the innermost error carries the code and constraint name.
+//
+// Both spellings of that name are checked on purpose. postgres.js, the driver
+// this service runs on, reports it as `constraint_name`; node-postgres reports
+// `constraint`. Matching only the latter is how the pre-existing conflict guard
+// here managed to never fire.
+function isOpenExecutionSlotConflict(error: unknown) {
+  for (let cursor = error, depth = 0; cursor && depth < 5; depth += 1) {
+    const candidate = cursor as {
+      code?: string;
+      constraint?: string;
+      constraint_name?: string;
+      cause?: unknown;
+    };
+    if (
+      typeof candidate === "object" &&
+      candidate.code === "23505" &&
+      (candidate.constraint_name === OPEN_EXECUTION_SLOT_CONSTRAINT ||
+        candidate.constraint === OPEN_EXECUTION_SLOT_CONSTRAINT)
+    ) {
+      return true;
+    }
+    cursor = candidate.cause;
+  }
+  return false;
+}
+
+// The routine's true schedule period.
+//
+// The obvious formula — `nextRunAt - triggeredAt` — is the period only when a
+// fire lands exactly on its own tick. A catch-up, delayed, or manual-with-trigger
+// fire lands mid-interval and yields an arbitrarily small number, which would
+// collapse a daily routine's stale threshold onto the 4h floor and let us reap a
+// legitimately-running 5-hour daily job. So for a cron trigger we measure the gap
+// between two consecutive future ticks instead, which does not depend on when we
+// fired; the subtraction stays as the fallback for everything else.
+function resolveScheduleIntervalMs(
+  trigger: { kind?: string | null; cronExpression?: string | null; timezone?: string | null } | null | undefined,
+  triggeredAt: Date,
+  nextRunAt: Date | null | undefined,
+) {
+  if (!nextRunAt) return null;
+  if (trigger?.kind === "schedule" && trigger.cronExpression && trigger.timezone) {
+    const followingTick = nextCronTickInTimeZone(trigger.cronExpression, trigger.timezone, nextRunAt);
+    if (followingTick) {
+      const period = followingTick.getTime() - nextRunAt.getTime();
+      if (period > 0) return period;
+    }
+  }
+  const span = nextRunAt.getTime() - triggeredAt.getTime();
+  return span > 0 ? span : null;
+}
+
+// `started_at` is NULL for a queued run that never launched — precisely the
+// never-started wedge class we have to catch — so anchor on created_at there.
+function liveHeartbeatRunAgeMs(run: { startedAt: Date | null; createdAt: Date }, now: Date) {
+  const anchor = run.startedAt ?? run.createdAt;
+  return now.getTime() - anchor.getTime();
+}
+
+// AUR-4543: decide whether a live execution issue is wedged rather than busy.
+// Reaping is destructive and fleet-wide, so it is gated three ways: scheduled
+// fires only (a manual fire must never kill live work), every live run on the
+// issue must have aged out, and the threshold is floored.
+function evaluateStaleActiveRun(input: {
+  source: string;
+  triggeredAt: Date;
+  scheduleIntervalMs: number | null;
+  liveRuns: Array<{ startedAt: Date | null; createdAt: Date }>;
+}) {
+  const thresholdMs = Math.max(input.scheduleIntervalMs ?? 0, STALE_ACTIVE_RUN_FLOOR_MS);
+  const ages = input.liveRuns.map((run) => liveHeartbeatRunAgeMs(run, input.triggeredAt));
+  const oldestAgeMs = ages.length ? Math.max(...ages) : null;
+  const youngestAgeMs = ages.length ? Math.min(...ages) : null;
+  // Reap only when EVERY live run on the issue has aged out (youngest past the
+  // threshold); one young run means the issue is legitimately busy. Observability
+  // keys on the oldest instead — raising a comment is cheap and should be the
+  // more sensitive signal, destroying run state is not and gets the conservative
+  // one.
+  const stale =
+    input.source === "schedule" &&
+    youngestAgeMs !== null &&
+    youngestAgeMs >= thresholdMs;
+  return { stale, thresholdMs, oldestAgeMs, youngestAgeMs };
 }
 
 function nextResultText(status: string, issueId?: string | null) {
@@ -1034,16 +1144,36 @@ export function routineService(
     targetIssue: { id: string; identifier: string | null };
     consecutiveCoalesceCount: number;
     triggeredAt: Date;
+    liveRunAgeMs?: number | null;
+    scheduleIntervalMs?: number | null;
   }, executor: Db) {
     const count = input.consecutiveCoalesceCount;
-    if (!isCoalesceAnomalyRaisePoint(count)) return;
+    const ageMs = input.liveRunAgeMs ?? null;
+    const intervalMs = input.scheduleIntervalMs ?? null;
+    // Count-based raise (unchanged): second consecutive fold, then each doubling.
+    const countRaise = isCoalesceAnomalyRaisePoint(count);
+    // AUR-4543 age-based raise: a fold into a run that has already outlived a
+    // full schedule interval is a wedge on the *first* fold. Waiting for a
+    // second fold costs another whole interval of silent darkness — for a daily
+    // routine that is another lost send-day.
+    const ageRaise = ageMs !== null && intervalMs !== null && ageMs > intervalMs;
+    if (!countRaise && !ageRaise) return;
     const lastCompletion = await findLastSuccessfulCompletionAt(input.routine, executor);
+    const headline = countRaise
+      ? `⚠️ **Routine wedge suspected: ${count} consecutive fires coalesced into this issue.**`
+      : `⚠️ **Routine wedge suspected: this issue's execution run has been live for ${formatApproxDuration(ageMs!)}, longer than the routine's ${formatApproxDuration(intervalMs!)} schedule interval.**`;
     const body = [
-      `⚠️ **Routine wedge suspected: ${count} consecutive fires coalesced into this issue.**`,
+      headline,
       "",
       `Routine "${input.routine.title}" (\`${input.routine.id}\`) fired at ${input.triggeredAt.toISOString()} and folded into this issue instead of dispatching new work — consecutive fold #${count}. This issue has held the routine's execution slot the whole time. Last successful completion of a run of this routine: ${lastCompletion ? lastCompletion.toISOString() : "none on record"}.`,
       "",
-      "If this issue is wedged rather than legitimately busy, the routine's output has silently stopped: close or unblock this issue so the next fire can dispatch. (Coalesce-anomaly guard, raised at 2 consecutive folds and each doubling.)",
+      ...(ageRaise
+        ? [
+          `This issue's live execution run has been in a live status for ${formatApproxDuration(ageMs!)} against a ${formatApproxDuration(intervalMs!)} schedule interval, so the fold above is very likely a wedge rather than genuine overlap.`,
+          "",
+        ]
+        : []),
+      "If this issue is wedged rather than legitimately busy, the routine's output has silently stopped: close or unblock this issue so the next fire can dispatch. (Coalesce-anomaly guard, raised at 2 consecutive folds, at each doubling, and on the first fold into a run older than one schedule interval.)",
     ].join("\n");
     await executor.insert(issueComments).values({
       companyId: input.routine.companyId,
@@ -1063,6 +1193,9 @@ export function routineService(
         routineTitle: input.routine.title,
         consecutiveCoalesceCount: count,
         lastSuccessfulCompletionAt: lastCompletion ? lastCompletion.toISOString() : null,
+        raiseReason: countRaise && ageRaise ? "count_and_age" : countRaise ? "count" : "age",
+        liveRunAgeMs: ageMs,
+        scheduleIntervalMs: intervalMs,
       },
     });
     await raiseLiveCoalesceAlarm({
@@ -1089,10 +1222,24 @@ export function routineService(
     executor: Db = db,
     dispatchFingerprint?: string | null,
     origin?: { kind: string; id: string | null },
+    // AUR-4543: the slot-conflict handler passes the issue this dispatch just
+    // created. A wakeup that inserted its heartbeat run before failing to bind
+    // it leaves that fresh issue matching the snapshot join below, and folding
+    // a dispatch into its own issue would be nonsense.
+    excludeIssueId?: string | null,
   ) {
     const fingerprintCondition = routineExecutionFingerprintCondition(dispatchFingerprint);
     const originKind = origin?.kind ?? "routine_execution";
     const originId = origin?.id ?? routine.id;
+    const scopeConditions = [
+      eq(issues.companyId, routine.companyId),
+      eq(issues.originKind, originKind),
+      eq(issues.originId, originId),
+      inArray(issues.status, OPEN_ISSUE_STATUSES),
+      isNull(issues.hiddenAt),
+      ...(fingerprintCondition ? [fingerprintCondition] : []),
+      ...(excludeIssueId ? [ne(issues.id, excludeIssueId)] : []),
+    ];
     const executionBoundIssue = await executor
       .select()
       .from(issues)
@@ -1103,16 +1250,7 @@ export function routineService(
           inArray(heartbeatRuns.status, LIVE_HEARTBEAT_RUN_STATUSES),
         ),
       )
-      .where(
-        and(
-          eq(issues.companyId, routine.companyId),
-          eq(issues.originKind, originKind),
-          eq(issues.originId, originId),
-          inArray(issues.status, OPEN_ISSUE_STATUSES),
-          isNull(issues.hiddenAt),
-          ...(fingerprintCondition ? [fingerprintCondition] : []),
-        ),
-      )
+      .where(and(...scopeConditions))
       .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
       .limit(1)
       .then((rows) => rows[0]?.issues ?? null);
@@ -1129,16 +1267,7 @@ export function routineService(
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = cast(${issues.id} as text)`,
         ),
       )
-      .where(
-        and(
-          eq(issues.companyId, routine.companyId),
-          eq(issues.originKind, originKind),
-          eq(issues.originId, originId),
-          inArray(issues.status, OPEN_ISSUE_STATUSES),
-          isNull(issues.hiddenAt),
-          ...(fingerprintCondition ? [fingerprintCondition] : []),
-        ),
-      )
+      .where(and(...scopeConditions))
       .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
       .limit(1)
       .then((rows) => rows[0]?.issues ?? null);
@@ -1157,6 +1286,7 @@ export function routineService(
     executor: Db = db,
     dispatchFingerprint?: string | null,
     origin?: { kind: string; id: string | null },
+    excludeIssueId?: string | null,
   ) {
     const fingerprintCondition = routineExecutionFingerprintCondition(dispatchFingerprint);
     const originKind = origin?.kind ?? "routine_execution";
@@ -1171,7 +1301,15 @@ export function routineService(
           eq(issues.originId, originId),
           inArray(issues.status, OPEN_ISSUE_STATUSES),
           isNull(issues.hiddenAt),
+          // AUR-4543: only re-use truly stranded issues (no execution link at all).
+          // An issue with executionRunId IS NOT NULL but a non-live run is in an
+          // "orphaned" state — a different defect that must fall through to the
+          // try/catch path (which detects the 23505 conflict and reaps if stale, or
+          // fails loudly for other orphaned cases). Reusing it here would bypass
+          // both the stale-active reap and the conflict surface.
+          isNull(issues.executionRunId),
           ...(fingerprintCondition ? [fingerprintCondition] : []),
+          ...(excludeIssueId ? [ne(issues.id, excludeIssueId)] : []),
         ),
       )
       .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
@@ -1225,6 +1363,9 @@ export function routineService(
     originKind: string;
     originId: string;
     keepIssueId: string;
+    // AUR-4543: exclude a freshly-reaped issue from cancellation — it was detached
+    // on purpose and should remain open for triage, not superseded as a stale umbrella.
+    alsoKeepIssueId?: string | null;
   }) {
     const staleIssues = await db
       .select({ id: issues.id, identifier: issues.identifier, status: issues.status })
@@ -1237,6 +1378,7 @@ export function routineService(
           inArray(issues.status, OPEN_ISSUE_STATUSES),
           ne(issues.id, input.keepIssueId),
           isNull(issues.hiddenAt),
+          ...(input.alsoKeepIssueId ? [ne(issues.id, input.alsoKeepIssueId)] : []),
         ),
       );
 
@@ -1273,6 +1415,146 @@ export function routineService(
       });
     }
     return superseded;
+  }
+
+  // Every live heartbeat run that makes `issue` discoverable by
+  // findLiveExecutionIssue. It has two join paths — the execution-bound run and
+  // any run carrying this issue in its context snapshot — and both key on live
+  // status. Missing the second path here would leave the issue discoverable
+  // after a reap and put us straight back in the coalesce branch.
+  async function findLiveHeartbeatRunsForIssue(
+    companyId: string,
+    issue: { id: string; executionRunId: string | null },
+    executor: Db = db,
+  ) {
+    const snapshotBound = sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = cast(${issue.id} as text)`;
+    const boundCondition = issue.executionRunId
+      ? or(eq(heartbeatRuns.id, issue.executionRunId), snapshotBound)
+      : snapshotBound;
+    return executor
+      .select({
+        id: heartbeatRuns.id,
+        startedAt: heartbeatRuns.startedAt,
+        createdAt: heartbeatRuns.createdAt,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          inArray(heartbeatRuns.status, LIVE_HEARTBEAT_RUN_STATUSES),
+          boundCondition,
+        ),
+      );
+  }
+
+  // AUR-4543: free a wedged routine execution slot so the next fire can dispatch.
+  //
+  // These writes deliberately go to the pooled `db` and NOT to the dispatch
+  // transaction, and that is load-bearing. `issueSvc` is bound to `db` (see the
+  // top of this service), so the `issueSvc.create` that follows a reap runs on a
+  // different connection. If the `issues.executionRunId = null` write were still
+  // uncommitted inside our transaction, that insert would block on the
+  // not-yet-dead `issues_open_routine_execution_uq` index entry waiting for us to
+  // commit, while we wait on the insert — an application-level deadlock that
+  // Postgres' deadlock detector cannot break. Mutating `issues` outside the
+  // dispatch transaction is the same pattern the reuse_and_rewake reopen uses.
+  // Committing eagerly also means a later rollback leaves the wedge cleaned up
+  // rather than half-reaped.
+  async function reapStaleActiveExecution(input: {
+    routine: RoutineRow;
+    issue: { id: string; identifier: string | null; originRunId: string | null };
+    liveRuns: Array<{ id: string }>;
+    triggeredAt: Date;
+    thresholdMs: number;
+    ageMs: number | null;
+  }) {
+    const ageLabel = input.ageMs === null ? "an unknown duration" : formatApproxDuration(input.ageMs);
+    const thresholdLabel = formatApproxDuration(input.thresholdMs);
+    const reason =
+      `Routine stale-active timeout: the execution run held a live status for ${ageLabel}, past the ` +
+      `${thresholdLabel} stale-active threshold for routine "${input.routine.title}" (${input.routine.id}).`;
+    const staleRunIds = input.liveRuns.map((run) => run.id);
+
+    // 1. Drop the wedged run(s) out of LIVE_HEARTBEAT_RUN_STATUSES so
+    //    findLiveExecutionIssue stops returning this issue on either join path.
+    if (staleRunIds.length > 0) {
+      await db
+        .update(heartbeatRuns)
+        .set({
+          status: "failed",
+          error: reason,
+          errorCode: STALE_ACTIVE_RUN_ERROR_CODE,
+          finishedAt: input.triggeredAt,
+          updatedAt: input.triggeredAt,
+        })
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, input.routine.companyId),
+            inArray(heartbeatRuns.id, staleRunIds),
+          ),
+        );
+    }
+
+    // 2. This is the step that actually frees the dispatch slot: the
+    //    issues_open_routine_execution_uq predicate requires
+    //    `execution_run_id is not null`. Detach, never cancel — detaching keeps
+    //    the thread intact for triage, cancelling destroys in-flight context and
+    //    cannot be undone.
+    await db
+      .update(issues)
+      .set({ executionRunId: null, executionLockedAt: null, updatedAt: input.triggeredAt })
+      .where(eq(issues.id, input.issue.id));
+
+    // 3. The predecessor routine run stopped being "issue_created" the moment its
+    //    heartbeat wedged. Leaving it green is exactly what let a dead routine
+    //    keep reporting healthy.
+    if (input.issue.originRunId) {
+      await db
+        .update(routineRuns)
+        .set({
+          status: "failed",
+          failureReason: reason,
+          completedAt: input.triggeredAt,
+          updatedAt: input.triggeredAt,
+        })
+        .where(
+          and(
+            eq(routineRuns.companyId, input.routine.companyId),
+            eq(routineRuns.id, input.issue.originRunId),
+          ),
+        );
+    }
+
+    // 4. Leave the evidence on the thread and in the activity log.
+    await db.insert(issueComments).values({
+      companyId: input.routine.companyId,
+      issueId: input.issue.id,
+      authorType: "system",
+      body: [
+        `⚠️ **Routine execution slot reclaimed after a stale-active timeout.**`,
+        "",
+        `${reason} The routine fired again at ${input.triggeredAt.toISOString()} and dispatched fresh work instead of folding into this issue.`,
+        "",
+        "This issue has been **detached** from its execution run, not cancelled: its thread and context are intact for triage. If the work here is still wanted, re-assign or re-wake it as normal.",
+      ].join("\n"),
+    });
+    await logActivity(db, {
+      companyId: input.routine.companyId,
+      actorType: "system",
+      actorId: "routine-scheduler",
+      action: "routine.stale_active_timeout",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        routineId: input.routine.id,
+        routineTitle: input.routine.title,
+        staleHeartbeatRunIds: staleRunIds,
+        predecessorRoutineRunId: input.issue.originRunId,
+        liveRunAgeMs: input.ageMs,
+        thresholdMs: input.thresholdMs,
+        triggeredAt: input.triggeredAt.toISOString(),
+      },
+    });
   }
 
   // For reuse_and_rewake: find the singleton issue regardless of status (open or closed).
@@ -1509,6 +1791,9 @@ export function routineService(
       title,
       description,
     });
+    // AUR-4543: hoisted outside the transaction so supersedeStaleOpenExecutionIssues
+    // (called after the transaction commits) can exclude the reaped issue from cancellation.
+    let reapedIssueId: string | null = null;
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(
@@ -1554,6 +1839,7 @@ export function routineService(
       const nextRunAt = input.trigger?.kind === "schedule" && input.trigger.cronExpression && input.trigger.timezone
         ? nextCronTickInTimeZone(input.trigger.cronExpression, input.trigger.timezone, triggeredAt)
         : undefined;
+      const scheduleIntervalMs = resolveScheduleIntervalMs(input.trigger, triggeredAt, nextRunAt);
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
@@ -1611,10 +1897,44 @@ export function routineService(
           // No prior issue — fall through to create one fresh (first fire).
         }
 
-        const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
-          kind: issueOriginKind,
-          id: issueOriginId,
-        });
+        // Explicitly nullable: findLiveExecutionIssue's inferred return type has
+        // lost its `null` arm (`rows[0]?.issues ?? null` reads as non-nullable
+        // without noUncheckedIndexedAccess), but it very much returns null.
+        let activeIssue: Awaited<ReturnType<typeof findLiveExecutionIssue>> | null =
+          await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
+            kind: issueOriginKind,
+            id: issueOriginId,
+          });
+        // AUR-4543: before folding, decide whether the incumbent is actually
+        // busy or merely wedged. A heartbeat run that never leaves a live status
+        // otherwise holds this slot forever and every later fire folds silently.
+        let activeIssueAgeMs: number | null = null;
+        if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
+          const liveRuns = await findLiveHeartbeatRunsForIssue(input.routine.companyId, activeIssue, txDb);
+          const staleness = evaluateStaleActiveRun({
+            source: input.source,
+            triggeredAt,
+            scheduleIntervalMs,
+            liveRuns,
+          });
+          activeIssueAgeMs = staleness.oldestAgeMs;
+          if (staleness.stale) {
+            await reapStaleActiveExecution({
+              routine: input.routine,
+              issue: activeIssue,
+              liveRuns,
+              triggeredAt,
+              thresholdMs: staleness.thresholdMs,
+              ageMs: staleness.oldestAgeMs,
+            });
+            // Slot is free — fall through to a fresh dispatch instead of folding.
+            // Track the reaped issue so the AUR-5001 stranded-reuse path below
+            // does not immediately re-wake it: the reaped issue now has
+            // executionRunId=null and would otherwise match findOpenNonLiveExecutionIssue.
+            reapedIssueId = activeIssue.id;
+            activeIssue = null;
+          }
+        }
         if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
           if (manualRunnerUserId) {
@@ -1644,6 +1964,8 @@ export function routineService(
             targetIssue: activeIssue,
             consecutiveCoalesceCount: touched.consecutiveCoalesceCount,
             triggeredAt,
+            liveRunAgeMs: activeIssueAgeMs,
+            scheduleIntervalMs,
           }, txDb);
           return updated ?? createdRun;
         }
@@ -1656,7 +1978,7 @@ export function routineService(
           const strandedIssue = await findOpenNonLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
             kind: issueOriginKind,
             id: issueOriginId,
-          });
+          }, reapedIssueId);
           if (strandedIssue) {
             // An umbrella held by a real unresolved blocker must stay blocked (reusing it
             // still avoids the duplicate umbrella, and the blocker resolving is what
@@ -1747,87 +2069,146 @@ export function routineService(
           }
         }
 
-        try {
-          createdIssue = await issueSvc.create(input.routine.companyId, {
-            projectId,
-            goalId: input.routine.goalId,
-            parentId: input.routine.parentIssueId,
-            title,
-            description,
-            status: "todo",
-            priority: input.routine.priority,
-            assigneeAgentId,
-            createdByAgentId: input.source === "manual" ? input.actor?.agentId ?? null : null,
-            createdByUserId: manualRunnerUserId,
-            originKind: issueOriginKind,
-            originId: issueOriginId,
-            originRunId: createdRun.id,
-            originFingerprint: dispatchFingerprint,
-            billingCode: issueBillingCode,
-            assigneeAdapterOverrides: input.routine.assigneeAdapterOverrides ?? null,
-            executionWorkspaceId: input.executionWorkspaceId ?? null,
-            executionWorkspacePreference: input.executionWorkspacePreference ?? null,
-            executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+        // Hoisted so the stale-active retry in the 23505 catch below can reissue
+        // the identical create rather than duplicating this payload.
+        const executionIssueInput = {
+          projectId,
+          goalId: input.routine.goalId,
+          parentId: input.routine.parentIssueId,
+          title,
+          description,
+          status: "todo",
+          priority: input.routine.priority,
+          assigneeAgentId,
+          createdByAgentId: input.source === "manual" ? input.actor?.agentId ?? null : null,
+          createdByUserId: manualRunnerUserId,
+          originKind: issueOriginKind,
+          originId: issueOriginId,
+          originRunId: createdRun.id,
+          originFingerprint: dispatchFingerprint,
+          billingCode: issueBillingCode,
+          assigneeAdapterOverrides: input.routine.assigneeAdapterOverrides ?? null,
+          executionWorkspaceId: input.executionWorkspaceId ?? null,
+          executionWorkspacePreference: input.executionWorkspacePreference ?? null,
+          executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+        };
+
+        // Keep the dispatch lock until the issue is linked to a queued heartbeat run.
+        const bindIssueToDispatch = (issue: NonNullable<typeof createdIssue>) =>
+          queueIssueAssignmentWakeup({
+            heartbeat,
+            issue,
+            reason: "issue_assigned",
+            mutation: "create",
+            contextSource: "routine.dispatch",
+            requestedByActorType: input.source === "schedule" ? "system" : undefined,
+            rethrowOnError: true,
           });
+
+        // AUR-4543: the statement that takes the open-execution slot is the
+        // wakeup's `execution_run_id` binding, NOT this insert — a fresh issue is
+        // created with a null execution_run_id, and the partial index only covers
+        // rows where that column is set. So a conflict guard wrapped around the
+        // create alone can never fire; it has to span both writes, which together
+        // are the single logical "take the slot" operation.
+        try {
+          createdIssue = await issueSvc.create(input.routine.companyId, executionIssueInput);
+          await bindIssueToDispatch(createdIssue);
         } catch (error) {
-          const isOpenExecutionConflict =
-            !!error &&
-            typeof error === "object" &&
-            "code" in error &&
-            (error as { code?: string }).code === "23505" &&
-            "constraint" in error &&
-            (error as { constraint?: string }).constraint === "issues_open_routine_execution_uq";
-          if (!isOpenExecutionConflict || input.routine.concurrencyPolicy === "always_enqueue") {
+          if (
+            !isOpenExecutionSlotConflict(error) ||
+            input.routine.concurrencyPolicy === "always_enqueue"
+          ) {
             throw error;
           }
 
-          const existingIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
-            kind: issueOriginKind,
-            id: issueOriginId,
-          });
+          const existingIssue = await findLiveExecutionIssue(
+            input.routine,
+            txDb,
+            dispatchFingerprint,
+            { kind: issueOriginKind, id: issueOriginId },
+            createdIssue?.id ?? null,
+          );
           if (!existingIssue) throw error;
-          const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
-          if (manualRunnerUserId) {
-            await touchIssueForUserInbox(txDb, {
-              companyId: input.routine.companyId,
-              issueId: existingIssue.id,
-              userId: manualRunnerUserId,
-              touchedAt: triggeredAt,
+
+          // AUR-4543: the same stale-active gate as the pre-create path. This
+          // branch is a second, independent entrance to coalescing — a wedge that
+          // appears between the check above and the slot write lands here, and
+          // gating only the first branch would leave the bug live one layer down
+          // while the outward behaviour looked fixed.
+          const conflictLiveRuns = await findLiveHeartbeatRunsForIssue(
+            input.routine.companyId,
+            existingIssue,
+            txDb,
+          );
+          const conflictStaleness = evaluateStaleActiveRun({
+            source: input.source,
+            triggeredAt,
+            scheduleIntervalMs,
+            liveRuns: conflictLiveRuns,
+          });
+          if (conflictStaleness.stale) {
+            await reapStaleActiveExecution({
+              routine: input.routine,
+              issue: existingIssue,
+              liveRuns: conflictLiveRuns,
+              triggeredAt,
+              thresholdMs: conflictStaleness.thresholdMs,
+              ageMs: conflictStaleness.oldestAgeMs,
             });
+            // Track so the post-transaction supersede sweep does not cancel the
+            // reaped issue — it was detached for triage, not superseded.
+            reapedIssueId = existingIssue.id;
+            // The slot is free now, so the write that just failed can land.
+            // Deliberately not retried again: a second conflict is real
+            // contention, not a wedge, and must surface rather than loop.
+            if (!createdIssue) {
+              createdIssue = await issueSvc.create(input.routine.companyId, executionIssueInput);
+            }
+            await bindIssueToDispatch(createdIssue);
+          } else {
+            // Folding into the incumbent, so drop the issue this dispatch had
+            // already created before it lost the race — otherwise the fold
+            // leaves an orphaned execution issue behind.
+            if (createdIssue) {
+              await txDb.delete(issues).where(eq(issues.id, createdIssue.id));
+              createdIssue = null;
+            }
+            const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
+            if (manualRunnerUserId) {
+              await touchIssueForUserInbox(txDb, {
+                companyId: input.routine.companyId,
+                issueId: existingIssue.id,
+                userId: manualRunnerUserId,
+                touchedAt: triggeredAt,
+              });
+            }
+            const updated = await finalizeRun(createdRun.id, {
+              status,
+              linkedIssueId: existingIssue.id,
+              coalescedIntoRunId: existingIssue.originRunId,
+              completedAt: triggeredAt,
+            }, txDb);
+            const touched = await updateRoutineTouchedState({
+              routineId: input.routine.id,
+              triggerId: input.trigger?.id ?? null,
+              triggeredAt,
+              status,
+              issueId: existingIssue.id,
+              nextRunAt,
+            }, txDb);
+            await maybeRaiseCoalesceAnomaly({
+              routine: input.routine,
+              targetIssue: existingIssue,
+              consecutiveCoalesceCount: touched.consecutiveCoalesceCount,
+              triggeredAt,
+              liveRunAgeMs: conflictStaleness.oldestAgeMs,
+              scheduleIntervalMs,
+            }, txDb);
+            return updated ?? createdRun;
           }
-          const updated = await finalizeRun(createdRun.id, {
-            status,
-            linkedIssueId: existingIssue.id,
-            coalescedIntoRunId: existingIssue.originRunId,
-            completedAt: triggeredAt,
-          }, txDb);
-          const touched = await updateRoutineTouchedState({
-            routineId: input.routine.id,
-            triggerId: input.trigger?.id ?? null,
-            triggeredAt,
-            status,
-            issueId: existingIssue.id,
-            nextRunAt,
-          }, txDb);
-          await maybeRaiseCoalesceAnomaly({
-            routine: input.routine,
-            targetIssue: existingIssue,
-            consecutiveCoalesceCount: touched.consecutiveCoalesceCount,
-            triggeredAt,
-          }, txDb);
-          return updated ?? createdRun;
         }
 
-        // Keep the dispatch lock until the issue is linked to a queued heartbeat run.
-        await queueIssueAssignmentWakeup({
-          heartbeat,
-          issue: createdIssue,
-          reason: "issue_assigned",
-          mutation: "create",
-          contextSource: "routine.dispatch",
-          requestedByActorType: input.source === "schedule" ? "system" : undefined,
-          rethrowOnError: true,
-        });
         const updated = await finalizeRun(createdRun.id, {
           status: "issue_created",
           linkedIssueId: createdIssue.id,
@@ -1877,6 +2258,7 @@ export function routineService(
           originKind: issueOriginKind,
           originId: issueOriginId,
           keepIssueId: run.linkedIssueId,
+          alsoKeepIssueId: reapedIssueId,
         });
       } catch (err) {
         logger.warn(

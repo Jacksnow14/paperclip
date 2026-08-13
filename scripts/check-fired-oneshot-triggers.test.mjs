@@ -12,6 +12,7 @@ import {
   trackedRoutineIds,
   buildFlagBody,
   buildAppendComment,
+  mergeTrackedIds,
   shouldAutoResolve,
   FLAG_TITLE_PREFIX,
 } from './check-fired-oneshot-triggers.mjs';
@@ -188,6 +189,52 @@ test('buildAppendComment: marker covers only the newly-added candidates', () => 
   ];
   const comment = buildAppendComment(newCandidates);
   assert.match(comment, /routine-ids-tracked: r3/);
+});
+
+// ── mergeTrackedIds ───────────────────────────────────────────────────────────
+
+test('mergeTrackedIds: unions new ids into an existing marker', () => {
+  const description = 'blah blah\n\nroutine-ids-tracked: r1,r2';
+  const merged = mergeTrackedIds(description, ['r3']);
+  assert.deepEqual(trackedRoutineIds(merged), new Set(['r1', 'r2', 'r3']));
+});
+
+test('mergeTrackedIds: appends a marker when description has none', () => {
+  const merged = mergeTrackedIds('no marker here', ['r1']);
+  assert.deepEqual(trackedRoutineIds(merged), new Set(['r1']));
+});
+
+test('mergeTrackedIds: deduplicates ids already tracked', () => {
+  const merged = mergeTrackedIds('routine-ids-tracked: r1,r2', ['r2', 'r3']);
+  assert.deepEqual(trackedRoutineIds(merged), new Set(['r1', 'r2', 'r3']));
+});
+
+test('mergeTrackedIds regression: extend-then-recompute keeps auto-resolve honest about a routine only tracked via a later extend', () => {
+  // Simulates two runs: (1) issue created tracking r1, r2; (2) a later run
+  // sees a NEW candidate r3 for the same owner and extends. Before this fix,
+  // extend only posted a comment — the description (which trackedRoutineIds
+  // and shouldAutoResolve actually read) never learned about r3, so a
+  // subsequent run would both re-flag r3 as "new" forever AND could
+  // auto-resolve the issue while r3 was still a live armed one-shot.
+  let description = buildFlagBody([
+    { routine: { id: 'r1', identifier: 'AUR-1', title: 'A' }, trigger: { id: 't1', cronExpression: '0 8 10 8 *', lastFiredAt: '2026-08-10T08:00:00Z' }, severity: 'fired-still-armed' },
+    { routine: { id: 'r2', identifier: 'AUR-2', title: 'B' }, trigger: { id: 't2', cronExpression: '0 8 11 8 *', lastFiredAt: '2026-08-11T08:00:00Z' }, severity: 'fired-still-armed' },
+  ]);
+
+  const newOnes = [
+    { routine: { id: 'r3', identifier: 'AUR-3', title: 'C' }, trigger: { id: 't3', cronExpression: '0 8 12 8 *', lastFiredAt: null }, severity: 'armed-will-recur' },
+  ];
+  description = mergeTrackedIds(description, newOnes.map((c) => c.routine.id));
+
+  // A later run resolves r1 and r2 but r3 is still armed.
+  const stillLiveCandidateIds = new Set(['r3']);
+  assert.equal(shouldAutoResolve({ description }, stillLiveCandidateIds), false);
+
+  // Once r3 is also disarmed, auto-resolve is safe.
+  assert.equal(shouldAutoResolve({ description }, new Set()), true);
+
+  // And r3 is never re-treated as "new" on a subsequent scan.
+  assert.equal(trackedRoutineIds(description).has('r3'), true);
 });
 
 // ── shouldAutoResolve ─────────────────────────────────────────────────────────

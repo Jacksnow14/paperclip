@@ -40,12 +40,17 @@
  * candidate routine for that agent, assigned to that agent, so only they
  * can disarm.
  *
- * Idempotent: an existing open flag issue for an agent is extended (a
- * comment naming the newly-seen routines) rather than duplicated, and a
- * routine already named in that issue's tracked-routine-ids marker is never
- * re-added. A flag issue is auto-resolved (closed `done`, with a comment)
- * once every routine it names is no longer a live candidate (archived, or
- * its date-gated trigger disabled).
+ * Idempotent: an existing open flag issue for an agent is extended — its
+ * `description`'s `routine-ids-tracked` marker is merged in-place (via
+ * PATCH, allowed for the issue author) AND a comment names the newly-seen
+ * routines for human visibility — rather than duplicated, and a routine
+ * already named in that marker is never re-added. Merging into `description`
+ * (not just posting a comment) matters: `trackedRoutineIds`/`shouldAutoResolve`
+ * only ever read `description`, so a routine tracked solely via a comment
+ * would be re-flagged as "new" every run and would be invisible to
+ * auto-resolve. A flag issue is auto-resolved (closed `done`, with a
+ * comment) once every routine it names is no longer a live candidate
+ * (archived, or its date-gated trigger disabled).
  *
  * Usage:
  *   node scripts/check-fired-oneshot-triggers.mjs            # detect + file
@@ -239,6 +244,22 @@ export function buildAppendComment(newCandidates) {
 }
 
 /**
+ * Returns `description` with its `routine-ids-tracked` marker updated to the
+ * union of what it already tracked plus `newIds`. The marker lives in the
+ * issue's `description` (not a comment) because `trackedRoutineIds` and
+ * `shouldAutoResolve` only ever read `description` — a routine added via a
+ * plain append-comment would never be re-read on a later run, so it would
+ * be re-flagged as "new" forever AND would be invisible to auto-resolve
+ * (an issue could close `done` while that routine is still armed).
+ */
+export function mergeTrackedIds(description, newIds) {
+  const merged = new Set([...trackedRoutineIds(description), ...newIds]);
+  const line = `routine-ids-tracked: ${[...merged].join(',')}`;
+  const desc = String(description ?? '');
+  return ROUTINE_IDS_MARKER.test(desc) ? desc.replace(ROUTINE_IDS_MARKER, line) : `${desc}\n\n${line}`;
+}
+
+/**
  * True if `flagIssue` should auto-resolve: every routine id it tracks is no
  * longer a live candidate, per the freshly-recomputed `candidateRoutineIds`
  * set (routine archived, or its date-gated trigger no longer enabled).
@@ -356,6 +377,11 @@ async function main() {
       extended.push({ ownerId, identifier: existing.identifier || existing.id });
       continue;
     }
+    const mergedDescription = mergeTrackedIds(existing.description, newOnes.map((c) => c.routine.id));
+    await apiFetch(`/api/issues/${existing.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ description: mergedDescription }),
+    });
     await apiFetch(`/api/issues/${existing.id}/comments`, {
       method: 'POST',
       body: JSON.stringify({ body: buildAppendComment(newOnes) }),

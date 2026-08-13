@@ -10239,7 +10239,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
     }
 
+    if (agent.status === "error" && source === "assignment") {
+      // AUR-5644: `error` is otherwise a permanent absorbing state — the only
+      // other automatic exit is a due scheduled_retry promotion (:5463),
+      // justified there because a due retry is an explicit, single, bounded
+      // system transition rather than a bulk sweep of stale queued work. A
+      // genuine new-assignment wake (queueIssueAssignmentWakeup; issue
+      // create/reassign/comment/interaction) is the same kind of explicit
+      // per-event signal, so it is safe to let it clear `error` too. This
+      // does NOT re-admit any other stale queued/scheduled work on the
+      // agent — it only lets *this* wake proceed; a genuinely dead lane with
+      // no new assignments stays in `error` and is caught by the AUR-5644
+      // detector instead.
+      const recovered = await db
+        .update(agents)
+        .set({ status: "idle", updatedAt: new Date() })
+        .where(and(eq(agents.id, agent.id), eq(agents.status, "error")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (recovered) agent.status = recovered.status;
+    }
+
     if (isHeartbeatAdmissionIneligibleAgentStatus(agent.status)) {
+      await writeSkippedRequest("agent_status_ineligible");
       throw conflict("Agent is not invokable in its current state", { status: agent.status });
     }
 

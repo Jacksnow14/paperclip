@@ -30,3 +30,17 @@ test('verifyReadBack: tolerates an empty list without throwing', () => {
   assert.equal(verifyReadBack([], 'c2', 'body').ok, false);
   assert.equal(verifyReadBack(null, 'c2', 'body').ok, false);
 });
+
+test('verifyReadBack: ok when the stored body reflects the API\'s escaped-linebreak normalization (AUR-5577)', () => {
+  const posted = 'line one\\nline two\\r\\nline three\\rline four';
+  const stored = 'line one\nline two\nline three\nline four';
+  const verdict = verifyReadBack([{ id: 'c2', body: stored }], 'c2', posted);
+  assert.deepEqual(verdict, { ok: true, length: stored.length });
+});
+
+test('verifyReadBack: still fails on a genuinely truncated body containing escaped linebreaks', () => {
+  const posted = 'a regex sample: \\n matches newline, in full';
+  const verdict = verifyReadBack([{ id: 'c2', body: 'a regex sample: \n matches' }], 'c2', posted);
+  assert.equal(verdict.ok, false);
+  assert.match(verdict.reason, /different body/);
+});

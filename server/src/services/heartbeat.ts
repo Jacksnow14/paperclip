@@ -82,6 +82,7 @@ import {
   type RunLivenessClassificationInput,
 } from "./run-liveness.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
+import { laneBreakerForDb } from "./lane-breaker.js";
 import {
   buildWorkspaceReadyComment,
   cleanupExecutionWorkspaceArtifacts,
@@ -6442,6 +6443,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     if (await reapQueuedRunIfUnclaimable(run, context, "heartbeat.claim_queued_run")) {
+      return null;
+    }
+
+    // AUR-5464: lane circuit breaker. A lane the fleet-capacity classifier
+    // proves cannot execute (quota wall / entitlement revocation / lane-down
+    // rollup, or an unhealthy provider probe report) admits nothing except a
+    // single half-open probe per interval. Like the global-cap branch below,
+    // the run is left QUEUED — the periodic admission drive re-attempts it —
+    // never cancelled: an outage must not destroy the work. Ordered after the
+    // reap gauntlet on purpose so stale/blocked/tree-held runs are still
+    // cancelled while the lane is down.
+    const laneDecision = await laneBreakerForDb(db)
+      .evaluateAdmission(run.companyId, { id: agent.id, adapterType: agent.adapterType })
+      .catch((err) => {
+        // The breaker is an availability guard, not a correctness gate: if it
+        // cannot evaluate (e.g. transient DB error), admission must not go
+        // dark fleet-wide. Fail open and let the run's own outcome feed the
+        // error stream.
+        logger.error({ err, runId: run.id, agentId: agent.id }, "laneBreaker evaluation failed; admitting");
+        return null;
+      });
+    if (laneDecision && !laneDecision.admit) {
       return null;
     }
 

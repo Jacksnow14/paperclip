@@ -286,9 +286,26 @@ describe("fleet capacity route", () => {
       byReason: { quota_exhausted: 1, ok: 1 },
     });
 
+    // AUR-5464: the lane-breaker read surface rides on the rows classified
+    // above. FIRE: the quota-starved lane reads open with its trip source.
+    // PASS: the healthy lane stays closed, so the view is not a constant.
+    const lanes = Object.fromEntries(
+      (res.body.lanes as Array<Record<string, unknown>>).map((lane) => [lane.lane, lane]),
+    );
+    expect(Object.keys(lanes).sort()).toEqual(["claude_local", "codex_local"]);
+    expect(lanes.codex_local).toMatchObject({
+      state: "open",
+      trippedBy: ["error_stream"],
+      reason: "quota_exhausted",
+    });
+    expect(lanes.claude_local).toMatchObject({ state: "closed", trippedBy: [], reason: null });
+
     // The regression teeth: classification and queue depth must come from
     // SEPARATE queries with disjoint status filters. Reverting to one shared
-    // window changes these rendered predicates and fails here.
+    // window changes these rendered predicates and fails here. The count also
+    // pins the lane view to the rows already fetched: re-deriving it with its
+    // own per-lane queries (which is how this route first 500'd, the db stub
+    // having no `selectDistinct`) pushes `captured` past 4.
     expect(captured).toHaveLength(4);
     const [starvedTerminalQ, starvedQueueQ, healthyTerminalQ, healthyQueueQ] = captured;
 

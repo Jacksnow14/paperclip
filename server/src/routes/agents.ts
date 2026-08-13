@@ -51,6 +51,7 @@ import {
 } from "../services/index.js";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
+import { laneBreakerForDb } from "../services/lane-breaker.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectAgentAdapterWorkspaceCommandPaths,
@@ -3389,7 +3390,58 @@ export function agentRoutes(
       ),
     );
 
-    res.json({ companyId, ...computeFleetCapacity(capacityAgents, runsByAgent, new Date()) });
+    const capacity = computeFleetCapacity(capacityAgents, runsByAgent, new Date());
+
+    // AUR-5464: the lane-breaker view is the board-visible "one durable state,
+    // not N failures" surface — per-lane open/closed, trip sources, and the
+    // next half-open probe time. Derived from the rows just classified above so
+    // this read route issues no additional queries.
+    const lanes = laneBreakerForDb(db).describeLanesFromRows(companyId, capacity.agents);
+
+    res.json({ companyId, lanes, ...capacity });
+  });
+
+  // AUR-5464: operator manual re-arm. Clears a provider-probe trip and makes
+  // the next queued run an IMMEDIATE half-open probe. Deliberately cannot
+  // blind-open a lane: if the provider is still down the probe fails and the
+  // lane re-trips, so this is safe to expose at company-access level (agents
+  // included) rather than board-only.
+  router.post("/companies/:companyId/fleet-capacity/lanes/:lane/rearm", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const lane = req.params.lane as string;
+    const actor = getActorInfo(req);
+    const result = laneBreakerForDb(db).manualRearm(companyId, lane, {
+      actorType: actor.actorType === "user" ? "user" : "agent",
+      actorId: actor.actorId,
+    });
+    res.json(result);
+  });
+
+  // AUR-5464: intake for the AUR-5435/AUR-5461 provider probe — the breaker's
+  // second, error-stream-independent trip source. An unhealthy report trips
+  // the lane; a healthy report only clears a probe-sourced trip (it can never
+  // force-clear an error-stream trip — only a succeeded run proves recovery).
+  router.post("/companies/:companyId/fleet-capacity/lanes/:lane/probe-report", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const lane = req.params.lane as string;
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (typeof body.healthy !== "boolean") {
+      throw unprocessable("probe report requires boolean `healthy`");
+    }
+    const observedAt = typeof body.observedAt === "string" ? new Date(body.observedAt) : new Date();
+    if (Number.isNaN(observedAt.getTime())) {
+      throw unprocessable("`observedAt` must be an ISO timestamp");
+    }
+    const actor = getActorInfo(req);
+    laneBreakerForDb(db).reportProviderProbe(lane, {
+      healthy: body.healthy,
+      reason: typeof body.reason === "string" ? body.reason : null,
+      observedAt,
+      source: typeof body.source === "string" ? body.source : `${actor.actorType}:${actor.actorId}`,
+    });
+    res.json({ ok: true, lane });
   });
 
   router.get("/companies/:companyId/live-runs", async (req, res) => {

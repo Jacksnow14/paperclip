@@ -347,7 +347,17 @@ else
         log "migration gate PASS for $rel12: $(tail -1 "$GATE_OUT" 2>/dev/null)"
       fi
     fi
-    if (( arm_built && ! gate_refused )); then
+    if (( arm_built && ! gate_refused )) && [[ -e "$APP_ROOT/releases/$rel12/startup-failed" ]]; then
+      # AUR-5095 property gate: this exact release dir already failed startup
+      # (the crash-loop failover marked it). Never flip `current` into it
+      # again, even if the sha ledger above was lost or rotated — the marker
+      # travels with the artifact, so a flip loop cannot outrun it. Re-seed
+      # the ledger from the marker so stage 1 stops re-building it too.
+      quarantined "$master_sha" || quarantine "$master_sha" startup-failed-marker
+      PHASE=arm-refused-startup-failed ARMED_SHA=$master_sha NOTE="releases/$rel12 carries a startup-failed marker (crash-loop failover)"
+      write_state
+      log "arm REFUSED: $NOTE"
+    elif (( arm_built && ! gate_refused )); then
       if repoint_current "$rel12"; then
         set_fail_count "$master_sha" 0
         activated_sha=$(read_activated_sha)
@@ -417,10 +427,13 @@ if [[ "$RESTART_ENABLED" != "1" ]]; then
   exit 0
 fi
 
-if quarantined "$activated_sha"; then
-  PHASE=armed-sha-quarantined ARMED_SHA=$activated_sha NOTE="refusing to restart into quarantined $activated_sha"
+if quarantined "$activated_sha" || [[ -e "$APP_ROOT/releases/${activated_sha:0:12}/startup-failed" ]]; then
+  # Second clause is the AUR-5095 property gate: a release the crash-loop
+  # failover marked startup-failed must never be restarted into, even if the
+  # sha ledger was lost — the marker travels with the artifact.
+  PHASE=armed-sha-quarantined ARMED_SHA=$activated_sha NOTE="refusing to restart into quarantined/startup-failed $activated_sha"
   write_state
-  log "REFUSING restart: activated sha $activated_sha is quarantined"
+  log "REFUSING restart: activated sha $activated_sha is quarantined or marked startup-failed"
   exit 1
 fi
 

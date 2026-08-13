@@ -408,6 +408,75 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(wakeup?.status).not.toBe("skipped");
   });
 
+  // AUR-5599: a fully unassigned issue (no agent, no user) is a deliberate park, not
+  // a rescue — unlike the AUR-5595 user-assignee case, this queued run still gets
+  // cancelled (a router is expected to pick a new owner, not the stale queued run's
+  // original agent). What AUR-5595 left behind is the lying error text: it still
+  // promised "the new owner will be woken instead" when no owner exists at all. This
+  // is the FIRE case for that text fix — it must stay cancelled, and must not claim a
+  // rescue nobody enqueued.
+  it("still cancels a queued run when the issue becomes fully unassigned, but tells the truth about it (AUR-5599)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "ParkedIssueCoder" });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Unassigned before the queued run could start",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    });
+
+    const { runId, wakeupRequestId } = await seedQueuedRun({
+      companyId,
+      agentId,
+      issueId,
+      wakeReason: "issue_assigned",
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    await waitForCondition(async () => {
+      const run = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      return run?.status === "cancelled";
+    });
+
+    const [run, wakeup] = await Promise.all([
+      db
+        .select({
+          status: heartbeatRuns.status,
+          errorCode: heartbeatRuns.errorCode,
+          error: heartbeatRuns.error,
+          resultJson: heartbeatRuns.resultJson,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ status: agentWakeupRequests.status, error: agentWakeupRequests.error })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId))
+        .then((rows) => rows[0] ?? null),
+    ]);
+
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("issue_assignee_changed");
+    expect(run?.resultJson).toMatchObject({ stopReason: "issue_assignee_changed" });
+    // The old promise text ("the new owner will be woken instead") is a lie when
+    // there is no new owner at all -- assert its absence, not just presence of some
+    // other string, so a regression that reintroduces it fails loudly.
+    expect(run?.error).not.toContain("the new owner will be woken instead");
+    expect(run?.error).toContain("unassigned");
+    expect(wakeup?.status).toBe("skipped");
+    expect(countExecuteCallsForRun(runId)).toBe(0);
+  });
+
   it("cancels queued runs when the issue reaches a terminal status before the run starts", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();

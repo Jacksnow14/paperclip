@@ -6724,16 +6724,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // interaction answer) with no successor ever created. Let the queued run proceed
     // under its original agent instead; it still holds the context that queued it.
     const newAssigneeIsUserOnly = !issue.assigneeAgentId && !!issue.assigneeUserId;
+    // AUR-5599: unassigning is a deliberate park, not a rescue — a fully unassigned
+    // issue (no agent, no user) still cancels, because a router is expected to pick a
+    // new owner rather than leaving the old agent grinding on a parked issue. But
+    // nothing enqueues that re-wake at cancel time, so the AUR-5595 promise text is
+    // just as much of a lie here: there is no "new owner" yet. Keep cancelling, tell
+    // the truth instead.
+    const newAssigneeIsFullyUnassigned = !issue.assigneeAgentId && !issue.assigneeUserId;
     if (issue.assigneeAgentId !== run.agentId && !isVerifiedMentionReplyWake && !newAssigneeIsUserOnly) {
       return {
         stale: true,
         errorCode: "issue_assignee_changed",
-        reason:
-          "Cancelled because issue assignee changed before the queued run could start; the new owner will be woken instead",
+        reason: newAssigneeIsFullyUnassigned
+          ? "Cancelled because the issue was unassigned before the queued run could start; no successor owner is assigned yet to resume this work"
+          : "Cancelled because issue assignee changed before the queued run could start; the new owner will be woken instead",
         details: {
           issueId,
           previousAssigneeAgentId: run.agentId,
           currentAssigneeAgentId: issue.assigneeAgentId,
+          currentAssigneeUserId: issue.assigneeUserId,
         },
       };
     }

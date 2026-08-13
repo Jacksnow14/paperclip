@@ -1286,6 +1286,7 @@ export function routineService(
     executor: Db = db,
     dispatchFingerprint?: string | null,
     origin?: { kind: string; id: string | null },
+    excludeIssueId?: string | null,
   ) {
     const fingerprintCondition = routineExecutionFingerprintCondition(dispatchFingerprint);
     const originKind = origin?.kind ?? "routine_execution";
@@ -1300,7 +1301,15 @@ export function routineService(
           eq(issues.originId, originId),
           inArray(issues.status, OPEN_ISSUE_STATUSES),
           isNull(issues.hiddenAt),
+          // AUR-4543: only re-use truly stranded issues (no execution link at all).
+          // An issue with executionRunId IS NOT NULL but a non-live run is in an
+          // "orphaned" state — a different defect that must fall through to the
+          // try/catch path (which detects the 23505 conflict and reaps if stale, or
+          // fails loudly for other orphaned cases). Reusing it here would bypass
+          // both the stale-active reap and the conflict surface.
+          isNull(issues.executionRunId),
           ...(fingerprintCondition ? [fingerprintCondition] : []),
+          ...(excludeIssueId ? [ne(issues.id, excludeIssueId)] : []),
         ),
       )
       .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
@@ -1354,6 +1363,9 @@ export function routineService(
     originKind: string;
     originId: string;
     keepIssueId: string;
+    // AUR-4543: exclude a freshly-reaped issue from cancellation — it was detached
+    // on purpose and should remain open for triage, not superseded as a stale umbrella.
+    alsoKeepIssueId?: string | null;
   }) {
     const staleIssues = await db
       .select({ id: issues.id, identifier: issues.identifier, status: issues.status })
@@ -1366,6 +1378,7 @@ export function routineService(
           inArray(issues.status, OPEN_ISSUE_STATUSES),
           ne(issues.id, input.keepIssueId),
           isNull(issues.hiddenAt),
+          ...(input.alsoKeepIssueId ? [ne(issues.id, input.alsoKeepIssueId)] : []),
         ),
       );
 
@@ -1402,6 +1415,8 @@ export function routineService(
       });
     }
     return superseded;
+  }
+
   // Every live heartbeat run that makes `issue` discoverable by
   // findLiveExecutionIssue. It has two join paths — the execution-bound run and
   // any run carrying this issue in its context snapshot — and both key on live
@@ -1776,6 +1791,9 @@ export function routineService(
       title,
       description,
     });
+    // AUR-4543: hoisted outside the transaction so supersedeStaleOpenExecutionIssues
+    // (called after the transaction commits) can exclude the reaped issue from cancellation.
+    let reapedIssueId: string | null = null;
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(
@@ -1910,6 +1928,10 @@ export function routineService(
               ageMs: staleness.oldestAgeMs,
             });
             // Slot is free — fall through to a fresh dispatch instead of folding.
+            // Track the reaped issue so the AUR-5001 stranded-reuse path below
+            // does not immediately re-wake it: the reaped issue now has
+            // executionRunId=null and would otherwise match findOpenNonLiveExecutionIssue.
+            reapedIssueId = activeIssue.id;
             activeIssue = null;
           }
         }
@@ -1956,7 +1978,7 @@ export function routineService(
           const strandedIssue = await findOpenNonLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
             kind: issueOriginKind,
             id: issueOriginId,
-          });
+          }, reapedIssueId);
           if (strandedIssue) {
             // An umbrella held by a real unresolved blocker must stay blocked (reusing it
             // still avoids the duplicate umbrella, and the blocker resolving is what
@@ -2134,6 +2156,9 @@ export function routineService(
               thresholdMs: conflictStaleness.thresholdMs,
               ageMs: conflictStaleness.oldestAgeMs,
             });
+            // Track so the post-transaction supersede sweep does not cancel the
+            // reaped issue — it was detached for triage, not superseded.
+            reapedIssueId = existingIssue.id;
             // The slot is free now, so the write that just failed can land.
             // Deliberately not retried again: a second conflict is real
             // contention, not a wedge, and must surface rather than loop.
@@ -2233,6 +2258,7 @@ export function routineService(
           originKind: issueOriginKind,
           originId: issueOriginId,
           keepIssueId: run.linkedIssueId,
+          alsoKeepIssueId: reapedIssueId,
         });
       } catch (err) {
         logger.warn(

@@ -575,6 +575,29 @@ function keyPart(iso: string): string {
   return iso.replace(/[:-]/g, "").replace("T", "-").slice(0, 13);
 }
 
+// A "now" that stays real-clock-anchored (required by pruneOldBackups'
+// daily/weekly/monthly cutoffs, which are always computed against the real
+// wall clock — see the tests below) but is guaranteed to be at least
+// `spanHours` past the most recent UTC midnight. Without this, subtracting
+// up to `spanHours` worth of hourly offsets from a real `Date.now()` taken
+// close to UTC midnight spills some of those "recent hourly" fixtures onto
+// the previous calendar day, which changes which tier they land in and makes
+// the test's pass/fail outcome depend on what time of day CI happens to run.
+// Only ever moves forward from the real clock, never backward.
+function safeNowForSpan(spanHours: number): number {
+  const real = new Date();
+  if (real.getUTCHours() >= spanHours) return real.getTime();
+  return Date.UTC(
+    real.getUTCFullYear(),
+    real.getUTCMonth(),
+    real.getUTCDate(),
+    spanHours,
+    real.getUTCMinutes(),
+    real.getUTCSeconds(),
+    real.getUTCMilliseconds(),
+  );
+}
+
 describe("pruneOldBackups — retention logic", () => {
   it("hourly count cap: 7 days × hourly cadence self-bounds to hourlyCount + daily/weekly/monthly", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-prune-hourly-"));
@@ -641,12 +664,16 @@ describe("pruneOldBackups — retention logic", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pc-prune-bytes-"));
     cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
 
-    // Must be real Date.now(), not a fixed past instant: AUR-4611's size-aware
-    // hourly count shrinks Tier 1 to 1 for this cap/size ratio, and the 2nd
-    // survivor is rescued by the daily tier's per-calendar-day dedup — which
-    // (see pruneOldBackups) only admits entries within `dailyDays` of the real
-    // wall clock, not of this fixture's own reference point.
-    const now = Date.now();
+    // Must be real-clock-anchored, not a fixed past instant: AUR-4611's
+    // size-aware hourly count shrinks Tier 1 to 1 for this cap/size ratio,
+    // and the 2nd survivor is rescued by the daily tier's per-calendar-day
+    // dedup — which (see pruneOldBackups) only admits entries within
+    // `dailyDays` of the real wall clock, not of this fixture's own
+    // reference point. Anchored via safeNowForSpan (not raw Date.now()) so
+    // the 4-hour spread below can never straddle a UTC-midnight boundary,
+    // which would otherwise put the 2nd-newest entry on a different
+    // calendar day than the newest and change which tier "rescues" it.
+    const now = safeNowForSpan(4);
     const MB = 1024 * 1024;
     // 5 files 1h apart, each 10 MiB → 50 MiB total, cap at 25 MiB → must keep 2
     const timestamps = Array.from({ length: 5 }, (_, i) => ({
@@ -702,13 +729,15 @@ describe("pruneOldBackups — retention logic", () => {
     cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
 
     const MB = 1024 * 1024;
-    // Must be real Date.now(), not a fixed past instant: pruneOldBackups'
+    // Must be real-clock-anchored, not a fixed past instant: pruneOldBackups'
     // daily/weekly/monthly cutoffs (packages/db/src/backup-lib.ts) are computed
     // against the real wall clock, not against this fixture's own reference
     // point. A fixed-past "now" would make every entry here look older than
     // the cutoffs and fall out of the ladder entirely instead of being
-    // deduped into it.
-    const now = Date.now();
+    // deduped into it. Anchored via safeNowForSpan (not raw Date.now()) so
+    // the 7-hour hourly spread below can never straddle a UTC-midnight
+    // boundary — see safeNowForSpan's own comment for why that matters.
+    const now = safeNowForSpan(7);
     const HOUR = 60 * 60 * 1000;
     const DAY = 24 * HOUR;
     const at = (agoMs: number) => ({ iso: new Date(now - agoMs).toISOString(), sizeBytes: 10 * MB });

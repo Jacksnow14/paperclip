@@ -330,6 +330,142 @@ export function resolveCancelReason({ target, targetId }) {
   return null;
 }
 
+// ── Stranded routine-execution detection (AUR-5634, Part B of AUR-5487) ─────
+//
+// `originKind: routine_execution` issues can strand silently (e.g.
+// `adapter_failed`) with no notification anywhere a human looks, because the
+// source issue — where the human commitment/date actually lives — is only
+// referenced in the execution issue's TITLE as prose, never as a structural
+// `parentId` link. Three cases measured in AUR-5487; AUR-5425 missed its
+// gate by 56 hours before a human happened to notice.
+//
+// Independent axis from the blocked-with-no-blocker detection above: it
+// fires on ANY non-terminal status (not just `blocked`), keyed on age alone,
+// and — unlike the Phase B2 umbrella aggregate — extracts the source
+// reference so the flag routes to whoever owns the commitment, not just the
+// CEO. A `blocked`-with-no-blocker routine dispatch umbrella older than the
+// threshold can legitimately be caught by BOTH this path and the Phase B2
+// aggregate; that's intentional, not a bug — the two flags serve different
+// readers (aggregate → CEO dispatch hygiene, this flag → the source owner's
+// commitment).
+
+/** Hours a `routine_execution` issue may sit non-terminal before it counts as stranded. */
+export const ROUTINE_EXECUTION_STALE_HOURS = 24;
+
+/**
+ * Duplicated literal, not a reference to ISSUE_STATUS_FILTER (defined
+ * below) — keep in sync. Same convention already used by
+ * UMBRELLA_FLAG_SEARCH_STATUSES above.
+ */
+export const NON_TERMINAL_STATUSES = ['backlog', 'todo', 'in_progress', 'blocked', 'in_review'];
+
+/**
+ * True when a routine-dispatch issue has sat non-terminal for at least
+ * ROUTINE_EXECUTION_STALE_HOURS. Threshold chosen from the AUR-5425 fixture:
+ * it stranded 55h+ before a human noticed; 24h catches it ~31h earlier while
+ * staying above the same-day turnaround most routine executions actually take.
+ */
+export function isStrandedRoutineExecution(issue, now = new Date()) {
+  return (
+    issue.originKind === 'routine_execution' &&
+    NON_TERMINAL_STATUSES.includes(issue.status) &&
+    hoursSince(issue.createdAt, now) >= ROUTINE_EXECUTION_STALE_HOURS
+  );
+}
+
+/**
+ * First `AUR-\d+` reference in the execution issue's TITLE ONLY — never the
+ * description. Validated against 5 real issues (AUR-5634): scanning the
+ * description produces false positives (AUR-5424's body mentions AUR-4510
+ * and AUR-3263/AUR-3264 with no clean single external source). Title-only
+ * correctly extracts AUR-1300 from AUR-5425's title, AUR-5366 from
+ * AUR-5430's title, AUR-5356 from AUR-5416's title, and null for AUR-5424
+ * and AUR-5427 (neither title carries a reference).
+ */
+export const SOURCE_ISSUE_REF_PATTERN = /AUR-\d+/;
+
+export function extractSourceIssueRef(issue) {
+  const match = SOURCE_ISSUE_REF_PATTERN.exec(issue.title ?? '');
+  return match ? match[0] : null;
+}
+
+/**
+ * Matches the flag title this path files. The capture group is always the
+ * EXECUTION issue identifier — the stable dedup key, since source-reference
+ * extraction can legitimately fail (AUR-5424/AUR-5427 shape).
+ */
+export const STRANDED_ROUTINE_FLAG_REGEX = /stranded-routine-execution:\s*(AUR-\d+)/i;
+
+export function strandedRoutineFlagTitle(executionIdentifier, sourceIdentifier) {
+  return sourceIdentifier
+    ? `stranded-routine-execution: ${executionIdentifier} stranded, source ${sourceIdentifier} not seeing it`
+    : `stranded-routine-execution: ${executionIdentifier} stranded, no source reference in title`;
+}
+
+export function buildStrandedRoutineFlagDescription(executionIssue, sourceIdentifier, now = new Date()) {
+  const execId = executionIssue.identifier ?? executionIssue.id;
+  const hrs = Math.round(hoursSince(executionIssue.createdAt, now));
+  const lines = [
+    '## Routine-execution issue stranded — source commitment may be missed',
+    '',
+    `**${execId}** ("${executionIssue.title}") is \`${executionIssue.status}\` with ` +
+      `\`originKind: routine_execution\`, created ${hrs}h ago and still not terminal ` +
+      '(`done`/`cancelled`).',
+    '',
+  ];
+  if (sourceIdentifier) {
+    lines.push(
+      `The execution issue's title references **${sourceIdentifier}** as the source issue where the ` +
+        'human commitment/date lives. That reference is prose only — no structural link exists — so the ' +
+        'source issue receives no notification of the stall on its own (AUR-5487/AUR-5634: three cases ' +
+        'measured this way, one missed its gate by 56 hours).',
+      '',
+      `Please check ${sourceIdentifier} and ${execId}: if the underlying commitment is still owed, re-drive ` +
+        `it; if ${execId} is dead, cancel it.`,
+    );
+  } else {
+    lines.push(
+      "No issue reference was found in the execution issue's title, so this flag is filed against the " +
+        'execution issue itself rather than a source issue. That means extraction failed to find a ' +
+        'reference — it does not mean no source exists; check the description/comments by hand.',
+      '',
+      `Please give ${execId} a real disposition.`,
+    );
+  }
+  lines.push(
+    '',
+    'Detected by scripts/check-stalled-blocked.mjs (stranded-routine-execution path, AUR-5634).',
+    '',
+    'exec.routing-rationale: skip',
+  );
+  return lines.join('\n');
+}
+
+/**
+ * Cancel reason for a stale stranded-routine-execution flag, or null if the
+ * flag should stay open. Mirrors resolveCancelReason's "not found among
+ * open issues == terminal" convention (issueByIdentifier is built from a
+ * non-terminal-status-only pool). No separate "no longer meets threshold"
+ * branch: age is monotonic and the only terminal statuses are done/cancelled
+ * (both covered above), so that case cannot occur once a target has flagged.
+ */
+export function resolveStrandedRoutineCancelReason({ target, targetId }) {
+  if (!target) {
+    return `Auto-resolved by stalled-blocked-watchdog: ${targetId} not found among open issues (done/cancelled).`;
+  }
+  if (['done', 'cancelled'].includes(target.status)) {
+    return `Auto-resolved by stalled-blocked-watchdog: ${targetId} is ${target.status}.`;
+  }
+  return null;
+}
+
+/**
+ * Anti-flood cap for this path's Phase B filing, independent of
+ * maxFlagsPerRun (house pattern from check-delivery-claims.mjs's
+ * FLAG_FILE_CAP: cap and LOG the drops — never silently truncate).
+ */
+export const STRANDED_ROUTINE_FLAG_CAP = 5;
+
 // ── API helpers ───────────────────────────────────────────────────────────────
 
 function makeApiHelpers(API_URL, headers) {
@@ -436,6 +572,13 @@ export async function main({ apply, apiUrl, apiKey, companyId, maxFlagsPerRun = 
   const umbrellaCandidates = candidates.filter(isRoutineDispatchUmbrella);
   const ordinaryCandidates = candidates.filter((issue) => !isRoutineDispatchUmbrella(issue));
 
+  // Stranded routine-execution candidates (AUR-5634): independent axis, keyed
+  // on age + non-terminal status rather than blocked-with-no-blocker. Scanned
+  // over `allIssues` (all non-terminal statuses), not just `blockedIssues`.
+  const strandedRoutineCandidates = allIssues
+    .filter((issue) => isStrandedRoutineExecution(issue))
+    .filter((issue) => !isOwnOutput(issue));
+
   const graded = ordinaryCandidates.map((issue) => ({ issue, grade: gradeBlockedIssue(issue) }));
 
   // A human-gated candidate that already carries a pending first-class
@@ -473,6 +616,11 @@ export async function main({ apply, apiUrl, apiKey, companyId, maxFlagsPerRun = 
   console.log(`\n  AWAITING-HUMAN (correctly modelled, ${awaitingHuman.length}):`);
   awaitingHuman.forEach(({ issue }) => {
     console.log(`    - ${issue.identifier} [${issue.priority}] already has a pending interaction — not filing.`);
+  });
+  console.log(`\n  STRANDED-ROUTINE-EXECUTION (independent axis, any non-terminal status, ${strandedRoutineCandidates.length}):`);
+  strandedRoutineCandidates.forEach((issue) => {
+    const src = extractSourceIssueRef(issue);
+    console.log(`    - ${issue.identifier} [${issue.status}] created=${Math.round(hoursSince(issue.createdAt))}h ago source=${src ?? 'none found'}`);
   });
   console.log();
 
@@ -607,6 +755,95 @@ export async function main({ apply, apiUrl, apiKey, companyId, maxFlagsPerRun = 
     console.log();
   }
 
+  // ── Phase A2: auto-resolve stale stranded-routine-execution flags (AUR-5634) ─
+  console.log('── Phase A2: Auto-resolve stale stranded-routine-execution flags ──');
+  const strandedFlagIssues = allIssues.filter((issue) => STRANDED_ROUTINE_FLAG_REGEX.test(issue.title ?? ''));
+  const openStrandedFlagTargets = new Set();
+  const toCancelStranded = [];
+
+  for (const flag of strandedFlagIssues) {
+    const match = STRANDED_ROUTINE_FLAG_REGEX.exec(flag.title);
+    if (!match) continue;
+    const targetId = match[1];
+    const target = issueByIdentifier.get(targetId) ?? null;
+    const reason = resolveStrandedRoutineCancelReason({ target, targetId });
+    if (reason) {
+      toCancelStranded.push({ flag, targetId, reason });
+    } else {
+      openStrandedFlagTargets.add(targetId);
+    }
+  }
+
+  if (toCancelStranded.length === 0) {
+    console.log('  No stale flags to resolve.\n');
+  } else {
+    for (const { flag, targetId, reason } of toCancelStranded) {
+      console.log(`  CANCEL ${flag.identifier ?? flag.id} → ${targetId}: ${reason}`);
+      if (apply) {
+        const ok = await runMutation(
+          `cancel ${flag.identifier ?? flag.id} (target ${targetId})`,
+          async () => {
+            await apiPatch(`/api/issues/${flag.id}`, { status: 'cancelled' });
+            await apiPost(`/api/issues/${flag.id}/comments`, { body: reason });
+          },
+          failedMutations,
+        );
+        if (ok) console.log('    → cancelled + commented.');
+      }
+    }
+    console.log();
+  }
+
+  // ── Phase B3: detect + file stranded-routine-execution flags (capped) ───────
+  console.log('── Phase B3: Detect and file stranded-routine-execution flags ──');
+  const strandedToFileAll = strandedRoutineCandidates.filter((issue) => !openStrandedFlagTargets.has(issue.identifier));
+  const strandedSkippedDedup = strandedRoutineCandidates.length - strandedToFileAll.length;
+  const strandedToFile = strandedToFileAll.slice(0, STRANDED_ROUTINE_FLAG_CAP);
+  const strandedDroppedByCap = strandedToFileAll.slice(STRANDED_ROUTINE_FLAG_CAP);
+
+  if (strandedSkippedDedup > 0) {
+    console.log(`  SKIPPED-DEDUP — open flag exists (${strandedSkippedDedup}).`);
+  }
+  if (strandedDroppedByCap.length > 0) {
+    console.log(`  CAP: STRANDED_ROUTINE_FLAG_CAP=${STRANDED_ROUTINE_FLAG_CAP} reached — dropping ${strandedDroppedByCap.length} candidate(s) this run (will be reconsidered next run):`);
+    strandedDroppedByCap.forEach((issue) => console.log(`    - ${issue.identifier ?? issue.id}`));
+  }
+
+  if (strandedToFile.length === 0) {
+    console.log('  No new flags to file.\n');
+  } else {
+    for (const issue of strandedToFile) {
+      const execId = issue.identifier ?? issue.id;
+      const sourceRef = extractSourceIssueRef(issue);
+      let sourceIssue = null;
+      if (sourceRef) {
+        try {
+          sourceIssue = await apiGet(`/api/issues/${sourceRef}`);
+        } catch {
+          console.log(`    NOTE: extracted source ref ${sourceRef} from ${execId}'s title but could not fetch it — filing against ${execId} instead.`);
+        }
+      }
+      const owner = resolveFlagOwner(sourceIssue ?? issue);
+      const title = strandedRoutineFlagTitle(execId, sourceIssue ? sourceRef : null);
+      console.log(`  FILE: "${title}" → owner ${owner}`);
+      if (apply) {
+        const ok = await runMutation(
+          `file stranded-routine-execution flag for ${execId}`,
+          () => apiPost(`/api/companies/${companyId}/issues`, {
+            title,
+            description: buildStrandedRoutineFlagDescription(issue, sourceIssue ? sourceRef : null),
+            status: 'todo',
+            priority: issue.priority ?? 'high',
+            assigneeAgentId: owner,
+          }),
+          failedMutations,
+        );
+        if (ok) console.log(`    → filed (assignee ${owner}).`);
+      }
+    }
+    console.log();
+  }
+
   console.log('── Summary ──');
   console.log(`  Candidates:         ${candidatesAll.length} (own-output=${ownOutputCandidates.length}, routine-umbrella=${umbrellaCandidates.length}, stalled=${graded.filter((g) => g.grade === 'stalled').length}, human-gated=${graded.filter((g) => g.grade === 'human-gated').length})`);
   console.log(`  Awaiting-human:     ${awaitingHuman.length} (correctly modelled, not filed)`);
@@ -615,6 +852,7 @@ export async function main({ apply, apiUrl, apiKey, companyId, maxFlagsPerRun = 
   console.log(`  Dropped (cap):      ${droppedByCap.length}${droppedByCap.length > 0 ? ' — ' + droppedByCap.map(({ issue }) => issue.identifier ?? issue.id).join(', ') : ''}`);
   console.log(`  Umbrella aggregate: ${umbrellaAction}${umbrellaCandidates.length > 0 ? ` (${umbrellaCandidates.length} umbrella(s))` : ''}`);
   console.log(`  Skipped-dedup:      ${skippedDedup.length}`);
+  console.log(`  Stranded-routine:   ${strandedRoutineCandidates.length} (resolved=${toCancelStranded.length}, filed=${strandedToFile.length}, dropped=${strandedDroppedByCap.length}, skipped-dedup=${strandedSkippedDedup})`);
   console.log(`  Failed:             ${failedMutations.length}`);
   if (failedMutations.length > 0) {
     for (const { label, status } of failedMutations) console.log(`    - ${label} → ${status}`);
@@ -622,13 +860,15 @@ export async function main({ apply, apiUrl, apiKey, companyId, maxFlagsPerRun = 
   }
 
   const umbrellaPending = umbrellaCandidates.length > 0;
-  const hasPendingActions = toCancel.length > 0 || toFile.length > 0 || umbrellaPending;
+  const hasPendingActions = toCancel.length > 0 || toFile.length > 0 || umbrellaPending || toCancelStranded.length > 0 || strandedToFile.length > 0;
   if (!apply && hasPendingActions) {
     console.log('\n[DRY-RUN] Pass --apply to execute the above actions.');
     return 1;
   }
 
-  const attemptedMutations = apply ? toCancel.length + toFile.length + (umbrellaCandidates.length > 0 ? 1 : 0) : 0;
+  const attemptedMutations = apply
+    ? toCancel.length + toFile.length + (umbrellaCandidates.length > 0 ? 1 : 0) + toCancelStranded.length + strandedToFile.length
+    : 0;
   if (attemptedMutations > 0 && failedMutations.length === attemptedMutations) {
     console.log('\nERROR: every intended mutation failed this run — see Failed list above.');
     return 4;

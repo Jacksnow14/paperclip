@@ -57,3 +57,8 @@ tests/release-smoke/playwright-report/
 .superset/
 .superpowers/
 .claude/worktrees/
+
+# CodeGraph tree-sitter index cache / Python bytecode cache — regenerable
+# local tool state that shouldn't ever be tracked (AUR-5633)
+.codegraph/
+**/__pycache__/

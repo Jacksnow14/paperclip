@@ -16,8 +16,9 @@ export interface BackupDirStats {
 }
 
 export interface DiskMonitorThresholds {
-  warnPercent: number; // default 80
-  actPercent: number;  // default 90
+  warnPercent: number;  // default 80
+  actPercent: number;   // default 90
+  clearPercent: number; // default 85 — must be < actPercent (hysteresis band)
 }
 
 export interface DiskCheckResult {
@@ -27,17 +28,24 @@ export interface DiskCheckResult {
   thresholds: DiskMonitorThresholds;
   warning: boolean;
   act: boolean;
+  // True once usage has dropped below clearPercent — the auto-resolve signal.
+  // Neither `act` nor `clear` is true in the [clearPercent, actPercent)
+  // hysteresis band, so a reading oscillating around one number can't flap
+  // an alert open/closed every cycle.
+  clear: boolean;
 }
 
 const DEFAULT_THRESHOLDS: DiskMonitorThresholds = {
   warnPercent: 80,
   actPercent: 90,
+  clearPercent: 85,
 };
 
-// Module-level pressure state — process-global, lifted when disk recovers
+// Module-level pressure state — process-global, lifted when disk recovers.
+// This is fine for the run-admission throttle (it only needs to hold for the
+// life of one process), unlike alert filing below, which must be correct
+// across a restart and therefore cannot depend on in-memory state.
 let _diskPressureActive = false;
-let _lastAlertMs = 0;
-const ALERT_DEDUP_MS = 60 * 60 * 1000; // suppress duplicate CEO alerts for 1 h
 
 export function isDiskPressureActive(): boolean {
   return _diskPressureActive;
@@ -136,7 +144,8 @@ export function checkDisk(
   const childProcessCount = getChildProcessCount();
   const warning = diskStats.usedPercent >= thresholds.warnPercent;
   const act = diskStats.usedPercent >= thresholds.actPercent;
-  return { diskStats, backupDirStats, childProcessCount, thresholds, warning, act };
+  const clear = diskStats.usedPercent < thresholds.clearPercent;
+  return { diskStats, backupDirStats, childProcessCount, thresholds, warning, act, clear };
 }
 
 export function formatDiskReport(result: DiskCheckResult): string {
@@ -172,6 +181,7 @@ export function updateDiskPressure(
       thresholds,
       warning: false,
       act: false,
+      clear: false,
     };
   }
 
@@ -195,12 +205,4 @@ export function updateDiskPressure(
   }
 
   return result;
-}
-
-/** Returns true if a CEO alert should fire (deduped: at most once per ALERT_DEDUP_MS). */
-export function shouldFireCeoAlert(): boolean {
-  const now = Date.now();
-  if (now - _lastAlertMs < ALERT_DEDUP_MS) return false;
-  _lastAlertMs = now;
-  return true;
 }

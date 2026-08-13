@@ -769,7 +769,7 @@ export async function startServer(): Promise<StartedServer> {
   }
 
   if (config.heartbeatSchedulerEnabled) {
-    const { isDiskPressureActive, updateDiskPressure, shouldFireCeoAlert, checkDisk, formatDiskReport, getArtifactDirFootprints, getBackupDirStats } = await import("./services/disk-monitor.js");
+    const { isDiskPressureActive, updateDiskPressure, checkDisk, formatDiskReport, getArtifactDirFootprints, getBackupDirStats } = await import("./services/disk-monitor.js");
     const { checkGlobalRunAdmission } = await import("./services/global-run-admission-monitor.js");
     const {
       runArtifactRetention,
@@ -777,6 +777,7 @@ export async function startServer(): Promise<StartedServer> {
     } = await import("./services/artifact-retention.js");
     const { resolveArtifactRetentionPolicy } = await import("./services/artifact-retention-config.js");
     const { createDailyHealthScheduler } = await import("./services/daily-health-scheduler.js");
+    const { handleDiskAlertAct, handleDiskAlertClear } = await import("./services/disk-alert.js");
 
     const DISK_CHECK_INTERVAL_MS = 60_000;
     const DISK_HEALTH_REPORT_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -820,7 +821,6 @@ export async function startServer(): Promise<StartedServer> {
       // "Emergency backup pruning triggered on next backup cycle" while no code
       // path pruned anything — remediation reported, none performed.
       if (result.act) {
-        const fireCeoAlert = shouldFireCeoAlert();
         void (async () => {
           let emergencyPruneLine: string;
           try {
@@ -866,24 +866,59 @@ export async function startServer(): Promise<StartedServer> {
             }
           }
 
-          if (!fireCeoAlert) return;
           try {
             const companyId = await getFirstCompanyId();
-            if (companyId) {
-              // Re-measure after remediation so the alert reports the state a
-              // responder will actually find.
-              const postRemediation = checkDisk(config.databaseBackupDir, config.databaseBackupDir);
-              await issuesSvc.create(companyId, {
-                title: `[DISK ALERT] Disk usage critical: ${result.diskStats.usedPercent.toFixed(1)}%`,
-                description: `## Disk High-Water-Mark Alert\n\nDisk usage has reached **${result.diskStats.usedPercent.toFixed(1)}%** (≥${result.thresholds.actPercent}% act threshold).\n\nAt detection: ${formatDiskReport(result)}\nAfter remediation: ${formatDiskReport(postRemediation)}\n\nImmediate actions taken:\n- Non-critical run admission throttled until disk recovers\n${emergencyPruneLine}\n\nManual action may be needed to free disk space.`,
-                status: "todo",
-                priority: "critical",
-                assigneeAgentId: CEO_AGENT_ID,
-              });
-              logger.warn({ usedPercent: result.diskStats.usedPercent }, "disk-monitor: created CEO disk alert issue");
+            if (!companyId) return;
+            // Re-measure after remediation so the alert reports the state a
+            // responder will actually find.
+            const postRemediation = checkDisk(config.databaseBackupDir, config.databaseBackupDir);
+            const readingBody = `Disk usage has reached **${result.diskStats.usedPercent.toFixed(1)}%** (≥${result.thresholds.actPercent}% act threshold).\n\nAt detection: ${formatDiskReport(result)}\nAfter remediation: ${formatDiskReport(postRemediation)}\n\nImmediate actions taken:\n- Non-critical run admission throttled until disk recovers\n${emergencyPruneLine}\n\nManual action may be needed to free disk space.`;
+
+            // AUR-4997: state-based dedup — an open [DISK ALERT] issue for this
+            // origin means the alert is already live; append the new reading as
+            // a comment instead of minting another `critical` issue every
+            // DISK_CHECK_INTERVAL_MS while disk stays over threshold. This
+            // survives a server restart because it's a DB query, not
+            // in-memory state.
+            const outcome = await handleDiskAlertAct({
+              companyId,
+              result,
+              assigneeAgentId: CEO_AGENT_ID,
+              readingBody,
+              issuesSvc,
+            });
+            // Skipped readings stay out of the log too: one warn per minute
+            // for the life of a disk-pressure episode is its own spam.
+            if (outcome.action !== "skipped_recent_reading") {
+              logger.warn(
+                { usedPercent: result.diskStats.usedPercent, issueId: outcome.issueId, action: outcome.action },
+                outcome.action === "created"
+                  ? "disk-monitor: created CEO disk alert issue"
+                  : "disk-monitor: appended reading to existing open disk alert",
+              );
             }
           } catch (err) {
-            logger.error({ err }, "disk-monitor: failed to create CEO disk alert issue");
+            logger.error({ err }, "disk-monitor: failed to file/update CEO disk alert issue");
+          }
+        })();
+      } else if (result.clear) {
+        // AUR-4997: auto-resolve — usage has dropped below the clear
+        // threshold (strictly below the act threshold, so a reading
+        // oscillating around one number can't flap the alert open/closed).
+        void (async () => {
+          try {
+            const companyId = await getFirstCompanyId();
+            if (!companyId) return;
+            const recoveryBody = `Disk usage recovered to **${result.diskStats.usedPercent.toFixed(1)}%** (< ${result.thresholds.clearPercent}% clear threshold).\n\n${formatDiskReport(result)}`;
+            const outcome = await handleDiskAlertClear({ companyId, recoveryBody, issuesSvc });
+            if (outcome.action === "resolved") {
+              logger.info(
+                { usedPercent: result.diskStats.usedPercent, issueId: outcome.issueId },
+                "disk-monitor: auto-resolved disk alert",
+              );
+            }
+          } catch (err) {
+            logger.error({ err }, "disk-monitor: failed to auto-resolve disk alert issue");
           }
         })();
       }

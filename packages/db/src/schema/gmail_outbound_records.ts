@@ -12,6 +12,11 @@ export const gmailOutboundRecords = pgTable(
     recipient: text("recipient"),
     subject: text("subject"),
     snippet: text("snippet"),
+    // AUR-4674: how this row was produced. "sent" = recorded by the sendMessage()
+    // chokepoint at dispatch time. "out_of_band*" = discovered by the outbound
+    // reconciler in the mailbox's SENT label with no chokepoint record — i.e. a
+    // send that bypassed the control plane (raw SA-key send, co-tenant, script).
+    status: text("status").notNull().default("sent"),
     sentAt: timestamp("sent_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },

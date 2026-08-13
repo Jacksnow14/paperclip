@@ -23,6 +23,32 @@ const FULL_RUN_MEMORY_FLOOR_MB = 3000;
 const CHANGED_MODE_MEMORY_FLOOR_MB = 1200;
 const CHANGED_MODE_SMALL_SET_LIMIT = 3;
 
+// AUR-5012: AUR-4536 landed after AUR-4064 shipped this gate and now wraps
+// every agent run in a transient systemd --user scope with a hard per-run
+// memcg ceiling (1168 MB on the 7747 MB host this was derived on — see
+// packages/adapter-utils/src/server-utils.ts's resolveRunMemoryCeilingMb).
+// The gate above only reads HOST `MemAvailable`, so it green-lights a run
+// the kernel then reaps at 1168 MB — the original AUR-3545 signature
+// (process_lost, zero cost events) via a different mechanism. The floors
+// above stay the HOST-side gate, unchanged; the constants and functions
+// below add a SECOND, cgroup-side gate on top, using the SAME floors (a run
+// must clear both the host floor and the cgroup floor to proceed in-process).
+//
+// Measured 2026-08-05: server `tsc --noEmit` only completes (exit 0, 62s,
+// peak RSS 2489 MB) inside a `systemd-run --user --scope -p MemoryMax=3500M`
+// with heap 3072 — that is the proven relaunch scope size. Never raise it
+// without re-measuring; never touch server-utils.ts's per-run ceiling to
+// "fix" this from the other side (AUR-4536 owns that number).
+const RELAUNCH_SCOPE_MEMORY_MB = 3500;
+// Recursion guard: set on the relaunched child's env so it never attempts to
+// relaunch itself again, however tight its own cgroup headroom looks.
+const RELAUNCH_SENTINEL_ENV_VAR = "PAPERCLIP_TYPECHECK_SCOPED";
+// cgroup v1's memory.limit_in_bytes reports a huge sentinel (near LLONG_MAX,
+// rounded to a page boundary) rather than the literal "max" string cgroup v2
+// uses for "no limit". Any reading past this threshold (a petabyte — orders
+// of magnitude beyond any real host) is treated as unlimited.
+const CGROUP_V1_UNLIMITED_THRESHOLD_BYTES = 1e15;
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, "..");
 
@@ -34,14 +60,130 @@ export function clampNodeOptions(nodeOptionsEnv) {
   return kept.join(" ");
 }
 
-export function evaluateMemoryGate(memAvailableMB, floorMB = FULL_RUN_MEMORY_FLOOR_MB) {
+export function evaluateMemoryGate(memAvailableMB, floorMB = FULL_RUN_MEMORY_FLOOR_MB, options = {}) {
+  const { mode = "full" } = options;
   if (memAvailableMB < floorMB) {
+    const advice =
+      mode === "changed"
+        ? "Retry when the host is quieter, or split your change so it touches fewer widely-depended-on packages."
+        : "Run 'pnpm typecheck:changed' to check only your touched packages, or retry when the host is quieter.";
     return {
       ok: false,
-      message: `insufficient memory: ${memAvailableMB} MB available, need ${floorMB} MB. Run 'pnpm typecheck:changed' to check only your touched packages, or retry when the host is quieter.`,
+      message: `insufficient memory: ${memAvailableMB} MB available, need ${floorMB} MB. ${advice}`,
     };
   }
   return { ok: true, message: null };
+}
+
+// --- cgroup awareness (AUR-5012) ---------------------------------------
+//
+// Pure parsing/decision functions below take injected text/readings so they
+// can be unit-tested without manufacturing real memory pressure on a host.
+// The IO wrappers that actually read /proc and /sys/fs/cgroup live further
+// down, alongside the other real-filesystem helpers (currentMemAvailableMB
+// etc.).
+
+// cgroup v2: a single line "0::<slice-path>". Returns the slice path (e.g.
+// "/user.slice/.../run-u123.scope") or null if this isn't a v2-only cgroup.
+export function parseCgroupV2LeafPath(procSelfCgroupText) {
+  for (const rawLine of (procSelfCgroupText ?? "").split("\n")) {
+    const line = rawLine.trim();
+    if (line.startsWith("0::")) {
+      const path = line.slice(3);
+      return path.length > 0 ? path : null;
+    }
+  }
+  return null;
+}
+
+// cgroup v1: one line per controller, "<hierarchy-id>:<controllers>:<path>".
+// Finds the line whose comma-separated controller list includes "memory".
+export function parseCgroupV1MemoryPath(procSelfCgroupText) {
+  for (const rawLine of (procSelfCgroupText ?? "").split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const parts = line.split(":");
+    if (parts.length < 3) continue;
+    const controllers = parts[1].split(",");
+    if (controllers.includes("memory")) {
+      const path = parts.slice(2).join(":");
+      return path.length > 0 ? path : null;
+    }
+  }
+  return null;
+}
+
+// Handles cgroup v2's literal "max" (no limit) and v1's huge sentinel value
+// for the same meaning. Returns null for "no limit" or an unparseable
+// reading — both mean "this file imposes no additional constraint".
+export function parseCgroupMemoryMaxMB(rawText) {
+  const trimmed = (rawText ?? "").trim();
+  if (trimmed === "" || trimmed === "max") return null;
+  const bytes = Number(trimmed);
+  if (!Number.isFinite(bytes) || bytes < 0) return null;
+  if (bytes >= CGROUP_V1_UNLIMITED_THRESHOLD_BYTES) return null;
+  return Math.floor(bytes / (1024 * 1024));
+}
+
+export function parseCgroupMemoryCurrentMB(rawText) {
+  const trimmed = (rawText ?? "").trim();
+  const bytes = Number(trimmed);
+  if (!Number.isFinite(bytes) || bytes < 0) return null;
+  return Math.floor(bytes / (1024 * 1024));
+}
+
+// null propagates "no cgroup constraint known" (unlimited max, or either
+// reading missing/unparseable) rather than a false 0 that would refuse
+// every run on a host where the cgroup files simply don't exist.
+export function computeCgroupHeadroomMB(maxMB, currentMB) {
+  if (maxMB === null || currentMB === null) return null;
+  return Math.max(0, maxMB - currentMB);
+}
+
+// The single effective-limit / relaunch decision. Takes plain numbers (or
+// null for "no cgroup reading") so every branch is unit-testable by
+// injection, per AUR-3545's "inject the readings, don't manufacture real
+// memory pressure" precedent.
+//
+// - cgroupHeadroomMB === null: no cgroup constraint (unreadable or
+//   unlimited) — falls back to the host-only floor check, exactly AUR-4064's
+//   original behaviour.
+// - Both host AND cgroup must clear floorMB for "run" (in-process).
+// - If only the cgroup reading is short, and a relaunch could plausibly fix
+//   it (not already scoped, systemd-run available, and a scope sized off
+//   the proven need would itself clear the floor), relaunch instead of
+//   refusing.
+// - Otherwise refuse — including when the HOST itself is short (a bigger
+//   scope can never exceed real host memory, so relaunching cannot help).
+export function decideExecutionPlan({
+  hostAvailableMB,
+  cgroupHeadroomMB,
+  floorMB,
+  alreadyScoped,
+  systemdAvailable,
+  scopeSizeMB = RELAUNCH_SCOPE_MEMORY_MB,
+}) {
+  const effectiveAvailableMB =
+    cgroupHeadroomMB === null ? hostAvailableMB : Math.min(hostAvailableMB, cgroupHeadroomMB);
+
+  if (effectiveAvailableMB >= floorMB) {
+    return { action: "run", effectiveAvailableMB };
+  }
+
+  if (hostAvailableMB < floorMB) {
+    // Host memory itself is the binding constraint. A relaunch scope can
+    // never exceed real host memory, so it cannot help here.
+    return { action: "refuse", effectiveAvailableMB, reason: "host" };
+  }
+
+  if (!alreadyScoped && systemdAvailable) {
+    const sizedMB = Math.min(scopeSizeMB, hostAvailableMB);
+    if (sizedMB >= floorMB) {
+      return { action: "relaunch", sizedMB, effectiveAvailableMB, reason: "cgroup" };
+    }
+  }
+
+  return { action: "refuse", effectiveAvailableMB, reason: "cgroup" };
 }
 
 export function readMemAvailableMB(meminfoText) {
@@ -270,6 +412,77 @@ function currentMemAvailableMB() {
   return readMemAvailableMB(readFileSync("/proc/meminfo", "utf8"));
 }
 
+// Real-filesystem counterpart to the pure cgroup parsers above. Tries
+// cgroup v2 first (this host, and every modern systemd host), falls back to
+// v1, and returns a `source` that is always logged so a fallback is never
+// silent. Any unreadable/missing file degrades to "unavailable" rather than
+// throwing — the caller then falls back to the host-only reading, exactly
+// like the existing `resolvedDirs === null` fallback above.
+function readCgroupState() {
+  let cgroupText;
+  try {
+    cgroupText = readFileSync("/proc/self/cgroup", "utf8");
+  } catch (err) {
+    return { headroomMB: null, source: "unavailable", detail: `/proc/self/cgroup unreadable: ${err.message}` };
+  }
+
+  const v2Path = parseCgroupV2LeafPath(cgroupText);
+  if (v2Path !== null) {
+    try {
+      const maxRaw = readFileSync(`/sys/fs/cgroup${v2Path}/memory.max`, "utf8");
+      const currentRaw = readFileSync(`/sys/fs/cgroup${v2Path}/memory.current`, "utf8");
+      const maxMB = parseCgroupMemoryMaxMB(maxRaw);
+      const currentMB = parseCgroupMemoryCurrentMB(currentRaw);
+      return { headroomMB: computeCgroupHeadroomMB(maxMB, currentMB), source: "v2", maxMB, currentMB };
+    } catch {
+      // v2 mount present but this leaf's memory files aren't (unusual, but
+      // fall through to a v1 attempt rather than giving up outright).
+    }
+  }
+
+  const v1Path = parseCgroupV1MemoryPath(cgroupText);
+  if (v1Path !== null) {
+    try {
+      const maxRaw = readFileSync(`/sys/fs/cgroup/memory${v1Path}/memory.limit_in_bytes`, "utf8");
+      const currentRaw = readFileSync(`/sys/fs/cgroup/memory${v1Path}/memory.usage_in_bytes`, "utf8");
+      const maxMB = parseCgroupMemoryMaxMB(maxRaw);
+      const currentMB = parseCgroupMemoryCurrentMB(currentRaw);
+      return { headroomMB: computeCgroupHeadroomMB(maxMB, currentMB), source: "v1", maxMB, currentMB };
+    } catch (err) {
+      return { headroomMB: null, source: "unavailable", detail: `cgroup v1 memory files unreadable: ${err.message}` };
+    }
+  }
+
+  return { headroomMB: null, source: "unavailable", detail: "no cgroup v2 or v1 memory-controller path in /proc/self/cgroup" };
+}
+
+// Mirrors resolveSystemdRunPath in packages/adapter-utils/src/server-utils.ts
+// (same two checks: systemd as PID 1, then a PATH scan) without importing
+// that module — this script runs standalone via `node scripts/typecheck.mjs`
+// pre-build, and AUR-4536 owns that file; this only reads the same signal.
+function resolveSystemdRunPathSync(env) {
+  if (process.platform !== "linux") return null;
+  if (!existsSync("/run/systemd/system")) return null;
+  const pathValue = env.PATH ?? "";
+  for (const dir of pathValue.split(":").filter(Boolean)) {
+    const candidate = join(dir, "systemd-run");
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function buildEscapeCommand(sizedMB, changedMode) {
+  const cmd = changedMode ? "pnpm typecheck:changed" : "pnpm typecheck";
+  return `systemd-run --user --scope -p MemoryMax=${sizedMB}M -p MemorySwapMax=0 -- ${cmd}`;
+}
+
+function describeCgroupState(cgroupState) {
+  if (cgroupState.headroomMB !== null) {
+    return `headroom ${cgroupState.headroomMB} MB (limit ${cgroupState.maxMB} MB, in-use ${cgroupState.currentMB} MB, source ${cgroupState.source})`;
+  }
+  return `unavailable (${cgroupState.source}${cgroupState.detail ? `: ${cgroupState.detail}` : ""})`;
+}
+
 function runPnpm(filterArgs, label) {
   const pnpmArgs = [...filterArgs, "--workspace-concurrency=1", "typecheck"];
   console.log(`[typecheck] ${label}: pnpm ${pnpmArgs.join(" ")}`);
@@ -285,14 +498,96 @@ function runPnpm(filterArgs, label) {
   process.exit(result.status ?? 1);
 }
 
-function runFull(reason) {
-  if (reason) console.log(`[typecheck] ${reason}`);
-  const gate = evaluateMemoryGate(currentMemAvailableMB());
-  if (!gate.ok) {
-    console.error(`[typecheck] ${gate.message}`);
+// Re-execs this same script (same argv) inside a fresh, bounded systemd
+// --user scope. `systemd-run --scope` execs directly into the target (no
+// wrapper pid), and the child's cgroup is a NEW scope entirely separate
+// from the parent run's 1168 MB ceiling — so headroom there is the full
+// sized MB, not this run's leftover. The recursion sentinel travels via env
+// so the child's own gate check refuses instead of relaunching again.
+function relaunchInScope(systemdRunPath, sizedMB, cliArgs) {
+  const scopeArgs = [
+    "--user",
+    "--scope",
+    "--quiet",
+    "--collect",
+    "-p",
+    `MemoryMax=${sizedMB}M`,
+    "-p",
+    "MemorySwapMax=0",
+    "--",
+    process.execPath,
+    fileURLToPath(import.meta.url),
+    ...cliArgs,
+  ];
+  console.log(`[typecheck] cgroup headroom insufficient; relaunching inside a bounded scope: MemoryMax=${sizedMB}M`);
+  const result = spawnSync(systemdRunPath, scopeArgs, {
+    cwd: repoRoot,
+    stdio: "inherit",
+    env: { ...process.env, [RELAUNCH_SENTINEL_ENV_VAR]: "1" },
+  });
+  if (result.error) {
+    console.error(`[typecheck] failed to relaunch inside a systemd scope: ${result.error.message}`);
     process.exit(1);
   }
-  runPnpm(["-r"], "full serial run");
+  process.exit(result.status ?? 1);
+}
+
+// Single choke point for both the full-run and changed-mode paths: reads
+// host + cgroup memory, decides run/relaunch/refuse, and either invokes
+// `run()` in-process, relaunches into a scope (never returns), or refuses
+// loudly (never returns) — never a silent kill.
+function gateAndRun(floorMB, mode, run) {
+  const hostAvailableMB = currentMemAvailableMB();
+  const cgroupState = readCgroupState();
+  const alreadyScoped = process.env[RELAUNCH_SENTINEL_ENV_VAR] === "1";
+  const systemdRunPath = resolveSystemdRunPathSync(process.env);
+
+  console.log(`[typecheck] host MemAvailable ${hostAvailableMB} MB; cgroup ${describeCgroupState(cgroupState)}`);
+
+  const plan = decideExecutionPlan({
+    hostAvailableMB,
+    cgroupHeadroomMB: cgroupState.headroomMB,
+    floorMB,
+    alreadyScoped,
+    systemdAvailable: systemdRunPath !== null,
+  });
+
+  if (plan.action === "run") {
+    console.log(`[typecheck] memory gate cleared: effective ${plan.effectiveAvailableMB} MB >= floor ${floorMB} MB`);
+    run();
+    return;
+  }
+
+  if (plan.action === "relaunch") {
+    relaunchInScope(systemdRunPath, plan.sizedMB, process.argv.slice(2));
+    return;
+  }
+
+  // refuse — never proceed into a run the kernel would silently reap.
+  if (plan.reason === "host") {
+    const gate = evaluateMemoryGate(hostAvailableMB, floorMB, { mode });
+    console.error(`[typecheck] ${gate.message}`);
+  } else {
+    const lines = [
+      `insufficient cgroup memory: need ${floorMB} MB, but ${describeCgroupState(cgroupState)}.`,
+    ];
+    if (alreadyScoped) {
+      lines.push(
+        `already relaunched into a bounded scope once (${RELAUNCH_SENTINEL_ENV_VAR}=1) — refusing rather than relaunching again.`,
+      );
+    } else if (systemdRunPath === null) {
+      lines.push(
+        `systemd-run is unavailable on this host, so this runner cannot self-relaunch. Escape: ${buildEscapeCommand(RELAUNCH_SCOPE_MEMORY_MB, mode === "changed")}`,
+      );
+    }
+    console.error(`[typecheck] ${lines.join(" ")}`);
+  }
+  process.exit(1);
+}
+
+function runFull(reason) {
+  if (reason) console.log(`[typecheck] ${reason}`);
+  gateAndRun(FULL_RUN_MEMORY_FLOOR_MB, "full", () => runPnpm(["-r"], "full serial run"));
 }
 
 function main() {
@@ -357,13 +652,8 @@ function main() {
     console.log(`[typecheck] changed packages (${packages.join(", ")}) expand to ${resolvedDirs.length} package(s) incl. dependents: ${resolvedDirs.join(", ")}`);
     floor = selectMemoryFloor(resolvedDirs);
   }
-  const gate = evaluateMemoryGate(currentMemAvailableMB(), floor);
-  if (!gate.ok) {
-    console.error(`[typecheck] ${gate.message}`);
-    process.exit(1);
-  }
 
-  runPnpm(filterArgs, `changed-package run (${packages.join(", ")})`);
+  gateAndRun(floor, "changed", () => runPnpm(filterArgs, `changed-package run (${packages.join(", ")})`));
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

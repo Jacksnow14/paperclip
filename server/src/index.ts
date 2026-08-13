@@ -6,7 +6,7 @@ import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { pathToFileURL } from "node:url";
 import type { Request as ExpressRequest, RequestHandler } from "express";
-import { and, eq, notInArray } from "drizzle-orm";
+import { and, asc, eq, notInArray } from "drizzle-orm";
 import {
   createDb,
   ensurePostgresDatabase,
@@ -1139,6 +1139,44 @@ export async function startServer(): Promise<StartedServer> {
         logger.info(
           { intervalMs: config.gmailIntakePollerIntervalMs },
           "Gmail intake poller: scheduled",
+        );
+      }
+    }
+
+    // AUR-4674: out-of-band outbound reconciler — detects sends that bypassed
+    // the control-plane chokepoint (raw SA-key sends) by sweeping each
+    // mailbox's SENT label against gmail_outbound_records, and files a
+    // critical incident for gated sends with no approved matching scope.
+    if (config.gmailOutboundReconcilerEnabled) {
+      if (!process.env.GOOGLE_WORKSPACE_SA_KEY) {
+        logger.info(
+          "Gmail outbound reconciler: GOOGLE_WORKSPACE_SA_KEY not set — reconciler disabled (no-op)",
+        );
+      } else {
+        const { createGmailOutboundReconciler, createGmailOutboundReconcilerScheduler } =
+          await import("./services/gmail-outbound-reconciler.js");
+        // The Workspace mailboxes are org-level, so the sweep is scoped to the
+        // single company that owns them: explicit override, else the oldest
+        // company (the founding company — later companies on this instance are
+        // test fixtures with no relation to the mailbox domain).
+        const getGmailOwningCompanyId = async (): Promise<string | undefined> => {
+          if (config.gmailOutboundReconcilerCompanyId) return config.gmailOutboundReconcilerCompanyId;
+          const rows = await (db as any)
+            .select({ id: companies.id })
+            .from(companies)
+            .orderBy(asc(companies.createdAt), asc(companies.id))
+            .limit(1);
+          return rows[0]?.id;
+        };
+        createGmailOutboundReconcilerScheduler({
+          getOwningCompanyId: getGmailOwningCompanyId,
+          reconciler: createGmailOutboundReconciler(db as any),
+          startupDelayMs: 120_000,
+          intervalMs: config.gmailOutboundReconcilerIntervalMs,
+        }).start();
+        logger.info(
+          { intervalMs: config.gmailOutboundReconcilerIntervalMs },
+          "Gmail outbound reconciler: scheduled",
         );
       }
     }

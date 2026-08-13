@@ -89,6 +89,9 @@ export interface Config {
   silentRunWatchdogEnabled: boolean;
   gmailIntakePollerEnabled: boolean;
   gmailIntakePollerIntervalMs: number;
+  gmailOutboundReconcilerEnabled: boolean;
+  gmailOutboundReconcilerIntervalMs: number;
+  gmailOutboundReconcilerCompanyId: string | undefined;
   artifactRetentionProdDefault: boolean;
   companyDeletionEnabled: boolean;
   telemetryEnabled: boolean;
@@ -347,6 +350,13 @@ export function loadConfig(): Config {
     silentRunWatchdogEnabled: process.env.SILENT_RUN_WATCHDOG_ENABLED !== "false",
     gmailIntakePollerEnabled: process.env.GMAIL_INTAKE_POLLER_ENABLED !== "false",
     gmailIntakePollerIntervalMs: Math.max(60_000, Number(process.env.GMAIL_INTAKE_POLLER_INTERVAL_MS) || 10 * 60 * 1000),
+    // AUR-4674: out-of-band send detector. Same env-gate style as the intake
+    // poller — on by default wherever the SA key is configured.
+    gmailOutboundReconcilerEnabled: process.env.GMAIL_OUTBOUND_RECONCILER_ENABLED !== "false",
+    gmailOutboundReconcilerIntervalMs: Math.max(60_000, Number(process.env.GMAIL_OUTBOUND_RECONCILER_INTERVAL_MS) || 10 * 60 * 1000),
+    // Owning company for the org-level mailbox sweep; unset falls back to the
+    // oldest company (see the reconciler wiring in index.ts).
+    gmailOutboundReconcilerCompanyId: process.env.GMAIL_OUTBOUND_RECONCILER_COMPANY_ID || undefined,
     // AUR-1735: opt-in switch that activates the AUR-1722 artifact-retention
     // policy when persisted instance settings are still dormant. Set on the
     // prod (default) deployment; leave unset on CI/dev so they stay dormant.

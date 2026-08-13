@@ -613,9 +613,15 @@ export function createGmailService(db?: Db) {
           })
           .onConflictDoNothing();
       } catch (err) {
-        logger.warn(
+        // AUR-4674: this write failing means the outbound audit trail — which
+        // the out-of-band reconciler treats as proof a send went through the
+        // chokepoint — is silently dying. It failed on EVERY send from ship
+        // time until 0105 converged the live schema (missing `snippet`
+        // column), and nobody saw the warn. Error-level so it pages a log
+        // sweep instead of vanishing.
+        logger.error(
           { err, alias, to: opts.to, messageId: res.data.id },
-          "gmail: failed to record outbound message for reply tracking (AUR-1796)",
+          "gmail: failed to record outbound message for reply tracking (AUR-1796/AUR-4674)",
         );
       }
     }

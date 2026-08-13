@@ -1433,4 +1433,269 @@ describe.sequential("agent permission routes", () => {
     expect(res.status).toBe(403);
     expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
   });
+
+  // AUR-5026: narrow `canUpdateAgentMetadata` grant — metadata-only PATCH on
+  // another agent. The matrix proves both halves: the grant admits exactly the
+  // metadata-only shape (CLEARING case) and nothing else (FIRING cases), and
+  // legacy admissions keep byte-identical replace semantics.
+  describe("narrow canUpdateAgentMetadata grant (AUR-5026)", () => {
+    const granteeId = "44444444-4444-4444-8444-444444444444";
+
+    function mockActorAndTarget(
+      permissions: Record<string, unknown>,
+      role = "engineer",
+    ) {
+      const actorAgent = {
+        ...baseAgent,
+        id: granteeId,
+        name: "Watchdog",
+        urlKey: "watchdog",
+        role,
+        permissions,
+      };
+      const target = { ...baseAgent, metadata: { keep: "x" } };
+      mockAgentService.getById.mockImplementation(async (id: string) => {
+        if (id === granteeId) return actorAgent;
+        if (id === agentId) return target;
+        return null;
+      });
+      return { actorAgent, target };
+    }
+
+    function granteeApp() {
+      return createApp({
+        type: "agent",
+        agentId: granteeId,
+        companyId,
+        source: "agent_key",
+        runId: "run-1",
+      });
+    }
+
+    it("admits a metadata-only PATCH on another agent and merges top-level metadata (CLEARING case)", async () => {
+      const { target } = mockActorAndTarget({ canCreateAgents: false, canUpdateAgentMetadata: true });
+      mockAgentService.update.mockResolvedValue({
+        ...target,
+        metadata: { keep: "x", darkLane: { enabled: true } },
+      });
+
+      const app = await granteeApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ metadata: { darkLane: { enabled: true } } }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      // Top-level merge: the pre-existing unrelated key survives, and nothing
+      // beyond metadata is written.
+      expect(mockAgentService.update).toHaveBeenCalledWith(
+        agentId,
+        { metadata: { keep: "x", darkLane: { enabled: true } } },
+        expect.anything(),
+      );
+      expect(res.body.metadata).toEqual({ keep: "x", darkLane: { enabled: true } });
+    });
+
+    it("rejects a mixed metadata+adapterType body from a grant-only holder with nothing written", async () => {
+      mockActorAndTarget({ canCreateAgents: false, canUpdateAgentMetadata: true });
+
+      const app = await granteeApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ metadata: { darkLane: { enabled: true } }, adapterType: "process" }));
+
+      expect(res.status).toBe(403);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalled();
+    });
+
+    it("rejects metadata: null from a grant-only holder (whole-record wipe hazard)", async () => {
+      mockActorAndTarget({ canCreateAgents: false, canUpdateAgentMetadata: true });
+
+      const app = await granteeApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ metadata: null }));
+
+      expect(res.status).toBe(422);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects an empty body from a grant-only holder", async () => {
+      mockActorAndTarget({ canCreateAgents: false, canUpdateAgentMetadata: true });
+
+      const app = await granteeApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({}));
+
+      expect(res.status).toBe(403);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("still rejects a metadata-only PATCH from an agent without the flag (original guard fires)", async () => {
+      mockActorAndTarget({ canCreateAgents: false, canUpdateAgentMetadata: false });
+
+      const app = await granteeApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ metadata: { darkLane: { enabled: true } } }));
+
+      expect(res.status).toBe(403);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("does not widen to the permissions route", async () => {
+      mockActorAndTarget({ canCreateAgents: false, canUpdateAgentMetadata: true });
+
+      const app = await granteeApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}/permissions`)
+        .send({ canCreateAgents: true, canAssignTasks: true }));
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("Only CEO can manage permissions");
+      expect(mockAgentService.updatePermissions).not.toHaveBeenCalled();
+    });
+
+    it("does not widen to the instructions-path route", async () => {
+      mockActorAndTarget({ canCreateAgents: false, canUpdateAgentMetadata: true });
+
+      const app = await granteeApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}/instructions-path`)
+        .send({ path: "/tmp/injected" }));
+
+      expect(res.status).toBe(403);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("does not widen to the instructions-bundle route", async () => {
+      mockActorAndTarget({ canCreateAgents: false, canUpdateAgentMetadata: true });
+
+      const app = await granteeApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}/instructions-bundle`)
+        .send({ mode: "external" }));
+
+      expect(res.status).toBe(403);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("does not widen to skill sync", async () => {
+      mockActorAndTarget({ canCreateAgents: false, canUpdateAgentMetadata: true });
+
+      const app = await granteeApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${agentId}/skills/sync`)
+        .send({ desiredSkills: ["some-skill"] }));
+
+      expect(res.status).toBe(403);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("does not widen to agent deletion", async () => {
+      mockActorAndTarget({ canCreateAgents: false, canUpdateAgentMetadata: true });
+
+      const app = await granteeApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .delete(`/api/agents/${agentId}`));
+
+      expect(res.status).toBe(403);
+    });
+
+    it("does not widen to agent creation", async () => {
+      mockActorAndTarget({ canCreateAgents: false, canUpdateAgentMetadata: true });
+
+      const app = await granteeApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(`/api/companies/${companyId}/agents`)
+        .send({
+          name: "Backdoor",
+          role: "engineer",
+          adapterType: "process",
+          adapterConfig: {},
+        }));
+
+      expect(res.status).toBe(403);
+      expect(mockAgentService.create).not.toHaveBeenCalled();
+    });
+
+    it("keeps wholesale replace semantics for a CEO-admitted metadata PATCH (regression pin)", async () => {
+      mockActorAndTarget({ canCreateAgents: false }, "ceo");
+
+      const app = await granteeApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ metadata: { darkLane: { enabled: true } } }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      // Not merged: the pre-existing `keep` key is replaced away, exactly as before.
+      expect(mockAgentService.update).toHaveBeenCalledWith(
+        agentId,
+        { metadata: { darkLane: { enabled: true } } },
+        expect.anything(),
+      );
+    });
+
+    it("keeps wholesale replace semantics for a board-admitted metadata PATCH (regression pin)", async () => {
+      mockAgentService.getById.mockResolvedValue({ ...baseAgent, metadata: { keep: "x" } });
+
+      const app = await createApp({
+        type: "board",
+        userId: "board-user",
+        source: "local_implicit",
+        isInstanceAdmin: true,
+        companyIds: [companyId],
+      });
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ metadata: { darkLane: { enabled: true } } }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockAgentService.update).toHaveBeenCalledWith(
+        agentId,
+        { metadata: { darkLane: { enabled: true } } },
+        expect.anything(),
+      );
+    });
+
+    it("keeps mixed-body updates working for canCreateAgents holders (regression pin)", async () => {
+      mockActorAndTarget({ canCreateAgents: true });
+
+      const app = await granteeApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ metadata: { darkLane: { enabled: true } }, title: "Retitled" }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockAgentService.update).toHaveBeenCalledWith(
+        agentId,
+        { metadata: { darkLane: { enabled: true } }, title: "Retitled" },
+        expect.anything(),
+      );
+    });
+
+    it("lets a CEO issue the flag through the permissions route", async () => {
+      mockActorAndTarget({ canCreateAgents: false }, "ceo");
+      mockAgentService.updatePermissions.mockResolvedValue({
+        ...baseAgent,
+        permissions: { canCreateAgents: false, canUpdateAgentMetadata: true },
+      });
+
+      const app = await granteeApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}/permissions`)
+        .send({ canCreateAgents: false, canAssignTasks: true, canUpdateAgentMetadata: true }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockAgentService.updatePermissions).toHaveBeenCalledWith(
+        agentId,
+        expect.objectContaining({ canUpdateAgentMetadata: true }),
+      );
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "agent.permissions_updated",
+        details: expect.objectContaining({ canUpdateAgentMetadata: true }),
+      }));
+    });
+  });
 });

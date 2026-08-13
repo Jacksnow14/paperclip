@@ -143,6 +143,7 @@ run_check() {
   PAPERCLIP_DRIFT_MERGE_DEBT_RECHECK_DELAY_SEC=0 \
   PAPERCLIP_DRIFT_CHECKOUTS="${PAPERCLIP_DRIFT_CHECKOUTS-}" \
   PAPERCLIP_DRIFT_CHECKOUT_REFRESH="${PAPERCLIP_DRIFT_CHECKOUT_REFRESH-}" \
+  PAPERCLIP_DRIFT_UNITS="${PAPERCLIP_DRIFT_UNITS-}" \
   FAKE_TIP_DATE="${FAKE_TIP_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
   FAKE_PR_DIR="${FAKE_PR_DIR:-$TMP/prs-none}" \
   NOTIFY_SINK="$SINK" \
@@ -715,6 +716,109 @@ if [[ "$lines" == "3" && "$bare" == "0" ]]; then
 else
   fail "all 3 checkout lines carry a refresh= field (absence = refresher dead)" \
     "lines=$lines bare=$bare out=$out"
+fi
+
+# --- unit-drift axis (AUR-5648, follow-up to AUR-5647) ----------------------
+# No deploy path re-runs the systemd installer scripts, so an installed unit
+# can silently keep an old copy while the active release's own copy (never
+# origin/master) has already moved on. These cases prove the axis both FIRES
+# on a genuinely stale/missing installed artifact and PASSES on a current one
+# — a check that can never return STALE is exactly the bug being fixed. The
+# axis is OPT-IN, same reasoning as PAPERCLIP_DRIFT_CHECKOUTS (case 39 below).
+
+UNIT_REL_DIR="$APP/current/scripts/deploy/systemd"
+mkdir -p "$UNIT_REL_DIR"
+printf 'release copy content\n' > "$UNIT_REL_DIR/fixture.service"
+UNIT_INSTALLED="$TMP/installed-fixture.service"
+UN_LOG="$LOG.unit-fixture"
+UN_STATE="$STATE.unit-fixture"
+
+run_check_unit() {
+  PAPERCLIP_DRIFT_UNITS="fixture:fixture.service:$UNIT_INSTALLED:system" run_check
+}
+
+# 34. PASS: installed copy byte-identical to the active release's own copy
+#     reports ok and pages no one.
+printf 'release copy content\n' > "$UNIT_INSTALLED"
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"; clear_ad_state
+rm -f "$UN_LOG" "$UN_STATE"
+out=$(run_check_unit); rc=$?
+if [[ "$rc" == "0" && "$(alerts)" == "0" ]] && grep -q "unit=fixture level=system .*status=ok" <<<"$out"; then
+  ok "unit content matching the active release reports ok and exits 0"
+else
+  fail "unit content matching the active release reports ok and exits 0" "rc=$rc alerts=$(alerts) out=$out"
+fi
+
+# 35. FIRE (below threshold): installed copy diverges from the active
+#     release's copy. Seeded at 3h — below the 24h unit-debt threshold, so it
+#     drifts (nonzero exit) but does not yet page.
+printf 'HAND-EDITED content, never reinstalled\n' > "$UNIT_INSTALLED"
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+: > "$UN_LOG"; : > "$UN_STATE"
+now=$(date -u +%s)
+stamp=$(date -u -d "@$(( now - 3 * 3600 ))" +%Y-%m-%dT%H:%M:%SZ)
+printf '%s unit=fixture level=system installed=%s status=DRIFT reason=unit-behind:fixture\n' \
+  "$stamp" "$UNIT_INSTALLED" >> "$UN_LOG"
+out=$(run_check_unit); rc=$?
+if [[ "$rc" == "1" && "$(alerts)" == "0" ]] && grep -q "reason=unit-behind:fixture" <<<"$out"; then
+  ok "unit content behind the active release for 3h drifts but does not page"
+else
+  fail "unit content behind the active release for 3h drifts but does not page" "rc=$rc alerts=$(alerts) out=$out"
+fi
+
+# 36. FIRE (sustained past threshold): left behind for 30h, it pages, naming
+#     the unit, at INFO severity (AUR-5355 posture: same fleet-internal debt
+#     character as checkout-debt/deploy-debt, not a founder-actionable page).
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+: > "$UN_LOG"; : > "$UN_STATE"
+stamp=$(date -u -d "@$(( now - 30 * 3600 ))" +%Y-%m-%dT%H:%M:%SZ)
+printf '%s unit=fixture level=system installed=%s status=DRIFT reason=unit-behind:fixture\n' \
+  "$stamp" "$UNIT_INSTALLED" >> "$UN_LOG"
+out=$(run_check_unit); rc=$?
+if [[ "$(alerts)" == "1" ]] && grep -q "unit-behind:fixture" "$SINK"; then
+  ok "unit content behind the active release for 30h pages, naming the unit"
+else
+  fail "unit content behind the active release for 30h pages, naming the unit" "rc=$rc alerts=$(alerts) sink=$(cat "$SINK" 2>/dev/null) out=$out"
+fi
+if grep -q "^INFO .*unit-behind:fixture" "$SINK" && ! grep -q "^SEV2 " "$SINK"; then
+  ok "unit-debt (unit-behind) escalates at INFO, not SEV2"
+else
+  fail "unit-debt (unit-behind) escalates at INFO, not SEV2" "sink=$(cat "$SINK" 2>/dev/null)"
+fi
+
+# 37. FIRE (missing): the installed artifact is absent entirely — a real
+#     MISSING status, not a skip, since the manifest names a definitive
+#     expected location.
+rm -f "$UNIT_INSTALLED"
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+: > "$UN_LOG"; : > "$UN_STATE"
+out=$(run_check_unit); rc=$?
+if [[ "$rc" == "1" ]] && grep -q "unit=fixture level=system .*status=DRIFT reason=unit-missing:fixture" <<<"$out"; then
+  ok "missing installed unit reports unit-missing, not a skip"
+else
+  fail "missing installed unit reports unit-missing, not a skip" "rc=$rc out=$out"
+fi
+
+# 38. A manifest line whose active-release source copy does not exist is
+#     reported and skipped (not alarmed) — nothing to prove drift against, the
+#     same posture as an unreachable checkout (case 24).
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+out=$(PAPERCLIP_DRIFT_UNITS="ghost:does-not-exist.service:$TMP/whatever:system" run_check); rc=$?
+if [[ "$rc" == "0" && "$(alerts)" == "0" ]] && grep -q "active release copy .*does-not-exist.service not found, skipping" <<<"$out"; then
+  ok "missing active-release source copy is skipped, not alarmed"
+else
+  fail "missing active-release source copy is skipped, not alarmed" "rc=$rc alerts=$(alerts) out=$out"
+fi
+
+# 39. Feature off by default: no PAPERCLIP_DRIFT_UNITS, no unit lines, exit
+#     still 0 on a converged deploy — opt-in for the same reason as
+#     PAPERCLIP_DRIFT_CHECKOUTS (case 25).
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+out=$(run_check); rc=$?
+if [[ "$rc" == "0" && "$(alerts)" == "0" ]] && ! grep -q "unit=" <<<"$out"; then
+  ok "empty unit list disables the axis entirely"
+else
+  fail "empty unit list disables the axis entirely" "rc=$rc alerts=$(alerts) out=$out"
 fi
 
 echo

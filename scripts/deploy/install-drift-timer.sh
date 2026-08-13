@@ -66,6 +66,34 @@ while IFS= read -r label; do
 done <<<"$labels"
 echo "checkout-drift axis armed for: $(printf '%b' "$checkouts" | cut -d: -f1 | tr '\n' ' ')"
 
+# --- unit-drift axis wiring (AUR-5648, follow-up to AUR-5647) ---------------
+# Same defect one level up from the checkout axis: a unit/timer/drop-in edit
+# merges to master, ships in the release tarball, and sits inert on disk until
+# a human happens to re-run the relevant install-*.sh by hand — AUR-5633
+# shipped in release 3a8d0d597825 but the installed drop-in stayed the Aug-5
+# copy for 183h. This axis's watch list ships as a sibling drop-in
+# (20-units.conf) already copied by the DROPIN_SRC block above, so this
+# script refuses to leave it in the dark (empty) state, exactly as for
+# PAPERCLIP_DRIFT_CHECKOUTS above.
+units=$(sudo cat "$UNIT_DIR/paperclip-deploy-drift.service.d"/*.conf 2>/dev/null |
+  sed -n 's/^Environment="\?PAPERCLIP_DRIFT_UNITS=//p' | sed 's/"$//' | tail -n 1 || true)
+if [[ -z "$units" ]]; then
+  echo "install-drift-timer: FATAL — PAPERCLIP_DRIFT_UNITS is empty after install." >&2
+  echo "  The unit-drift axis (AUR-5648) would run against zero units and report a" >&2
+  echo "  clean fleet forever. Add entries to" >&2
+  echo "  scripts/deploy/systemd/paperclip-deploy-drift.service.d/20-units.conf" >&2
+  echo "  as label:source-relative-path:installed-path:level. See AUR-5648." >&2
+  exit 1
+fi
+
+unit_labels=$(printf '%b' "$units" | cut -d: -f1 | grep -v '^[[:space:]]*$' || true)
+while IFS= read -r label; do
+  [[ -n "$label" ]] || continue
+  sudo touch "${LOG_BASE}.unit-${label}" "${STATE_BASE}.unit-${label}"
+  sudo chown "$UNIT_USER:$UNIT_USER" "${LOG_BASE}.unit-${label}" "${STATE_BASE}.unit-${label}"
+done <<<"$unit_labels"
+echo "unit-drift axis armed for: $(printf '%b' "$units" | cut -d: -f1 | tr '\n' ' ')"
+
 if [[ "$NO_SYSTEMD" != "1" ]]; then
   sudo systemctl daemon-reload
   sudo systemctl enable --now paperclip-deploy-drift.timer

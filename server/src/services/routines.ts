@@ -1078,6 +1078,74 @@ export function routineService(
     return rows.length > 0;
   }
 
+  // AUR-5466 (E): a routine must never accrue more than one open execution umbrella —
+  // the new occurrence supersedes and closes the stale ones. The finders above are
+  // fingerprint-scoped on purpose (a payload/config change should not coalesce into an
+  // umbrella dispatched under different inputs), but a daily routine that interpolates a
+  // date variable into its title mints a NEW fingerprint every day, so yesterday's
+  // still-open umbrella is invisible to today's reuse pass and sits open forever
+  // (5 accrued on one routine during the 08-06 outage). This sweep runs after dispatch
+  // has settled on a target issue and closes every OTHER open umbrella of the same
+  // routine regardless of fingerprint. Carve-outs:
+  //   - `always_enqueue` routines never reach this (parallel umbrellas are by design);
+  //     the caller gates on concurrencyPolicy.
+  //   - an umbrella held by a real unresolved blocker is left alone: it represents work
+  //     waiting on a dependency, and cancelling it silently could lose that work.
+  async function supersedeStaleOpenExecutionIssues(input: {
+    routine: typeof routines.$inferSelect;
+    originKind: string;
+    originId: string;
+    keepIssueId: string;
+  }) {
+    const staleIssues = await db
+      .select({ id: issues.id, identifier: issues.identifier, status: issues.status })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, input.routine.companyId),
+          eq(issues.originKind, input.originKind),
+          eq(issues.originId, input.originId),
+          inArray(issues.status, OPEN_ISSUE_STATUSES),
+          ne(issues.id, input.keepIssueId),
+          isNull(issues.hiddenAt),
+        ),
+      );
+
+    let superseded = 0;
+    for (const stale of staleIssues) {
+      if (await hasUnresolvedBlockerEdge(input.routine.companyId, stale.id)) continue;
+      const cancelled = await issueSvc.update(stale.id, { status: "cancelled" });
+      if (!cancelled) continue;
+      superseded += 1;
+      await issueSvc.addComment(
+        stale.id,
+        [
+          `- Cancelled: superseded stale routine umbrella. Routine \`${input.routine.id}\` dispatched a newer occurrence (issue \`${input.keepIssueId}\`), and a routine keeps at most one open execution umbrella (AUR-5466).`,
+          "- Next action: none. The superseding issue carries the routine's current occurrence.",
+        ].join("\n"),
+        {},
+        { authorType: "system" },
+      );
+      await logActivity(db, {
+        companyId: input.routine.companyId,
+        actorType: "system",
+        actorId: "system",
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: stale.id,
+        details: {
+          identifier: stale.identifier,
+          status: "cancelled",
+          previousStatus: stale.status,
+          source: "routine.supersede_stale_umbrella",
+          routineId: input.routine.id,
+          supersededByIssueId: input.keepIssueId,
+        },
+      });
+    }
+    return superseded;
+  }
+
   // For reuse_and_rewake: find the singleton issue regardless of status (open or closed).
   // Prefer a currently-open issue so that legacy churn (many stale closed execution
   // issues) can't cause us to reopen an old closed one while a live one already exists.
@@ -1650,6 +1718,30 @@ export function routineService(
         return failed ?? createdRun;
       }
     });
+
+    // AUR-5466 (E): once this dispatch has settled on a target umbrella (created,
+    // reused, or coalesced into), collapse any other open umbrella of the same routine.
+    // Outside the transaction on purpose: the sweep posts comments and must never make
+    // the dispatch itself fail or hold its row locks.
+    if (
+      input.routine.concurrencyPolicy !== "always_enqueue" &&
+      run?.linkedIssueId &&
+      (run.status === "issue_created" || run.status === "coalesced" || run.status === "skipped")
+    ) {
+      try {
+        await supersedeStaleOpenExecutionIssues({
+          routine: input.routine,
+          originKind: issueOriginKind,
+          originId: issueOriginId,
+          keepIssueId: run.linkedIssueId,
+        });
+      } catch (err) {
+        logger.warn(
+          { err, routineId: input.routine.id, runId: run.id },
+          "failed to supersede stale routine execution umbrellas",
+        );
+      }
+    }
 
     if (input.source === "schedule" || input.source === "webhook") {
       const actorId = input.source === "schedule" ? "routine-scheduler" : "routine-webhook";

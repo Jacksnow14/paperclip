@@ -36,6 +36,8 @@ import { instanceSettingsService } from "../instance-settings.js";
 import { issueRecoveryActionService, recoveryActionDormancyCutoff } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { issueService } from "../issues.js";
+import { NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES, PROCESS_LOST_ERROR_CODE } from "../productivity-review.js";
+import { findActiveAdapterQuotaPause } from "../quota-pause.js";
 import { getRunLogStore } from "../run-log-store.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
@@ -214,6 +216,37 @@ function didAutomaticRecoveryFail(
     UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
       latestRun.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
     );
+}
+
+// AUR-5466: a terminal run carrying one of these codes died at the provider wall
+// (auth/quota/transient upstream) or was killed by the control plane (process_lost) —
+// before the assigned agent did any work. Filing `stranded_assigned_issue` or
+// `missing_disposition` off such a run blames the assignee for an infrastructure
+// outage. Reuses the productivity-review list rather than copying it: a second copy
+// would drift and silently re-attribute a code the first list excused.
+function isNonAttributableInfraRunFailure(latestRun: LatestIssueRun) {
+  if (!latestRun) return false;
+  if (
+    !UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
+      latestRun.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
+    )
+  ) {
+    return false;
+  }
+  const errorCode = readNonEmptyString(latestRun.errorCode);
+  if (!errorCode) return false;
+  // `process_lost` is deliberately NOT excused here even though it is in the imported
+  // list. The provider-wall codes have an external recovery signal — the lane comes
+  // back, the quota pause expires — so requeue-instead-of-escalate self-heals. A lost
+  // process has no such signal: reapOrphanedRuns stamps `process_lost` on every
+  // dead-pid run, and its bounded reap-retry ladder (PROCESS_LOST_RETRY_MAX_ATTEMPTS)
+  // uses the stranded escalation as its designed fail-loud terminal. Excusing it would
+  // turn a crash-looping run from a loud recovery action into silent requeue-forever
+  // churn — disarming that watchdog, not removing blame. The productivity-review list
+  // excuses `process_lost` from *scorecards*, where it is pure blame with no watchdog
+  // role.
+  if (errorCode === PROCESS_LOST_ERROR_CODE) return false;
+  return (NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES as readonly string[]).includes(errorCode);
 }
 
 function successfulRunHandoffRecoveryEvidence(latestRun: LatestIssueRun): SuccessfulRunHandoffRecoveryEvidence | null {
@@ -1857,6 +1890,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     previousStatus: "todo" | "in_progress";
     latestRun: LatestIssueRun;
   }) {
+    // AUR-5466: same backstop as escalateStrandedAssignedIssue — a recovery issue whose
+    // run died at the provider wall is not evidence the recovery failed.
+    if (isNonAttributableInfraRunFailure(input.latestRun)) {
+      logger.info(
+        {
+          issueId: input.issue.id,
+          latestRunId: input.latestRun?.id ?? null,
+          latestRunErrorCode: input.latestRun?.errorCode ?? null,
+        },
+        "recovery: declining in-place recovery-issue escalation for non-attributable provider failure",
+      );
+      return null;
+    }
+
     const updated = await issuesSvc.update(input.issue.id, { status: "blocked" });
     if (!updated) return null;
 
@@ -1941,6 +1988,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
+    // AUR-5466 backstop for callers outside reconcileStrandedAssignedIssues (the
+    // heartbeat promotion-blocked path and any future caller): never file blame off a
+    // provider-wall failure. The reconciler's own level-triggered sweep is the revival
+    // path for issues this declines to escalate.
+    if (isNonAttributableInfraRunFailure(input.latestRun)) {
+      logger.info(
+        {
+          issueId: input.issue.id,
+          latestRunId: input.latestRun?.id ?? null,
+          latestRunErrorCode: input.latestRun?.errorCode ?? null,
+        },
+        "recovery: declining stranded-issue escalation for non-attributable provider failure",
+      );
+      return null;
+    }
+
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
         issue: input.issue,
@@ -2244,6 +2307,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       skipped: 0,
       reviewParkedSkipped: 0,
       dependencyBlockedSkipped: 0,
+      // AUR-5466: failed retries whose error code is in NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES.
+      // These are lane evidence, not agent evidence — requeued instead of escalated, or held
+      // without requeue while the assignee's adapter is under an active quota pause.
+      infraExcusedRequeued: 0,
+      infraPauseHeld: 0,
       issueIds: [] as string[],
     };
 
@@ -2271,7 +2339,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       const latestRun = await getLatestIssueRun(issue.companyId, issue.id);
-      if (isStrandedIssueRecoveryIssue(issue) && isUnsuccessfulTerminalIssueRun(latestRun)) {
+      // AUR-5466: a recovery issue whose own run died at the provider wall falls through
+      // to the ordinary todo/in_progress handling below, which requeues it instead of
+      // marking the recovery issue blocked-in-place off an infrastructure failure.
+      if (
+        isStrandedIssueRecoveryIssue(issue) &&
+        isUnsuccessfulTerminalIssueRun(latestRun) &&
+        !isNonAttributableInfraRunFailure(latestRun)
+      ) {
         const updated = await escalateStrandedRecoveryIssueInPlace({
           issue,
           previousStatus: issue.status as "todo" | "in_progress",
@@ -2333,23 +2408,39 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         if (didAutomaticRecoveryFail(latestRun, "assignment_recovery")) {
-          const failureSummary = summarizeRunFailureForIssueComment(latestRun);
-          const updated = await escalateStrandedAssignedIssue({
-            issue,
-            previousStatus: "todo",
-            latestRun,
-            comment:
-              "Paperclip automatically retried dispatch for this assigned `todo` issue after a lost wake/run, " +
-              `but it still has no live execution path.${failureSummary ?? ""} ` +
-              "Escalating it to a recovery owner so it is visible for intervention.",
-          });
-          if (updated) {
-            result.escalated += 1;
-            result.issueIds.push(issue.id);
-          } else {
-            result.skipped += 1;
+          if (!isNonAttributableInfraRunFailure(latestRun)) {
+            const failureSummary = summarizeRunFailureForIssueComment(latestRun);
+            const updated = await escalateStrandedAssignedIssue({
+              issue,
+              previousStatus: "todo",
+              latestRun,
+              comment:
+                "Paperclip automatically retried dispatch for this assigned `todo` issue after a lost wake/run, " +
+                `but it still has no live execution path.${failureSummary ?? ""} ` +
+                "Escalating it to a recovery owner so it is visible for intervention.",
+            });
+            if (updated) {
+              result.escalated += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
           }
-          continue;
+
+          // AUR-5466: the recovery retry died at the provider wall before the agent ran.
+          // That is lane evidence, not agent evidence — do not file blame against the
+          // assignee. Requeue below (the sweep is level-triggered, so this self-heals
+          // once the lane recovers), unless the lane is under an active quota pause, in
+          // which case requeueing would only manufacture another dead run into a lane
+          // that provably cannot execute it. The pause self-expires (capped by
+          // MAX_ADAPTER_QUOTA_PAUSE_MS), so a held issue is requeued on a later sweep.
+          if (await findActiveAdapterQuotaPause(db, issue.companyId, agent.adapterType, new Date())) {
+            result.infraPauseHeld += 1;
+            result.skipped += 1;
+            continue;
+          }
+          result.infraExcusedRequeued += 1;
         }
 
         if (await isInvocationBudgetBlocked(issue, agentId)) {
@@ -2392,20 +2483,34 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
-        const updated = await escalateStrandedAssignedIssue({
-          issue,
-          previousStatus: "in_progress",
-          latestRun,
-          recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
-          successfulRunHandoffEvidence: handoffEvidence,
-        });
-        if (updated) {
-          result.successfulRunHandoffEscalated += 1;
-          result.issueIds.push(issue.id);
+        // AUR-5466: an "exhausted" corrective handoff whose final run died at the
+        // provider wall never gave the agent a chance to record a disposition — filing
+        // `missing_disposition` off it blames the assignee for an outage. Fall through
+        // to the continuation requeue at the bottom of this branch instead (or hold
+        // under an active lane quota pause, same rule as the `todo` branch).
+        if (isNonAttributableInfraRunFailure(latestRun)) {
+          if (await findActiveAdapterQuotaPause(db, issue.companyId, agent.adapterType, new Date())) {
+            result.infraPauseHeld += 1;
+            result.skipped += 1;
+            continue;
+          }
+          result.infraExcusedRequeued += 1;
         } else {
-          result.skipped += 1;
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "in_progress",
+            latestRun,
+            recoveryCause: SUCCESSFUL_RUN_MISSING_STATE_REASON,
+            successfulRunHandoffEvidence: handoffEvidence,
+          });
+          if (updated) {
+            result.successfulRunHandoffEscalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
         }
-        continue;
       }
       if (isSuccessfulInProgressContinuationRun(latestRun)) {
         const successfulRun = latestRun;
@@ -2456,23 +2561,37 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
       if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
-        const failureSummary = summarizeRunFailureForIssueComment(latestRun);
-        const updated = await escalateStrandedAssignedIssue({
-          issue,
-          previousStatus: "in_progress",
-          latestRun,
-          comment:
-            "Paperclip automatically retried continuation for this assigned `in_progress` issue after its live " +
-            `execution disappeared, but it still has no live execution path.${failureSummary ?? ""} ` +
-            "Escalating it to a recovery owner so it is visible for intervention.",
-        });
-        if (updated) {
-          result.escalated += 1;
-          result.issueIds.push(issue.id);
+        if (isNonAttributableInfraRunFailure(latestRun)) {
+          // AUR-5466: same rule as the `todo` branch — requeue below instead of filing
+          // blame. When the exhausted-handoff branch above already fell through for this
+          // run, its pause check and counter increment cover this issue.
+          if (!handoffEvidence) {
+            if (await findActiveAdapterQuotaPause(db, issue.companyId, agent.adapterType, new Date())) {
+              result.infraPauseHeld += 1;
+              result.skipped += 1;
+              continue;
+            }
+            result.infraExcusedRequeued += 1;
+          }
         } else {
-          result.skipped += 1;
+          const failureSummary = summarizeRunFailureForIssueComment(latestRun);
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "in_progress",
+            latestRun,
+            comment:
+              "Paperclip automatically retried continuation for this assigned `in_progress` issue after its live " +
+              `execution disappeared, but it still has no live execution path.${failureSummary ?? ""} ` +
+              "Escalating it to a recovery owner so it is visible for intervention.",
+          });
+          if (updated) {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
         }
-        continue;
       }
 
       if (await isInvocationBudgetBlocked(issue, agentId)) {

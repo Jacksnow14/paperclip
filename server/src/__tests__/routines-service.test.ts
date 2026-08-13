@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -443,6 +443,137 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .from(routines)
       .where(eq(routines.id, routine.id));
     expect(afterTwo?.count).toBe(2);
+  });
+
+  // AUR-5466 (E) group: a routine must never keep more than one open execution
+  // umbrella. The reuse finders above are fingerprint-scoped, so a daily routine that
+  // interpolates a date into its title mints a new fingerprint every occurrence and
+  // yesterday's still-open umbrella is invisible to them (the open-umbrella unique
+  // index is also per-fingerprint since migration 0062, so nothing at the DB layer
+  // stops the pile-up — 5 accrued on one routine during the 08-06 outage). The new
+  // dispatch supersedes and cancels the stale ones.
+  it("collapses stale open umbrellas from earlier fingerprints when a new occurrence dispatches (AUR-5466 FIRE)", async () => {
+    const { companyId, issueSvc, routine, svc } = await seedFixture();
+    const staleDayOne = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: `${routine.title} — day 1`,
+      description: routine.description,
+      status: "todo",
+      priority: routine.priority,
+      assigneeAgentId: routine.assigneeAgentId,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: randomUUID(),
+      originFingerprint: "occurrence-day-1",
+    });
+    const staleDayTwo = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: `${routine.title} — day 2`,
+      description: routine.description,
+      status: "in_progress",
+      priority: routine.priority,
+      assigneeAgentId: routine.assigneeAgentId,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: randomUUID(),
+      originFingerprint: "occurrence-day-2",
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).toBeTruthy();
+    expect(run.linkedIssueId).not.toBe(staleDayOne.id);
+    expect(run.linkedIssueId).not.toBe(staleDayTwo.id);
+
+    const staleRows = await db
+      .select({ id: issues.id, status: issues.status })
+      .from(issues)
+      .where(inArray(issues.id, [staleDayOne.id, staleDayTwo.id]));
+    expect(staleRows.map((row) => row.status)).toEqual(["cancelled", "cancelled"]);
+
+    const [target] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, run.linkedIssueId!));
+    expect(target?.status).toBe("todo");
+
+    const staleComments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, staleDayOne.id));
+    expect(staleComments.some((row) => row.body.includes("superseded stale routine umbrella"))).toBe(true);
+    expect(staleComments.some((row) => row.body.includes(run.linkedIssueId!))).toBe(true);
+  });
+
+  it("leaves a stale umbrella held by a real unresolved blocker open when a new occurrence dispatches (AUR-5466 PASS)", async () => {
+    const { companyId, issueSvc, routine, svc } = await seedFixture();
+    const blockerIssue = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: "real blocker",
+      description: "still open",
+      status: "todo",
+      priority: routine.priority,
+    });
+    const heldUmbrella = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: `${routine.title} — held`,
+      description: routine.description,
+      status: "blocked",
+      priority: routine.priority,
+      assigneeAgentId: routine.assigneeAgentId,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: randomUUID(),
+      originFingerprint: "occurrence-held",
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssue.id,
+      relatedIssueId: heldUmbrella.id,
+      type: "blocks",
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).not.toBe(heldUmbrella.id);
+
+    // Held by a real dependency: superseding must not cancel it out from under the blocker.
+    const [held] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, heldUmbrella.id));
+    expect(held?.status).toBe("blocked");
+  });
+
+  it("does not collapse umbrellas for always_enqueue routines (AUR-5466 PASS)", async () => {
+    const { companyId, issueSvc, routine, svc } = await seedFixture();
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "always_enqueue" })
+      .where(eq(routines.id, routine.id));
+    const priorUmbrella = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: `${routine.title} — parallel`,
+      description: routine.description,
+      status: "todo",
+      priority: routine.priority,
+      assigneeAgentId: routine.assigneeAgentId,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: randomUUID(),
+      originFingerprint: "occurrence-parallel",
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).not.toBe(priorUmbrella.id);
+
+    // Parallel umbrellas are by design under always_enqueue.
+    const [prior] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, priorUmbrella.id));
+    expect(prior?.status).toBe("todo");
   });
 
   // The mirror of the `blocked` FIRES case, and the more dangerous one: `backlog` is

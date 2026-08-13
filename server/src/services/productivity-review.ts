@@ -64,6 +64,14 @@ export const NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES = [
   // this entry the split would silently make quota-walled runs attributable again.
   "claude_quota_exhausted",
   "claude_auth_required",
+  // AUR-5466: the codex/gemini twins of `claude_transient_upstream`. Both are emitted
+  // only when the adapter classifies the failure as errorFamily "transient_upstream"
+  // (packages/adapters/codex-local/src/server/execute.ts, gemini-local ditto) — the run
+  // dies at the provider wall before the agent does any work, exactly like the claude
+  // code above. `adapter_failed` is deliberately NOT added: it covers adapter bugs and
+  // config errors that re-running reproduces, which is not proven non-attributable.
+  "codex_transient_upstream",
+  "gemini_transient_upstream",
 ] as const;
 
 // AUR-4513: codes for failures that are DETERMINISTIC -- re-running the same work

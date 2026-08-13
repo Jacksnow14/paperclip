@@ -2184,6 +2184,173 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("Recovery owner: [CodexCoder]");
   });
 
+  // AUR-5466 group: an outage must not manufacture work that blames an agent. A retry
+  // that died at the provider wall (NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES, minus the
+  // process_lost carve-out) is lane evidence, not agent evidence — it requeues instead
+  // of filing `stranded_assigned_issue`/`missing_disposition` against the assignee.
+  it("requeues instead of escalating when the dispatch retry died at the provider wall (AUR-5466 FIRE)", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "failed",
+      retryReason: "assignment_recovery",
+      runErrorCode: "claude_auth_required",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(0);
+    expect(result.infraExcusedRequeued).toBe(1);
+    expect(result.dispatchRequeued).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    // The core assertion: no blame filed against the assignee.
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(actions).toHaveLength(0);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+
+    // And a live execution path exists instead: the retry was requeued.
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const retryRun = runs.find((row) => row.id !== runId);
+    expect(retryRun?.id).toBeTruthy();
+    expect((retryRun?.contextSnapshot as Record<string, unknown>)?.retryReason).toBe("assignment_recovery");
+    if (retryRun) {
+      await waitForRunToSettle(heartbeat, retryRun.id);
+    }
+  });
+
+  it("still escalates a genuine strand whose retry failed without a provider-wall code (AUR-5466 PASS)", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "failed",
+      retryReason: "assignment_recovery",
+      // The 08-06 outage also emitted `adapter_failed`, but that code covers adapter
+      // bugs and config errors that re-running reproduces — it stays attributable.
+      runErrorCode: "adapter_failed",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+    expect(result.infraExcusedRequeued).toBe(0);
+    expect(result.dispatchRequeued).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    await expectSourceScopedStrandedRecoveryAction({
+      companyId,
+      agentId,
+      issueId,
+      runId,
+      previousStatus: "todo",
+      retryReason: "assignment_recovery",
+    });
+  });
+
+  it("holds an infra-excused issue without requeueing while its lane is under an active quota pause (AUR-5466)", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "failed",
+      retryReason: "assignment_recovery",
+      runErrorCode: "claude_auth_required",
+    });
+    // An active quota pause on the same adapter lane: a scheduled_retry run carrying a
+    // future transient horizon. Its context references a different issue so it does not
+    // count as this issue's own execution path.
+    const pauseHorizon = new Date(Date.now() + 60 * 60 * 1000);
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "scheduled_retry",
+      scheduledRetryAt: pauseHorizon,
+      contextSnapshot: {
+        issueId: randomUUID(),
+        transientRetryNotBefore: pauseHorizon.toISOString(),
+      },
+      updatedAt: new Date(),
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(0);
+    expect(result.infraPauseHeld).toBe(1);
+    expect(result.infraExcusedRequeued).toBe(0);
+    expect(result.dispatchRequeued).toBe(0);
+
+    // No blame filed, and no new run manufactured into a lane that cannot execute it.
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(actions).toHaveLength(0);
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(2);
+    expect(runs.map((row) => row.status).sort()).toEqual(["failed", "scheduled_retry"]);
+    expect(runs.some((row) => row.id === runId)).toBe(true);
+  });
+
+  it("requeues instead of filing missing_disposition when the exhausted handoff died at the provider wall (AUR-5466 FIRE)", async () => {
+    const { companyId, agentId, runId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "claude_quota_exhausted",
+    });
+    const sourceRunId = randomUUID();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          resumeFromRunId: sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.successfulRunHandoffEscalated).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.infraExcusedRequeued).toBe(1);
+    expect(result.continuationRequeued).toBe(1);
+
+    // The exhausted handoff never gave the agent a chance to record a disposition —
+    // no `missing_disposition` blame, and a fresh continuation run instead.
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    expect(actions).toHaveLength(0);
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const retryRun = runs.find((row) => row.id !== runId);
+    expect(retryRun?.id).toBeTruthy();
+    expect((retryRun?.contextSnapshot as Record<string, unknown>)?.retryReason).toBe("issue_continuation_needed");
+    if (retryRun) {
+      await waitForRunToSettle(heartbeat, retryRun.id);
+    }
+  });
+
   // AUR-4250 regression group. Escalation used to write `status: "blocked"` with an empty
   // `blockedByIssueIds`, which per AUR-4257 drops the issue out of execution entirely — undoing
   // the invokable owner + enqueued wake it had just built. `blocked` was load-bearing only as a

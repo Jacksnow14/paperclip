@@ -6,6 +6,7 @@ import { and, desc, eq, inArray, notInArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
+  agents,
   executionWorkspaces,
   issueExecutionDecisions,
   issueRelations,
@@ -4070,6 +4071,54 @@ export function issueRoutes(
           });
         }
 
+        // AUR-5639: When a board user (founder) comments, wake the CEO as a stakeholder
+        // in addition to the assigned agent, so founder feedback reaches both the working
+        // agent and leadership.
+        if (actor.actorType === "user") {
+          (async () => {
+            try {
+              const ceoAgents = await db
+                .select()
+                .from(agents)
+                .where(and(eq(agents.companyId, issue.companyId), eq(agents.role, "ceo")))
+                .limit(1);
+
+              if (ceoAgents.length > 0 && ceoAgents[0].id !== assigneeId) {
+                addWakeup(ceoAgents[0].id, {
+                  source: "automation",
+                  triggerDetail: "system",
+                  reason: reopened ? "issue_reopened_via_comment" : "issue_commented",
+                  payload: {
+                    issueId: id,
+                    commentId: comment.id,
+                    mutation: "comment",
+                    boardComment: true,
+                    ...(reopened ? { reopenedFrom: reopenFromStatus } : {}),
+                    ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+                    ...(interruptedRunId ? { interruptedRunId } : {}),
+                  },
+                  requestedByActorType: actor.actorType,
+                  requestedByActorId: actor.actorId,
+                  contextSnapshot: {
+                    issueId: id,
+                    taskId: id,
+                    commentId: comment.id,
+                    wakeCommentId: comment.id,
+                    source: reopened ? "issue.comment.reopen.board_stakeholder" : "issue.comment.board_stakeholder",
+                    wakeReason: reopened ? "issue_reopened_via_comment" : "issue_commented",
+                    boardComment: true,
+                    ...(reopened ? { reopenedFrom: reopenFromStatus } : {}),
+                    ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+                    ...(interruptedRunId ? { interruptedRunId } : {}),
+                  },
+                });
+              }
+            } catch (err) {
+              logger.warn({ err, issueId: id }, "failed to wake CEO on board comment");
+            }
+          })();
+        }
+
         let mentionedIds: string[] = [];
         try {
           mentionedIds = await svc.findMentionedAgents(issue.companyId, commentBody);
@@ -5327,6 +5376,50 @@ export function issueRoutes(
               ...(interruptedRunId ? { interruptedRunId } : {}),
             },
           });
+        }
+      }
+
+      // AUR-5639: When a board user (founder) comments, wake the CEO as a stakeholder
+      // in addition to the assigned agent, so founder feedback reaches both the working
+      // agent and leadership.
+      if (actor.actorType === "user" && !mentionReply) {
+        try {
+          const ceoAgents = await db
+            .select()
+            .from(agents)
+            .where(and(eq(agents.companyId, currentIssue.companyId), eq(agents.role, "ceo")))
+            .limit(1);
+
+          if (ceoAgents.length > 0 && !wakeups.has(ceoAgents[0].id)) {
+            wakeups.set(ceoAgents[0].id, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_commented",
+              payload: {
+                issueId: currentIssue.id,
+                commentId: comment.id,
+                mutation: "comment",
+                boardComment: true,
+                ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+                ...(interruptedRunId ? { interruptedRunId } : {}),
+              },
+              requestedByActorType: actor.actorType,
+              requestedByActorId: actor.actorId,
+              contextSnapshot: {
+                issueId: currentIssue.id,
+                taskId: currentIssue.id,
+                commentId: comment.id,
+                wakeCommentId: comment.id,
+                source: "issue.comment.board_stakeholder",
+                wakeReason: "issue_commented",
+                boardComment: true,
+                ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
+                ...(interruptedRunId ? { interruptedRunId } : {}),
+              },
+            });
+          }
+        } catch (err) {
+          logger.warn({ err, issueId: currentIssue.id }, "failed to wake CEO on board comment");
         }
       }
 

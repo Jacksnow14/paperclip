@@ -26,7 +26,7 @@ const attachmentInputSchema = z.object({
 const ccSchema = z.union([z.string(), z.array(z.string())]).optional();
 
 const sendMessageBodySchema = z.object({
-  to: z.string().email(),
+  to: z.string().min(1),
   subject: z.string().min(1),
   body: z.string().min(1),
   replyToMessageId: z.string().optional(),

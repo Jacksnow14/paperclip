@@ -134,6 +134,32 @@ describe("Gmail outbound guard — route enforcement", () => {
       expect(mockMessagesSend).toHaveBeenCalledOnce();
     });
 
+    // AUR-5676: AUR-5107's board approval scoped `to` to a comma-separated
+    // list of 8 recipients (valid per RFC 2822). The schema used to reject
+    // any `to` that wasn't a single RFC-5322 email address before this ever
+    // reached isApprovalScopedToSend's exact-string comparison.
+    it("allows a gated send whose approval scope is a comma-separated recipient list", async () => {
+      const to = "a@example.com,b@example.com,c@example.com";
+      approvalRow = {
+        id: "appr-multi",
+        companyId: "company-1",
+        status: "approved",
+        type: "request_board_approval",
+        payload: { gmailOutbound: { mailbox: "board", to } },
+      };
+      const app = await createApp();
+      const res = await request(app)
+        .post("/api/companies/company-1/gmail/mailboxes/board/messages")
+        .send({
+          to,
+          subject: "URGENT fraud report",
+          body: "We are reporting an account takeover.",
+          ceoApprovalId: "appr-multi",
+        });
+      expect(res.status).toBe(201);
+      expect(mockMessagesSend).toHaveBeenCalledOnce();
+    });
+
     it("still blocks when the approval exists but is only pending", async () => {
       approvalRow = {
         id: "appr-pending",

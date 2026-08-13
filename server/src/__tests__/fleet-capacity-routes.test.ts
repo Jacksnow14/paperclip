@@ -232,17 +232,26 @@ describe("fleet capacity route", () => {
   });
 
   it("classifies a quota-starved agent as blocked even when its queue backlog exceeds the run window", async () => {
+    // Relative to real now, not a fixed calendar date: fleet-capacity's
+    // DORMANT_AFTER_MS (14 days) classifies a last success older than that as
+    // `no_recent_runs` rather than `ok`. A hardcoded past date ages past that
+    // threshold as real time passes and the "healthy" agent's expected `ok`
+    // silently flips to dormant — exactly what broke this test on trunk.
+    // Deltas between events are preserved from the original fixed timestamps.
+    const now = Date.now();
+    const minutesAgo = (m: number) => new Date(now - m * 60_000).toISOString();
+
     // Probe: 220 queued rows are all NEWER than the 6 quota failures. Under
     // the reverted (single shared window of 200) fetch, the queue evicts every
     // terminal run and this agent classifies healthy `no_recent_runs`.
-    const starvedTerminal = runRows(6, "failed", "2026-07-29T14:00:00Z", QUOTA_ERROR);
-    const starvedQueue = runRows(220, "queued", "2026-07-29T23:00:00Z");
+    const starvedTerminal = runRows(6, "failed", minutesAgo(550), QUOTA_ERROR);
+    const starvedQueue = runRows(220, "queued", minutesAgo(10));
     // Control: a deep queue on a healthy agent must NOT read as blocked.
     const healthyTerminal = [
-      ...runRows(1, "succeeded", "2026-07-29T22:30:00Z"),
-      ...runRows(4, "succeeded", "2026-07-29T20:00:00Z"),
+      ...runRows(1, "succeeded", minutesAgo(40)),
+      ...runRows(4, "succeeded", minutesAgo(190)),
     ];
-    const healthyQueue = runRows(40, "queued", "2026-07-29T23:05:00Z");
+    const healthyQueue = runRows(40, "queued", minutesAgo(5));
 
     const { db, captured } = createCapacityDbStub([
       starvedTerminal,

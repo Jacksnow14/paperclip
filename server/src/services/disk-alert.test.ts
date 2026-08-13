@@ -86,6 +86,7 @@ describe("handleDiskAlertAct — state-based dedup", () => {
       assigneeAgentId: "ceo-agent",
       readingBody: "reading 2",
       issuesSvc,
+      readingCommentIntervalMs: 0,
     });
     expect(second.action).toBe("commented");
     expect(second.issueId).toBe(first.issueId);
@@ -124,6 +125,7 @@ describe("handleDiskAlertAct — state-based dedup", () => {
       assigneeAgentId: "ceo-agent",
       readingBody: "reading 2",
       issuesSvc,
+      readingCommentIntervalMs: 0,
     });
     expect(second.action).toBe("commented");
     expect(second.issueId).toBe(first.issueId);
@@ -164,6 +166,7 @@ describe("handleDiskAlertAct — state-based dedup", () => {
       assigneeAgentId: "ceo-agent",
       readingBody: "reading",
       issuesSvc,
+      readingCommentIntervalMs: 0,
     });
 
     expect(outcome).toEqual({ action: "commented_after_race", issueId: winningIssueId });
@@ -194,6 +197,7 @@ describe("handleDiskAlertAct — state-based dedup", () => {
       assigneeAgentId: "ceo-agent",
       readingBody: "reading",
       issuesSvc,
+      readingCommentIntervalMs: 0,
     });
 
     expect(outcome).toEqual({ action: "commented_after_race", issueId: winningIssueId });
@@ -237,6 +241,38 @@ describe("handleDiskAlertAct — state-based dedup", () => {
     expect(capturedData?.originKind).toBe(DISK_ALERT_ORIGIN_KIND);
     expect(capturedData?.originId).toBe(DISK_ALERT_ORIGIN_ID);
     expect(String(capturedData?.description)).toContain("exec.routing-rationale: skip");
+  });
+
+  it("throttles 'still active' comments: a reading inside the interval is skipped, one after it comments", async () => {
+    // The monitor loop fires every 60s while over threshold — without this
+    // floor an all-day episode appends 1,440 comments, each waking the
+    // assignee. Fresh module so this test owns the throttle state.
+    vi.resetModules();
+    const mod = await import("./disk-alert.js");
+    const issuesSvc = makeFakeIssuesSvc();
+    const result = makeResult(92);
+    const base = { companyId: COMPANY_ID, result, assigneeAgentId: "ceo-agent", issuesSvc };
+
+    const nowSpy = vi.spyOn(Date, "now");
+    try {
+      nowSpy.mockReturnValue(1_000_000);
+      const first = await mod.handleDiskAlertAct({ ...base, readingBody: "reading 1" });
+      expect(first.action).toBe("created");
+
+      // One minute later (the real loop cadence): still inside the interval.
+      nowSpy.mockReturnValue(1_000_000 + 60_000);
+      const second = await mod.handleDiskAlertAct({ ...base, readingBody: "reading 2" });
+      expect(second).toEqual({ action: "skipped_recent_reading", issueId: first.issueId });
+      expect(issuesSvc.comments).toHaveLength(0);
+
+      // Past the interval: the reading lands as a comment again.
+      nowSpy.mockReturnValue(1_000_000 + mod.DISK_ALERT_READING_COMMENT_INTERVAL_MS + 1);
+      const third = await mod.handleDiskAlertAct({ ...base, readingBody: "reading 3" });
+      expect(third).toEqual({ action: "commented", issueId: first.issueId });
+      expect(issuesSvc.comments).toHaveLength(1);
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 });
 

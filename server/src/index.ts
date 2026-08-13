@@ -887,12 +887,16 @@ export async function startServer(): Promise<StartedServer> {
               readingBody,
               issuesSvc,
             });
-            logger.warn(
-              { usedPercent: result.diskStats.usedPercent, issueId: outcome.issueId, action: outcome.action },
-              outcome.action === "created"
-                ? "disk-monitor: created CEO disk alert issue"
-                : "disk-monitor: appended reading to existing open disk alert",
-            );
+            // Skipped readings stay out of the log too: one warn per minute
+            // for the life of a disk-pressure episode is its own spam.
+            if (outcome.action !== "skipped_recent_reading") {
+              logger.warn(
+                { usedPercent: result.diskStats.usedPercent, issueId: outcome.issueId, action: outcome.action },
+                outcome.action === "created"
+                  ? "disk-monitor: created CEO disk alert issue"
+                  : "disk-monitor: appended reading to existing open disk alert",
+              );
+            }
           } catch (err) {
             logger.error({ err }, "disk-monitor: failed to file/update CEO disk alert issue");
           }

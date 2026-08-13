@@ -10,6 +10,16 @@ export const DISK_ALERT_ORIGIN_ID = "disk-usage";
 export const DISK_ALERT_OPEN_STATUSES = "backlog,todo,in_progress,in_review,blocked";
 const DISK_ALERT_UNIQUE_CONSTRAINT = "issues_active_disk_alert_uq";
 
+// The monitor loop calls handleDiskAlertAct every DISK_CHECK_INTERVAL_MS
+// (60s) for as long as usage stays over the act threshold. Without a floor
+// between "still active" comments, a day over threshold would append 1,440
+// comments — and every comment bumps the issue and wakes its assignee, which
+// is the same alert-spam AUR-4997 exists to kill, just relocated. In-memory
+// is acceptable for this (unlike issue-level dedup): the worst case after a
+// restart is one early comment, never a duplicate issue.
+export const DISK_ALERT_READING_COMMENT_INTERVAL_MS = 60 * 60 * 1000;
+let _lastReadingCommentMs = 0;
+
 export interface DiskAlertIssueRef {
   id: string;
 }
@@ -48,7 +58,8 @@ function isDiskAlertUniqueConflict(err: unknown): boolean {
 export type DiskAlertActOutcome =
   | { action: "created"; issueId: string }
   | { action: "commented"; issueId: string }
-  | { action: "commented_after_race"; issueId: string };
+  | { action: "commented_after_race"; issueId: string }
+  | { action: "skipped_recent_reading"; issueId: string };
 
 export interface DiskAlertActOptions {
   companyId: string;
@@ -56,6 +67,8 @@ export interface DiskAlertActOptions {
   assigneeAgentId: string;
   readingBody: string;
   issuesSvc: DiskAlertIssuesPort;
+  /** Test seam; production callers use the default. */
+  readingCommentIntervalMs?: number;
 }
 
 /**
@@ -65,9 +78,14 @@ export interface DiskAlertActOptions {
  */
 export async function handleDiskAlertAct(opts: DiskAlertActOptions): Promise<DiskAlertActOutcome> {
   const { companyId, result, assigneeAgentId, readingBody, issuesSvc } = opts;
+  const intervalMs = opts.readingCommentIntervalMs ?? DISK_ALERT_READING_COMMENT_INTERVAL_MS;
   const existing = await findOpenDiskAlertIssue(issuesSvc, companyId);
   if (existing) {
+    if (Date.now() - _lastReadingCommentMs < intervalMs) {
+      return { action: "skipped_recent_reading", issueId: existing.id };
+    }
     await issuesSvc.addComment(existing.id, `## Disk alert still active\n\n${readingBody}`, {});
+    _lastReadingCommentMs = Date.now();
     return { action: "commented", issueId: existing.id };
   }
 
@@ -85,12 +103,19 @@ export async function handleDiskAlertAct(opts: DiskAlertActOptions): Promise<Dis
       originKind: DISK_ALERT_ORIGIN_KIND,
       originId: DISK_ALERT_ORIGIN_ID,
     });
+    // The created issue's description carries this reading — the next
+    // "still active" comment owes a full interval from here.
+    _lastReadingCommentMs = Date.now();
     return { action: "created", issueId: created.id };
   } catch (err) {
     if (!isDiskAlertUniqueConflict(err)) throw err;
     const racedExisting = await findOpenDiskAlertIssue(issuesSvc, companyId);
     if (!racedExisting) throw err;
+    if (Date.now() - _lastReadingCommentMs < intervalMs) {
+      return { action: "skipped_recent_reading", issueId: racedExisting.id };
+    }
     await issuesSvc.addComment(racedExisting.id, `## Disk alert still active\n\n${readingBody}`, {});
+    _lastReadingCommentMs = Date.now();
     return { action: "commented_after_race", issueId: racedExisting.id };
   }
 }

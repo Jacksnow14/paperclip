@@ -64,6 +64,7 @@ vi.mock("../adapters/index.ts", async () => {
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { runningProcesses } from "../adapters/index.ts";
+import { CLASS_B_STRANDED_REARM_PER_RUN_CAP } from "../services/recovery/service.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -1487,6 +1488,208 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       reason: "heartbeat.wakeOnDemand.disabled",
       status: "skipped",
       idempotencyKey: expect.stringContaining("issue_graph_liveness:"),
+    });
+  });
+
+  /** A stranded_assigned_issue action parked on a blocked issue (AUR-4996). */
+  async function insertStrandedRecoveryAction(opts: {
+    companyId: string;
+    sourceIssueId: string;
+    ownerAgentId: string | null;
+    lastAttemptAt: Date | null;
+    attemptCount?: number;
+  }) {
+    const [row] = await db
+      .insert(issueRecoveryActions)
+      .values({
+        companyId: opts.companyId,
+        sourceIssueId: opts.sourceIssueId,
+        kind: "stranded_assigned_issue",
+        status: "active",
+        ownerType: opts.ownerAgentId ? "agent" : "board",
+        ownerAgentId: opts.ownerAgentId,
+        cause: "stranded_assigned_issue",
+        fingerprint: `source_scoped_recovery:${opts.companyId}:${opts.sourceIssueId}:stranded_assigned_issue`,
+        evidence: {},
+        nextAction: "Restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
+        attemptCount: opts.attemptCount ?? 1,
+        lastAttemptAt: opts.lastAttemptAt,
+      })
+      .returning({ id: issueRecoveryActions.id });
+    return row?.id as string;
+  }
+
+  it("re-arms a dormant stranded action on a recently-blocked missing-edge issue, once per dormancy window", async () => {
+    await enableAutoRecovery();
+    const { companyId, coderId, issuePrefix } = await seedCompanyWithAgents();
+    // 2 days blocked: below the 7d attention stage, i.e. the AUR-4996 dead zone.
+    const blockedIssueId = await insertBlockedIssueWithoutBlockerEdge({
+      companyId,
+      issuePrefix,
+      issueNumber: 1,
+      assigneeAgentId: coderId,
+      createdAt: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000),
+    });
+    const actionId = await insertStrandedRecoveryAction({
+      companyId,
+      sourceIssueId: blockedIssueId,
+      ownerAgentId: coderId,
+      lastAttemptAt: new Date(Date.now() - 30 * 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const first = await heartbeat.reconcileIssueGraphLiveness();
+    expect(first).toMatchObject({
+      classBStrandedRearmed: 1,
+      classBStrandedRearmDeferredCap: 0,
+      classBNudged: 0,
+      classBEscalated: 0,
+      classBNoop: 0,
+      classBStrandedRearmedIssueIds: [blockedIssueId],
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId));
+    expect(action).toMatchObject({
+      kind: "stranded_assigned_issue",
+      status: "active",
+      attemptCount: 2,
+      ownerAgentId: coderId,
+    });
+    expect(action!.lastAttemptAt!.getTime()).toBeGreaterThan(Date.now() - 60 * 60 * 1000);
+
+    const wakeups = await db
+      .select({
+        reason: agentWakeupRequests.reason,
+        idempotencyKey: agentWakeupRequests.idempotencyKey,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, coderId),
+        ),
+      );
+    const rearmWake = wakeups.find(
+      (wake) => wake.idempotencyKey === `source_scoped_recovery_action:${actionId}:2`,
+    );
+    expect(rearmWake).toBeDefined();
+    expect((rearmWake!.payload as Record<string, unknown>).recoveryCause).toBe("stranded_assigned_issue");
+
+    // The refreshed lastAttemptAt makes the action non-dormant, so the next
+    // sweep must NOT re-fire it — the dormancy window is the retry spacing.
+    const second = await heartbeat.reconcileIssueGraphLiveness();
+    expect(second).toMatchObject({ classBStrandedRearmed: 0, classBNoop: 1 });
+    const [after] = await db
+      .select({ attemptCount: issueRecoveryActions.attemptCount })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId));
+    expect(after!.attemptCount).toBe(2);
+  });
+
+  it("leaves a non-dormant stranded action alone below the attention stage", async () => {
+    await enableAutoRecovery();
+    const { companyId, coderId, issuePrefix } = await seedCompanyWithAgents();
+    const blockedIssueId = await insertBlockedIssueWithoutBlockerEdge({
+      companyId,
+      issuePrefix,
+      issueNumber: 1,
+      assigneeAgentId: coderId,
+      createdAt: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000),
+    });
+    const actionId = await insertStrandedRecoveryAction({
+      companyId,
+      sourceIssueId: blockedIssueId,
+      ownerAgentId: coderId,
+      lastAttemptAt: new Date(Date.now() - 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const reconciled = await heartbeat.reconcileIssueGraphLiveness();
+    // Below the attention stage a live (non-dormant) stranded action means the
+    // stranded loop still owns the retry, so the sweep noops rather than
+    // double-waking the owner.
+    expect(reconciled).toMatchObject({
+      classBStrandedRearmed: 0,
+      classBNoop: 1,
+    });
+    const [action] = await db
+      .select({ attemptCount: issueRecoveryActions.attemptCount, status: issueRecoveryActions.status })
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId));
+    expect(action).toMatchObject({ attemptCount: 1, status: "active" });
+  });
+
+  it("resolves a dormant stranded action when an open first-class blocker governs the issue", async () => {
+    await enableAutoRecovery();
+    const seeded = await seedBlockedChain();
+    const actionId = await insertStrandedRecoveryAction({
+      companyId: seeded.companyId,
+      sourceIssueId: seeded.blockedIssueId,
+      ownerAgentId: seeded.coderId,
+      lastAttemptAt: new Date(Date.now() - 30 * 60 * 60 * 1000),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const reconciled = await heartbeat.reconcileIssueGraphLiveness();
+    expect(reconciled).toMatchObject({
+      classBStrandedResolvedBlockerGoverned: 1,
+      classBStrandedRearmed: 0,
+    });
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId));
+    expect(action).toMatchObject({
+      status: "resolved",
+      outcome: "blocked",
+      kind: "stranded_assigned_issue",
+    });
+
+    const [issue] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, seeded.blockedIssueId));
+    expect(issue!.status).toBe("blocked");
+  });
+
+  it("caps stranded re-arms per run and drains the remainder on the next run", async () => {
+    await enableAutoRecovery();
+    const { companyId, coderId, issuePrefix } = await seedCompanyWithAgents();
+    const population = CLASS_B_STRANDED_REARM_PER_RUN_CAP + 1;
+    for (let index = 0; index < population; index += 1) {
+      const blockedIssueId = await insertBlockedIssueWithoutBlockerEdge({
+        companyId,
+        issuePrefix,
+        issueNumber: index + 1,
+        assigneeAgentId: coderId,
+        createdAt: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000),
+      });
+      await insertStrandedRecoveryAction({
+        companyId,
+        sourceIssueId: blockedIssueId,
+        ownerAgentId: coderId,
+        lastAttemptAt: new Date(Date.now() - 30 * 60 * 60 * 1000),
+      });
+    }
+
+    const heartbeat = heartbeatService(db);
+    const first = await heartbeat.reconcileIssueGraphLiveness();
+    expect(first).toMatchObject({
+      classBStrandedRearmed: CLASS_B_STRANDED_REARM_PER_RUN_CAP,
+      classBStrandedRearmDeferredCap: 1,
+    });
+
+    // Deferral is not loss: the deferred row is still dormant on the next run
+    // while the re-armed rows are fresh, so exactly it gets picked up.
+    const second = await heartbeat.reconcileIssueGraphLiveness();
+    expect(second).toMatchObject({
+      classBStrandedRearmed: 1,
+      classBStrandedRearmDeferredCap: 0,
     });
   });
 

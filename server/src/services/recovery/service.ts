@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -87,6 +87,13 @@ const MISSING_BLOCKER_EDGE_ESCALATION_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 // would flip it back every tick. Cap auto-recovery at one per
 // (issueId, blocker-set) per rolling window and downgrade to Class B after.
 const CLASS_A_OSCILLATION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+// AUR-4996: how many dormant `stranded_assigned_issue` actions the Class B sweep may
+// re-fire per run. The releasable population measured live was 223 (98% of the blocked
+// backlog), so an uncapped first sweep would flood a day's worth of recovery wakes into
+// one tick — this is the per-run cap AUR-4300 deliberately deferred. Deferred rows are
+// counted (classBStrandedRearmDeferredCap), never silently dropped, and the next run
+// picks them up.
+export const CLASS_B_STRANDED_REARM_PER_RUN_CAP = 25;
 const ISSUE_GRAPH_LIVENESS_RESULT_ID_ARRAY_LIMIT = 50;
 
 function pushBoundedIssueId(ids: string[], issueId: string) {
@@ -1825,7 +1832,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
   async function enqueueSourceScopedStrandedRecoveryWake(input: {
     action: Awaited<ReturnType<typeof recoveryActionsSvc.upsertSourceScoped>>;
-    issue: typeof issues.$inferSelect;
+    // Only the id is read; the Class B sweep re-arm path (AUR-4996) holds a
+    // narrow projection of the issue row, not the full select shape.
+    issue: Pick<typeof issues.$inferSelect, "id">;
     latestRun: LatestIssueRun;
     recoveryCause: StrandedRecoveryCause;
   }) {
@@ -3303,6 +3312,42 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
+  /**
+   * Dormant `stranded_assigned_issue` actions on blocked issues (AUR-4996).
+   *
+   * `reconcileStrandedAssignedIssues` only scans `todo`/`in_progress`, so once its
+   * escalation parks an issue in `blocked` the action it minted can never re-arm
+   * through that loop — and `loadAnyActiveRecoveryActions` above deliberately
+   * excludes dormant rows (AUR-4300), so these issues sail past the
+   * classBSkippedOtherRecoveryAction guard and used to land in classBNoop
+   * forever. Measured live 2026-08-06: 202 of 235 blocked-issue recovery actions
+   * were dormant stranded rows, 171 of them below the 7d attention stage.
+   * A `lastAttemptAt` of null has never fired at all, so it counts as dormant.
+   */
+  async function loadDormantStrandedRecoveryActions(sourceIssueIds: string[]) {
+    if (sourceIssueIds.length === 0) return new Map<string, typeof issueRecoveryActions.$inferSelect>();
+    const rows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          inArray(issueRecoveryActions.sourceIssueId, [...new Set(sourceIssueIds)]),
+          eq(issueRecoveryActions.kind, "stranded_assigned_issue"),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+          or(
+            isNull(issueRecoveryActions.lastAttemptAt),
+            lte(issueRecoveryActions.lastAttemptAt, recoveryActionDormancyCutoff()),
+          ),
+        ),
+      )
+      .orderBy(desc(issueRecoveryActions.updatedAt));
+    const result = new Map<string, typeof issueRecoveryActions.$inferSelect>();
+    for (const row of rows) {
+      if (!result.has(row.sourceIssueId)) result.set(row.sourceIssueId, row);
+    }
+    return result;
+  }
+
   async function loadAnyActiveRecoveryActions(sourceIssueIds: string[]) {
     if (sourceIssueIds.length === 0) return new Map<string, typeof issueRecoveryActions.$inferSelect>();
     const rows = await db
@@ -3533,6 +3578,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       classBNoop: 0,
       classBBoardOnly: 0,
       classBSkippedOtherRecoveryAction: 0,
+      classBStrandedRearmed: 0,
+      classBStrandedRearmDeferredCap: 0,
+      classBStrandedResolvedBlockerGoverned: 0,
       blockedEnteredAtFallbacks: 0,
       issueGraphRecoveryActionsResolved: 0,
       actionErrors: 0,
@@ -3540,6 +3588,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       classAIssueIds: [] as string[],
       classBNudgedIssueIds: [] as string[],
       classBEscalatedIssueIds: [] as string[],
+      classBStrandedRearmedIssueIds: [] as string[],
     };
 
     // These pre-loop loaders used to sit outside every try/catch. A throw here
@@ -3550,9 +3599,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // the log gate) and let the caller's chain continue.
     const prescan = await (async () => {
       try {
-        const [graphLivenessActions, anyActiveActions] = await Promise.all([
+        const [graphLivenessActions, anyActiveActions, dormantStrandedActions] = await Promise.all([
           loadActiveIssueGraphLivenessRecoveryActions(sourceIssueIds),
           loadAnyActiveRecoveryActions(sourceIssueIds),
+          loadDormantStrandedRecoveryActions(sourceIssueIds),
         ]);
         // Owner resolution is needed for every issue that can end up needing an
         // owner: 30-day escalations, capped Class A downgrades, and the
@@ -3570,6 +3620,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           ok: true as const,
           graphLivenessActions,
           anyActiveActions,
+          dormantStrandedActions,
           ownerMaps,
           recentClassAFingerprintsByIssueId,
         };
@@ -3590,6 +3641,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const {
       graphLivenessActions,
       anyActiveActions,
+      dormantStrandedActions,
       ownerMaps,
       recentClassAFingerprintsByIssueId,
     } = prescan;
@@ -3692,6 +3744,62 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       return action;
+    }
+
+    // AUR-4996: per-run budget for stranded re-arm wakes. See
+    // CLASS_B_STRANDED_REARM_PER_RUN_CAP for why this is capped.
+    let strandedRearmsThisRun = 0;
+
+    /**
+     * Re-fire a dormant `stranded_assigned_issue` action in place: bump the
+     * attempt, refresh `lastAttemptAt`, and re-enqueue the recovery-owner wake
+     * the stranded loop would have sent. The refreshed `lastAttemptAt` makes
+     * the action non-dormant, so the next sweep noops it for 24h — the
+     * dormancy window is the retry spacing, exactly as it is for the
+     * `todo`-path escalation cooldown. Returns false when the action lost the
+     * race to a concurrent resolve.
+     */
+    async function rearmDormantStrandedAction(args: {
+      classification: DurableBlockedIssueClassification;
+      action: typeof issueRecoveryActions.$inferSelect;
+    }) {
+      const { classification, action } = args;
+      const rearmed = await recoveryActionsSvc.rearmActiveForIssue({
+        companyId: classification.issue.companyId,
+        sourceIssueId: classification.issue.id,
+        actionId: action.id,
+        lastAttemptAt: input.now,
+      });
+      if (!rearmed) return false;
+
+      await logActivity(db, {
+        companyId: classification.issue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: rearmed.ownerAgentId,
+        runId: input.runId ?? null,
+        action: "issue.recovery_action_rearmed",
+        entityType: "issue",
+        entityId: classification.issue.id,
+        details: {
+          identifier: classification.issue.identifier,
+          recoveryActionId: rearmed.id,
+          recoveryActionKind: rearmed.kind,
+          recoveryActionOwnerAgentId: rearmed.ownerAgentId,
+          recoveryActionAttemptCount: rearmed.attemptCount,
+          source: "recovery.reconcile_issue_graph_liveness",
+          durableBlockerClassification: classification.kind,
+          stage: "class_b_stranded_rearm",
+        },
+      });
+
+      await enqueueSourceScopedStrandedRecoveryWake({
+        action: rearmed,
+        issue: { id: classification.issue.id },
+        latestRun: null,
+        recoveryCause: "stranded_assigned_issue",
+      });
+      return true;
     }
 
     for (const classification of classifications) {
@@ -3878,6 +3986,46 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             });
             if (resolved) result.issueGraphRecoveryActionsResolved += 1;
           }
+
+          // AUR-4996: a dormant stranded action on a genuinely-blocked issue is
+          // dead bookkeeping — the open blocker's lifecycle governs the issue
+          // now (Class A flips it back to todo when the blockers go terminal),
+          // and re-waking a recovery owner who can do nothing until then would
+          // be noise. Retire it; if the issue strands again after unblocking,
+          // `ensureSourceScopedStrandedRecoveryAction` mints a fresh action.
+          const dormantStranded = dormantStrandedActions.get(classification.issue.id);
+          if (dormantStranded) {
+            const resolvedStranded = await recoveryActionsSvc.resolveActiveForIssue({
+              companyId: classification.issue.companyId,
+              sourceIssueId: classification.issue.id,
+              actionId: dormantStranded.id,
+              status: "resolved",
+              outcome: "blocked",
+              resolutionNote:
+                "Resolved automatically: the source issue is governed by an open first-class blocker, so stranded-issue recovery no longer applies.",
+            });
+            if (resolvedStranded) {
+              result.classBStrandedResolvedBlockerGoverned += 1;
+              await logActivity(db, {
+                companyId: classification.issue.companyId,
+                actorType: "system",
+                actorId: "system",
+                agentId: null,
+                runId: input.runId ?? null,
+                action: "issue.recovery_action_resolved",
+                entityType: "issue",
+                entityId: classification.issue.id,
+                details: {
+                  identifier: classification.issue.identifier,
+                  recoveryActionId: resolvedStranded.id,
+                  recoveryActionKind: resolvedStranded.kind,
+                  source: "recovery.reconcile_issue_graph_liveness",
+                  durableBlockerClassification: classification.kind,
+                  stage: "class_b_stranded_resolved_blocker_governed",
+                },
+              });
+            }
+          }
           result.classBNoop += 1;
           continue;
         }
@@ -3904,6 +4052,27 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               runId: input.runId ?? null,
             });
             if (resolved) result.issueGraphRecoveryActionsResolved += 1;
+          }
+
+          // AUR-4996: below the 7d attention stage, a missing-edge blocked
+          // issue whose stranded action has gone dormant has NO other live
+          // recovery path: the stranded loop cannot see blocked issues, and
+          // this sweep used to noop it here until the 7d stage. Re-fire the
+          // stranded wake instead, spaced by the 24h dormancy window and
+          // capped per run. Board-owned actions (no ownerAgentId) are left to
+          // the attention ladder — there is no one to wake.
+          const dormantStranded = dormantStrandedActions.get(classification.issue.id);
+          if (dormantStranded?.ownerAgentId) {
+            if (strandedRearmsThisRun >= CLASS_B_STRANDED_REARM_PER_RUN_CAP) {
+              result.classBStrandedRearmDeferredCap += 1;
+              continue;
+            }
+            strandedRearmsThisRun += 1;
+            if (await rearmDormantStrandedAction({ classification, action: dormantStranded })) {
+              result.classBStrandedRearmed += 1;
+              pushBoundedIssueId(result.classBStrandedRearmedIssueIds, classification.issue.id);
+              continue;
+            }
           }
           result.classBNoop += 1;
           continue;
@@ -4276,6 +4445,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       classBNoop: 0,
       classBBoardOnly: 0,
       classBSkippedOtherRecoveryAction: 0,
+      classBStrandedRearmed: 0,
+      classBStrandedRearmDeferredCap: 0,
+      classBStrandedResolvedBlockerGoverned: 0,
       blockedEnteredAtFallbacks: 0,
       issueGraphRecoveryActionsResolved: 0,
       actionErrors: 0,
@@ -4283,6 +4455,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       classAIssueIds: [] as string[],
       classBNudgedIssueIds: [] as string[],
       classBEscalatedIssueIds: [] as string[],
+      classBStrandedRearmedIssueIds: [] as string[],
     };
 
     if (!autoRecoveryEnabled) {
@@ -4307,6 +4480,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     result.classBNoop = durableBlockedIssueActuation.classBNoop;
     result.classBBoardOnly = durableBlockedIssueActuation.classBBoardOnly;
     result.classBSkippedOtherRecoveryAction = durableBlockedIssueActuation.classBSkippedOtherRecoveryAction;
+    result.classBStrandedRearmed = durableBlockedIssueActuation.classBStrandedRearmed;
+    result.classBStrandedRearmDeferredCap = durableBlockedIssueActuation.classBStrandedRearmDeferredCap;
+    result.classBStrandedResolvedBlockerGoverned = durableBlockedIssueActuation.classBStrandedResolvedBlockerGoverned;
     result.blockedEnteredAtFallbacks = durableBlockedIssueActuation.blockedEnteredAtFallbacks;
     result.issueGraphRecoveryActionsResolved = durableBlockedIssueActuation.issueGraphRecoveryActionsResolved;
     result.actionErrors = durableBlockedIssueActuation.actionErrors;
@@ -4314,6 +4490,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     result.classAIssueIds = durableBlockedIssueActuation.classAIssueIds;
     result.classBNudgedIssueIds = durableBlockedIssueActuation.classBNudgedIssueIds;
     result.classBEscalatedIssueIds = durableBlockedIssueActuation.classBEscalatedIssueIds;
+    result.classBStrandedRearmedIssueIds = durableBlockedIssueActuation.classBStrandedRearmedIssueIds;
 
     const findings = await collectIssueGraphLivenessFindings();
     result.findings = findings.length;

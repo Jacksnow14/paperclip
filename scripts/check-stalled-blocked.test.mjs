@@ -24,6 +24,15 @@ import {
   DEFAULT_MAX_FLAGS_PER_RUN,
   resolveMaxFlagsPerRun,
   ISSUE_STATUS_FILTER,
+  ROUTINE_EXECUTION_STALE_HOURS,
+  NON_TERMINAL_STATUSES,
+  isStrandedRoutineExecution,
+  extractSourceIssueRef,
+  STRANDED_ROUTINE_FLAG_REGEX,
+  strandedRoutineFlagTitle,
+  buildStrandedRoutineFlagDescription,
+  resolveStrandedRoutineCancelReason,
+  STRANDED_ROUTINE_FLAG_CAP,
   main,
 } from './check-stalled-blocked.mjs';
 
@@ -335,6 +344,194 @@ test('resolveCancelReason: auto-resolves a flag whose target is now a routine di
   assert.match(reason, /aggregate umbrella flag/);
 });
 
+// ── extractSourceIssueRef (AUR-5634): title-only, 5 real fixtures ───────────
+
+test('extractSourceIssueRef: extracts AUR-1300 from AUR-5425\'s real title', () => {
+  assert.equal(extractSourceIssueRef({
+    title: 'Weekly Google Workspace security audit (tryauranode.com) — AUR-1300',
+  }), 'AUR-1300');
+});
+
+test('extractSourceIssueRef: extracts AUR-5366 from AUR-5430\'s real title', () => {
+  assert.equal(extractSourceIssueRef({
+    title: 'One-shot 2026-08-12: send PlumbSmart first contact (AUR-5366 pilot acquisition)',
+  }), 'AUR-5366');
+});
+
+test('extractSourceIssueRef: extracts AUR-5356 from AUR-5416\'s real title', () => {
+  assert.equal(extractSourceIssueRef({
+    title: 'Telephony-gateway deploy-staleness watchdog — AUR-5356',
+  }), 'AUR-5356');
+});
+
+test('extractSourceIssueRef: null for AUR-5424\'s real title (no reference)', () => {
+  assert.equal(extractSourceIssueRef({ title: 'Etsy Aug-10 2026 kill-gate evaluation (one-shot)' }), null);
+});
+
+test('extractSourceIssueRef: null for AUR-5427\'s real title (no reference)', () => {
+  assert.equal(extractSourceIssueRef({ title: 'Weekly Etsy Shop Operations — 2026-08-10' }), null);
+});
+
+test('extractSourceIssueRef: scans the title only, never the description (regression)', () => {
+  // AUR-5424's real description mentions AUR-4510 and AUR-3263/AUR-3264 with no
+  // clean single external source — scanning it would produce a false positive.
+  assert.equal(extractSourceIssueRef({
+    title: 'Etsy Aug-10 2026 kill-gate evaluation (one-shot)',
+    description: 'Follows the kill-gate policy from AUR-4510, see also AUR-3263 and AUR-3264 for prior runs.',
+  }), null);
+});
+
+test('extractSourceIssueRef: picks the FIRST reference when a title has more than one', () => {
+  assert.equal(extractSourceIssueRef({ title: 'AUR-100 blocks AUR-200 from proceeding' }), 'AUR-100');
+});
+
+// ── isStrandedRoutineExecution (AUR-5634) ────────────────────────────────────
+
+test('isStrandedRoutineExecution: true for a routine_execution issue past the threshold, still backlog (AUR-5416 shape)', () => {
+  const now = new Date('2026-08-13T00:00:00Z');
+  assert.equal(isStrandedRoutineExecution({
+    originKind: 'routine_execution',
+    status: 'backlog',
+    createdAt: '2026-08-08T09:15:12.230Z',
+  }, now), true);
+});
+
+test('isStrandedRoutineExecution: true for a routine_execution issue past the threshold, in_review (AUR-5427 shape)', () => {
+  const now = new Date('2026-08-13T00:00:00Z');
+  assert.equal(isStrandedRoutineExecution({
+    originKind: 'routine_execution',
+    status: 'in_review',
+    createdAt: '2026-08-10T14:00:19.001Z',
+  }, now), true);
+});
+
+test('isStrandedRoutineExecution: false when originKind is not routine_execution', () => {
+  const now = new Date('2026-08-13T00:00:00Z');
+  assert.equal(isStrandedRoutineExecution({
+    originKind: 'manual',
+    status: 'backlog',
+    createdAt: '2026-08-08T09:15:12.230Z',
+  }, now), false);
+});
+
+test('isStrandedRoutineExecution: false when status is terminal (done)', () => {
+  const now = new Date('2026-08-13T00:00:00Z');
+  assert.equal(isStrandedRoutineExecution({
+    originKind: 'routine_execution',
+    status: 'done',
+    createdAt: '2026-08-08T09:15:12.230Z',
+  }, now), false);
+});
+
+test('isStrandedRoutineExecution: false when status is terminal (cancelled)', () => {
+  const now = new Date('2026-08-13T00:00:00Z');
+  assert.equal(isStrandedRoutineExecution({
+    originKind: 'routine_execution',
+    status: 'cancelled',
+    createdAt: '2026-08-08T09:15:12.230Z',
+  }, now), false);
+});
+
+test('isStrandedRoutineExecution: false when under the threshold', () => {
+  const now = new Date('2026-08-08T10:00:00Z');
+  assert.equal(isStrandedRoutineExecution({
+    originKind: 'routine_execution',
+    status: 'backlog',
+    createdAt: '2026-08-08T09:15:12.230Z', // 45 minutes old
+  }, now), false);
+});
+
+test('isStrandedRoutineExecution: boundary — false at exactly threshold minus one hour, true at exactly threshold', () => {
+  const created = '2026-08-08T09:00:00.000Z';
+  assert.equal(isStrandedRoutineExecution(
+    { originKind: 'routine_execution', status: 'todo', createdAt: created },
+    new Date(new Date(created).getTime() + (ROUTINE_EXECUTION_STALE_HOURS - 1) * 3600 * 1000),
+  ), false);
+  assert.equal(isStrandedRoutineExecution(
+    { originKind: 'routine_execution', status: 'todo', createdAt: created },
+    new Date(new Date(created).getTime() + ROUTINE_EXECUTION_STALE_HOURS * 3600 * 1000),
+  ), true);
+});
+
+test('isStrandedRoutineExecution: true for every NON_TERMINAL_STATUSES entry', () => {
+  const now = new Date('2026-08-13T00:00:00Z');
+  for (const status of NON_TERMINAL_STATUSES) {
+    assert.equal(isStrandedRoutineExecution({
+      originKind: 'routine_execution',
+      status,
+      createdAt: '2026-08-08T09:15:12.230Z',
+    }, now), true, `expected status "${status}" to count as non-terminal/strandable`);
+  }
+});
+
+// ── STRANDED_ROUTINE_FLAG_REGEX / strandedRoutineFlagTitle round-trip ───────
+
+test('strandedRoutineFlagTitle + STRANDED_ROUTINE_FLAG_REGEX: with-source title round-trips the EXECUTION identifier', () => {
+  const title = strandedRoutineFlagTitle('AUR-5416', 'AUR-5356');
+  assert.match(title, /^stranded-routine-execution:/);
+  assert.match(title, /AUR-5356/);
+  const match = STRANDED_ROUTINE_FLAG_REGEX.exec(title);
+  assert.ok(match);
+  assert.equal(match[1], 'AUR-5416', 'capture group is the execution identifier, the stable dedup key');
+});
+
+test('strandedRoutineFlagTitle + STRANDED_ROUTINE_FLAG_REGEX: no-source fallback title still round-trips the execution identifier', () => {
+  const title = strandedRoutineFlagTitle('AUR-5427', null);
+  assert.match(title, /no source reference in title/);
+  const match = STRANDED_ROUTINE_FLAG_REGEX.exec(title);
+  assert.ok(match);
+  assert.equal(match[1], 'AUR-5427');
+});
+
+// ── buildStrandedRoutineFlagDescription ──────────────────────────────────────
+
+test('buildStrandedRoutineFlagDescription: with a source reference, names both issues and does not claim no source exists', () => {
+  const desc = buildStrandedRoutineFlagDescription({
+    id: 'e1',
+    identifier: 'AUR-5416',
+    title: 'Telephony-gateway deploy-staleness watchdog — AUR-5356',
+    status: 'backlog',
+    createdAt: '2026-08-08T09:15:12.230Z',
+  }, 'AUR-5356', new Date('2026-08-13T00:00:00Z'));
+  assert.match(desc, /AUR-5416/);
+  assert.match(desc, /AUR-5356/);
+  assert.match(desc, /exec\.routing-rationale: skip/);
+});
+
+test('buildStrandedRoutineFlagDescription: without a source reference, explicitly says extraction failed (not "no source exists")', () => {
+  const desc = buildStrandedRoutineFlagDescription({
+    id: 'e2',
+    identifier: 'AUR-5427',
+    title: 'Weekly Etsy Shop Operations — 2026-08-10',
+    status: 'in_review',
+    createdAt: '2026-08-10T14:00:19.001Z',
+  }, null, new Date('2026-08-13T00:00:00Z'));
+  assert.match(desc, /extraction failed/);
+  assert.match(desc, /does not mean no source exists/, 'must explicitly disclaim the false "no source exists" reading, not just omit it');
+});
+
+// ── resolveStrandedRoutineCancelReason ───────────────────────────────────────
+
+test('resolveStrandedRoutineCancelReason: resolves when the target is no longer found among open issues', () => {
+  const reason = resolveStrandedRoutineCancelReason({ target: null, targetId: 'AUR-5416' });
+  assert.match(reason, /not found among open issues/);
+});
+
+test('resolveStrandedRoutineCancelReason: resolves when the target has flipped to done', () => {
+  const reason = resolveStrandedRoutineCancelReason({ target: { status: 'done' }, targetId: 'AUR-5416' });
+  assert.match(reason, /is done/);
+});
+
+test('resolveStrandedRoutineCancelReason: resolves when the target has flipped to cancelled', () => {
+  const reason = resolveStrandedRoutineCancelReason({ target: { status: 'cancelled' }, targetId: 'AUR-5416' });
+  assert.match(reason, /is cancelled/);
+});
+
+test('resolveStrandedRoutineCancelReason: null (stays open) when the target is still non-terminal', () => {
+  const reason = resolveStrandedRoutineCancelReason({ target: { status: 'backlog' }, targetId: 'AUR-5416' });
+  assert.equal(reason, null);
+});
+
 // ── main() integration (AUR-5000 acceptance bar: FIRES / PASSES / CAPS / GROUPS) ─
 
 const API_URL = 'http://test.local';
@@ -552,4 +749,191 @@ test('main() GROUPS: comments on an existing open aggregate flag instead of refi
   assert.equal(filedAnyIssue, false, 'should comment on the existing aggregate, not file a new one');
   const commented = calls.find((c) => c.method === 'POST' && c.path === '/api/issues/ue1/comments');
   assert.ok(commented, 'expected a comment on the existing open umbrella aggregate flag');
+});
+
+// ── main() integration: stranded-routine-execution path (AUR-5634) ──────────
+
+test('main() FIRES: a stranded routine_execution issue with a source reference in its title fetches the source and flags it', async () => {
+  const execIssue = {
+    id: 'e1',
+    identifier: 'AUR-5416',
+    title: 'Telephony-gateway deploy-staleness watchdog — AUR-5356',
+    status: 'backlog',
+    priority: 'high',
+    originKind: 'routine_execution',
+    originId: 'some-other-routine-id',
+    createdAt: '2020-01-01T00:00:00Z', // far enough in the past to clear the threshold regardless of test run time
+    updatedAt: '2020-01-01T00:00:00Z',
+  };
+  const sourceIssue = { id: 'src1', identifier: 'AUR-5356', title: 'Source issue', status: 'todo', assigneeAgentId: 'sourceOwner' };
+  const { fetchStub, calls } = makeFetchStub({
+    [BLOCKED_QUERY]: [],
+    [ALL_QUERY]: [execIssue],
+    'GET /api/issues/AUR-5356': sourceIssue,
+    [FILE_ISSUE_ROUTE]: { id: 'flag1' },
+  });
+  global.fetch = fetchStub;
+
+  const code = await main({ apply: true, apiUrl: API_URL, apiKey: 'key', companyId: COMPANY_ID, maxFlagsPerRun: 5 });
+
+  assert.equal(code, 0);
+  const filed = calls.filter((c) => c.method === 'POST' && c.path === `/api/companies/${COMPANY_ID}/issues`);
+  assert.equal(filed.length, 1, 'expected exactly one stranded-routine-execution flag');
+  assert.match(filed[0].body.title, /^stranded-routine-execution: AUR-5416/);
+  assert.match(filed[0].body.title, /AUR-5356/);
+  assert.equal(filed[0].body.assigneeAgentId, 'sourceOwner', 'flag routes to the SOURCE issue\'s owner, not the execution issue');
+  const sourceFetched = calls.some((c) => c.method === 'GET' && c.path === '/api/issues/AUR-5356');
+  assert.ok(sourceFetched, 'expected the source issue to be fetched to resolve its owner');
+});
+
+test('main() FIRES: a stranded routine_execution issue with no source reference falls back to flagging the execution issue itself', async () => {
+  const execIssue = {
+    id: 'e2',
+    identifier: 'AUR-5427',
+    title: 'Weekly Etsy Shop Operations — 2026-08-10',
+    status: 'in_review',
+    priority: 'medium',
+    originKind: 'routine_execution',
+    originId: 'some-other-routine-id',
+    createdAt: '2020-01-01T00:00:00Z',
+    updatedAt: '2020-01-01T00:00:00Z',
+    assigneeAgentId: 'execOwner',
+  };
+  const { fetchStub, calls } = makeFetchStub({
+    [BLOCKED_QUERY]: [],
+    [ALL_QUERY]: [execIssue],
+    [FILE_ISSUE_ROUTE]: { id: 'flag1' },
+  });
+  global.fetch = fetchStub;
+
+  const code = await main({ apply: true, apiUrl: API_URL, apiKey: 'key', companyId: COMPANY_ID, maxFlagsPerRun: 5 });
+
+  assert.equal(code, 0);
+  const filed = calls.filter((c) => c.method === 'POST' && c.path === `/api/companies/${COMPANY_ID}/issues`);
+  assert.equal(filed.length, 1);
+  assert.match(filed[0].body.title, /^stranded-routine-execution: AUR-5427/);
+  assert.match(filed[0].body.title, /no source reference in title/);
+  assert.equal(filed[0].body.assigneeAgentId, 'execOwner', 'no source to route to — falls back to the execution issue\'s own owner');
+  const sourceFetchAttempted = calls.some((c) => c.method === 'GET' && /^\/api\/issues\/AUR-\d+$/.test(c.path));
+  assert.equal(sourceFetchAttempted, false, 'no source ref extracted — no source lookup should be attempted');
+});
+
+test('main() PASSES: a routine_execution issue below the staleness threshold is not flagged', async () => {
+  const execIssue = {
+    id: 'e3',
+    identifier: 'AUR-9001',
+    title: 'Some fresh routine dispatch — AUR-1000',
+    status: 'backlog',
+    priority: 'high',
+    originKind: 'routine_execution',
+    originId: 'some-other-routine-id',
+    createdAt: new Date(Date.now() - 3600 * 1000).toISOString(), // 1h old, under the 24h threshold
+    updatedAt: new Date(Date.now() - 3600 * 1000).toISOString(),
+  };
+  const { fetchStub, calls } = makeFetchStub({
+    [BLOCKED_QUERY]: [],
+    [ALL_QUERY]: [execIssue],
+  });
+  global.fetch = fetchStub;
+
+  const code = await main({ apply: true, apiUrl: API_URL, apiKey: 'key', companyId: COMPANY_ID, maxFlagsPerRun: 5 });
+
+  assert.equal(code, 0);
+  const filed = calls.filter((c) => c.method === 'POST' && c.path === `/api/companies/${COMPANY_ID}/issues`);
+  assert.equal(filed.length, 0, 'issue is under threshold — nothing should be filed');
+});
+
+test('main() DEDUPES: does not re-file a stranded-routine-execution flag when an open one already targets the execution issue', async () => {
+  const execIssue = {
+    id: 'e4',
+    identifier: 'AUR-5416',
+    title: 'Telephony-gateway deploy-staleness watchdog — AUR-5356',
+    status: 'backlog',
+    priority: 'high',
+    originKind: 'routine_execution',
+    originId: 'some-other-routine-id',
+    createdAt: '2020-01-01T00:00:00Z',
+    updatedAt: '2020-01-01T00:00:00Z',
+  };
+  const existingFlag = {
+    id: 'flagExisting',
+    identifier: 'AUR-9700',
+    title: strandedRoutineFlagTitle('AUR-5416', 'AUR-5356'),
+    status: 'todo',
+  };
+  const { fetchStub, calls } = makeFetchStub({
+    [BLOCKED_QUERY]: [],
+    [ALL_QUERY]: [execIssue, existingFlag],
+  });
+  global.fetch = fetchStub;
+
+  const code = await main({ apply: true, apiUrl: API_URL, apiKey: 'key', companyId: COMPANY_ID, maxFlagsPerRun: 5 });
+
+  assert.equal(code, 0);
+  const filed = calls.filter((c) => c.method === 'POST' && c.path === `/api/companies/${COMPANY_ID}/issues`);
+  assert.equal(filed.length, 0, 'an open flag already targets AUR-5416 — should not refile');
+});
+
+test('main() CAPS: STRANDED_ROUTINE_FLAG_CAP + 2 stranded candidates files exactly the cap and names the dropped identifiers', async () => {
+  const execIssues = Array.from({ length: STRANDED_ROUTINE_FLAG_CAP + 2 }, (_, i) => ({
+    id: `se${i + 1}`,
+    identifier: `AUR-920${i + 1}`,
+    title: `Some stranded routine dispatch ${i + 1}`,
+    status: 'backlog',
+    priority: 'high',
+    originKind: 'routine_execution',
+    originId: 'some-other-routine-id',
+    createdAt: '2020-01-01T00:00:00Z',
+    updatedAt: '2020-01-01T00:00:00Z',
+    assigneeAgentId: 'agentX',
+  }));
+  const { fetchStub, calls } = makeFetchStub({
+    [BLOCKED_QUERY]: [],
+    [ALL_QUERY]: execIssues,
+    [FILE_ISSUE_ROUTE]: { id: 'flagN' },
+  });
+  global.fetch = fetchStub;
+
+  const code = await main({ apply: true, apiUrl: API_URL, apiKey: 'key', companyId: COMPANY_ID, maxFlagsPerRun: 50 });
+
+  assert.equal(code, 0);
+  const filed = calls.filter((c) => c.method === 'POST' && c.path === `/api/companies/${COMPANY_ID}/issues`);
+  assert.equal(filed.length, STRANDED_ROUTINE_FLAG_CAP, 'expected exactly STRANDED_ROUTINE_FLAG_CAP flags filed');
+
+  const droppedIds = execIssues.slice(STRANDED_ROUTINE_FLAG_CAP).map((s) => s.identifier);
+  const capLine = logLines.find((l) => l.includes('STRANDED_ROUTINE_FLAG_CAP'));
+  assert.ok(capLine, 'expected a CAP log line naming STRANDED_ROUTINE_FLAG_CAP');
+  for (const id of droppedIds) {
+    const named = logLines.some((l) => l.includes(id));
+    assert.ok(named, `dropped identifier ${id} should be named explicitly in the output`);
+  }
+});
+
+test('main() RESOLVES: auto-cancels a stranded-routine-execution flag once its target reaches done', async () => {
+  // The execution issue (AUR-5430) is DONE, so it is absent from the ALL_QUERY
+  // response, matching real API behavior (ISSUE_STATUS_FILTER excludes terminal
+  // statuses) — its absence from issueByIdentifier is exactly what should trigger
+  // resolveStrandedRoutineCancelReason's "not found among open issues" branch.
+  const staleFlag = {
+    id: 'flagStale',
+    identifier: 'AUR-9800',
+    title: strandedRoutineFlagTitle('AUR-5430', 'AUR-5366'),
+    status: 'todo',
+  };
+  const { fetchStub, calls } = makeFetchStub({
+    [BLOCKED_QUERY]: [],
+    [ALL_QUERY]: [staleFlag],
+    'PATCH /api/issues/flagStale': { id: 'flagStale', status: 'cancelled' },
+    'POST /api/issues/flagStale/comments': { id: 'comment1' },
+  });
+  global.fetch = fetchStub;
+
+  const code = await main({ apply: true, apiUrl: API_URL, apiKey: 'key', companyId: COMPANY_ID, maxFlagsPerRun: 5 });
+
+  assert.equal(code, 0);
+  const cancelled = calls.find((c) => c.method === 'PATCH' && c.path === '/api/issues/flagStale');
+  assert.ok(cancelled, 'the stale flag should be auto-resolved once its target is not found among open (non-terminal) issues');
+  assert.equal(cancelled.body.status, 'cancelled');
+  const filedAnyFlag = calls.some((c) => c.method === 'POST' && c.path === `/api/companies/${COMPANY_ID}/issues`);
+  assert.equal(filedAnyFlag, false);
 });

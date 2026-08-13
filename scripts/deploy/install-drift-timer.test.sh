@@ -22,6 +22,7 @@ set -uo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 INSTALL="$SCRIPT_DIR/install-drift-timer.sh"
 REPO_DROPIN="$SCRIPT_DIR/systemd/paperclip-deploy-drift.service.d/10-checkouts.conf"
+REPO_UNITS_DROPIN="$SCRIPT_DIR/systemd/paperclip-deploy-drift.service.d/20-units.conf"
 [[ -f "$INSTALL" ]] || { echo "missing $INSTALL" >&2; exit 1; }
 
 TMP=$(mktemp -d)
@@ -88,9 +89,13 @@ else
 fi
 
 # 2. Control: the same installer, same stubs, WITH a watch list, succeeds. Case
-#    1 must fail for the empty list and nothing else.
+#    1 must fail for the empty list and nothing else. Also carries a
+#    PAPERCLIP_DRIFT_UNITS entry — since AUR-5648 both watch lists are
+#    required for a clean install, so every case past this point that expects
+#    success supplies both.
 run_install '[Service]
-Environment="PAPERCLIP_DRIFT_CHECKOUTS=alpha:/tmp/alpha:main\nbeta:/tmp/beta:master"'; rc=$?
+Environment="PAPERCLIP_DRIFT_CHECKOUTS=alpha:/tmp/alpha:main\nbeta:/tmp/beta:master"
+Environment="PAPERCLIP_DRIFT_UNITS=svc:foo.service:/tmp/foo.service:system"'; rc=$?
 if [[ "$rc" == "0" ]] && grep -q "armed for: alpha beta" "$OUT"; then
   ok "install with a watch list succeeds and names the armed checkouts"
 else
@@ -119,8 +124,9 @@ fi
 #    the shipped one coexisted, and the installer announced 14 armed checkouts
 #    for a 7-entry list.
 run_install '[Service]
-Environment="PAPERCLIP_DRIFT_CHECKOUTS=stale:/tmp/stale:main"'
-extra="$TMP/stage.$CASE/systemd/paperclip-deploy-drift.service.d/20-later.conf"
+Environment="PAPERCLIP_DRIFT_CHECKOUTS=stale:/tmp/stale:main"
+Environment="PAPERCLIP_DRIFT_UNITS=svc:foo.service:/tmp/foo.service:system"'
+extra="$TMP/stage.$CASE/systemd/paperclip-deploy-drift.service.d/30-later.conf"
 printf '%s\n' '[Service]
 Environment="PAPERCLIP_DRIFT_CHECKOUTS=winner:/tmp/winner:main"' > "$extra"
 # Re-run the same staged installer now that a second drop-in exists.
@@ -151,6 +157,84 @@ else
     ok "repo ships a non-empty checkout watch list ($count entries, all label:path:branch)"
   else
     fail "repo ships a non-empty checkout watch list" "count=$count malformed=$bad entries=$entries"
+  fi
+fi
+
+# --- unit-drift axis wiring (AUR-5648) --------------------------------------
+# Mirrors cases 1-4 above, one level up: PAPERCLIP_DRIFT_UNITS ships dark by
+# the same construction (empty opt-in default, nothing sets it) unless this
+# installer refuses to leave it that way.
+
+# 6. The dark state is refused for units too. A checkout watch list alone is
+#    not enough — both guards must independently hold.
+run_install '[Service]
+Environment="PAPERCLIP_DRIFT_CHECKOUTS=alpha:/tmp/alpha:main"'; rc=$?
+if [[ "$rc" != "0" ]] && grep -q "PAPERCLIP_DRIFT_UNITS is empty" "$OUT"; then
+  ok "install with no unit watch list fails loudly"
+else
+  fail "install with no unit watch list fails loudly" "rc=$rc out=$(cat "$OUT")"
+fi
+
+# 7. Control: WITH a unit watch list (and a checkout list, so only the unit
+#    guard is under test), install succeeds and names the armed units.
+run_install '[Service]
+Environment="PAPERCLIP_DRIFT_CHECKOUTS=alpha:/tmp/alpha:main"
+Environment="PAPERCLIP_DRIFT_UNITS=gamma:foo.service:/tmp/foo.service:system\ndelta:bar.timer:/tmp/bar.timer:user"'; rc=$?
+if [[ "$rc" == "0" ]] && grep -q "unit-drift axis armed for: gamma delta" "$OUT"; then
+  ok "install with a unit watch list succeeds and names the armed units"
+else
+  fail "install with a unit watch list succeeds and names the armed units" "rc=$rc out=$(cat "$OUT")"
+fi
+
+# 8. Every armed unit gets its own pre-created (log, state) pair — same
+#    silent-disable hazard as the checkout axis: the unit runs as $UNIT_USER
+#    against root-owned /var/log.
+missing=()
+for label in gamma delta; do
+  [[ -f "${LOG_BASE}.unit-${label}" ]] || missing+=("log:$label")
+  [[ -f "${LOG_BASE%.log}.alert-state.unit-${label}" ]] || missing+=("state:$label")
+done
+if [[ ${#missing[@]} -eq 0 ]]; then
+  ok "each armed unit gets a pre-created (log, state) pair"
+else
+  fail "each armed unit gets a pre-created (log, state) pair" "missing: ${missing[*]}"
+fi
+
+# 9. Two drop-ins setting PAPERCLIP_DRIFT_UNITS: the installer must read the
+#    LAST assignment, exactly as systemd does and exactly as case 5 proved for
+#    PAPERCLIP_DRIFT_CHECKOUTS.
+run_install '[Service]
+Environment="PAPERCLIP_DRIFT_CHECKOUTS=alpha:/tmp/alpha:main"
+Environment="PAPERCLIP_DRIFT_UNITS=stale:foo.service:/tmp/foo.service:system"'
+extra="$TMP/stage.$CASE/systemd/paperclip-deploy-drift.service.d/30-later-units.conf"
+printf '%s\n' '[Service]
+Environment="PAPERCLIP_DRIFT_UNITS=winner:bar.service:/tmp/bar.service:system"' > "$extra"
+PATH="$BIN:$PATH" \
+PAPERCLIP_DRIFT_UNIT_DIR="$TMP/units.$CASE" \
+PAPERCLIP_DRIFT_LOG="$LOG_BASE" \
+PAPERCLIP_DRIFT_ALERT_STATE="${LOG_BASE%.log}.alert-state" \
+PAPERCLIP_DRIFT_UNIT_USER="$(id -un)" \
+PAPERCLIP_DRIFT_INSTALL_NO_SYSTEMD=1 \
+  bash "$TMP/stage.$CASE/install-drift-timer.sh" >"$OUT" 2>&1
+if grep -qx "unit-drift axis armed for: winner " "$OUT"; then
+  ok "with two drop-ins the installer reads the last unit assignment, as systemd does"
+else
+  fail "with two drop-ins the installer reads the last unit assignment, as systemd does" "out=$(cat "$OUT")"
+fi
+
+# 10. The checked-in unit watch list is real: non-empty and every entry
+#     parses as label:source-relative-path:installed-path:level.
+if [[ ! -f "$REPO_UNITS_DROPIN" ]]; then
+  fail "repo ships a non-empty unit watch list" "missing $REPO_UNITS_DROPIN"
+else
+  uentries=$(sed -n 's/^Environment="\?PAPERCLIP_DRIFT_UNITS=//p' "$REPO_UNITS_DROPIN" | sed 's/"$//')
+  uentries=$(printf '%b' "$uentries" | grep -v '^[[:space:]]*$' || true)
+  ucount=$(printf '%s\n' "$uentries" | grep -c . || true)
+  ubad=$(printf '%s\n' "$uentries" | grep -vcE '^[A-Za-z0-9._-]+:[^:]+:/[^:]+:(system|user)$' || true)
+  if [[ "$ucount" -gt 0 && "$ubad" == "0" ]]; then
+    ok "repo ships a non-empty unit watch list ($ucount entries, all label:src:installed:level)"
+  else
+    fail "repo ships a non-empty unit watch list" "count=$ucount malformed=$ubad entries=$uentries"
   fi
 fi
 

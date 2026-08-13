@@ -102,6 +102,27 @@
 #               upstream branch. Same debt character as deploy-debt but measured
 #               against a checkout on disk; a routine can legitimately lag a few
 #               hours behind merges, so the threshold stays at the original 24h.
+#
+# UNIT-DRIFT AXIS (AUR-5648, follow-up to AUR-5647): no deploy path ever
+# re-runs the systemd installer scripts in scripts/deploy/ — a unit/timer/
+# drop-in edit merges to master, ships in the release tarball, and then sits
+# inert on disk until a human happens to re-run the installer by hand.
+# AUR-5633 merged and shipped in release 3a8d0d597825, but the installed
+# drop-in stayed the Aug-5 copy for 183h, paging on an already-obsolete
+# premise. This axis walks a configured manifest of installed systemd
+# artifacts and diffs each against the ACTIVE release's own copy under
+# $APP_ROOT/current/scripts/deploy/systemd/ — not origin/master — matching
+# the pattern already used for activated_sha elsewhere in this script: it
+# answers "does the installed unit match what THIS release says should be
+# installed", not "does it match the tip of master" (a release that has not
+# yet activated a unit edit is not drift).
+#
+#   unit-debt (unit-behind:<label>, unit-missing:<label>)
+#               A watched installed systemd artifact's content differs from
+#               (or is absent versus) the active release's own copy. Same
+#               debt character as checkout-debt: a unit change can legitimately
+#               lag a merge by hours until someone re-runs the relevant
+#               install-*.sh. Threshold: 24h.
 set -uo pipefail
 
 HEALTH_URL=${PAPERCLIP_HEALTH_URL:-http://127.0.0.1:3100/api/health}
@@ -143,6 +164,15 @@ CHECKOUT_ISSUE_URL=${PAPERCLIP_DRIFT_CHECKOUT_ISSUE_URL:-https://paperclip/AUR/i
 # Kill switch for the checkout self-healing refresher (AUR-4984). Default ON;
 # 0 restores detect-only behaviour (refresh=disabled on every checkout line).
 CHECKOUT_REFRESH=${PAPERCLIP_DRIFT_CHECKOUT_REFRESH:-1}
+# unit-drift axis (AUR-5648): `label:source-relative-path:installed-path:level`,
+# one entry per line. DELIBERATELY EMPTY by default — opt-in via
+# PAPERCLIP_DRIFT_UNITS, same reasoning as CHECKOUTS above. `level` (system or
+# user) is informational only (carried through to the alert context); read
+# access to both classes of installed unit does not require sudo (world- or
+# owner-readable — see install-drift-timer.sh's assertion).
+UNITS=${PAPERCLIP_DRIFT_UNITS-}
+UNIT_DEBT_THRESHOLD_SEC=${PAPERCLIP_DRIFT_UNIT_DEBT_THRESHOLD_SEC:-86400}
+UNIT_ISSUE_URL=${PAPERCLIP_DRIFT_UNIT_ISSUE_URL:-https://paperclip/AUR/issues/AUR-5648}
 
 ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -294,6 +324,7 @@ run_drift_gate() {
   TIP_AGE_SEC="$tip_age_sec" MERGE_DEBT_ISSUE_URL="$MERGE_DEBT_ISSUE_URL" \
   CHECKOUT_DEBT_THRESHOLD_SEC="$CHECKOUT_DEBT_THRESHOLD_SEC" \
   CHECKOUT_ISSUE_URL="$CHECKOUT_ISSUE_URL" CONTEXT="$gate_context" \
+  UNIT_DEBT_THRESHOLD_SEC="$UNIT_DEBT_THRESHOLD_SEC" UNIT_ISSUE_URL="$UNIT_ISSUE_URL" \
   ALERT_COOLDOWN_SEC="$ALERT_COOLDOWN_SEC" RUNNING_SHA="${running_sha:0:12}" \
   MASTER_SHA="${master_sha:0:12}" ISSUE_URL="$ISSUE_URL" \
   python3 -c '
@@ -317,6 +348,10 @@ elif reason.startswith("checkout-behind:"):
     # checkout on disk; routines legitimately lag merges by hours, so this
     # keeps the original 24h debt threshold instead of the retuned 1h one.
     klass, threshold = "checkout-debt", int(os.environ["CHECKOUT_DEBT_THRESHOLD_SEC"])
+elif reason.startswith("unit-behind:") or reason.startswith("unit-missing:"):
+    # AUR-5648: same debt character as checkout-debt — a unit change can
+    # legitimately lag a merge by hours until someone re-runs the installer.
+    klass, threshold = "unit-debt", int(os.environ["UNIT_DEBT_THRESHOLD_SEC"])
 else:
     print("QUIET\tunclassified-reason:%s" % reason); raise SystemExit(0)
 
@@ -428,6 +463,15 @@ elif reason.startswith("checkout-behind:"):
         % (hours, klass, reason, os.environ.get("CONTEXT", ""),
            os.environ["CHECKOUT_ISSUE_URL"], note)
     )
+elif reason.startswith("unit-behind:") or reason.startswith("unit-missing:"):
+    # Same rationale as checkout-behind: the running server can be fully
+    # converged while an installed systemd unit/timer/drop-in is a stale or
+    # hand-edited copy of what the active release ships (AUR-5648).
+    text = (
+        "Paperclip unit drift sustained %dh (%s): %s. %s %s%s"
+        % (hours, klass, reason, os.environ.get("CONTEXT", ""),
+           os.environ["UNIT_ISSUE_URL"], note)
+    )
 else:
     text = (
         "Paperclip deploy drift sustained %dh (%s): %s.%s "
@@ -437,8 +481,10 @@ else:
     )
 # AUR-5355: deploy-debt/checkout-debt are fleet-internal noise the founder
 # cannot act on and are demoted to INFO (logged, never delivered); every
-# other klass keeps paging at SEV2.
-severity = "INFO" if klass in ("deploy-debt", "checkout-debt") else "SEV2"
+# other klass keeps paging at SEV2. unit-debt (AUR-5648) is the same
+# character of debt — a merged-but-not-yet-installed unit edit is not
+# something the founder can act on directly — so it joins the INFO group.
+severity = "INFO" if klass in ("deploy-debt", "checkout-debt", "unit-debt") else "SEV2"
 print("ALERT\t%s\t%s" % (severity, text))
 ' 2>/dev/null || printf 'QUIET\tescalation-gate-failed'
   )
@@ -550,6 +596,53 @@ while IFS=: read -r co_label co_path co_branch; do
       "Checkout $co_label ($co_path) is pinned at ${co_local_head:0:12}; origin/$co_branch is ${co_fetch_head:0:12}."
   fi
 done <<< "$CHECKOUTS"
+
+# --- unit-drift axis (AUR-5648) ---------------------------------------------
+# No deploy path re-runs the systemd installer scripts, so a unit/timer/
+# drop-in edit can merge, ship in the release tarball, and sit inert on disk
+# indefinitely. Each manifest line is diffed against the ACTIVE release's own
+# copy (never origin/master — a release that has not yet activated a unit
+# edit is not drift), isolated in its own log/state file pair exactly like the
+# checkout-drift axis above. Missing-at-installed-path is a real MISSING
+# status, not a skip: every manifest line names a definitive expected
+# location, unlike a checkout that may simply not exist on this host.
+while IFS=: read -r un_label un_src un_installed un_level; do
+  [[ -n "$un_label" ]] || continue
+
+  un_release_src="$APP_ROOT/current/scripts/deploy/systemd/$un_src"
+
+  if [[ ! -e "$un_release_src" ]]; then
+    # The active release does not carry this source file at all — nothing to
+    # diff against. This is a manifest/release mismatch, not provable drift
+    # of the installed artifact, so it is reported (not silently skipped) and
+    # left out of the DRIFT verdict — same posture as an unreachable checkout.
+    echo "unit drift: $un_label active release copy $un_release_src not found, skipping" >&2
+    continue
+  fi
+
+  if [[ ! -e "$un_installed" ]]; then
+    un_status=DRIFT un_reason="unit-missing:${un_label}"
+    overall_drift=1
+  elif cmp -s "$un_installed" "$un_release_src" 2>/dev/null; then
+    un_status=ok un_reason=-
+  else
+    un_status=DRIFT un_reason="unit-behind:${un_label}"
+    overall_drift=1
+  fi
+
+  un_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  un_line="$un_ts unit=$un_label level=$un_level installed=$un_installed status=$un_status reason=$un_reason"
+  echo "$un_line"
+  un_log="${DRIFT_LOG}.unit-${un_label}"
+  un_state="${ALERT_STATE}.unit-${un_label}"
+  echo "$un_line" >> "$un_log" 2>/dev/null || true
+
+  if [[ "$un_status" == "DRIFT" ]]; then
+    echo "paperclip unit drift: $un_label ($un_installed, $un_level) does not match the active release's $un_release_src" >&2
+    run_drift_gate "$un_log" "$un_state" "$un_reason" \
+      "Unit $un_label ($un_level) at $un_installed does not match the active release's $un_release_src."
+  fi
+done <<< "$UNITS"
 
 [[ "$overall_drift" == "1" ]] && exit 1
 exit 0

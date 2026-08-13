@@ -489,11 +489,19 @@ export function agentRoutes(
       ? await access.listPrincipalGrants(agent.companyId, "agent", agent.id)
       : [];
     const hasExplicitTaskAssignGrant = grants.some((grant) => grant.permissionKey === "tasks:assign");
+    const hasExplicitRoutinesManageGrant = grants.some((grant) => grant.permissionKey === "routines:manage");
+
+    const routineManageAccess = agent.role === "ceo"
+      ? { canManageRoutines: true, routineManageSource: "ceo_role" as const }
+      : hasExplicitRoutinesManageGrant
+        ? { canManageRoutines: true, routineManageSource: "explicit_grant" as const }
+        : { canManageRoutines: false, routineManageSource: "none" as const };
 
     if (agent.role === "ceo") {
       return {
         canAssignTasks: true,
         taskAssignSource: "ceo_role" as const,
+        ...routineManageAccess,
         membership,
         grants,
       };
@@ -503,6 +511,7 @@ export function agentRoutes(
       return {
         canAssignTasks: true,
         taskAssignSource: "agent_creator" as const,
+        ...routineManageAccess,
         membership,
         grants,
       };
@@ -512,6 +521,7 @@ export function agentRoutes(
       return {
         canAssignTasks: true,
         taskAssignSource: "explicit_grant" as const,
+        ...routineManageAccess,
         membership,
         grants,
       };
@@ -520,6 +530,7 @@ export function agentRoutes(
     return {
       canAssignTasks: false,
       taskAssignSource: "none" as const,
+      ...routineManageAccess,
       membership,
       grants,
     };
@@ -2438,6 +2449,7 @@ export function agentRoutes(
 
     const effectiveCanAssignTasks =
       agent.role === "ceo" || Boolean(agent.permissions?.canCreateAgents) || req.body.canAssignTasks;
+    const grantedByUserId = req.actor.type === "board" ? (req.actor.userId ?? null) : null;
     await access.ensureMembership(agent.companyId, "agent", agent.id, "member", "active");
     await access.setPrincipalPermission(
       agent.companyId,
@@ -2445,8 +2457,25 @@ export function agentRoutes(
       agent.id,
       "tasks:assign",
       effectiveCanAssignTasks,
-      req.actor.type === "board" ? (req.actor.userId ?? null) : null,
+      grantedByUserId,
     );
+
+    if (req.body.canManageRoutines !== undefined) {
+      await access.setPrincipalPermission(
+        agent.companyId,
+        "agent",
+        agent.id,
+        "routines:manage",
+        req.body.canManageRoutines,
+        grantedByUserId,
+      );
+    }
+    // Mirror buildAgentAccessState: the CEO holds routine administration by role, so the
+    // audit trail must record the effective capability, not just the explicit grant row
+    // (hasPermission returns false for a CEO who was never granted routines:manage).
+    const canManageRoutines =
+      agent.role === "ceo" ||
+      (await access.hasPermission(agent.companyId, "agent", agent.id, "routines:manage"));
 
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -2462,6 +2491,7 @@ export function agentRoutes(
         canCreateAgents: agent.permissions?.canCreateAgents ?? false,
         canUpdateAgentMetadata: agent.permissions?.canUpdateAgentMetadata ?? false,
         canAssignTasks: effectiveCanAssignTasks,
+        canManageRoutines,
       },
     });
 

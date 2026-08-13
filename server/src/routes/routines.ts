@@ -10,7 +10,7 @@ import {
 } from "@paperclipai/shared";
 import { trackRoutineCreated } from "@paperclipai/shared/telemetry";
 import { validate } from "../middleware/validate.js";
-import { accessService, logActivity, routineService } from "../services/index.js";
+import { accessService, agentService, logActivity, routineService } from "../services/index.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import { forbidden, unauthorized } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
@@ -25,6 +25,7 @@ export function routineRoutes(
     pluginWorkerManager: options.pluginWorkerManager,
   });
   const access = accessService(db);
+  const agents = agentService(db);
 
   async function assertBoardCanAssignTasks(req: Request, companyId: string) {
     assertCompanyAccess(req, companyId);
@@ -49,15 +50,28 @@ export function routineRoutes(
     return access.hasPermission(companyId, "agent", agentId, "routines:manage");
   }
 
+  async function agentCanAdminRoutines(agentId: string, companyId: string): Promise<boolean> {
+    const actorAgent = await agents.getById(agentId);
+    // The CEO bypass must be company-scoped: agents.getById is a global lookup and
+    // `role` is a property of the agent row, not of a company membership. Without the
+    // companyId comparison this helper would authorize company A's CEO against
+    // company B's routines. Today every call site is downstream of
+    // assertCanManageExistingRoutine (which runs assertCompanyAccess first), so this
+    // is defense-in-depth rather than a live hole — but the helper takes a companyId
+    // and must actually honor it, or the next call site added inherits a cross-tenant bug.
+    if (actorAgent && actorAgent.role === "ceo" && actorAgent.companyId === companyId) return true;
+    return agentHasRoutinesManage(agentId, companyId);
+  }
+
   async function assertCanAdminRoutine(req: Request, companyId: string) {
     if (req.actor.type === "board") {
       await assertBoardCanAssignTasks(req, companyId);
       return;
     }
     if (req.actor.type === "agent" && req.actor.agentId) {
-      if (await agentHasRoutinesManage(req.actor.agentId, companyId)) return;
+      if (await agentCanAdminRoutines(req.actor.agentId, companyId)) return;
     }
-    throw forbidden("Board operators or agents with routines:manage permission required");
+    throw forbidden("Board operators, the CEO, or agents with routines:manage permission required");
   }
 
   async function assertCanManageExistingRoutine(req: Request, routineId: string) {
@@ -67,7 +81,7 @@ export function routineRoutes(
     if (req.actor.type === "board") return routine;
     if (req.actor.type !== "agent" || !req.actor.agentId) throw unauthorized();
     if (routine.assigneeAgentId === req.actor.agentId) return routine;
-    if (await agentHasRoutinesManage(req.actor.agentId, routine.companyId)) return routine;
+    if (await agentCanAdminRoutines(req.actor.agentId, routine.companyId)) return routine;
     throw forbidden("Agents can only manage routines assigned to themselves");
   }
 

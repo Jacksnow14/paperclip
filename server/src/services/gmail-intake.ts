@@ -405,8 +405,10 @@ export function createGmailIntakeService(db: Db) {
               eq(gmailIntakeRecords.companyId, companyId),
               eq(gmailIntakeRecords.mailbox, mailbox),
               eq(gmailIntakeRecords.gmailThreadId, parsed.gmailThreadId),
+              isNotNull(gmailIntakeRecords.issueId),
             ),
           )
+          .orderBy(desc(gmailIntakeRecords.createdAt))
           .limit(1);
 
         const existingIssueId = existingThreadRecord[0]?.issueId ?? null;

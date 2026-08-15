@@ -1252,6 +1252,14 @@ export async function startServer(): Promise<StartedServer> {
           "orphaned recovery action reconciliation closed actions on terminal issues",
         );
       }
+      // AUR-5708: force-cancels a `running` run that has held its issue's execution
+      // lock past the configured threshold with no liveness activity, releasing the
+      // lock (drains any parked deferred wake). This repairs state like the sweeps
+      // above, so it is NOT gated behind HEARTBEAT_SCHEDULER_ENABLED-adjacent knobs
+      // that only exist to stop meta-issue minting.
+      if (config.staleExecutionLockSweepEnabled) {
+        await heartbeat.reconcileStaleExecutionLocks({ thresholdMs: config.staleExecutionLockThresholdMs });
+      }
       // The two sweeps below are the only ones in this chain that exist purely to
       // MINT meta-issues; everything above repairs run/issue state. Skipping them
       // therefore costs no recovery capability, which is what makes them safe to

@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, inArray, isNotNull, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -7297,6 +7297,76 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { reaped: reaped.length, runIds: reaped };
   }
 
+  /**
+   * AUR-5708: `issues.executionRunId` has no wall-clock timeout. `reapOrphanedRuns`
+   * only catches a run whose local process handle is gone (a crash); it does nothing
+   * for a `running` run whose adapter process is still alive but wedged, so the lock
+   * is never released and every mutating call against the issue (including plain
+   * comments) 409s until a board user force-cancels. This sweep force-cancels a
+   * `running` run once it has both held the issue's execution lock past
+   * `thresholdMs` AND shown no liveness activity for at least that long, reusing
+   * `buildRunOutputSilence` (the same silence primitive the active-run-output
+   * watchdog uses to mint review issues) instead of a second silence heuristic. A
+   * lock that is old but still producing output is left alone — only genuinely
+   * silent runs get force-cancelled.
+   */
+  async function reconcileStaleExecutionLocks(opts?: { now?: Date; thresholdMs?: number }) {
+    const now = opts?.now ?? new Date();
+    const thresholdMs = Math.max(60_000, opts?.thresholdMs ?? 30 * 60 * 1000);
+    const lockedBefore = new Date(now.getTime() - thresholdMs);
+
+    const candidates = await db
+      .select({
+        issueId: issues.id,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(
+        and(
+          isNotNull(issues.executionRunId),
+          isNotNull(issues.executionLockedAt),
+          lte(issues.executionLockedAt, lockedBefore),
+        ),
+      )
+      .limit(200);
+
+    const result = {
+      scanned: candidates.length,
+      cancelled: 0,
+      cancelledRunIds: [] as string[],
+      skippedNotRunning: 0,
+      skippedRecentActivity: 0,
+    };
+
+    for (const candidate of candidates) {
+      if (!candidate.executionRunId) continue;
+      const run = await getRun(candidate.executionRunId);
+      if (!run || run.status !== "running") {
+        result.skippedNotRunning += 1;
+        continue;
+      }
+
+      const silence = await buildRunOutputSilence(run, now);
+      if ((silence.silenceAgeMs ?? 0) < thresholdMs) {
+        result.skippedRecentActivity += 1;
+        continue;
+      }
+
+      const reason = `Force-cancelled: issue execution lock held past ${Math.round(thresholdMs / 60_000)}m with no liveness activity (silent for ${Math.round((silence.silenceAgeMs ?? 0) / 60_000)}m)`;
+      const cancelled = await cancelRunInternal(run.id, reason);
+      if (cancelled && cancelled.status === "cancelled") {
+        result.cancelled += 1;
+        result.cancelledRunIds.push(cancelled.id);
+      }
+    }
+
+    if (result.cancelled > 0) {
+      logger.warn({ ...result, thresholdMs }, "stale execution lock sweep force-cancelled hung runs");
+    }
+
+    return result;
+  }
+
   // Agents that currently have queued work, oldest-queued first. Ordering is
   // starvation-first and deterministic (the pre-AUR-4143 query had no ORDER BY,
   // so arbitrary heap order became de-facto priority).
@@ -11458,6 +11528,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reapOrphanedRuns,
     reapStrandedDeferredWakes,
     reapUnclaimableQueuedRuns,
+    reconcileStaleExecutionLocks,
 
     promoteDueScheduledRetries,
     retryScheduledRetryNow,

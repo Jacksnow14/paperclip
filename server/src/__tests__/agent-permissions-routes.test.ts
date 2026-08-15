@@ -1529,6 +1529,60 @@ describe.sequential("agent permission routes", () => {
     expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
   });
 
+  // AUR-5708: an agent may cancel its own run without board auth; cancelling
+  // another agent's run stays board-only.
+  it("allows an agent to cancel its own run without board auth", async () => {
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: "run-1",
+      companyId,
+      agentId,
+      status: "running",
+    });
+    mockHeartbeatService.cancelRun.mockResolvedValue({
+      id: "run-1",
+      companyId,
+      agentId,
+      status: "cancelled",
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      runId: "run-1",
+      source: "agent_key",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).post("/api/heartbeat-runs/run-1/cancel").send({}));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ id: "run-1", status: "cancelled" });
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("run-1");
+  });
+
+  it("rejects an agent cancelling another agent's run without board auth", async () => {
+    const otherAgentId = "55555555-5555-4555-8555-555555555555";
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: "run-1",
+      companyId,
+      agentId: otherAgentId,
+      status: "running",
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      runId: "run-1",
+      source: "agent_key",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).post("/api/heartbeat-runs/run-1/cancel").send({}));
+
+    expect(res.status).toBe(403);
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+  });
+
   // AUR-5026: narrow `canUpdateAgentMetadata` grant — metadata-only PATCH on
   // another agent. The matrix proves both halves: the grant admits exactly the
   // metadata-only shape (CLEARING case) and nothing else (FIRING cases), and

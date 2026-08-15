@@ -87,6 +87,8 @@ export interface Config {
   heartbeatSchedulerIntervalMs: number;
   productivityReviewSweepEnabled: boolean;
   silentRunWatchdogEnabled: boolean;
+  staleExecutionLockSweepEnabled: boolean;
+  staleExecutionLockThresholdMs: number;
   gmailIntakePollerEnabled: boolean;
   gmailIntakePollerIntervalMs: number;
   gmailOutboundReconcilerEnabled: boolean;
@@ -348,6 +350,14 @@ export function loadConfig(): Config {
     // in instance settings is the equivalent switch for liveness-escalation minting.
     productivityReviewSweepEnabled: process.env.PRODUCTIVITY_REVIEW_SWEEP_ENABLED !== "false",
     silentRunWatchdogEnabled: process.env.SILENT_RUN_WATCHDOG_ENABLED !== "false",
+    // AUR-5708: force-cancels a `running` run (and releases the issue execution
+    // lock it holds) once it has held the lock past this threshold with no
+    // liveness activity. Unlike the silent-run watchdog above (which only mints
+    // a review issue), this repairs state, so it stays on by default. 30 minutes
+    // mirrors the incident threshold from AUR-5707, where a hung run blocked all
+    // mutating calls on a critical issue for 10+ minutes with no operator escape.
+    staleExecutionLockSweepEnabled: process.env.STALE_EXECUTION_LOCK_SWEEP_ENABLED !== "false",
+    staleExecutionLockThresholdMs: Math.max(60_000, Number(process.env.STALE_EXECUTION_LOCK_THRESHOLD_MS) || 30 * 60 * 1000),
     gmailIntakePollerEnabled: process.env.GMAIL_INTAKE_POLLER_ENABLED !== "false",
     gmailIntakePollerIntervalMs: Math.max(60_000, Number(process.env.GMAIL_INTAKE_POLLER_INTERVAL_MS) || 10 * 60 * 1000),
     // AUR-4674: out-of-band send detector. Same env-gate style as the intake

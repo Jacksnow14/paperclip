@@ -16,6 +16,10 @@ import {
 } from "../services/gmail.js";
 import { GmailOutboundBlockedError, type GmailOutboundDecision } from "../services/gmail-outbound-guard.js";
 import { GmailProspectSuppressedError, type ProspectSuppressionVerdict } from "../services/gmail-prospect-guard.js";
+import {
+  IntendedRecipientMismatchError,
+  ProspectingRecipientError,
+} from "../services/outbound-recipient-shape.js";
 import { createGmailIntakeService } from "../services/gmail-intake.js";
 
 const attachmentInputSchema = z.object({
@@ -35,6 +39,12 @@ const sendMessageBodySchema = z.object({
   replyTo: z.string().email().optional(),
   attachments: z.array(attachmentInputSchema).optional(),
   ceoApprovalId: z.string().optional(),
+  // AUR-5732: cold prospecting must prove it is reaching a human, and that the
+  // human is the one recorded on the tracker row.
+  prospecting: z.boolean().optional(),
+  recipientPersonName: z.string().optional(),
+  queueJustification: z.string().optional(),
+  intendedRecipient: z.string().optional(),
 });
 
 const replyBodySchema = z
@@ -49,6 +59,12 @@ const replyBodySchema = z
     // AUR-4479: a self-addressed reply must be a deliberate act, never the
     // accidental outcome of recipient resolution.
     allowSelfAddressed: z.boolean().optional(),
+    // AUR-5732: see sendMessageBodySchema. On a reply these are checked against
+    // the recipient RESOLVED from the thread.
+    prospecting: z.boolean().optional(),
+    recipientPersonName: z.string().optional(),
+    queueJustification: z.string().optional(),
+    intendedRecipient: z.string().optional(),
   })
   .refine((v) => Boolean(v.replyToMessageId || v.threadId), {
     message: "replyToMessageId or threadId is required",
@@ -287,6 +303,15 @@ export function gmailRoutes(db: Db) {
         const data = await gmail.sendMessage(mailbox, body, guard, { companyId });
         res.status(201).json(data);
       } catch (err) {
+        // AUR-5732: a queue-shaped prospecting recipient or a To: that is not
+        // the intended prospect is a caller mistake, not a policy escalation —
+        // 422 so the fix is "supply the right recipient", not "get approval".
+        if (
+          err instanceof ProspectingRecipientError ||
+          err instanceof IntendedRecipientMismatchError
+        ) {
+          throw unprocessable(err.message);
+        }
         if (err instanceof GmailOutboundBlockedError) {
           fileBlockedSendIncident(db, companyId, req, mailbox, { to: body.to }, err.decision);
           throw forbidden(err.message);
@@ -315,6 +340,15 @@ export function gmailRoutes(db: Db) {
         const data = await gmail.replyInThread(mailbox, body, guard, { companyId });
         res.status(201).json(data);
       } catch (err) {
+        // AUR-5732: a queue-shaped prospecting recipient or a To: that is not
+        // the intended prospect is a caller mistake, not a policy escalation —
+        // 422 so the fix is "supply the right recipient", not "get approval".
+        if (
+          err instanceof ProspectingRecipientError ||
+          err instanceof IntendedRecipientMismatchError
+        ) {
+          throw unprocessable(err.message);
+        }
         if (err instanceof GmailOutboundBlockedError) {
           fileBlockedSendIncident(
             db,

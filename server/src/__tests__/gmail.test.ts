@@ -795,6 +795,186 @@ describe("createGmailService", () => {
       });
     });
 
+    // AUR-5732 — AUR-4479 above asks "is the recipient not us?". It never asks
+    // "is the recipient the PROSPECT?", so the 2026-07-29 Help at Home resend
+    // passed verification while landing back in the "Great Support" ticket
+    // queue. These tests exercise the two missing questions end-to-end through
+    // the service, on the real thread shape that produced the failure.
+    describe("reaches a human, not a ticket queue (AUR-5732)", () => {
+      // The queue auto-responder. This is what actually sat in the thread and
+      // what recipient resolution therefore locked onto.
+      const QUEUE_MSG = {
+        id: "q1",
+        threadId: "thread681",
+        payload: {
+          headers: [
+            { name: "Message-ID", value: "<ticket-6208185@helpathome.com>" },
+            { name: "Subject", value: "[Great Support] Re: Coupa onboarding" },
+            { name: "From", value: "Great Support <Coupa@helpathome.com>" },
+          ],
+        },
+      };
+      const OUR_MSG = {
+        id: "o1",
+        threadId: "thread681",
+        payload: {
+          headers: [
+            { name: "Message-ID", value: "<ours-681@mail.gmail.com>" },
+            { name: "Subject", value: "[Great Support] Re: Coupa onboarding" },
+            { name: "From", value: "Alex at Auranode <alex@tryauranode.com>" },
+          ],
+        },
+      };
+      const JUSTIFICATION =
+        "Buyer explicitly asked us to file through the supplier portal intake queue.";
+
+      describe("recipient-shape check on prospecting sends", () => {
+        it("FIRES on the queue address AUR-681 actually used", async () => {
+          const service = createGmailService();
+          await expect(
+            service.sendMessage("alex", {
+              to: "Coupa@helpathome.com",
+              subject: "Finish the work Coupa starts",
+              body: "One-pager attached.",
+              prospecting: true,
+              recipientPersonName: "Zachary Welsher",
+            }),
+          ).rejects.toThrow(/role\/queue\/shared inbox/i);
+          expect(mockMessagesSend).not.toHaveBeenCalled();
+        });
+
+        it("PASSES on a named human's work address", async () => {
+          mockMessagesSend.mockResolvedValue({ data: { id: "human1" } });
+          const service = createGmailService();
+
+          await service.sendMessage("alex", {
+            to: "zwelsher@helpathome.com",
+            subject: "Finish the work Coupa starts",
+            body: "One-pager attached.",
+            prospecting: true,
+            recipientPersonName: "Zachary Welsher",
+          });
+
+          const decoded = Buffer.from(
+            mockMessagesSend.mock.calls[0][0].requestBody.raw,
+            "base64url",
+          ).toString("utf-8");
+          expect(decoded).toContain("To: zwelsher@helpathome.com");
+        });
+
+        it("PASSES a queue when the send explicitly justifies it", async () => {
+          mockMessagesSend.mockResolvedValue({ data: { id: "queue1" } });
+          const service = createGmailService();
+
+          await service.sendMessage("alex", {
+            to: "Coupa@helpathome.com",
+            subject: "Supplier portal intake",
+            body: "Filing as requested.",
+            prospecting: true,
+            queueJustification: JUSTIFICATION,
+          });
+
+          expect(mockMessagesSend).toHaveBeenCalledOnce();
+        });
+
+        it("leaves non-prospecting sends alone", async () => {
+          // Answering a support queue that wrote to US first is legitimate and
+          // must not be blocked — a gate that can never clear is as broken as
+          // one that never fires.
+          mockMessagesSend.mockResolvedValue({ data: { id: "inbound-reply" } });
+          const service = createGmailService();
+
+          await service.sendMessage("alex", {
+            to: "Coupa@helpathome.com",
+            subject: "Re: your question",
+            body: "Answering your question.",
+          });
+
+          expect(mockMessagesSend).toHaveBeenCalledOnce();
+        });
+      });
+
+      describe("To: must equal the intended prospect, not merely 'not us'", () => {
+        it("FIRES when a threaded reply resolves to the queue instead of the prospect", async () => {
+          // Exactly the 2026-07-29 resend: our message is last, AUR-4479 walks
+          // back and finds the queue auto-responder, To: is not us, guard
+          // passes, message id returned, and it reaches a ticket queue.
+          mockThreadsGet.mockResolvedValue({
+            data: { id: "thread681", messages: [QUEUE_MSG, OUR_MSG] },
+          });
+          mockMessagesGet.mockImplementation(async ({ id }: { id: string }) => ({
+            data: id === "q1" ? QUEUE_MSG : OUR_MSG,
+          }));
+          const service = createGmailService();
+
+          await expect(
+            service.replyInThread("alex", {
+              threadId: "thread681",
+              body: "Following up on the discovery call.",
+              intendedRecipient: "zwelsher@helpathome.com",
+            }),
+          ).rejects.toThrow(/does not match the intended prospect/i);
+          expect(mockMessagesSend).not.toHaveBeenCalled();
+        });
+
+        it("PASSES when the thread resolves to the intended prospect", async () => {
+          const HUMAN_MSG = {
+            id: "h1",
+            threadId: "thread682",
+            payload: {
+              headers: [
+                { name: "Message-ID", value: "<zw-1@helpathome.com>" },
+                { name: "Subject", value: "Re: Coupa onboarding" },
+                { name: "From", value: "Zachary Welsher <zwelsher@helpathome.com>" },
+              ],
+            },
+          };
+          mockThreadsGet.mockResolvedValue({
+            data: { id: "thread682", messages: [HUMAN_MSG] },
+          });
+          mockMessagesGet.mockResolvedValue({ data: HUMAN_MSG });
+          mockMessagesSend.mockResolvedValue({ data: { id: "ok1", threadId: "thread682" } });
+          const service = createGmailService();
+
+          const result = await service.replyInThread("alex", {
+            threadId: "thread682",
+            body: "Following up on the discovery call.",
+            intendedRecipient: "zwelsher@helpathome.com",
+          });
+
+          expect(result.resolvedRecipient).toBe("Zachary Welsher <zwelsher@helpathome.com>");
+          expect(result.intendedRecipientMatched).toBe(true);
+        });
+
+        it("reports intendedRecipientMatched as null when nothing was declared", async () => {
+          mockMessagesGet.mockResolvedValue({ data: QUEUE_MSG });
+          mockMessagesSend.mockResolvedValue({ data: { id: "ok2" } });
+          const service = createGmailService();
+
+          const result = await service.replyInThread("alex", {
+            replyToMessageId: "q1",
+            body: "Thanks.",
+          });
+
+          // Absence must stay visible rather than reading as a pass.
+          expect(result.intendedRecipientMatched).toBeNull();
+        });
+
+        it("FIRES on a direct send addressed to someone other than the intended prospect", async () => {
+          const service = createGmailService();
+          await expect(
+            service.sendMessage("alex", {
+              to: "Coupa@helpathome.com",
+              subject: "Finish the work Coupa starts",
+              body: "One-pager attached.",
+              intendedRecipient: "zwelsher@helpathome.com",
+            }),
+          ).rejects.toThrow(/does not match the intended prospect/i);
+          expect(mockMessagesSend).not.toHaveBeenCalled();
+        });
+      });
+    });
+
     it("throws when neither replyToMessageId nor threadId is given", async () => {
       const service = createGmailService();
       await expect(

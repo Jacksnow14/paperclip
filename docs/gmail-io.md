@@ -167,6 +167,43 @@ is always a deliberate act, never an accident. The same rule is enforced one lev
 down in `sendMessage()`: a *threaded* send whose entire recipient set is on our own
 domain is rejected outright.
 
+### "Not us" was the wrong question — prospecting must reach a HUMAN (AUR-5732)
+
+The AUR-4479 read-back above asks *"is the recipient not us?"*. It never asks *"is
+the recipient the prospect?"* — so the 2026-07-29 Help at Home resend passed
+verification while going straight back into a helpdesk ticket queue.
+
+`Coupa@helpathome.com` is not a person; it is Help at Home's "Great Support" queue.
+Every one of our ~9 touches auto-opened a new support ticket, and on 2026-08-11 five
+of them were closed and merged into an unrelated landscaping-invoice ticket. All 18
+AUR-681 contact paths were role/queue/shared inboxes. Ten weeks, ~14 accounts, one
+substantive reply — from a helpdesk agent on queue duty, not a buyer.
+
+Two fields close it, both on `POST .../messages` and `POST .../reply`:
+
+| field | effect |
+| --- | --- |
+| `prospecting: true` | turns on the **recipient-shape check**. A role/queue-shaped recipient (in `to` **or** `cc`) is refused unless `queueJustification` (≥20 chars) says why the queue is right for this send. Naming a human does **not** excuse mailing a queue — that was the exact AUR-681 pattern. A human-shaped recipient still requires `recipientPersonName`, so "who is this for?" is answered before the send. |
+| `intendedRecipient` | the prospect address recorded on the tracker row. The address actually placed in `To:` must equal it. On a **reply** this is checked against the recipient *resolved from the thread*, which is the only place a queue auto-responder can silently take the conversation over. |
+
+Both are opt-in per send: replying to a support queue that wrote to **us** first is
+legitimate and stays unblocked. Violations are `422` (fix the recipient), not `403`
+(get approval) — see `server/src/services/outbound-recipient-shape.ts`.
+
+The `201` body now also carries `intendedRecipientMatched`: `true`/`false` when an
+`intendedRecipient` was declared, and `null` when none was — so absence stays visible
+instead of reading as a pass.
+
+```bash
+curl -s -X POST ... "$API/.../reply" -d '{
+  "threadId": "'"$THREAD_ID"'",
+  "body": "...",
+  "prospecting": true,
+  "recipientPersonName": "Zachary Welsher",
+  "intendedRecipient": "zwelsher@helpathome.com"
+}' | jq -e '.intendedRecipientMatched == true'
+```
+
 ## Outbound gate (CEO-approval chokepoint)
 
 Every outbound send — `POST .../messages` and `POST .../reply` alike — is

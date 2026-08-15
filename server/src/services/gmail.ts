@@ -4,6 +4,11 @@ import { gmailOutboundRecords } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { HttpError, badRequest, notFound, tooManyRequests, badGateway, gatewayTimeout } from "../errors.js";
 import { classifyGmailOutbound, GmailOutboundBlockedError } from "./gmail-outbound-guard.js";
+import {
+  assertIntendedRecipient,
+  assertProspectingRecipient,
+  normalizeAddress,
+} from "./outbound-recipient-shape.js";
 import { loadServiceAccountKey } from "./google-service-account.js";
 
 const DOMAIN = "tryauranode.com";
@@ -221,6 +226,23 @@ export interface GmailSendOptions {
    * reply-recipient resolution.
    */
   allowSelfAddressed?: boolean;
+  /**
+   * AUR-5732: declare this a COLD PROSPECTING send. Turns on the recipient-shape
+   * gate — a role/queue/shared inbox recipient must then carry
+   * `queueJustification`, and a human recipient must be named. Replying to a
+   * party who wrote to us first is not prospecting; leave this unset there.
+   */
+  prospecting?: boolean;
+  /** AUR-5732: the human this prospecting send is for, e.g. "Zachary Welsher". */
+  recipientPersonName?: string;
+  /** AUR-5732: why a role/queue inbox is nonetheless correct for this send. */
+  queueJustification?: string;
+  /**
+   * AUR-5732: the prospect address recorded on the tracker row. The address
+   * actually placed in To: must equal it, or the send is refused. AUR-4479 only
+   * proved the recipient was not us; this proves it is the prospect.
+   */
+  intendedRecipient?: string;
 }
 
 export interface GmailReplyOptions {
@@ -232,6 +254,18 @@ export interface GmailReplyOptions {
   attachments?: GmailAttachmentInput[];
   /** AUR-4479: see GmailSendOptions.allowSelfAddressed. */
   allowSelfAddressed?: boolean;
+  /** AUR-5732: see GmailSendOptions.prospecting. */
+  prospecting?: boolean;
+  /** AUR-5732: see GmailSendOptions.recipientPersonName. */
+  recipientPersonName?: string;
+  /** AUR-5732: see GmailSendOptions.queueJustification. */
+  queueJustification?: string;
+  /**
+   * AUR-5732: the prospect address this reply is meant to reach. Checked
+   * against the recipient RESOLVED from the thread, which is the only place a
+   * queue auto-responder can silently take the conversation over.
+   */
+  intendedRecipient?: string;
 }
 
 export interface GmailListOptions {
@@ -534,6 +568,46 @@ export function createGmailService(db?: Db) {
       );
     }
 
+    // AUR-5732 — extend the AUR-4479 read-back from "To: is not us" to "To: is
+    // the intended prospect". Checked here, at the same chokepoint every caller
+    // funnels through, so it also covers replyInThread — where the recipient is
+    // RESOLVED from the thread rather than chosen, and a queue auto-responder
+    // in that thread silently becomes the recipient.
+    if (opts.intendedRecipient) {
+      assertIntendedRecipient(
+        opts.to,
+        opts.intendedRecipient,
+        opts.replyToMessageId ? `threaded reply anchored at ${opts.replyToMessageId}` : "direct send",
+      );
+    }
+
+    // AUR-5732 — recipient-shape gate for cold prospecting. Every AUR-681
+    // contact path was a role/queue inbox; the outreach was triaged as ticket
+    // noise for ten weeks and nobody's guard asked the question.
+    if (opts.prospecting) {
+      const verdicts = assertProspectingRecipient({
+        to: opts.to,
+        cc: opts.cc,
+        recipientPersonName: opts.recipientPersonName,
+        queueJustification: opts.queueJustification,
+      });
+      logger.info(
+        {
+          alias,
+          to: opts.to,
+          subject: opts.subject,
+          recipientShapes: verdicts.map((v) => ({
+            address: v.address,
+            shape: v.shape,
+            matchedRule: v.matchedRule,
+          })),
+          recipientPersonName: opts.recipientPersonName ?? null,
+          queueJustified: Boolean(opts.queueJustification),
+        },
+        "gmail: prospecting recipient shape checked (AUR-5732)",
+      );
+    }
+
     // AUR-2682 service-layer chokepoint: classify EVERY outbound, regardless
     // of which code path called us (direct send, replyInThread, future
     // callers). Gated categories are hard-blocked unless the caller has
@@ -707,6 +781,12 @@ export function createGmailService(db?: Db) {
         replyTo: opts.replyTo,
         attachments: opts.attachments,
         allowSelfAddressed: opts.allowSelfAddressed,
+        // AUR-5732: the resolved recipient is the thing that has to match the
+        // intended prospect — that is exactly the axis AUR-4479 never measured.
+        prospecting: opts.prospecting,
+        recipientPersonName: opts.recipientPersonName,
+        queueJustification: opts.queueJustification,
+        intendedRecipient: opts.intendedRecipient,
       },
       guard,
       tracking,
@@ -714,7 +794,18 @@ export function createGmailService(db?: Db) {
     // AUR-4479: surface the resolved recipient so callers can ASSERT on who was
     // actually addressed. A returned message id proves dispatch, not delivery
     // to the intended party.
-    return { ...sent, resolvedRecipient: replyTo, recipientSourceMessageId };
+    // AUR-5732: `intendedRecipientMatched` is the stronger claim — the resolved
+    // recipient IS the prospect, not merely somebody external. Null when the
+    // caller declared no intended recipient, so absence stays visible rather
+    // than reading as a pass.
+    return {
+      ...sent,
+      resolvedRecipient: replyTo,
+      recipientSourceMessageId,
+      intendedRecipientMatched: opts.intendedRecipient
+        ? normalizeAddress(replyTo) === normalizeAddress(opts.intendedRecipient)
+        : null,
+    };
   }
 
   // AUR-4479: walk a thread newest-first and return the last sender who is not

@@ -210,6 +210,28 @@ export class ProspectingRecipientError extends Error {
 /** A justification has to say something; a single space is not a reason. */
 const MIN_JUSTIFICATION_CHARS = 20;
 
+/**
+ * How confident we are that a recipient address actually reaches the person
+ * it is asserted to reach — orthogonal to RecipientShape, which only says
+ * whether the address FORMAT looks like a person.
+ *
+ * AUR-5735 wrote six addresses at `pattern_hypothesis`: human-shaped,
+ * derived from a confirmed org email pattern (e.g. first.last@domain), but
+ * never observed for that specific person. Every one of them classifies as
+ * `named_human` and trivially satisfies `recipientPersonName` — neither
+ * check says anything about whether the mailbox exists or belongs to them.
+ */
+export type EvidenceGrade =
+  | "verified_firstparty"
+  | "pattern_hypothesis"
+  | "queue_only_confirmed"
+  | "none";
+
+// Grades that clear the bar without an explicit evidenceJustification. An
+// omitted or unrecognized grade is treated the same as the weakest grade —
+// fail closed, matching the posture of an unjustified queue send below.
+const VERIFIED_EVIDENCE_GRADES: ReadonlySet<string> = new Set<EvidenceGrade>(["verified_firstparty"]);
+
 export interface ProspectingRecipientInput {
   to: string;
   cc?: string | string[];
@@ -217,12 +239,23 @@ export interface ProspectingRecipientInput {
   recipientPersonName?: string;
   /** Why a queue/role inbox is nonetheless the right target for this send. */
   queueJustification?: string;
+  /**
+   * How the caller knows this address reaches `recipientPersonName`, e.g.
+   * "verified_firstparty" | "pattern_hypothesis" | "none". Only
+   * `verified_firstparty` clears the bar on its own; anything else needs
+   * `evidenceJustification`. Required whenever a named-human address is in
+   * play — see AUR-5735/AUR-5737.
+   */
+  evidenceGrade?: string;
+  /** Why sending on non-verified evidence is nonetheless correct for this send. */
+  evidenceJustification?: string;
 }
 
 /**
  * Gate a COLD PROSPECTING send. Throws ProspectingRecipientError unless the
  * caller has either named the human being written to or explicitly justified
- * writing to a queue.
+ * writing to a queue, AND — for any named-human address — asserted verified
+ * evidence that the address actually reaches that person.
  *
  * Rules:
  *  - Any role/queue-shaped recipient (to or cc) requires `queueJustification`.
@@ -230,6 +263,11 @@ export interface ProspectingRecipientInput {
  *    that named a target human and then mailed the queue anyway.
  *  - A send with no role-shaped recipient still has to carry one of the two
  *    fields, so "who is this for?" is answered before the send, not after.
+ *  - Any named-human recipient requires evidenceGrade: "verified_firstparty",
+ *    or evidenceJustification (>= MIN_JUSTIFICATION_CHARS) if the evidence is
+ *    weaker than that. `recipientPersonName` alone proves nothing — AUR-5735
+ *    generated six plausible-but-unverified candidates that would otherwise
+ *    sail through on that field alone.
  */
 export function assertProspectingRecipient(input: ProspectingRecipientInput): RecipientShapeVerdict[] {
   const verdicts = classifyRecipientSet([input.to, input.cc]);
@@ -240,6 +278,7 @@ export function assertProspectingRecipient(input: ProspectingRecipientInput): Re
   const justification = (input.queueJustification ?? "").trim();
   const personName = (input.recipientPersonName ?? "").trim();
   const queues = verdicts.filter((v) => v.shape === "role_inbox");
+  const namedHumans = verdicts.filter((v) => v.shape === "named_human");
 
   if (queues.length > 0 && justification.length < MIN_JUSTIFICATION_CHARS) {
     throw new ProspectingRecipientError(
@@ -258,6 +297,27 @@ export function assertProspectingRecipient(input: ProspectingRecipientInput): Re
     throw new ProspectingRecipientError(
       `Refusing to send: prospecting send must name the human it is for. ` +
         `Pass recipientPersonName (or queueJustification if this is deliberately a shared inbox).`,
+      verdicts,
+    );
+  }
+
+  const evidenceGrade = (input.evidenceGrade ?? "").trim();
+  const evidenceJustification = (input.evidenceJustification ?? "").trim();
+  if (
+    namedHumans.length > 0 &&
+    !VERIFIED_EVIDENCE_GRADES.has(evidenceGrade) &&
+    evidenceJustification.length < MIN_JUSTIFICATION_CHARS
+  ) {
+    throw new ProspectingRecipientError(
+      `Refusing to send: recipient evidence grade is not verified (evidenceGrade=` +
+        `${evidenceGrade || "unset"}) for ${namedHumans.map((h) => h.address).join(", ")}. ` +
+        `AUR-5735 wrote six human-shaped but unverified addresses this way — e.g. ` +
+        `abbey.jones@sonoco.com, derived from a confirmed org pattern but never observed for ` +
+        `that person — and every one of them would pass this guard on recipientPersonName alone. ` +
+        `Pass evidenceGrade: "verified_firstparty" once the address is directly observed (a ` +
+        `reply, a byline, a first-party mailbox hit), or evidenceJustification (>= ` +
+        `${MIN_JUSTIFICATION_CHARS} chars) stating why sending on unverified evidence is the ` +
+        `correct call for this specific send.`,
       verdicts,
     );
   }

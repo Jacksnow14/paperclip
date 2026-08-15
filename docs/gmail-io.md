@@ -316,6 +316,15 @@ prevent.
 checkout the subprocess is run against — set it in tests to point at a
 fixture or a branch worktree.
 
+**Exempt when the CEO already approved this exact send.** A send whose
+`ceoApprovalId` is verified and scoped to this mailbox/`to`/subject (the same
+scoping the outbound gate above checks) skips this guard entirely. Role/queue
+mailboxes (`report@`, `compliance@`, `security@`) are routinely the *correct*
+address for approved business correspondence — a fraud report, a compliance
+escalation — and that is not the class of unsupervised cold-send mistake this
+guard exists to catch. A human sign-off on this specific recipient outranks
+the automated non-prospect heuristic.
+
 ## Limits
 
 - Attachments are capped at a ~25MB decoded size (checked against the base64

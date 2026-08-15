@@ -639,18 +639,28 @@ export function createGmailService(db?: Db) {
     // ticket-queue mailbox answered exclusively by a machine, twice, kept
     // getting resent to anyway. Scoped to external addresses only; an account
     // is not disqualified by this, only this automated route into it.
-    const ccList = Array.isArray(opts.cc) ? opts.cc : opts.cc ? [opts.cc] : [];
-    const externalRecipients = new Set(
-      [opts.to, ...ccList].flatMap((v) => extractEmailAddresses(v)).filter((addr) => !isOwnDomain(addr)),
-    );
-    for (const address of externalRecipients) {
-      const verdict = await checkProspectSendability(address);
-      if (verdict && !verdict.sendable) {
-        logger.error(
-          { alias, to: opts.to, cc: opts.cc, address, reason: verdict.reason, source: verdict.source },
-          "gmail-guard: BLOCKED prospect-suppressed recipient at service chokepoint (AUR-5734)",
-        );
-        throw new GmailProspectSuppressedError(verdict);
+    //
+    // A send the CEO explicitly approved for this exact mailbox/to/subject is
+    // exempt, same precedent as the gated-outbound check just above: the
+    // non-prospect heuristic exists to catch cold sends an agent chose
+    // unsupervised, and a role/queue mailbox is routinely the CORRECT address
+    // for approved business correspondence (compliance, fraud reports,
+    // support escalations) — that is not the class of mistake this guard is
+    // for, and a human sign-off on this specific recipient outranks it.
+    if (!isApprovalScopedToSend(guard, alias, opts)) {
+      const ccList = Array.isArray(opts.cc) ? opts.cc : opts.cc ? [opts.cc] : [];
+      const externalRecipients = new Set(
+        [opts.to, ...ccList].flatMap((v) => extractEmailAddresses(v)).filter((addr) => !isOwnDomain(addr)),
+      );
+      for (const address of externalRecipients) {
+        const verdict = await checkProspectSendability(address);
+        if (verdict && !verdict.sendable) {
+          logger.error(
+            { alias, to: opts.to, cc: opts.cc, address, reason: verdict.reason, source: verdict.source },
+            "gmail-guard: BLOCKED prospect-suppressed recipient at service chokepoint (AUR-5734)",
+          );
+          throw new GmailProspectSuppressedError(verdict);
+        }
       }
     }
 

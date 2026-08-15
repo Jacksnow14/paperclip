@@ -46,9 +46,26 @@ vi.mock("googleapis", () => ({
   },
 }));
 
+// This file is not about the AUR-5734 second-sink guard (that's covered by
+// gmail-prospect-guard.test.ts) — it exercises unrelated sendMessage/
+// replyInThread behavior with fixture addresses that incidentally look like
+// role mailboxes (e.g. report@, support@). Mock checkProspectSendability to
+// "unable to verify" (null, i.e. the guard's own fail-open path) so it never
+// interferes with tests that aren't exercising it.
+vi.mock("../services/gmail-prospect-guard.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/gmail-prospect-guard.js")>(
+    "../services/gmail-prospect-guard.js",
+  );
+  return {
+    ...actual,
+    checkProspectSendability: vi.fn().mockResolvedValue(null),
+  };
+});
+
 // Import after mock setup
 const { createGmailService, decodeGmailMessageBody, isSupportedGmailAlias, GMAIL_SUPPORTED_ALIASES } =
   await import("../services/gmail.js");
+const { checkProspectSendability } = await import("../services/gmail-prospect-guard.js");
 
 const FAKE_SA_KEY = JSON.stringify({
   type: "service_account",
@@ -429,6 +446,64 @@ describe("createGmailService", () => {
         ),
       ).resolves.toEqual({ id: "sent1" });
       expect(mockMessagesSend).toHaveBeenCalledOnce();
+    });
+
+    // AUR-5734: the second-sink non-prospect guard must not re-block a send
+    // the CEO already approved for this exact recipient. report@ is exactly
+    // the kind of role mailbox the real check-recipient.ts non-prospect rule
+    // flags — and exactly the kind of address legitimate approved compliance
+    // correspondence (fraud reports, escalations) is routinely addressed to.
+    // Without the exemption, this send 403s even with a valid, scoped
+    // approval, which is precisely the report@bunq.com scenario that failed
+    // once the sibling Auranode check-recipient.ts script actually landed.
+    it("allows a gated outbound to a role mailbox the non-prospect guard would otherwise refuse, when explicitly approved", async () => {
+      vi.mocked(checkProspectSendability).mockResolvedValue({
+        address: "report@bunq.com",
+        sendable: false,
+        reason: "role/system mailbox: report@",
+        source: "non-prospect",
+      });
+      mockMessagesSend.mockResolvedValue({ data: { id: "sent-approved-role" } });
+      const service = createGmailService();
+      try {
+        await expect(
+          service.sendMessage(
+            "board",
+            {
+              to: "report@bunq.com",
+              subject: "Fraud report",
+              body: "We are reporting an account takeover.",
+            },
+            { approvalVerified: true, approvalScope: { mailbox: "board", to: "report@bunq.com" } },
+          ),
+        ).resolves.toEqual({ id: "sent-approved-role" });
+        expect(mockMessagesSend).toHaveBeenCalledOnce();
+        expect(checkProspectSendability).not.toHaveBeenCalled();
+      } finally {
+        vi.mocked(checkProspectSendability).mockReset().mockResolvedValue(null);
+      }
+    });
+
+    it("still blocks an unapproved send to a non-prospect-flagged address, even outside the gated-domain list", async () => {
+      vi.mocked(checkProspectSendability).mockResolvedValue({
+        address: "queue@example.com",
+        sendable: false,
+        reason: "machine-only mailbox: 2 automated replies, 0 human",
+        source: "suppression",
+      });
+      const service = createGmailService();
+      try {
+        await expect(
+          service.sendMessage("board", {
+            to: "queue@example.com",
+            subject: "Following up",
+            body: "Checking in.",
+          }),
+        ).rejects.toMatchObject({ name: "GmailProspectSuppressedError" });
+        expect(mockMessagesSend).not.toHaveBeenCalled();
+      } finally {
+        vi.mocked(checkProspectSendability).mockReset().mockResolvedValue(null);
+      }
     });
 
     // AUR-3628: approvalVerified alone (no matching scope, or a scope for a

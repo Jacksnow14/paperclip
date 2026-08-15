@@ -3618,9 +3618,15 @@ export function agentRoutes(
   });
 
   router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {
-    assertBoard(req);
     const runId = req.params.runId as string;
     const existing = await heartbeat.getRun(runId);
+    // AUR-5708: an agent may cancel its own stuck run without board auth — the
+    // run's own agent proving liveness of the request is a stronger signal than
+    // waiting on a board user. Cancelling any other agent's run stays board-only.
+    const isSelfCancel = req.actor.type === "agent" && !!existing && existing.agentId === req.actor.agentId;
+    if (!isSelfCancel) {
+      assertBoard(req);
+    }
     if (existing) {
       assertCompanyAccess(req, existing.companyId);
     }
@@ -3629,12 +3635,12 @@ export function agentRoutes(
     if (run) {
       await logActivity(db, {
         companyId: run.companyId,
-        actorType: "user",
-        actorId: req.actor.userId ?? "board",
+        actorType: req.actor.type === "agent" ? "agent" : "user",
+        actorId: req.actor.type === "agent" ? (req.actor.agentId ?? "unknown-agent") : (req.actor.userId ?? "board"),
         action: "heartbeat.cancelled",
         entityType: "heartbeat_run",
         entityId: run.id,
-        details: { agentId: run.agentId },
+        details: { agentId: run.agentId, selfCancel: isSelfCancel },
       });
     }
 

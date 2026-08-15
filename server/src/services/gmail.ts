@@ -239,6 +239,16 @@ export interface GmailSendOptions {
   /** AUR-5732: why a role/queue inbox is nonetheless correct for this send. */
   queueJustification?: string;
   /**
+   * AUR-5735/AUR-5737: how the caller knows this address reaches
+   * recipientPersonName — "verified" | "pattern_hypothesis" |
+   * "queue_only_confirmed" | "none". recipientPersonName alone proves nothing
+   * about whether the mailbox exists or belongs to that person; required for
+   * any named-human recipient.
+   */
+  evidenceGrade?: string;
+  /** AUR-5735/AUR-5737: why sending on non-verified evidence is nonetheless correct. */
+  evidenceJustification?: string;
+  /**
    * AUR-5732: the prospect address recorded on the tracker row. The address
    * actually placed in To: must equal it, or the send is refused. AUR-4479 only
    * proved the recipient was not us; this proves it is the prospect.
@@ -261,6 +271,10 @@ export interface GmailReplyOptions {
   recipientPersonName?: string;
   /** AUR-5732: see GmailSendOptions.queueJustification. */
   queueJustification?: string;
+  /** AUR-5735/AUR-5737: see GmailSendOptions.evidenceGrade. */
+  evidenceGrade?: string;
+  /** AUR-5735/AUR-5737: see GmailSendOptions.evidenceJustification. */
+  evidenceJustification?: string;
   /**
    * AUR-5732: the prospect address this reply is meant to reach. Checked
    * against the recipient RESOLVED from the thread, which is the only place a
@@ -591,6 +605,8 @@ export function createGmailService(db?: Db) {
         cc: opts.cc,
         recipientPersonName: opts.recipientPersonName,
         queueJustification: opts.queueJustification,
+        evidenceGrade: opts.evidenceGrade,
+        evidenceJustification: opts.evidenceJustification,
       });
       logger.info(
         {
@@ -604,8 +620,10 @@ export function createGmailService(db?: Db) {
           })),
           recipientPersonName: opts.recipientPersonName ?? null,
           queueJustified: Boolean(opts.queueJustification),
+          evidenceGrade: opts.evidenceGrade ?? null,
+          evidenceJustified: Boolean(opts.evidenceJustification),
         },
-        "gmail: prospecting recipient shape checked (AUR-5732)",
+        "gmail: prospecting recipient shape checked (AUR-5732/AUR-5737)",
       );
     }
 
@@ -818,6 +836,8 @@ export function createGmailService(db?: Db) {
         prospecting: opts.prospecting,
         recipientPersonName: opts.recipientPersonName,
         queueJustification: opts.queueJustification,
+        evidenceGrade: opts.evidenceGrade,
+        evidenceJustification: opts.evidenceJustification,
         intendedRecipient: opts.intendedRecipient,
       },
       guard,

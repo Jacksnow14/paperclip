@@ -44,6 +44,11 @@ const sendMessageBodySchema = z.object({
   prospecting: z.boolean().optional(),
   recipientPersonName: z.string().optional(),
   queueJustification: z.string().optional(),
+  // AUR-5735/AUR-5737: recipientPersonName alone proves nothing about
+  // whether the mailbox belongs to that person — evidenceGrade asserts how
+  // the caller knows.
+  evidenceGrade: z.string().optional(),
+  evidenceJustification: z.string().optional(),
   intendedRecipient: z.string().optional(),
 });
 
@@ -64,6 +69,9 @@ const replyBodySchema = z
     prospecting: z.boolean().optional(),
     recipientPersonName: z.string().optional(),
     queueJustification: z.string().optional(),
+    // AUR-5735/AUR-5737: see sendMessageBodySchema.
+    evidenceGrade: z.string().optional(),
+    evidenceJustification: z.string().optional(),
     intendedRecipient: z.string().optional(),
   })
   .refine((v) => Boolean(v.replyToMessageId || v.threadId), {

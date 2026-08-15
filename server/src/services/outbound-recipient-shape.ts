@@ -210,6 +210,36 @@ export class ProspectingRecipientError extends Error {
 /** A justification has to say something; a single space is not a reason. */
 const MIN_JUSTIFICATION_CHARS = 20;
 
+/**
+ * How confident we are that a recipient address actually reaches the person
+ * it is asserted to reach — orthogonal to RecipientShape, which only says
+ * whether the address FORMAT looks like a person.
+ *
+ * AUR-5735 wrote six addresses at `pattern_hypothesis`: human-shaped,
+ * derived from a confirmed org email pattern (e.g. first.last@domain), but
+ * never observed for that specific person. Every one of them classifies as
+ * `named_human` and trivially satisfies `recipientPersonName` — neither
+ * check says anything about whether the mailbox exists or belongs to them.
+ */
+export type EvidenceGrade = "verified" | "pattern_hypothesis" | "queue_only_confirmed" | "none";
+
+// Grades that clear the bar without an explicit evidenceJustification. An
+// omitted or unrecognized grade is treated the same as the weakest grade —
+// fail closed, matching the posture of an unjustified queue send below.
+// AUR-5735 defines "verified" as the only grade an address was actually
+// observed at (header, signed document, org directory, or a confirmed
+// person/switchboard reply) — the one grade this guard may clear on its own.
+const VERIFIED_EVIDENCE_GRADES: ReadonlySet<string> = new Set<EvidenceGrade>(["verified"]);
+
+// A justification can only override a grade the caller has actually named.
+// An unset/unrecognized grade is not "a weaker grade" to be excused — it is
+// no assertion at all, and must fail regardless of justification length.
+const KNOWN_NON_VERIFIED_EVIDENCE_GRADES: ReadonlySet<string> = new Set<EvidenceGrade>([
+  "pattern_hypothesis",
+  "queue_only_confirmed",
+  "none",
+]);
+
 export interface ProspectingRecipientInput {
   to: string;
   cc?: string | string[];
@@ -217,12 +247,23 @@ export interface ProspectingRecipientInput {
   recipientPersonName?: string;
   /** Why a queue/role inbox is nonetheless the right target for this send. */
   queueJustification?: string;
+  /**
+   * How the caller knows this address reaches `recipientPersonName`, e.g.
+   * "verified" | "pattern_hypothesis" | "queue_only_confirmed" | "none". Only
+   * `verified` clears the bar on its own; anything else needs
+   * `evidenceJustification`. Required whenever a named-human address is in
+   * play — see AUR-5735/AUR-5737.
+   */
+  evidenceGrade?: string;
+  /** Why sending on non-verified evidence is nonetheless correct for this send. */
+  evidenceJustification?: string;
 }
 
 /**
  * Gate a COLD PROSPECTING send. Throws ProspectingRecipientError unless the
  * caller has either named the human being written to or explicitly justified
- * writing to a queue.
+ * writing to a queue, AND — for any named-human address — asserted verified
+ * evidence that the address actually reaches that person.
  *
  * Rules:
  *  - Any role/queue-shaped recipient (to or cc) requires `queueJustification`.
@@ -230,6 +271,11 @@ export interface ProspectingRecipientInput {
  *    that named a target human and then mailed the queue anyway.
  *  - A send with no role-shaped recipient still has to carry one of the two
  *    fields, so "who is this for?" is answered before the send, not after.
+ *  - Any named-human recipient requires evidenceGrade: "verified", or
+ *    evidenceJustification (>= MIN_JUSTIFICATION_CHARS) if the evidence is
+ *    weaker than that. `recipientPersonName` alone proves nothing — AUR-5735
+ *    generated six plausible-but-unverified candidates that would otherwise
+ *    sail through on that field alone.
  */
 export function assertProspectingRecipient(input: ProspectingRecipientInput): RecipientShapeVerdict[] {
   const verdicts = classifyRecipientSet([input.to, input.cc]);
@@ -240,6 +286,7 @@ export function assertProspectingRecipient(input: ProspectingRecipientInput): Re
   const justification = (input.queueJustification ?? "").trim();
   const personName = (input.recipientPersonName ?? "").trim();
   const queues = verdicts.filter((v) => v.shape === "role_inbox");
+  const namedHumans = verdicts.filter((v) => v.shape === "named_human");
 
   if (queues.length > 0 && justification.length < MIN_JUSTIFICATION_CHARS) {
     throw new ProspectingRecipientError(
@@ -260,6 +307,32 @@ export function assertProspectingRecipient(input: ProspectingRecipientInput): Re
         `Pass recipientPersonName (or queueJustification if this is deliberately a shared inbox).`,
       verdicts,
     );
+  }
+
+  const evidenceGrade = (input.evidenceGrade ?? "").trim();
+  const evidenceJustification = (input.evidenceJustification ?? "").trim();
+  if (namedHumans.length > 0 && !VERIFIED_EVIDENCE_GRADES.has(evidenceGrade)) {
+    // A justification only excuses a grade the caller actually asserted.
+    // Skipping evidenceGrade entirely is not "a weaker grade" — it is no
+    // assertion at all, and evidenceJustification cannot stand in for it.
+    const overridden =
+      KNOWN_NON_VERIFIED_EVIDENCE_GRADES.has(evidenceGrade) &&
+      evidenceJustification.length >= MIN_JUSTIFICATION_CHARS;
+    if (!overridden) {
+      throw new ProspectingRecipientError(
+        `Refusing to send: recipient evidence grade is not verified (evidenceGrade=` +
+          `${evidenceGrade || "unset"}) for ${namedHumans.map((h) => h.address).join(", ")}. ` +
+          `AUR-5735 wrote six human-shaped but unverified addresses this way — e.g. ` +
+          `abbey.jones@sonoco.com, derived from a confirmed org pattern but never observed for ` +
+          `that person — and every one of them would pass this guard on recipientPersonName alone. ` +
+          `Pass evidenceGrade: "verified" once the address is directly observed (a ` +
+          `reply, a byline, a first-party mailbox hit), or an explicit non-verified ` +
+          `evidenceGrade (e.g. "pattern_hypothesis") plus evidenceJustification (>= ` +
+          `${MIN_JUSTIFICATION_CHARS} chars) stating why sending on unverified evidence is the ` +
+          `correct call for this specific send.`,
+        verdicts,
+      );
+    }
   }
 
   return verdicts;

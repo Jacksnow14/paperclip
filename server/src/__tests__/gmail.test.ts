@@ -928,6 +928,7 @@ describe("createGmailService", () => {
             body: "One-pager attached.",
             prospecting: true,
             recipientPersonName: "Zachary Welsher",
+            evidenceGrade: "verified",
           });
 
           const decoded = Buffer.from(
@@ -947,6 +948,40 @@ describe("createGmailService", () => {
             body: "Filing as requested.",
             prospecting: true,
             queueJustification: JUSTIFICATION,
+          });
+
+          expect(mockMessagesSend).toHaveBeenCalledOnce();
+        });
+
+        it("FIRES on a pattern_hypothesis address even though it is human-shaped and named (AUR-5735/AUR-5737)", async () => {
+          const service = createGmailService();
+
+          await expect(
+            service.sendMessage("alex", {
+              to: "abbey.jones@sonoco.com",
+              subject: "Following up on your supplier portal",
+              body: "One-pager attached.",
+              prospecting: true,
+              recipientPersonName: "Abbey Jones",
+              evidenceGrade: "pattern_hypothesis",
+            }),
+          ).rejects.toThrow(/evidence grade is not verified/i);
+          expect(mockMessagesSend).not.toHaveBeenCalled();
+        });
+
+        it("PASSES a pattern_hypothesis address when explicitly evidence-justified", async () => {
+          mockMessagesSend.mockResolvedValue({ data: { id: "hypothesis1" } });
+          const service = createGmailService();
+
+          await service.sendMessage("alex", {
+            to: "abbey.jones@sonoco.com",
+            subject: "Following up on your supplier portal",
+            body: "One-pager attached.",
+            prospecting: true,
+            recipientPersonName: "Abbey Jones",
+            evidenceGrade: "pattern_hypothesis",
+            evidenceJustification:
+              "Sole named procurement contact at this account; time-sensitive deal, sending anyway.",
           });
 
           expect(mockMessagesSend).toHaveBeenCalledOnce();

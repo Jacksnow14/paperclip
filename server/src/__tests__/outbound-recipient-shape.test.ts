@@ -129,6 +129,7 @@ describe("assertProspectingRecipient (AUR-5732)", () => {
     const verdicts = assertProspectingRecipient({
       to: "zwelsher@helpathome.com",
       recipientPersonName: "Zachary Welsher",
+      evidenceGrade: "verified",
     });
     expect(verdicts).toHaveLength(1);
     expect(verdicts[0].shape).toBe("named_human");
@@ -175,6 +176,103 @@ describe("assertProspectingRecipient (AUR-5732)", () => {
 
   it("refuses a prospecting send with no recipients at all", () => {
     expect(() => assertProspectingRecipient({ to: "" })).toThrow(/no recipients/i);
+  });
+});
+
+// AUR-5735 wrote six human-shaped but unverified addresses to
+// aur681-contact-model.csv at evidence_grade: pattern_hypothesis — derived
+// from a confirmed org pattern (first.last@domain) but never observed for
+// that specific person. Every one of them classifies as named_human and
+// trivially satisfies recipientPersonName. This suite proves the guard now
+// asks the question recipientPersonName cannot answer: not "is this
+// human-shaped and named?" but "do we actually know this reaches them?"
+describe("assertProspectingRecipient — evidence grade (AUR-5735/AUR-5737)", () => {
+  const QUEUE_JUSTIFICATION =
+    "Supplier portal is the only published intake and the buyer asked us to use it.";
+  const EVIDENCE_JUSTIFICATION =
+    "Sole procurement contact at this account per LinkedIn; account is time-sensitive.";
+
+  it("FIRES on a pattern_hypothesis address — the AUR-5735 failure mode", () => {
+    expect(() =>
+      assertProspectingRecipient({
+        to: "abbey.jones@sonoco.com",
+        recipientPersonName: "Abbey Jones",
+        evidenceGrade: "pattern_hypothesis",
+      }),
+    ).toThrow(/evidence grade is not verified/i);
+  });
+
+  it("PASSES a verified address", () => {
+    const verdicts = assertProspectingRecipient({
+      to: "abbey.jones@sonoco.com",
+      recipientPersonName: "Abbey Jones",
+      evidenceGrade: "verified",
+    });
+    expect(verdicts[0].shape).toBe("named_human");
+  });
+
+  it("FIRES when evidenceGrade is omitted entirely — fails closed, not open", () => {
+    expect(() =>
+      assertProspectingRecipient({
+        to: "abbey.jones@sonoco.com",
+        recipientPersonName: "Abbey Jones",
+      }),
+    ).toThrow(/evidence grade is not verified/i);
+  });
+
+  it("FIRES when evidenceGrade is omitted even with a long evidenceJustification — justification cannot override an unasserted grade", () => {
+    expect(() =>
+      assertProspectingRecipient({
+        to: "abbey.jones@sonoco.com",
+        recipientPersonName: "Abbey Jones",
+        evidenceJustification: EVIDENCE_JUSTIFICATION,
+      }),
+    ).toThrow(/evidence grade is not verified/i);
+  });
+
+  it("PASSES a non-verified grade when explicitly justified", () => {
+    const verdicts = assertProspectingRecipient({
+      to: "abbey.jones@sonoco.com",
+      recipientPersonName: "Abbey Jones",
+      evidenceGrade: "pattern_hypothesis",
+      evidenceJustification: EVIDENCE_JUSTIFICATION,
+    });
+    expect(verdicts[0].shape).toBe("named_human");
+  });
+
+  it("rejects a token evidenceJustification that says nothing", () => {
+    expect(() =>
+      assertProspectingRecipient({
+        to: "abbey.jones@sonoco.com",
+        recipientPersonName: "Abbey Jones",
+        evidenceGrade: "pattern_hypothesis",
+        evidenceJustification: "   ok   ",
+      }),
+    ).toThrow(ProspectingRecipientError);
+  });
+
+  it("does not require evidenceGrade for a queue-only send with no named human", () => {
+    // No human is being claimed here — the queue itself is already justified
+    // by queueJustification, a separate axis this suite doesn't touch.
+    const verdicts = assertProspectingRecipient({
+      to: "Coupa@helpathome.com",
+      queueJustification: QUEUE_JUSTIFICATION,
+    });
+    expect(verdicts[0].shape).toBe("role_inbox");
+  });
+
+  it("names every affected address in the error so the misfire is diagnosable", () => {
+    try {
+      assertProspectingRecipient({
+        to: "abbey.jones@sonoco.com",
+        recipientPersonName: "Abbey Jones",
+        evidenceGrade: "pattern_hypothesis",
+      });
+      expect.unreachable("should have thrown");
+    } catch (err) {
+      expect(err).toBeInstanceOf(ProspectingRecipientError);
+      expect((err as ProspectingRecipientError).message).toContain("abbey.jones@sonoco.com");
+    }
   });
 });
 

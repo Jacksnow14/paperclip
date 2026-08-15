@@ -129,7 +129,7 @@ describe("assertProspectingRecipient (AUR-5732)", () => {
     const verdicts = assertProspectingRecipient({
       to: "zwelsher@helpathome.com",
       recipientPersonName: "Zachary Welsher",
-      evidenceGrade: "verified_firstparty",
+      evidenceGrade: "verified",
     });
     expect(verdicts).toHaveLength(1);
     expect(verdicts[0].shape).toBe("named_human");
@@ -202,11 +202,11 @@ describe("assertProspectingRecipient — evidence grade (AUR-5735/AUR-5737)", ()
     ).toThrow(/evidence grade is not verified/i);
   });
 
-  it("PASSES a verified_firstparty address", () => {
+  it("PASSES a verified address", () => {
     const verdicts = assertProspectingRecipient({
       to: "abbey.jones@sonoco.com",
       recipientPersonName: "Abbey Jones",
-      evidenceGrade: "verified_firstparty",
+      evidenceGrade: "verified",
     });
     expect(verdicts[0].shape).toBe("named_human");
   });

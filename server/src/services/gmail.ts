@@ -239,7 +239,7 @@ export interface GmailSendOptions {
   queueJustification?: string;
   /**
    * AUR-5735/AUR-5737: how the caller knows this address reaches
-   * recipientPersonName — "verified_firstparty" | "pattern_hypothesis" |
+   * recipientPersonName — "verified" | "pattern_hypothesis" |
    * "queue_only_confirmed" | "none". recipientPersonName alone proves nothing
    * about whether the mailbox exists or belongs to that person; required for
    * any named-human recipient.

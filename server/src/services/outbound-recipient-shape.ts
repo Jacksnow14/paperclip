@@ -221,16 +221,15 @@ const MIN_JUSTIFICATION_CHARS = 20;
  * `named_human` and trivially satisfies `recipientPersonName` — neither
  * check says anything about whether the mailbox exists or belongs to them.
  */
-export type EvidenceGrade =
-  | "verified_firstparty"
-  | "pattern_hypothesis"
-  | "queue_only_confirmed"
-  | "none";
+export type EvidenceGrade = "verified" | "pattern_hypothesis" | "queue_only_confirmed" | "none";
 
 // Grades that clear the bar without an explicit evidenceJustification. An
 // omitted or unrecognized grade is treated the same as the weakest grade —
 // fail closed, matching the posture of an unjustified queue send below.
-const VERIFIED_EVIDENCE_GRADES: ReadonlySet<string> = new Set<EvidenceGrade>(["verified_firstparty"]);
+// AUR-5735 defines "verified" as the only grade an address was actually
+// observed at (header, signed document, org directory, or a confirmed
+// person/switchboard reply) — the one grade this guard may clear on its own.
+const VERIFIED_EVIDENCE_GRADES: ReadonlySet<string> = new Set<EvidenceGrade>(["verified"]);
 
 export interface ProspectingRecipientInput {
   to: string;
@@ -241,8 +240,8 @@ export interface ProspectingRecipientInput {
   queueJustification?: string;
   /**
    * How the caller knows this address reaches `recipientPersonName`, e.g.
-   * "verified_firstparty" | "pattern_hypothesis" | "none". Only
-   * `verified_firstparty` clears the bar on its own; anything else needs
+   * "verified" | "pattern_hypothesis" | "queue_only_confirmed" | "none". Only
+   * `verified` clears the bar on its own; anything else needs
    * `evidenceJustification`. Required whenever a named-human address is in
    * play — see AUR-5735/AUR-5737.
    */
@@ -263,8 +262,8 @@ export interface ProspectingRecipientInput {
  *    that named a target human and then mailed the queue anyway.
  *  - A send with no role-shaped recipient still has to carry one of the two
  *    fields, so "who is this for?" is answered before the send, not after.
- *  - Any named-human recipient requires evidenceGrade: "verified_firstparty",
- *    or evidenceJustification (>= MIN_JUSTIFICATION_CHARS) if the evidence is
+ *  - Any named-human recipient requires evidenceGrade: "verified", or
+ *    evidenceJustification (>= MIN_JUSTIFICATION_CHARS) if the evidence is
  *    weaker than that. `recipientPersonName` alone proves nothing — AUR-5735
  *    generated six plausible-but-unverified candidates that would otherwise
  *    sail through on that field alone.
@@ -314,7 +313,7 @@ export function assertProspectingRecipient(input: ProspectingRecipientInput): Re
         `AUR-5735 wrote six human-shaped but unverified addresses this way — e.g. ` +
         `abbey.jones@sonoco.com, derived from a confirmed org pattern but never observed for ` +
         `that person — and every one of them would pass this guard on recipientPersonName alone. ` +
-        `Pass evidenceGrade: "verified_firstparty" once the address is directly observed (a ` +
+        `Pass evidenceGrade: "verified" once the address is directly observed (a ` +
         `reply, a byline, a first-party mailbox hit), or evidenceJustification (>= ` +
         `${MIN_JUSTIFICATION_CHARS} chars) stating why sending on unverified evidence is the ` +
         `correct call for this specific send.`,

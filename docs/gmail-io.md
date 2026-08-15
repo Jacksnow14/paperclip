@@ -190,6 +190,38 @@ Both are opt-in per send: replying to a support queue that wrote to **us** first
 legitimate and stays unblocked. Violations are `422` (fix the recipient), not `403`
 (get approval) — see `server/src/services/outbound-recipient-shape.ts`.
 
+### Naming a human is not the same as knowing you've reached them (AUR-5735/AUR-5737)
+
+The shape check above only asks whether an address *looks* like a person. AUR-5735
+then researched sixteen accounts and wrote six addresses derived from a confirmed org
+email pattern (e.g. `first.last@domain`) but **never actually observed** for the named
+person — human-shaped, plausible, and unverified. Every one of them satisfies
+`recipientPersonName` trivially, so the shape check alone would let all six through.
+
+Two more fields, required whenever `prospecting: true` and the recipient is
+`named_human`-shaped:
+
+| field | effect |
+| --- | --- |
+| `evidenceGrade` | how the caller knows this address reaches `recipientPersonName`: `"verified"` \| `"pattern_hypothesis"` \| `"queue_only_confirmed"` \| `"none"`. Only `"verified"` (the address was directly observed — a header, a signed document, an org directory, or a confirmed person/switchboard reply) clears the bar on its own. Anything else — including an omitted or unrecognized grade — fails closed. |
+| `evidenceJustification` | why sending on non-`verified` evidence is nonetheless correct for this specific send (≥20 chars), the same override shape as `queueJustification`. |
+
+```bash
+curl -s -X POST ... "$API/.../messages" -d '{
+  "to": "abbey.jones@sonoco.com",
+  "subject": "...",
+  "body": "...",
+  "prospecting": true,
+  "recipientPersonName": "Abbey Jones",
+  "evidenceGrade": "pattern_hypothesis",
+  "evidenceJustification": "Sole named procurement contact at this account; time-sensitive deal, sending anyway."
+}'
+```
+
+Omitting `evidenceGrade`/`evidenceJustification` on a named-human prospecting send now
+fails closed with a `422`, even though the field was optional before AUR-5737 — see
+`server/src/services/outbound-recipient-shape.ts`.
+
 The `201` body now also carries `intendedRecipientMatched`: `true`/`false` when an
 `intendedRecipient` was declared, and `null` when none was — so absence stays visible
 instead of reading as a pass.

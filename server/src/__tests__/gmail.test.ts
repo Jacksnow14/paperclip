@@ -853,7 +853,7 @@ describe("createGmailService", () => {
             body: "One-pager attached.",
             prospecting: true,
             recipientPersonName: "Zachary Welsher",
-            evidenceGrade: "verified_firstparty",
+            evidenceGrade: "verified",
           });
 
           const decoded = Buffer.from(

@@ -232,6 +232,53 @@ LF character, before being interpolated into the raw RFC822 message
 (defense-in-depth — the outbound guard's recipient scan already tokenizes
 CRLF-smuggled recipients for classification purposes).
 
+## Prospect-suppression gate (AUR-5734 — the "second sink")
+
+AUR-3864 taught the Auranode email-deliverability CLI's dispatcher to refuse a
+recipient whose reply history proves they only ever answer with a machine
+(`loadUnifiedSuppression()`), and AUR-3749 taught it to refuse role/system
+mailboxes and own-domain recipients (`nonProspectReason()`). Both only ever
+reached the Resend/dispatcher send path. The Gmail route is a **second sink**:
+an agent driving `sendMessage()`/`replyInThread()` directly never consulted
+either check, so the exact recipient the dispatcher had already learned to
+refuse — Help at Home's `coupa@` ticket-queue mailbox, answered twice by a
+machine and zero times by a human — kept being resent to over this route.
+
+`sendMessage()` now consults the SAME truth as the dispatcher for every
+**external** recipient (`to` + `cc`, own-domain addresses are exempt) before
+building the Gmail client. It does not re-implement the predicate: it shells
+out to the canonical Auranode checkout's `check-recipient.ts`
+(`server/src/services/gmail-prospect-guard.ts`, `checkProspectSendability()`),
+which imports `loadUnifiedSuppression()`/`nonProspectReason()` unchanged.
+Paperclip and Auranode are separately deployed repos with no shared package
+graph but are colocated on this host — this subprocess call is the reuse
+seam, not a second copy of the logic.
+
+**A refusal is a `GmailProspectSuppressedError`, HTTP 403**, naming the
+address and the evidence verbatim (e.g. `machine-only mailbox: 2 automated
+replies, 0 human`), same as the CLI's run log — never a silent drop. Like the
+outbound gate above, a blocked send files a high-priority incident issue
+(fire-and-forget, assigned to the calling agent) via
+`fileProspectSuppressedIncident()` in `server/src/routes/gmail.ts`. **The
+account is not disqualified — only this automated route into it** — the
+incident's guidance is to find a verified human contact, not to give up on
+the account.
+
+**Fails open, loudly, on infra failure.** If the Auranode checkout can't be
+found or the subprocess errors/times out, `checkProspectSendability()` logs at
+`error` level and returns `null` rather than throwing; `sendMessage()` treats
+`null` as "unable to verify" and lets the send proceed. The underlying
+predicate is itself deliberately fail-open (silence is not evidence of a
+machine-only mailbox — see `machine-only-suppression.ts`); an infra hiccup on
+this side of the subprocess boundary is a weaker signal still, and
+hard-blocking every external Gmail send whenever the sibling checkout is
+briefly unavailable would be a worse outage than the one this guard exists to
+prevent.
+
+`AURANODE_REPO_DIR` (default `/home/ievgen/Auranode`) overrides which
+checkout the subprocess is run against — set it in tests to point at a
+fixture or a branch worktree.
+
 ## Limits
 
 - Attachments are capped at a ~25MB decoded size (checked against the base64

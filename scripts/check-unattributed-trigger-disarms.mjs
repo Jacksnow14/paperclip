@@ -72,8 +72,11 @@ import { createRequire } from 'node:module';
 import { parseArgs } from 'node:util';
 import { resolveApiBase } from './lib/paperclip-api-base.mjs';
 
-const require = createRequire(new URL('../packages/db/package.json', import.meta.url));
-const postgres = require('postgres');
+// `postgres` is loaded lazily inside connectDb() below, not at module scope —
+// the scripts-test CI job runs `node --test scripts/` with no `pnpm install`
+// step (see .github/workflows/ci.yml), so a top-level `require('postgres')`
+// breaks module import for every test in this file even when a mock
+// fetchCandidateRows is supplied and connectDb() is never called.
 
 // ── Pure logic (exported, used in tests) ────────────────────────────────────
 
@@ -194,6 +197,8 @@ export async function queryCandidateRows(sql, companyId) {
 }
 
 function connectDb() {
+  const require = createRequire(new URL('../packages/db/package.json', import.meta.url));
+  const postgres = require('postgres');
   return postgres({
     host: process.env.PGHOST ?? '127.0.0.1',
     port: Number(process.env.PGPORT ?? 54329),

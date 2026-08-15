@@ -15,6 +15,7 @@ import {
   type GmailSendGuardContext,
 } from "../services/gmail.js";
 import { GmailOutboundBlockedError, type GmailOutboundDecision } from "../services/gmail-outbound-guard.js";
+import { GmailProspectSuppressedError, type ProspectSuppressionVerdict } from "../services/gmail-prospect-guard.js";
 import {
   IntendedRecipientMismatchError,
   ProspectingRecipientError,
@@ -190,6 +191,48 @@ function fileBlockedSendIncident(
     });
 }
 
+// Fire-and-forget: file a high-priority incident when the AUR-5734 second-sink
+// guard refuses a recipient, so it surfaces as "a human contact is needed
+// instead" rather than a swallowed 403.
+function fileProspectSuppressedIncident(
+  db: Db,
+  companyId: string,
+  req: Request,
+  mailbox: string,
+  context: { to?: string; replyToMessageId?: string; threadId?: string },
+  verdict: ProspectSuppressionVerdict,
+) {
+  const callerAgentId = req.actor.type === "agent" ? (req.actor.agentId ?? null) : null;
+  if (!callerAgentId) return;
+  const target = context.to
+    ? `to ${context.to}`
+    : `replying in ${context.replyToMessageId ? `message ${context.replyToMessageId}` : `thread ${context.threadId}`}`;
+  void import("../services/index.js")
+    .then(({ issueService }) =>
+      issueService(db).create(companyId, {
+        title: `BLOCKED: suppressed prospect ${verdict.address} from ${mailbox}@ ${target}`,
+        description:
+          `## Gmail prospect-suppression guardrail triggered (AUR-5734)\n\n` +
+          `**Mailbox:** ${mailbox}@tryauranode.com\n` +
+          `**Target:** ${target}\n` +
+          `**Suppressed address:** ${verdict.address}\n` +
+          `**Source:** ${verdict.source}\n` +
+          `**Evidence:** ${verdict.reason}\n\n` +
+          `The account is not disqualified — only this automated route into it. ` +
+          `Find a different, verified human contact at this account instead of resending to this address.`,
+        priority: "high",
+        status: "todo",
+        assigneeAgentId: callerAgentId,
+      }),
+    )
+    .catch((err: unknown) => {
+      logger.error(
+        { err, mailbox, target, address: verdict.address },
+        "gmail-guard: failed to create prospect-suppressed incident issue",
+      );
+    });
+}
+
 export function gmailRoutes(db: Db) {
   const router = Router();
   const gmail = createGmailService(db);
@@ -273,6 +316,10 @@ export function gmailRoutes(db: Db) {
           fileBlockedSendIncident(db, companyId, req, mailbox, { to: body.to }, err.decision);
           throw forbidden(err.message);
         }
+        if (err instanceof GmailProspectSuppressedError) {
+          fileProspectSuppressedIncident(db, companyId, req, mailbox, { to: body.to }, err.verdict);
+          throw forbidden(err.message);
+        }
         throw err;
       }
     },
@@ -310,6 +357,17 @@ export function gmailRoutes(db: Db) {
             mailbox,
             { replyToMessageId: body.replyToMessageId, threadId: body.threadId },
             err.decision,
+          );
+          throw forbidden(err.message);
+        }
+        if (err instanceof GmailProspectSuppressedError) {
+          fileProspectSuppressedIncident(
+            db,
+            companyId,
+            req,
+            mailbox,
+            { replyToMessageId: body.replyToMessageId, threadId: body.threadId },
+            err.verdict,
           );
           throw forbidden(err.message);
         }

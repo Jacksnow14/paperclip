@@ -9,6 +9,7 @@ import {
   fetchMergedMemRecords,
   GAP_CATEGORY,
   COMPLIANCE_CATEGORY,
+  MEMORY_RECORD_PAGE_LIMIT,
   isProbeIssue,
   classifyStaleSweepClosure,
 } from './retro-compliance-audit.mjs';
@@ -250,6 +251,73 @@ test('fetchMergedMemRecords deduplicates records present in both org and project
   const get = async () => ({ records: [shared] });
   const records = await fetchMergedMemRecords(get, 'co-1', [{ id: 'uuid-1', projectId: 'proj-1' }]);
   assert.equal(records.length, 1);
+});
+
+test('fetchMergedMemRecords paginates org-wide records until the audit window is covered', async () => {
+  const sinceMs = Date.parse('2026-08-12T00:00:00.000Z');
+  const issue = {
+    id: 'uuid-target',
+    identifier: 'AUR-4701',
+    projectId: null,
+    completedAt: '2026-08-12T00:15:00.000Z',
+  };
+  const firstPage = Array.from({ length: MEMORY_RECORD_PAGE_LIMIT }, (_, i) => ({
+    id: `fresh-${i}`,
+    createdAt: '2026-08-12T12:00:00.000Z',
+    metadata: { category: 'lesson' },
+  }));
+  const hiddenScorecard = {
+    id: 'perf-hidden',
+    createdAt: '2026-08-12T00:30:00.000Z',
+    metadata: { category: 'performance_scorecard', issue_id: issue.id },
+  };
+  const offsets = [];
+  const get = async (path) => {
+    const url = new URL(path, 'http://paperclip.test');
+    offsets.push(url.searchParams.get('offset'));
+    if (url.searchParams.get('offset') === '0') return { records: firstPage };
+    if (url.searchParams.get('offset') === String(MEMORY_RECORD_PAGE_LIMIT)) return { records: [hiddenScorecard] };
+    throw new Error(`unexpected path: ${path}`);
+  };
+
+  const records = await fetchMergedMemRecords(get, 'co-1', [issue], { sinceMs });
+
+  assert.deepEqual(offsets, ['0', String(MEMORY_RECORD_PAGE_LIMIT)]);
+  assert.ok(hasPerformanceScorecard(records, issue), 'scorecard past the first 500-row slice must be found');
+});
+
+test('fetchMergedMemRecords paginates project-scoped records until the audit window is covered', async () => {
+  const sinceMs = Date.parse('2026-08-12T00:00:00.000Z');
+  const issue = {
+    id: 'uuid-project-target',
+    identifier: 'AUR-4701',
+    projectId: 'proj-1',
+    completedAt: '2026-08-12T00:15:00.000Z',
+  };
+  const firstProjectPage = Array.from({ length: MEMORY_RECORD_PAGE_LIMIT }, (_, i) => ({
+    id: `project-fresh-${i}`,
+    createdAt: '2026-08-12T12:00:00.000Z',
+    metadata: { category: 'lesson' },
+  }));
+  const hiddenScorecard = {
+    id: 'adj-hidden',
+    createdAt: '2026-08-12T00:30:00.000Z',
+    metadata: { category: 'scorecard_adjusted', issue_id: issue.id },
+  };
+  const projectOffsets = [];
+  const get = async (path) => {
+    const url = new URL(path, 'http://paperclip.test');
+    if (!url.searchParams.has('projectId')) return { records: [] };
+    projectOffsets.push(url.searchParams.get('offset'));
+    if (url.searchParams.get('offset') === '0') return { records: firstProjectPage };
+    if (url.searchParams.get('offset') === String(MEMORY_RECORD_PAGE_LIMIT)) return { records: [hiddenScorecard] };
+    throw new Error(`unexpected path: ${path}`);
+  };
+
+  const records = await fetchMergedMemRecords(get, 'co-1', [issue], { sinceMs });
+
+  assert.deepEqual(projectOffsets, ['0', String(MEMORY_RECORD_PAGE_LIMIT)]);
+  assert.ok(hasScorecardAdjusted(records, issue), 'project scorecard past the first 500-row slice must be found');
 });
 
 test('fetchMergedMemRecords: AUR-2817 regression — project-scoped scorecard reported compliant', async () => {

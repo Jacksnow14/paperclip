@@ -47,6 +47,7 @@ const CTO = '371a1b08-0286-4a12-a516-f587f42df5eb';
  */
 export const GAP_CATEGORY = 'lesson';
 export const COMPLIANCE_CATEGORY = 'retrospective_compliance_gap';
+export const MEMORY_RECORD_PAGE_LIMIT = 500;
 
 /**
  * Retrospective heading detector — matches the literal `## Retrospective` heading.
@@ -239,16 +240,57 @@ export function hasScorecardAdjusted(memRecords, issue) {
  * (invisible to the org-wide endpoint) are not silently missed.
  * Exported for unit testing.
  */
-export async function fetchMergedMemRecords(get, companyId, issues) {
-  const orgRaw = await get(`/api/companies/${companyId}/memory/records?limit=500`);
-  const orgRecords = asArray(orgRaw, 'records');
+function appendQuery(path, params) {
+  const [base, query = ''] = path.split('?');
+  const search = new URLSearchParams(query);
+  for (const [key, value] of Object.entries(params)) search.set(key, String(value));
+  return `${base}?${search.toString()}`;
+}
+
+function timestampMs(value) {
+  const ms = new Date(value ?? 0).getTime();
+  return Number.isFinite(ms) && ms > 0 ? ms : null;
+}
+
+function oldestCreatedAtMs(records) {
+  const times = records.map(r => timestampMs(r.createdAt)).filter(ms => ms !== null);
+  return times.length ? Math.min(...times) : null;
+}
+
+function minCompletedAtMs(issues) {
+  const times = issues.map(i => timestampMs(i.completedAt)).filter(ms => ms !== null);
+  return times.length ? Math.min(...times) : null;
+}
+
+// AUR-4701: the audit window must drive the lookup window; a fixed first page
+// of the whole memory corpus can be narrower than the closed-issue scan.
+async function fetchMemoryRecordPages(get, path, { sinceMs = null, limit = MEMORY_RECORD_PAGE_LIMIT } = {}) {
+  const records = [];
+  for (let offset = 0; ; offset += limit) {
+    const raw = await get(appendQuery(path, { limit, offset }));
+    const page = asArray(raw, 'records');
+    records.push(...page);
+    if (page.length < limit) break;
+
+    const oldestMs = oldestCreatedAtMs(page);
+    if (sinceMs !== null && oldestMs !== null && oldestMs < sinceMs) break;
+  }
+  return records;
+}
+
+export async function fetchMergedMemRecords(get, companyId, issues, options = {}) {
+  const sinceMs = Number.isFinite(options.sinceMs) ? options.sinceMs : minCompletedAtMs(issues);
+  const orgRecords = await fetchMemoryRecordPages(get, `/api/companies/${companyId}/memory/records`, { sinceMs });
 
   const projectIds = [...new Set(issues.map(i => i.projectId).filter(Boolean))];
   const projSets = await Promise.all(
     projectIds.map(async pid => {
       try {
-        const r = await get(`/api/companies/${companyId}/memory/records?projectId=${encodeURIComponent(pid)}&limit=500`);
-        return asArray(r, 'records');
+        return await fetchMemoryRecordPages(
+          get,
+          `/api/companies/${companyId}/memory/records?projectId=${encodeURIComponent(pid)}`,
+          { sinceMs },
+        );
       } catch { return []; }
     })
   );
@@ -304,7 +346,7 @@ export async function main({ hours, apply, apiUrl, apiKey, companyId, runIssueId
   // to the org-wide endpoint) are not falsely flagged as missing (AUR-2858 fix).
   let memRecords = [];
   try {
-    memRecords = await fetchMergedMemRecords(get, companyId, closedRecent);
+    memRecords = await fetchMergedMemRecords(get, companyId, closedRecent, { sinceMs: since });
   } catch (e) {
     console.warn(`[warn] Could not fetch memory records for scorecard checks: ${e.message}`);
   }

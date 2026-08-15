@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRunWatchdogDecisions, heartbeatRuns, issues } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -179,6 +179,31 @@ describeEmbeddedPostgres("stale execution lock sweep", () => {
 
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(issue?.executionRunId).toBe(runId);
+  });
+
+  it("does not cancel a stale-locked run that has an active snooze decision", async () => {
+    const now = new Date("2026-05-01T12:00:00.000Z");
+    const thresholdMs = 30 * 60 * 1000;
+    const { companyId, runId } = await seedLockedRun({
+      now,
+      lockAgeMs: thresholdMs + 5 * 60 * 1000,
+    });
+    await db.insert(heartbeatRunWatchdogDecisions).values({
+      companyId,
+      runId,
+      decision: "snooze",
+      snoozedUntil: new Date(now.getTime() + 60 * 60 * 1000),
+      reason: "known long-running task, continuing on purpose",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStaleExecutionLocks({ now, thresholdMs });
+
+    expect(result.cancelled).toBe(0);
+    expect(result.skippedSnoozed).toBe(1);
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
   });
 
   it("leaves a lock in place when it has not yet crossed the threshold", async () => {

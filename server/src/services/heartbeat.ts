@@ -7342,6 +7342,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       cancelledRunIds: [] as string[],
       skippedNotRunning: 0,
       skippedRecentActivity: 0,
+      skippedSnoozed: 0,
     };
 
     for (const candidate of candidates) {
@@ -7353,6 +7354,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const silence = await buildRunOutputSilence(run, now);
+      // A board/agent decision to snooze this run's silence (POST
+      // .../watchdog-decisions) is an explicit "I know it's quiet, leave it running"
+      // override. scanSilentActiveRuns respects the same decision before minting a
+      // review issue; this sweep must respect it too before force-cancelling the
+      // process outright, or the override is silently defeated by a more destructive
+      // action than the one it was recorded against.
+      if (silence.snoozedUntil) {
+        result.skippedSnoozed += 1;
+        continue;
+      }
       if ((silence.silenceAgeMs ?? 0) < thresholdMs) {
         result.skippedRecentActivity += 1;
         continue;

@@ -231,6 +231,15 @@ export type EvidenceGrade = "verified" | "pattern_hypothesis" | "queue_only_conf
 // person/switchboard reply) — the one grade this guard may clear on its own.
 const VERIFIED_EVIDENCE_GRADES: ReadonlySet<string> = new Set<EvidenceGrade>(["verified"]);
 
+// A justification can only override a grade the caller has actually named.
+// An unset/unrecognized grade is not "a weaker grade" to be excused — it is
+// no assertion at all, and must fail regardless of justification length.
+const KNOWN_NON_VERIFIED_EVIDENCE_GRADES: ReadonlySet<string> = new Set<EvidenceGrade>([
+  "pattern_hypothesis",
+  "queue_only_confirmed",
+  "none",
+]);
+
 export interface ProspectingRecipientInput {
   to: string;
   cc?: string | string[];
@@ -302,23 +311,28 @@ export function assertProspectingRecipient(input: ProspectingRecipientInput): Re
 
   const evidenceGrade = (input.evidenceGrade ?? "").trim();
   const evidenceJustification = (input.evidenceJustification ?? "").trim();
-  if (
-    namedHumans.length > 0 &&
-    !VERIFIED_EVIDENCE_GRADES.has(evidenceGrade) &&
-    evidenceJustification.length < MIN_JUSTIFICATION_CHARS
-  ) {
-    throw new ProspectingRecipientError(
-      `Refusing to send: recipient evidence grade is not verified (evidenceGrade=` +
-        `${evidenceGrade || "unset"}) for ${namedHumans.map((h) => h.address).join(", ")}. ` +
-        `AUR-5735 wrote six human-shaped but unverified addresses this way — e.g. ` +
-        `abbey.jones@sonoco.com, derived from a confirmed org pattern but never observed for ` +
-        `that person — and every one of them would pass this guard on recipientPersonName alone. ` +
-        `Pass evidenceGrade: "verified" once the address is directly observed (a ` +
-        `reply, a byline, a first-party mailbox hit), or evidenceJustification (>= ` +
-        `${MIN_JUSTIFICATION_CHARS} chars) stating why sending on unverified evidence is the ` +
-        `correct call for this specific send.`,
-      verdicts,
-    );
+  if (namedHumans.length > 0 && !VERIFIED_EVIDENCE_GRADES.has(evidenceGrade)) {
+    // A justification only excuses a grade the caller actually asserted.
+    // Skipping evidenceGrade entirely is not "a weaker grade" — it is no
+    // assertion at all, and evidenceJustification cannot stand in for it.
+    const overridden =
+      KNOWN_NON_VERIFIED_EVIDENCE_GRADES.has(evidenceGrade) &&
+      evidenceJustification.length >= MIN_JUSTIFICATION_CHARS;
+    if (!overridden) {
+      throw new ProspectingRecipientError(
+        `Refusing to send: recipient evidence grade is not verified (evidenceGrade=` +
+          `${evidenceGrade || "unset"}) for ${namedHumans.map((h) => h.address).join(", ")}. ` +
+          `AUR-5735 wrote six human-shaped but unverified addresses this way — e.g. ` +
+          `abbey.jones@sonoco.com, derived from a confirmed org pattern but never observed for ` +
+          `that person — and every one of them would pass this guard on recipientPersonName alone. ` +
+          `Pass evidenceGrade: "verified" once the address is directly observed (a ` +
+          `reply, a byline, a first-party mailbox hit), or an explicit non-verified ` +
+          `evidenceGrade (e.g. "pattern_hypothesis") plus evidenceJustification (>= ` +
+          `${MIN_JUSTIFICATION_CHARS} chars) stating why sending on unverified evidence is the ` +
+          `correct call for this specific send.`,
+        verdicts,
+      );
+    }
   }
 
   return verdicts;

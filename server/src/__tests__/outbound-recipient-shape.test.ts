@@ -220,6 +220,16 @@ describe("assertProspectingRecipient — evidence grade (AUR-5735/AUR-5737)", ()
     ).toThrow(/evidence grade is not verified/i);
   });
 
+  it("FIRES when evidenceGrade is omitted even with a long evidenceJustification — justification cannot override an unasserted grade", () => {
+    expect(() =>
+      assertProspectingRecipient({
+        to: "abbey.jones@sonoco.com",
+        recipientPersonName: "Abbey Jones",
+        evidenceJustification: EVIDENCE_JUSTIFICATION,
+      }),
+    ).toThrow(/evidence grade is not verified/i);
+  });
+
   it("PASSES a non-verified grade when explicitly justified", () => {
     const verdicts = assertProspectingRecipient({
       to: "abbey.jones@sonoco.com",

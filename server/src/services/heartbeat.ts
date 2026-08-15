@@ -7308,7 +7308,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * `buildRunOutputSilence` (the same silence primitive the active-run-output
    * watchdog uses to mint review issues) instead of a second silence heuristic. A
    * lock that is old but still producing output is left alone — only genuinely
-   * silent runs get force-cancelled.
+   * silent runs get force-cancelled. Passes `allowImmediateRecovery: false` to
+   * `releaseIssueExecutionAndPromote` — like the other system force-cancel paths
+   * (stale-queued-run gate, blocked-dependency gate), this cancel happens
+   * *because the run itself was the problem*, so re-arming a fresh run for the
+   * same (possibly still-wedged) agent immediately would silently re-acquire the
+   * lock this sweep exists to release, and could spin forever if the agent is
+   * systemically stuck.
    */
   async function reconcileStaleExecutionLocks(opts?: { now?: Date; thresholdMs?: number }) {
     const now = opts?.now ?? new Date();
@@ -7353,7 +7359,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const reason = `Force-cancelled: issue execution lock held past ${Math.round(thresholdMs / 60_000)}m with no liveness activity (silent for ${Math.round((silence.silenceAgeMs ?? 0) / 60_000)}m)`;
-      const cancelled = await cancelRunInternal(run.id, reason);
+      const cancelled = await cancelRunInternal(run.id, reason, { allowImmediateRecovery: false });
       if (cancelled && cancelled.status === "cancelled") {
         result.cancelled += 1;
         result.cancelledRunIds.push(cancelled.id);
@@ -11114,7 +11120,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return wakeupIds.length;
   }
 
-  async function cancelRunInternal(runId: string, reason = "Cancelled by control plane") {
+  async function cancelRunInternal(
+    runId: string,
+    reason = "Cancelled by control plane",
+    opts: { allowImmediateRecovery?: boolean } = {},
+  ) {
     const run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
     if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) return run;
@@ -11159,7 +11169,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         level: "warn",
         message: "run cancelled",
       });
-      await releaseIssueExecutionAndPromote(cancelled);
+      await releaseIssueExecutionAndPromote(cancelled, {
+        allowImmediateRecovery: opts.allowImmediateRecovery ?? true,
+      });
     }
 
     runningProcesses.delete(run.id);

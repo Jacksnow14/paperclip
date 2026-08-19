@@ -131,7 +131,7 @@ async function hasExplicitBlockedWaitingPath(
     executionPolicy?: Record<string, unknown> | null;
     monitorNextCheckAt?: Date | string | null;
   },
-  dbOrTx: any = db,
+  dbOrTx: any,
 ) {
   if (typeof input.assigneeUserId === "string" && input.assigneeUserId.trim().length > 0) {
     return true;
@@ -197,7 +197,7 @@ async function assertBlockedDispositionHasPath(
     executionPolicy?: Record<string, unknown> | null;
     monitorNextCheckAt?: Date | string | null;
   },
-  dbOrTx: any = db,
+  dbOrTx: any,
 ) {
   if (input.status !== "blocked") {
     return;
@@ -4689,7 +4689,7 @@ export function issueService(db: Db) {
             ).get(id)?.unresolvedBlockerIssueIds ?? [];
       }
       if (patch.status === "in_progress") {
-        if (unresolvedBlockerIssueIds.length > 0) {
+        if ((unresolvedBlockerIssueIds ?? []).length > 0) {
           throw unprocessable("Issue is blocked by unresolved blockers", { unresolvedBlockerIssueIds });
         }
       }

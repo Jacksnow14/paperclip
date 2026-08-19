@@ -222,7 +222,13 @@ function aggregateScores(records) {
       bucket = { agentId: id, scores: [], quality: [], taskTypes: [], oldest: '', newest: '' };
       byAgent.set(id, bucket);
     }
-    const sa = Number(m.score_adjusted);
+    // AUR-5410: a row with no measured cost at close time is flagged
+    // exclude_from_aggregates/metrics_lost and omits score_adjusted rather than
+    // fabricating a divide-by-1 score — skip it explicitly rather than relying
+    // only on Number.isFinite(undefined), so an unmeasured row can never sneak
+    // a score into this agent's mean via some other representation (e.g. null).
+    const excluded = m.exclude_from_aggregates === true || m.metrics_lost === true;
+    const sa = excluded ? NaN : Number(m.score_adjusted);
     const q = Number(m.quality_signal);
     const ts = r.createdAt || '';
     if (Number.isFinite(sa)) bucket.scores.push(sa);

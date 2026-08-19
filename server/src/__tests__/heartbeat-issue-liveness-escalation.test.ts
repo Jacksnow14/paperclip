@@ -1522,13 +1522,13 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
   it("re-arms a dormant stranded action on a recently-blocked missing-edge issue, once per dormancy window", async () => {
     await enableAutoRecovery();
     const { companyId, coderId, issuePrefix } = await seedCompanyWithAgents();
-    // 2 days blocked: below the 7d attention stage, i.e. the AUR-4996 dead zone.
+    // 6 hours blocked: below the 1d attention stage, i.e. the AUR-4996 dead zone.
     const blockedIssueId = await insertBlockedIssueWithoutBlockerEdge({
       companyId,
       issuePrefix,
       issueNumber: 1,
       assigneeAgentId: coderId,
-      createdAt: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000),
+      createdAt: new Date(Date.now() - 6 * 60 * 60 * 1000),
     });
     const actionId = await insertStrandedRecoveryAction({
       companyId,
@@ -1598,7 +1598,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       issuePrefix,
       issueNumber: 1,
       assigneeAgentId: coderId,
-      createdAt: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000),
+      createdAt: new Date(Date.now() - 6 * 60 * 60 * 1000),
     });
     const actionId = await insertStrandedRecoveryAction({
       companyId,
@@ -1667,7 +1667,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         issuePrefix,
         issueNumber: index + 1,
         assigneeAgentId: coderId,
-        createdAt: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000),
+        createdAt: new Date(Date.now() - 6 * 60 * 60 * 1000),
       });
       await insertStrandedRecoveryAction({
         companyId,

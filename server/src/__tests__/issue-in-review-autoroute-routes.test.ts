@@ -158,6 +158,7 @@ const BASE_ISSUE = {
   assigneeAgentId: "agent-1",
   assigneeUserId: null,
   createdByUserId: "user-creator",
+  createdByAgentId: null,
   identifier: "AUR-999",
   title: "Test issue",
   executionPolicy: null,
@@ -315,6 +316,67 @@ describe("in_review auto-route guard", () => {
         assigneeUserId: "user-creator",
       }),
     );
+  });
+
+  it("AUR-5832: auto-routes agent in_review to reporting-chain manager when issue has no creator", async () => {
+    const creatorlessIssue = { ...BASE_ISSUE, createdByUserId: null, createdByAgentId: null };
+    mockIssueService.getById.mockResolvedValue(creatorlessIssue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...creatorlessIssue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    mockAgentService.getById.mockResolvedValue({ id: "agent-1", reportsTo: "manager-agent-1" });
+
+    const res = await request(await createAgentApp())
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.objectContaining({
+        status: "in_review",
+        assigneeAgentId: "manager-agent-1",
+        assigneeUserId: null,
+      }),
+    );
+    // assertCanAssignTasks must not have been consulted for this auto-routed path
+    expect(mockAccessService.hasPermission).not.toHaveBeenCalled();
+  });
+
+  it("AUR-5832: rejects with 422 when issue has no creator and requesting agent has no manager", async () => {
+    const creatorlessIssue = { ...BASE_ISSUE, createdByUserId: null, createdByAgentId: null };
+    mockIssueService.getById.mockResolvedValue(creatorlessIssue);
+    mockAgentService.getById.mockResolvedValue({ id: "agent-1", reportsTo: null });
+
+    const res = await request(await createAgentApp())
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toMatch(/in_review requires reassignment/);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("AUR-5832: existing auto-route-to-creator behavior is unchanged when createdByAgentId exists but createdByUserId does not (no manager fallback)", async () => {
+    const issueWithAgentCreator = {
+      ...BASE_ISSUE,
+      createdByUserId: null,
+      createdByAgentId: "other-creator-agent",
+    };
+    mockIssueService.getById.mockResolvedValue(issueWithAgentCreator);
+    // Even if the requesting agent has a manager, this path must still 422 —
+    // the manager fallback only activates when there is NO creator at all.
+    mockAgentService.getById.mockResolvedValue({ id: "agent-1", reportsTo: "manager-agent-1" });
+
+    const res = await request(await createAgentApp())
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toMatch(/in_review requires reassignment/);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   it("rejects non-owner agent with 409 before guard fires", async () => {

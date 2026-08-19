@@ -927,7 +927,14 @@ export function issueRoutes(
     };
     updateFields: Record<string, unknown>;
     actorType: string;
+    // AUR-5832: set when the in_review auto-route guard above fell back to the
+    // requesting agent's reporting-chain manager (creator-less issue, no
+    // tasks:assign). That reassignment is itself the review path — the manager
+    // is woken by the assignment change — mirroring how a human createdByUserId
+    // assignee already satisfies this check below without further validation.
+    autoRoutedToManagerAgentId?: string | null;
   }) {
+    if (input.autoRoutedToManagerAgentId) return;
     const nextStatus = typeof input.updateFields.status === "string"
       ? input.updateFields.status
       : input.existing.status;
@@ -3400,6 +3407,7 @@ export function issueRoutes(
     // Auto-route in_review: prevent agents from leaving themselves as assignee
     const effectiveInReviewStatus =
       typeof updateFields.status === "string" ? updateFields.status : existing.status;
+    let autoRoutedToManagerAgentId: string | null = null;
     if (
       effectiveInReviewStatus === "in_review" &&
       req.actor.type === "agent" &&
@@ -3416,6 +3424,24 @@ export function issueRoutes(
         if (existing.createdByUserId) {
           updateFields.assigneeAgentId = null;
           updateFields.assigneeUserId = existing.createdByUserId;
+        } else if (!existing.createdByAgentId) {
+          // Creator-less issue (e.g. routine_execution origin, AUR-5832): there is
+          // no createdByUserId/createdByAgentId to auto-route to, so fall back to
+          // the requesting agent's own reporting-chain manager instead of hard-
+          // rejecting. Scoped tightly to the no-creator case only — an issue with
+          // a createdByAgentId but no createdByUserId still 422s below, unchanged.
+          const requestingAgent = await agentsSvc.getById(req.actor.agentId);
+          const managerAgentId = requestingAgent?.reportsTo ?? null;
+          if (managerAgentId) {
+            updateFields.assigneeAgentId = managerAgentId;
+            updateFields.assigneeUserId = null;
+            autoRoutedToManagerAgentId = managerAgentId;
+          } else {
+            res.status(422).json({
+              error: "in_review requires reassignment: set assigneeAgentId or assigneeUserId to a reviewer",
+            });
+            return;
+          }
         } else {
           res.status(422).json({
             error: "in_review requires reassignment: set assigneeAgentId or assigneeUserId to a reviewer",
@@ -3429,6 +3455,7 @@ export function issueRoutes(
       existing,
       updateFields,
       actorType: req.actor.type,
+      autoRoutedToManagerAgentId,
     });
 
     const nextAssigneeAgentId =
@@ -3448,8 +3475,8 @@ export function issueRoutes(
     const isAgentAutoRoutedInReview =
       effectiveInReviewStatus === "in_review" &&
       req.actor.type === "agent" &&
-      updateFields.assigneeUserId === existing.createdByUserId &&
-      updateFields.assigneeAgentId === null;
+      ((updateFields.assigneeUserId === existing.createdByUserId && updateFields.assigneeAgentId === null) ||
+        (autoRoutedToManagerAgentId !== null && updateFields.assigneeAgentId === autoRoutedToManagerAgentId));
 
     if (assigneeWillChange && !transition.workflowControlledAssignment) {
       if (!isAgentReturningIssueToCreator && !isAgentAutoRoutedInReview) {

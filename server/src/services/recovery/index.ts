@@ -30,6 +30,7 @@ export type {
 } from "./issue-graph-liveness.js";
 export {
   recoveryService,
+  ORPHAN_BLOCKER_MENTION_HANDOFF_GRACE_MS,
 } from "./service.js";
 export {
   DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS,

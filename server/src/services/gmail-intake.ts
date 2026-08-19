@@ -49,6 +49,22 @@ export function isDmarcAggregateReport(from: string, subject: string): boolean {
   return DMARC_REPORT_SUBJECT_RE.test(subject);
 }
 
+// Marketing/promotional mail is not actionable correspondence (AUR-5831):
+// GlockApps and Shopify newsletter sends (AUR-5803, AUR-5804, both cancelled
+// 2026-08-19) were minting "Inbound email received" issues and burning agent
+// heartbeats on unsubscribe-able bulk mail. The RFC 2369/8058 List-Unsubscribe
+// header is the standard machine-checkable signal for this class of mail —
+// since Gmail/Yahoo's Feb-2024 bulk-sender rules, any ESP sending promotional
+// mail at volume is required to set it, and genuine correspondence (including
+// transactional receipts and password resets) essentially never carries it.
+// Prefer this structural signal over subject/body keyword matching, which is
+// both easy for a sender to vary and prone to false positives on legitimate
+// mail that happens to mention a keyword (see isDmarcAggregateReport above
+// for the same reasoning applied to its domain/subject checks).
+export function isMarketingEmail(listUnsubscribe: string): boolean {
+  return listUnsubscribe.trim().length > 0;
+}
+
 // Our own outbound mail is not correspondence (AUR-5473). The intake listing
 // query is a plain Gmail search, which matches SENT as well as received mail —
 // so every cold email the outreach sequence sends from alex@ was minting an
@@ -96,6 +112,8 @@ interface ParsedMessage {
   // Gmail's own label set for this message. Used to tell mail delivered to this
   // mailbox from our own SENT copies — see isOwnOutboundCopy (AUR-5473).
   labelIds: string[];
+  // Raw List-Unsubscribe header value, "" when absent. See isMarketingEmail (AUR-5831).
+  listUnsubscribe: string;
 }
 
 function extractHeader(
@@ -206,6 +224,7 @@ function parseMessage(
     autoSubmitted === "auto-replied" ||
     autoSubmitted === "auto-generated" ||
     precedence === "bulk";
+  const listUnsubscribe = sanitizeHeaderValue(extractHeader(headers, "list-unsubscribe"));
 
   return {
     from,
@@ -216,6 +235,7 @@ function parseMessage(
     gmailMessageId,
     isAutoReply,
     labelIds: msg.labelIds ?? [],
+    listUnsubscribe,
   };
 }
 
@@ -391,6 +411,23 @@ export function createGmailIntakeService(db: Db) {
           logger.info(
             { mailbox, messageId: parsed.gmailMessageId, from: parsed.from },
             "gmail-intake: suppressed DMARC aggregate report (telemetry, no issue)",
+          );
+          skipped++;
+          continue;
+        }
+
+        // Marketing/promotional mail is not actionable correspondence
+        // (AUR-5831). Record the intake so the message is not refetched on
+        // every poll, mint no issue, and leave the mail untouched — same
+        // suppress-in-place treatment as the DMARC and own-outbound cases
+        // above.
+        if (isMarketingEmail(parsed.listUnsubscribe)) {
+          await db.insert(gmailIntakeRecords).values(
+            buildIntakeRecordValues(companyId, mailbox, parsed, null),
+          );
+          logger.info(
+            { mailbox, messageId: parsed.gmailMessageId, from: parsed.from, subject: parsed.subject },
+            "gmail-intake: suppressed marketing/promotional email (List-Unsubscribe present, no issue)",
           );
           skipped++;
           continue;

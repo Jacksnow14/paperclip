@@ -52,6 +52,7 @@ const {
   repairUtf8Mojibake,
   isDmarcAggregateReport,
   isOwnOutboundCopy,
+  isMarketingEmail,
 } = await import("../services/gmail-intake.js");
 
 // Minimal Drizzle-like db mock that supports select/insert chaining.
@@ -713,6 +714,115 @@ describe("DMARC aggregate-report suppression (AUR-4466)", () => {
     expect(isDmarcAggregateReport("jane@example.com", "Your weekly report domain ideas")).toBe(false);
     expect(isDmarcAggregateReport("jane@example.com", "Report Domain: d.com is down")).toBe(false);
     expect(isDmarcAggregateReport("jane@example.com", "Re: Report Domain: d.com Submitter: z")).toBe(false);
+  });
+});
+
+describe("marketing/promotional email suppression (AUR-5831)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function makeMarketingMessage(
+    id: string,
+    threadId: string,
+    from: string,
+    subject: string,
+    listUnsubscribe: string,
+  ) {
+    const msg = makeMessage(id, threadId, subject);
+    msg.payload.headers[0].value = from;
+    if (listUnsubscribe) {
+      msg.payload.headers.push({ name: "List-Unsubscribe", value: listUnsubscribe });
+    }
+    return msg;
+  }
+
+  it.each([
+    [
+      "gappie@glockapps.co",
+      "Your inbox placement report is ready",
+      "<mailto:unsubscribe@glockapps.co>, <https://glockapps.co/unsubscribe?id=1>",
+    ],
+    [
+      "email@email.shopify.com",
+      "New features to grow your store",
+      "<https://email.shopify.com/unsubscribe/abc123>",
+    ],
+  ])(
+    "skips issue creation for promotional mail from %s (AUR-5803/AUR-5804)",
+    async (from, subject, listUnsubscribe) => {
+      const msg = makeMarketingMessage("mkt-1", "thread-mkt-1", from, subject, listUnsubscribe);
+      mockListMessages.mockResolvedValue({ messages: [{ id: "mkt-1" }] });
+      mockGetMessage.mockResolvedValue(msg);
+      mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+      mockModifyMessageLabels.mockResolvedValue({});
+      mockIssueCreate.mockResolvedValue({ id: "should-not-exist" });
+      mockAddComment.mockResolvedValue({});
+
+      const db = buildDbMock({ selectRows: [] });
+      const svc = createGmailIntakeService(db);
+      const result = await svc.processMailbox(COMPANY_ID, "alex");
+
+      expect(mockIssueCreate).not.toHaveBeenCalled();
+      expect(mockAddComment).not.toHaveBeenCalled();
+      expect(result.created).toBe(0);
+      expect(result.skipped).toBe(1);
+      expect(result.processed).toBe(1);
+    },
+  );
+
+  it("records the intake with a null issueId so the mail is not reprocessed", async () => {
+    const msg = makeMarketingMessage(
+      "mkt-2",
+      "thread-mkt-2",
+      "gappie@glockapps.co",
+      "Your inbox placement report is ready",
+      "<mailto:unsubscribe@glockapps.co>",
+    );
+    mockListMessages.mockResolvedValue({ messages: [{ id: "mkt-2" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    await svc.processMailbox(COMPANY_ID, "alex");
+
+    const insertValues = (db as ReturnType<typeof buildDbMock>)._insertChain.values.mock
+      .calls[0][0] as Record<string, unknown>;
+    expect(insertValues.gmailMessageId).toBe("mkt-2");
+    expect(insertValues.issueId).toBeNull();
+  });
+
+  it("still mints an issue for a normal reply with no List-Unsubscribe header (guard does not over-suppress)", async () => {
+    const msg = makeMarketingMessage(
+      "normal-2",
+      "thread-normal-2",
+      "Jane Prospect <jane@example.com>",
+      "Re: quick question about pricing",
+      "",
+    );
+    mockListMessages.mockResolvedValue({ messages: [{ id: "normal-2" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-normal-2" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "alex");
+
+    expect(mockIssueCreate).toHaveBeenCalledOnce();
+    expect(result.created).toBe(1);
+    expect(result.skipped).toBe(0);
+  });
+
+  it("classifier: presence of List-Unsubscribe (any value) is sufficient, blank/whitespace is not", () => {
+    expect(isMarketingEmail("<mailto:unsubscribe@example.com>")).toBe(true);
+    expect(isMarketingEmail("<https://example.com/unsub>")).toBe(true);
+    expect(isMarketingEmail("")).toBe(false);
+    expect(isMarketingEmail("   ")).toBe(false);
   });
 });
 

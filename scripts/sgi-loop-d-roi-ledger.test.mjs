@@ -54,6 +54,32 @@ test('computeRoi still counts explicit value signals as explicit', () => {
   assert.equal(rows[0].valueSignal, 5);
 });
 
+test('AUR-5410: computeRoi excludes a scorecard_adjusted row flagged exclude_from_aggregates/metrics_lost', () => {
+  const issueProjects = new Map([['AUR-7', { projectId: 'p-mixed', projectName: null, priority: 'high' }]]);
+  const measuredOnly = [card('AUR-7', { value_signal: 1, quality_signal: 4 })]; // token_cost: 1000 (from card())
+  const withUnmeasuredRowAdded = [
+    ...measuredOnly,
+    card('AUR-7', { value_signal: 1, quality_signal: 4, token_cost: 0, exclude_from_aggregates: true, metrics_lost: true }),
+  ];
+
+  const { rows: baseline } = computeRoi(measuredOnly, issueProjects);
+  const { rows: withExcludedRow } = computeRoi(withUnmeasuredRowAdded, issueProjects);
+
+  // PASSING: the excluded row must not move vpt or samples at all — same result
+  // whether or not the flagged row is present.
+  assert.equal(withExcludedRow[0].vpt, baseline[0].vpt);
+  assert.equal(withExcludedRow[0].samples, 1);
+
+  // FIRING: re-run the pre-fix arithmetic (no skip) to prove what this guard
+  // exists to catch — the unmeasured row's adjValue gets summed into the
+  // numerator while contributing 0 to tokenCost, doubling vpt from 1.6 to 3.2.
+  const preFixAdjustedValue = 1.6 + 1.6; // two rows' worth of adjValue at quality 4, priority 'high'
+  const preFixVpt = preFixAdjustedValue / (1000 / 1000); // tokenCost still only 1000 — the zero-cost row added nothing
+  assert.equal(preFixVpt, 3.2);
+  assert.equal(baseline[0].vpt, 1.6);
+  assert.notEqual(withExcludedRow[0].vpt, preFixVpt);
+});
+
 test('computeRoi keeps the revenue basis when a project_value record exists', () => {
   const issueProjects = new Map([['AUR-4', { projectId: 'p-rev', projectName: 'Revenue', priority: 'medium' }]]);
   const all = [

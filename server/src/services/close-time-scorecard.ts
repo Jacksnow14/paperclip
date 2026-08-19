@@ -91,9 +91,21 @@ export function buildCloseTimeScorecardCaptures(issue: CloseTimeScorecardIssue, 
   const safeTokenCost = Math.max(Math.round(tokenCost), 0);
   const qualitySignal = DEFAULT_QUALITY_SIGNAL;
   const valueSignal = DEFAULT_QUALITY_SIGNAL;
-  const scoreAdjusted = (qualitySignal * valueSignal) / Math.max(safeTokenCost, 1);
+  // AUR-5410: token_cost:0 means "we never measured cost", not "this cost
+  // nothing" — the previous `Math.max(safeTokenCost, 1)` clamp turned an
+  // absent measurement into score_adjusted: 9.0, the best possible score in
+  // the registry, so routing was decided by which candidate happened to have
+  // an unmeasured close. A row with no measured cost gets no score at all:
+  // score_adjusted is omitted (not null — `Number(null) === 0`, which would
+  // silently drag a reader's average toward zero instead of being skipped)
+  // and both records are flagged so readers can exclude them explicitly.
+  const hasMeasuredCost = safeTokenCost > 0;
+  const scoreAdjusted = hasMeasuredCost ? (qualitySignal * valueSignal) / safeTokenCost : undefined;
   const owner = { type: "agent" as const, id: issue.assigneeAgentId };
   const source = { kind: "issue" as const, issueId: issue.id };
+  const unmeasuredFlags = hasMeasuredCost
+    ? {}
+    : { metrics_lost: true, exclude_from_aggregates: true };
 
   const performanceScorecard = {
     title: `performance/${issue.assigneeAgentId}/${taskType}/${day}/${issueRef}`,
@@ -108,6 +120,7 @@ export function buildCloseTimeScorecardCaptures(issue: CloseTimeScorecardIssue, 
       quality_signal: qualitySignal,
       value_signal: valueSignal,
       auto_generated: true,
+      ...unmeasuredFlags,
       ...(issue.projectId ? { project_id: issue.projectId } : {}),
     },
     source,
@@ -117,17 +130,20 @@ export function buildCloseTimeScorecardCaptures(issue: CloseTimeScorecardIssue, 
 
   const scorecardAdjusted = {
     title: `scorecard-adjusted/${issue.assigneeAgentId}/${taskType}/${day}/${issueRef}`,
-    content: `Adjusted score ${scoreAdjusted.toFixed(4)} (auto-captured at close time, AUR-4224).`,
+    content: hasMeasuredCost
+      ? `Adjusted score ${(scoreAdjusted as number).toFixed(4)} (auto-captured at close time, AUR-4224).`
+      : `No cost measurement available at close time (cost_events empty for this issue) — score suppressed, not fabricated (AUR-5410).`,
     metadata: {
       category: "scorecard_adjusted",
       issue_id: issueRef,
       agent_id: issue.assigneeAgentId,
       task_type: taskType,
-      score_adjusted: scoreAdjusted,
+      ...(hasMeasuredCost ? { score_adjusted: scoreAdjusted } : {}),
       quality_signal: qualitySignal,
       value_signal: valueSignal,
       token_cost: safeTokenCost,
       auto_generated: true,
+      ...unmeasuredFlags,
       ...(issue.projectId ? { project_id: issue.projectId } : {}),
     },
     source,

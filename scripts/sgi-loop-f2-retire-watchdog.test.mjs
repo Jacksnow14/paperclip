@@ -260,6 +260,21 @@ test('aggregateScores groups by agent_id and computes means', () => {
   assert.equal(agents[0].meanQuality, 3);
 });
 
+test('AUR-5410: aggregateScores skips a scorecard_adjusted row flagged exclude_from_aggregates/metrics_lost', () => {
+  const records = [
+    makeRecord('a2', 0, { score_adjusted: 2, quality_signal: 4 }),
+    // FIRING: an unmeasured close with no score_adjusted field at all, but
+    // (contrived) still carrying a score_adjusted value to prove the explicit
+    // flag check — not just Number.isFinite(undefined) — is what excludes it.
+    makeRecord('a2', 1, { score_adjusted: 9, quality_signal: 3, exclude_from_aggregates: true, metrics_lost: true }),
+  ];
+  const agents = aggregateScores(records);
+  assert.equal(agents.length, 1);
+  // PASSING: only the un-flagged row counts — mean stays at 2, not (2+9)/2 = 5.5.
+  assert.equal(agents[0].n, 1);
+  assert.equal(agents[0].meanScore, 2);
+});
+
 test('quartileThreshold returns the value at the 25th percentile index', () => {
   assert.equal(quartileThreshold([4, 3, 2, 1]), 2); // sorted [1,2,3,4], idx=floor(4*0.25)=1 -> 2
 });

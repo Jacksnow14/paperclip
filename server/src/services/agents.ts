@@ -20,6 +20,7 @@ import { AGENT_DEFAULT_MAX_CONCURRENT_RUNS, isUuidLike, normalizeAgentUrlKey } f
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { mergeAgentPermissionsPatch, normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
+import { getAgentQuotaStates } from "./agent-quota-state.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -275,7 +276,13 @@ export function agentService(db: Db) {
       .then((rows) => rows[0] ?? null);
     if (!row) return null;
     const [hydrated] = await hydrateAgentSpend([row]);
-    return normalizeAgentRow(hydrated);
+    const normalized = normalizeAgentRow(hydrated);
+    // AUR-4604: surfaced on every getById, including internal call sites
+    // (chain-of-command walks, manager lookups, pre-update existence
+    // checks) that discard it — same N+1-per-agent tradeoff lane-breaker.ts
+    // already makes (AUR-5464) for one extra fast indexed query per call.
+    const quotaStates = await getAgentQuotaStates(db, row.companyId, [row.id]);
+    return { ...normalized, quotaState: quotaStates.get(row.id) ?? null };
   }
 
   async function ensureManager(companyId: string, managerId: string) {
@@ -405,7 +412,16 @@ export function agentService(db: Db) {
       }
       const rows = await db.select().from(agents).where(and(...conditions));
       const hydrated = await hydrateAgentSpend(rows);
-      return hydrated.map(normalizeAgentRow);
+      const normalized = hydrated.map(normalizeAgentRow);
+      const quotaStates = await getAgentQuotaStates(
+        db,
+        companyId,
+        normalized.map((row) => row.id),
+      );
+      return normalized.map((row) => ({
+        ...row,
+        quotaState: quotaStates.get(row.id) ?? null,
+      }));
     },
 
     getById,

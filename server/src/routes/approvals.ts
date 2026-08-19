@@ -119,16 +119,29 @@ export function approvalRoutes(
     res.json(redactApprovalPayload(approval));
   });
 
-  router.post("/companies/:companyId/approvals", validate(createApprovalSchema), async (req, res) => {
+  router.post("/companies/:companyId/approvals", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const payloadErrors = checkBoardApprovalPayloadViolations(req.body.type, req.body.payload);
+
+    // AUR-5383 review fix: the board-approval guard must see the raw request
+    // body BEFORE `createApprovalSchema` runs. The schema requires `payload`
+    // to be present, so a request that omits `payload` entirely (e.g. just
+    // `{ type: "request_board_approval" }`) used to fail Zod validation
+    // first and surface as a generic 400, never reaching this guard.
+    const rawType = typeof req.body?.type === "string" ? req.body.type : undefined;
+    const rawPayload =
+      req.body?.payload && typeof req.body.payload === "object" && !Array.isArray(req.body.payload)
+        ? (req.body.payload as Record<string, unknown>)
+        : undefined;
+    const payloadErrors = checkBoardApprovalPayloadViolations(rawType, rawPayload);
     if (payloadErrors.length > 0) {
       throw unprocessable(
-        `Invalid '${req.body.type}' approval: ${payloadErrors.length} validation error(s)`,
+        `Invalid '${rawType}' approval: ${payloadErrors.length} validation error(s)`,
         { errors: payloadErrors },
       );
     }
+
+    req.body = createApprovalSchema.parse(req.body);
     const rawIssueIds = req.body.issueIds;
     const issueIds = Array.isArray(rawIssueIds)
       ? rawIssueIds.filter((value: unknown): value is string => typeof value === "string")

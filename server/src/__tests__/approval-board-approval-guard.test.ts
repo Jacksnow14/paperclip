@@ -119,6 +119,19 @@ describe("POST /companies/:companyId/approvals — board-approval payload guard"
     expect(mockApprovalService.create).not.toHaveBeenCalled();
   });
 
+  it("422s naming all three fields when payload is omitted entirely (not just empty)", async () => {
+    const res = await request(await createAgentApp())
+      .post("/api/companies/company-1/approvals")
+      .send({ type: "request_board_approval" });
+
+    expect(res.status).toBe(422);
+    const body = JSON.stringify(res.body);
+    expect(body).toContain("title");
+    expect(body).toContain("valueAtStake");
+    expect(body).toContain("costOfInaction");
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+  });
+
   it("422s naming all three fields when payload is empty", async () => {
     const res = await request(await createAgentApp())
       .post("/api/companies/company-1/approvals")

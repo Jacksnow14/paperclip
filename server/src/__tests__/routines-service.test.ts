@@ -2826,4 +2826,145 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
     expect(await readAlarmIssues(companyId, rollingRoutine.id)).toHaveLength(0);
   });
+
+  // AUR-5786 (follow-up to AUR-5387): a rolling issue that loses its assignee
+  // (unassigned, agent deleted/retired) and is then found in a terminal status
+  // must NOT be silently counted as a clean dispatch. queueIssueAssignmentWakeup
+  // no-ops on a missing assignee, so a reopen with no assignee dispatches
+  // nothing even though the branch otherwise reads like a successful rewake —
+  // this must increment the wedge counter and raise immediately, not wait for
+  // the doubling threshold.
+  it("reuse_and_rewake: terminal reopen with no assignee is a fault, not a clean dispatch (AUR-5786)", async () => {
+    const { companyId, agentId, projectId, svc } = await seedFixture();
+    const ctoAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: ctoAgentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const rollingRoutine = await svc.create(
+      companyId,
+      {
+        projectId,
+        goalId: null,
+        parentIssueId: null,
+        title: "rolling watchdog with a retired assignee",
+        description: null,
+        assigneeAgentId: agentId,
+        priority: "medium",
+        status: "active",
+        concurrencyPolicy: "reuse_and_rewake",
+        catchUpPolicy: "skip_missed",
+      },
+      {},
+    );
+
+    // Fire 1: genuine dispatch, counter stays 0.
+    const run1 = await svc.runRoutine(rollingRoutine.id, { source: "schedule" });
+    expect(run1.status).toBe("issue_created");
+    const rollingIssueId = run1.linkedIssueId!;
+    let [routineRow] = await db.select().from(routines).where(eq(routines.id, rollingRoutine.id));
+    expect(routineRow?.consecutiveCoalesceCount).toBe(0);
+
+    // The rolling issue's assignee is retired/removed, then the agent closes it.
+    await db
+      .update(issues)
+      .set({ status: "done", assigneeAgentId: null, updatedAt: new Date() })
+      .where(eq(issues.id, rollingIssueId));
+
+    // Fire 2 reopens the terminal issue, but there is nobody to wake.
+    const run2 = await svc.runRoutine(rollingRoutine.id, { source: "schedule" });
+    expect(run2.status).toBe("issue_created");
+    expect(run2.linkedIssueId).toBe(rollingIssueId);
+
+    const [reopenedIssue] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, rollingIssueId));
+    expect(reopenedIssue?.status).toBe("todo");
+
+    // The counter must NOT reset to 0 — this reopen dispatched nobody.
+    [routineRow] = await db.select().from(routines).where(eq(routines.id, rollingRoutine.id));
+    expect(routineRow?.consecutiveCoalesceCount).toBe(1);
+
+    // The alarm must fire immediately, even though count=1 is below the normal
+    // doubling threshold (isCoalesceAnomalyRaisePoint requires count >= 2).
+    const alarmIssues = await readAlarmIssues(companyId, rollingRoutine.id);
+    expect(alarmIssues).toHaveLength(1);
+    expect(alarmIssues[0]?.assigneeAgentId).toBe(ctoAgentId);
+
+    const anomalyLogs = await db
+      .select({ action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.action, "routine.coalesce_anomaly"), eq(activityLog.entityId, rollingIssueId)));
+    expect(anomalyLogs).toHaveLength(1);
+    expect((anomalyLogs[0]?.details as { raiseReason?: string } | null)?.raiseReason).toBe("no_assignee");
+
+    const reopenLogs = await db
+      .select({ action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.action, "routine.terminal_reopen"), eq(activityLog.entityId, rollingIssueId)));
+    expect(reopenLogs).toHaveLength(1);
+    const reopenDetails = reopenLogs[0]?.details as { previousStatus?: string; hadAssignee?: boolean } | null;
+    expect(reopenDetails?.previousStatus).toBe("done");
+    expect(reopenDetails?.hadAssignee).toBe(false);
+  });
+
+  // AUR-5786: the audit trail must record a normal reopen too (assignee present),
+  // not just the no-assignee fault case — this is the forensic evidence that was
+  // missing during the AUR-5412 incident review.
+  it("reuse_and_rewake: terminal reopen with an assignee records an audit trail and still dispatches cleanly", async () => {
+    const { companyId, agentId, projectId, svc } = await seedFixture();
+    const rollingRoutine = await svc.create(
+      companyId,
+      {
+        projectId,
+        goalId: null,
+        parentIssueId: null,
+        title: "rolling watchdog with a live assignee",
+        description: null,
+        assigneeAgentId: agentId,
+        priority: "medium",
+        status: "active",
+        concurrencyPolicy: "reuse_and_rewake",
+        catchUpPolicy: "skip_missed",
+      },
+      {},
+    );
+
+    const run1 = await svc.runRoutine(rollingRoutine.id, { source: "schedule" });
+    const rollingIssueId = run1.linkedIssueId!;
+    await db.update(issues).set({ status: "cancelled", updatedAt: new Date() }).where(eq(issues.id, rollingIssueId));
+
+    const run2 = await svc.runRoutine(rollingRoutine.id, { source: "schedule" });
+    expect(run2.status).toBe("issue_created");
+    expect(run2.linkedIssueId).toBe(rollingIssueId);
+
+    // A genuine dispatch (assignee present) must still reset the counter to 0
+    // and must NOT raise a coalesce anomaly.
+    const [routineRow] = await db.select().from(routines).where(eq(routines.id, rollingRoutine.id));
+    expect(routineRow?.consecutiveCoalesceCount).toBe(0);
+    expect(await readAlarmIssues(companyId, rollingRoutine.id)).toHaveLength(0);
+
+    const reopenLogs = await db
+      .select({ action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.action, "routine.terminal_reopen"), eq(activityLog.entityId, rollingIssueId)));
+    expect(reopenLogs).toHaveLength(1);
+    const reopenDetails = reopenLogs[0]?.details as { previousStatus?: string; hadAssignee?: boolean } | null;
+    expect(reopenDetails?.previousStatus).toBe("cancelled");
+    expect(reopenDetails?.hadAssignee).toBe(true);
+
+    const reopenComments = await db
+      .select({ id: issueComments.id, authorType: issueComments.authorType, body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, rollingIssueId));
+    expect(reopenComments).toHaveLength(1);
+    expect(reopenComments[0]?.authorType).toBe("system");
+    expect(reopenComments[0]?.body).toContain("terminal status (`cancelled`)");
+  });
 });

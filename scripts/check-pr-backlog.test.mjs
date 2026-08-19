@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import {
   DEFAULT_REPOS,
+  api,
   applyFileCap,
   assessLaneHealth,
   decideActions,
@@ -439,6 +440,42 @@ test('applyFileCap keeps safety/guardrail PRs first, then oldest-first, dropping
   const { kept, dropped } = applyFileCap(items, 2);
   assert.deepEqual(kept.map((k) => k.number), [2, 3]); // safety-critical first, then oldest chore
   assert.deepEqual(dropped.map((d) => d.number), [1]);
+});
+
+test('api() throws with the response body on failure (AUR-5790)', async () => {
+  // A 403/400 with no body logged costs the next responder a full diagnosis
+  // loop re-deriving the server's stated reason from scratch.
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response('{"error":"Missing permission: tasks:assign"}', { status: 403 });
+  try {
+    await assert.rejects(
+      () => api({ apiBase: 'http://example.invalid' }, 'POST', '/api/companies/x/issues'),
+      (err) => {
+        assert.match(err.message, /POST \/api\/companies\/x\/issues → 403/);
+        assert.match(err.message, /Missing permission: tasks:assign/);
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('api() throws a plain status line when the body is empty', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response('', { status: 500 });
+  try {
+    await assert.rejects(
+      () => api({ apiBase: 'http://example.invalid' }, 'GET', '/api/issues/x'),
+      (err) => {
+        assert.equal(err.message, 'GET /api/issues/x → 500');
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('applyFileCap keeps everything when under the cap', () => {

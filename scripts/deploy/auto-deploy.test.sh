@@ -152,7 +152,17 @@ run_tick() { # extra env as KEY=VAL args
   # AUR-5019: the migration gate defaults to a pass-through stub (`true`) so the
   # pre-gate cases keep asserting their own concern; the J cases point GATE_CMD
   # at a scripted stub to drive block/infra/pass outcomes.
-  env "$@" \
+  #
+  # PAPERCLIP_AUTO_HEALTH_RESTART_ENABLED is pinned OFF here (production
+  # default is ON) so cases A-J, several of which deliberately leave the
+  # scratch unit health-unreachable (D/F), stay exactly as they were before
+  # the health self-heal feature existed. The K cases below opt back in
+  # explicitly, same pattern as PAPERCLIP_AUTO_RESTART_ENABLED above.
+  #
+  # "$@" MUST come last: env(1) applies same-name VAR=VAL assignments in
+  # order with the last one winning, so a caller override placed before the
+  # fixed defaults below would be silently clobbered by them.
+  env \
     PAPERCLIP_DEPLOY_MIGRATION_GATE_CMD="${GATE_CMD:-true}" \
     PAPERCLIP_DEPLOY_APP_ROOT="$APP" \
     PAPERCLIP_DEPLOY_REMOTE="$FIX" \
@@ -170,6 +180,8 @@ run_tick() { # extra env as KEY=VAL args
     PAPERCLIP_DEPLOY_QUIESCE_INTERVAL_SEC=1 \
     PAPERCLIP_DEPLOY_HEALTH_TIMEOUT_SEC=6 \
     PAPERCLIP_DEPLOY_HEALTH_POLL_SEC=1 \
+    PAPERCLIP_AUTO_HEALTH_RESTART_ENABLED=0 \
+    "$@" \
     bash "$AUTODEPLOY" >> "$TMP/tick.out" 2>&1
 }
 
@@ -621,6 +633,98 @@ else
   fail "J4: a passing gate resets the infra streak (next refusal counts from 1)" \
     "current=$(readlink "$APP/current") counter=$(cat "$STATE_DIR/auto-deploy.gate-infra-failures" 2>/dev/null) alerts=$(cat "$ALERTS" 2>/dev/null)"
 fi
+
+# ================================================================================
+# K. Health self-heal (2026-08-19 outage): probe_health failing on an
+#    UNCHANGED activated sha — the unit stopped is the test's stand-in for "the
+#    process is alive but every DB-bound route is wedged" (both look identical
+#    to probe_health, which only sees the HTTP surface). Restore a clean
+#    healthy baseline first: this axis is independent of D/E/F above.
+set_master "$SHA_G"; point_current "$SHA_G"; set_counts 0 0
+systemctl --user restart "$UNIT"
+wait_sha "$SHA_G" 10 || { echo "FATAL: scratch unit did not return to $G12 before K" >&2; exit 1; }
+HUS="$STATE_DIR/auto-deploy.health-unreachable-since"
+HRL="$STATE_DIR/auto-deploy.health-restart-last"
+
+# K0: kill switch off (explicit =0, same as A-J's pinned default) -> even a
+#     long-sustained outage never restarts, and the since-file is cleared
+#     rather than left accumulating silently.
+systemctl --user stop "$UNIT"; systemctl --user reset-failed "$UNIT" 2>/dev/null
+printf '%s' "$(( $(date -u +%s) - 3600 ))" > "$HUS"
+: > "$ALERTS"
+run_tick PAPERCLIP_AUTO_HEALTH_RESTART_ENABLED=0
+if ! systemctl --user is-active --quiet "$UNIT" && [[ ! -s "$ALERTS" ]] && [[ ! -f "$HUS" ]]; then
+  ok "K0: kill switch off — sustained outage never restarts, since-file cleared"
+else
+  fail "K0: kill switch off — sustained outage never restarts, since-file cleared" \
+    "active=$(systemctl --user is-active "$UNIT") alerts=$(cat "$ALERTS" 2>/dev/null) since=$(cat "$HUS" 2>/dev/null)"
+fi
+[[ "$(state_get phase)" == "health-unreachable" ]] \
+  && ok "K0: state still reports health-unreachable (drift detector's alerting is untouched)" \
+  || fail "K0: state still reports health-unreachable (drift detector's alerting is untouched)" "phase=$(state_get phase)"
+
+# K1: enabled, but not sustained past threshold yet -> first tick just starts
+#     the clock, no restart attempted.
+rm -f "$HUS" "$HRL"; : > "$ALERTS"
+run_tick PAPERCLIP_AUTO_HEALTH_RESTART_ENABLED=1 PAPERCLIP_AUTO_HEALTH_RESTART_THRESHOLD_SEC=3600
+if ! systemctl --user is-active --quiet "$UNIT" && [[ ! -s "$ALERTS" ]] && [[ -f "$HUS" ]]; then
+  ok "K1: below threshold — no restart yet, since-file started"
+else
+  fail "K1: below threshold — no restart yet, since-file started" \
+    "active=$(systemctl --user is-active "$UNIT") alerts=$(cat "$ALERTS" 2>/dev/null) since=$(cat "$HUS" 2>/dev/null || echo MISSING)"
+fi
+
+# K2: sustained past threshold (since-file backdated) -> restarts into the
+#     SAME activated sha and self-recovers, no rollback question involved.
+printf '%s' "$(( $(date -u +%s) - 120 ))" > "$HUS"
+: > "$ALERTS"
+run_tick PAPERCLIP_AUTO_HEALTH_RESTART_ENABLED=1 PAPERCLIP_AUTO_HEALTH_RESTART_THRESHOLD_SEC=60 PAPERCLIP_AUTO_HEALTH_RESTART_COOLDOWN_SEC=0
+if wait_sha "$SHA_G" 5 && systemctl --user is-active --quiet "$UNIT"; then
+  ok "K2: sustained unreachable past threshold — self-heal restart recovers the SAME sha ($G12)"
+else
+  fail "K2: sustained unreachable past threshold — self-heal restart recovers the SAME sha ($G12)" "sha=$(health_sha)"
+fi
+grep -q "SELF-RECOVERED" "$ALERTS" \
+  && ok "K2: self-recovery notifies INFO, not a founder-facing SEV2" \
+  || fail "K2: self-recovery notifies INFO, not a founder-facing SEV2" "alerts=$(cat "$ALERTS" 2>/dev/null)"
+[[ ! -f "$HUS" ]] \
+  && ok "K2: since-file cleared on success (next outage starts a fresh clock)" \
+  || fail "K2: since-file cleared on success (next outage starts a fresh clock)" "since=$(cat "$HUS" 2>/dev/null)"
+
+# K3: restart does not hold (activated sha is genuinely broken) -> health
+#     gate times out, escalates SEV2, and records the attempt (for K4).
+#     master must move to B too, not just current — otherwise stage 1 (arm)
+#     sees activated != master and quietly flips current back to G before
+#     stage 2 ever runs, as D/F already establish for the rollback path.
+set_master "$SHA_B"; point_current "$SHA_B"
+systemctl --user stop "$UNIT" 2>/dev/null; systemctl --user reset-failed "$UNIT" 2>/dev/null
+printf '%s' "$(( $(date -u +%s) - 120 ))" > "$HUS"
+: > "$ALERTS"
+run_tick PAPERCLIP_AUTO_HEALTH_RESTART_ENABLED=1 PAPERCLIP_AUTO_HEALTH_RESTART_THRESHOLD_SEC=60 PAPERCLIP_AUTO_HEALTH_RESTART_COOLDOWN_SEC=0
+if grep -q "did NOT bring it back healthy" "$ALERTS"; then
+  ok "K3: broken activated sha — self-heal restart fails and escalates SEV2"
+else
+  fail "K3: broken activated sha — self-heal restart fails and escalates SEV2" "alerts=$(cat "$ALERTS" 2>/dev/null)"
+fi
+[[ -f "$HRL" ]] \
+  && ok "K3: restart attempt recorded (starts the cooldown clock)" \
+  || fail "K3: restart attempt recorded (starts the cooldown clock)" "missing $HRL"
+
+# K4: cooldown blocks an immediate re-attempt on the still-broken sha — no
+#     restart-loop, no repeat page; the drift detector's own sustained
+#     provenance alert is the backstop from here.
+: > "$ALERTS"
+run_tick PAPERCLIP_AUTO_HEALTH_RESTART_ENABLED=1 PAPERCLIP_AUTO_HEALTH_RESTART_THRESHOLD_SEC=60 PAPERCLIP_AUTO_HEALTH_RESTART_COOLDOWN_SEC=3600
+if [[ ! -s "$ALERTS" ]] && grep -q "a prior restart didn't hold" "$TMP/auto.log"; then
+  ok "K4: cooldown suppresses a repeat restart attempt/page on the same outage"
+else
+  fail "K4: cooldown suppresses a repeat restart attempt/page on the same outage" "alerts=$(cat "$ALERTS" 2>/dev/null)"
+fi
+
+# restore a clean baseline in case this suite ever gains cases after K.
+set_master "$SHA_G"; point_current "$SHA_G"; set_counts 0 0
+systemctl --user restart "$UNIT"
+wait_sha "$SHA_G" 10 || echo "WARNING: scratch unit did not return to $G12 after K" >&2
 
 echo
 if [[ "$FAILURES" -eq 0 ]]; then

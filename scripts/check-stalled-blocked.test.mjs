@@ -33,6 +33,12 @@ import {
   buildStrandedRoutineFlagDescription,
   resolveStrandedRoutineCancelReason,
   STRANDED_ROUTINE_FLAG_CAP,
+  DEAD_APPROVAL_AGE_DAYS,
+  DEAD_APPROVAL_COMMENT_MARKER,
+  daysSince,
+  isDeadPendingApproval,
+  buildDeadApprovalComment,
+  hasDeadApprovalComment,
   main,
 } from './check-stalled-blocked.mjs';
 
@@ -775,6 +781,7 @@ test('main() FIRES: a stranded routine_execution issue with a source reference i
   const { fetchStub, calls } = makeFetchStub({
     [BLOCKED_QUERY]: [],
     [ALL_QUERY]: [execIssue],
+    [APPROVALS_PENDING_QUERY]: [],
     'GET /api/issues/AUR-5356': sourceIssue,
     [FILE_ISSUE_ROUTE]: { id: 'flag1' },
   });
@@ -808,6 +815,7 @@ test('main() FIRES: a stranded routine_execution issue with no source reference 
   const { fetchStub, calls } = makeFetchStub({
     [BLOCKED_QUERY]: [],
     [ALL_QUERY]: [execIssue],
+    [APPROVALS_PENDING_QUERY]: [],
     [FILE_ISSUE_ROUTE]: { id: 'flag1' },
   });
   global.fetch = fetchStub;
@@ -839,6 +847,7 @@ test('main() PASSES: a routine_execution issue below the staleness threshold is 
   const { fetchStub, calls } = makeFetchStub({
     [BLOCKED_QUERY]: [],
     [ALL_QUERY]: [execIssue],
+    [APPROVALS_PENDING_QUERY]: [],
   });
   global.fetch = fetchStub;
 
@@ -870,6 +879,7 @@ test('main() DEDUPES: does not re-file a stranded-routine-execution flag when an
   const { fetchStub, calls } = makeFetchStub({
     [BLOCKED_QUERY]: [],
     [ALL_QUERY]: [execIssue, existingFlag],
+    [APPROVALS_PENDING_QUERY]: [],
   });
   global.fetch = fetchStub;
 
@@ -896,6 +906,7 @@ test('main() CAPS: STRANDED_ROUTINE_FLAG_CAP + 2 stranded candidates files exact
   const { fetchStub, calls } = makeFetchStub({
     [BLOCKED_QUERY]: [],
     [ALL_QUERY]: execIssues,
+    [APPROVALS_PENDING_QUERY]: [],
     [FILE_ISSUE_ROUTE]: { id: 'flagN' },
   });
   global.fetch = fetchStub;
@@ -929,6 +940,7 @@ test('main() RESOLVES: auto-cancels a stranded-routine-execution flag once its t
   const { fetchStub, calls } = makeFetchStub({
     [BLOCKED_QUERY]: [],
     [ALL_QUERY]: [staleFlag],
+    [APPROVALS_PENDING_QUERY]: [],
     'PATCH /api/issues/flagStale': { id: 'flagStale', status: 'cancelled' },
     'POST /api/issues/flagStale/comments': { id: 'comment1' },
   });

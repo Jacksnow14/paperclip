@@ -38,11 +38,25 @@ const AGENT: FleetCapacityAgentInput & { adapterType: string } = {
  * Db only ever reaches logActivity (whose rejection the breaker swallows by
  * design) — classification never touches it because the loader is injected.
  */
-function makeBreaker(fixtures: { agents?: FleetCapacityAgentInput[]; runs: FleetCapacityRunInput[] }) {
-  const state = { nowMs: T0, runs: fixtures.runs };
+function makeBreaker(fixtures: {
+  agents?: FleetCapacityAgentInput[];
+  runs: FleetCapacityRunInput[];
+  /** Per-agent override, for fixtures where lane-mates have different histories. Falls back to `runs`. */
+  runsByAgent?: Record<string, FleetCapacityRunInput[]>;
+}) {
+  const state = {
+    nowMs: T0,
+    runs: fixtures.runs,
+    // Mutable + read live on every load() — lets tests move ONE agent's
+    // history mid-scenario (e.g. simulate its probe succeeding) without
+    // re-baking the closure.
+    runsByAgent: { ...(fixtures.runsByAgent ?? {}) } as Record<string, FleetCapacityRunInput[]>,
+  };
   const load: LaneClassificationLoader = async () => ({
     agents: fixtures.agents ?? [AGENT],
-    runsByAgent: new Map((fixtures.agents ?? [AGENT]).map((a) => [a.id, state.runs])),
+    runsByAgent: new Map(
+      (fixtures.agents ?? [AGENT]).map((a) => [a.id, state.runsByAgent[a.id] ?? state.runs]),
+    ),
   });
   const breaker = new LaneBreaker({ db: {} as Db, load, now: () => new Date(state.nowMs) });
   return { breaker, state };
@@ -283,5 +297,86 @@ describe("LaneBreaker — describeLanes read surface", () => {
     });
     // PASS: an unrelated healthy lane stays closed, so the view discriminates.
     expect(byLane.codex_local).toMatchObject({ state: "closed", trippedBy: [], reason: null });
+  });
+});
+
+describe("LaneBreaker — AUR-5903 shared half-open countdown survives a healthy lane-mate", () => {
+  const TRIPPED_AGENT: FleetCapacityAgentInput & { adapterType: string } = {
+    id: "agent-tripped",
+    name: "Claude Code Fast",
+    adapterType: "claude_local",
+    pausedAt: null,
+  };
+  const HEALTHY_AGENT: FleetCapacityAgentInput & { adapterType: string } = {
+    id: "agent-healthy",
+    name: "CTO",
+    adapterType: "claude_local",
+    pausedAt: null,
+  };
+
+  it("FIRE (pre-fix): a healthy same-lane agent's own admission check must not wipe the tripped agent's in-flight probe countdown", async () => {
+    const { breaker, state } = makeBreaker({
+      agents: [TRIPPED_AGENT, HEALTHY_AGENT],
+      runs: REVOKED_RUNS,
+      runsByAgent: { [TRIPPED_AGENT.id]: REVOKED_RUNS, [HEALTHY_AGENT.id]: HEALTHY_RUNS },
+    });
+
+    // Trip observed for the tripped agent; next probe scheduled a full
+    // interval out from T0 (T0 + HALF_OPEN_PROBE_INTERVAL_MS).
+    const first = await breaker.evaluateAdmission(COMPANY, TRIPPED_AGENT);
+    expect(first.admit).toBe(false);
+
+    // Mirrors resumeQueuedRuns() sweeping every claude_local agent in the same
+    // scheduler tick: a healthy lane-mate (its OWN row is clean) evaluates
+    // admission in between. Before the fix this deleted the shared per-lane
+    // halfOpen entry and logged a false "re-armed" transition, even though
+    // the lane is still genuinely tripped by TRIPPED_AGENT.
+    const healthyCheck = await breaker.evaluateAdmission(COMPANY, HEALTHY_AGENT);
+    expect(healthyCheck.admit).toBe(true);
+    expect(healthyCheck.trippedBy).toEqual([]);
+
+    // Advance to just past the ORIGINAL probe deadline (not a fresh one). If
+    // the healthy check above had wiped the countdown, a probe wouldn't be
+    // eligible again until this same instant PLUS another full interval, so
+    // this would still read `admit: false`.
+    state.nowMs = T0 + HALF_OPEN_PROBE_INTERVAL_MS + 1_000;
+    const probe = await breaker.evaluateAdmission(COMPANY, TRIPPED_AGENT);
+    expect(probe.admit).toBe(true);
+    expect(probe.halfOpenProbe).toBe(true);
+    expect(probe.state).toBe("half_open");
+  });
+
+  it("a healthy agent's own admission is unaffected by a tripped lane-mate", async () => {
+    const { breaker } = makeBreaker({
+      agents: [TRIPPED_AGENT, HEALTHY_AGENT],
+      runs: REVOKED_RUNS,
+      runsByAgent: { [TRIPPED_AGENT.id]: REVOKED_RUNS, [HEALTHY_AGENT.id]: HEALTHY_RUNS },
+    });
+    await breaker.evaluateAdmission(COMPANY, TRIPPED_AGENT);
+    const decision = await breaker.evaluateAdmission(COMPANY, HEALTHY_AGENT);
+    expect(decision.admit).toBe(true);
+    expect(decision.halfOpenProbe).toBe(false);
+  });
+
+  it("once every agent in the lane is healthy, the shared half-open state genuinely clears", async () => {
+    const { breaker, state } = makeBreaker({
+      agents: [TRIPPED_AGENT, HEALTHY_AGENT],
+      runs: REVOKED_RUNS,
+      runsByAgent: { [TRIPPED_AGENT.id]: REVOKED_RUNS, [HEALTHY_AGENT.id]: HEALTHY_RUNS },
+    });
+    await breaker.evaluateAdmission(COMPANY, TRIPPED_AGENT); // trip observed
+
+    // The tripped agent itself recovers (a succeeded run lands).
+    state.nowMs = T0 + 60_000;
+    state.runsByAgent[TRIPPED_AGENT.id] = [run("succeeded", state.nowMs - 1_000), ...REVOKED_RUNS];
+    const recovered = await breaker.evaluateAdmission(COMPANY, TRIPPED_AGENT);
+    expect(recovered.admit).toBe(true);
+    expect(recovered.state).toBe("closed");
+
+    // Now the lane is genuinely healthy end-to-end; the healthy agent's own
+    // check should also observe (and is free to clear) the closed state.
+    const healthyCheck = await breaker.evaluateAdmission(COMPANY, HEALTHY_AGENT);
+    expect(healthyCheck.admit).toBe(true);
+    expect(healthyCheck.state).toBe("closed");
   });
 });

@@ -237,9 +237,7 @@ export class LaneBreaker {
     const snapshot = await this.getLaneSnapshot(companyId, lane, now);
     const row = snapshot.rows.find((r) => r.agentId === agent.id) ?? null;
 
-    const errorStreamTrip =
-      row != null &&
-      (LANE_BREAKER_HARD_TRIP_REASONS.has(row.reason) || row.reason === "quota_reset_unverified");
+    const errorStreamTrip = row != null && LaneBreaker.isErrorStreamTripped(row);
     const probeTrip = this.activeProbeTrip(lane, snapshot.lastSuccessAtMs);
 
     const trippedBy: LaneBreakerTripSource[] = [];
@@ -247,8 +245,22 @@ export class LaneBreaker {
     if (probeTrip) trippedBy.push("provider_probe");
 
     if (trippedBy.length === 0) {
-      await this.recordTransition(companyId, lane, "closed", null, null);
-      this.halfOpen.delete(this.key(companyId, lane));
+      // AUR-5903: `halfOpen` and the closed/open transition log are keyed
+      // per-LANE (by design — see file docstring), but `row` above is this
+      // ONE calling agent's error-stream state. A healthy agent asking "am I
+      // admitted?" is not the same question as "is the lane recovered?" —
+      // other agents sharing this lane key can still be tripped. Gate the
+      // shared side effects on the lane-wide state (every row in the
+      // snapshot, same computation `buildLaneState` uses), not the calling
+      // agent's own row, so an untripped agent's admission check can never
+      // wipe another agent's in-flight half-open probe countdown or spam a
+      // false "re-armed" transition while the lane is still genuinely open.
+      const laneTripped =
+        probeTrip != null || snapshot.rows.some((r) => LaneBreaker.isErrorStreamTripped(r));
+      if (!laneTripped) {
+        await this.recordTransition(companyId, lane, "closed", null, null);
+        this.halfOpen.delete(this.key(companyId, lane));
+      }
       return { admit: true, halfOpenProbe: false, state: "closed", trippedBy, reason: null, detail: null };
     }
 
@@ -342,9 +354,7 @@ export class LaneBreaker {
     rows: FleetCapacityRow[],
     lastSuccessAtMs: number | null,
   ): LaneBreakerLaneState {
-    const trippedRows = rows.filter(
-      (r) => LANE_BREAKER_HARD_TRIP_REASONS.has(r.reason) || r.reason === "quota_reset_unverified",
-    );
+    const trippedRows = rows.filter((r) => LaneBreaker.isErrorStreamTripped(r));
     const probeTrip = this.activeProbeTrip(lane, lastSuccessAtMs);
     const trippedBy: LaneBreakerTripSource[] = [];
     if (trippedRows.length > 0) trippedBy.push("error_stream");
@@ -365,6 +375,11 @@ export class LaneBreaker {
       providerProbe: report ? { ...report, observedAt: report.observedAt.toISOString() } : null,
       manualRearmAt: manualRearmAt ? manualRearmAt.toISOString() : null,
     };
+  }
+
+  /** True when a row's own error-stream history hard-trips (or reset-unverified-soft-trips) the lane. */
+  private static isErrorStreamTripped(row: FleetCapacityRow): boolean {
+    return LANE_BREAKER_HARD_TRIP_REASONS.has(row.reason) || row.reason === "quota_reset_unverified";
   }
 
   private key(companyId: string, lane: string) {

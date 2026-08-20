@@ -443,6 +443,56 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(notices[0]?.body ?? "").toContain("routine-umbrella cancelled by recovery action");
   });
 
+  // AUR-4709: `assertBlockedDispositionHasPath` now rejects any `blocked` write with zero
+  // first-class edges. This fallback writes `blocked` with an empty `blockedByIssueIds`, but
+  // `ensureSourceScopedStrandedRecoveryAction` (called just above in the same escalation) has
+  // just refreshed the source-scoped recovery action's `lastAttemptAt`, so it is still inside
+  // the dormancy window at write time and satisfies the guard's active-recovery-action wait
+  // path. This proves the reconciler's own internal writes still land `blocked` without the
+  // guard throwing a 422 and crashing it.
+  it("lands a non-routine stranded issue in blocked with zero edges once recovery attempts are exhausted, without tripping the write-path guard (AUR-4709)", async () => {
+    const { sourceIssueId, coderId } = await seedCompany();
+    const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+    } as const;
+
+    for (let i = 0; i < 4; i++) {
+      await recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue!,
+        previousStatus: "in_progress",
+        latestRun,
+        comment: "Automatic continuation recovery failed.",
+      });
+      await backdateRecoveryActionPastDormancy(sourceIssue!.id);
+    }
+
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue!.id));
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]?.attemptCount).toBeGreaterThan(3);
+
+    const [finalIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue!.id));
+    expect(finalIssue?.status).toBe("blocked");
+
+    const relations = await db
+      .select()
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, sourceIssue!.id));
+    expect(relations).toHaveLength(0);
+  });
+
   // The invariant here is the tail re-assert, not any particular constant: `enqueueWakeup` flips
   // the issue to `in_progress` mid-escalation (a wake claimed before escalation finished writing),
   // and escalation's own status decision must win that race rather than silently losing it.
@@ -562,7 +612,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issues)
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
     expect(recoveryIssues).toHaveLength(1);
-    expect(recoveryIssues[0]?.status).toBe("blocked");
+    expect(recoveryIssues[0]?.status).toBe("todo");
   });
 
   it("exposes active recovery actions on the issue read API", async () => {
@@ -1084,6 +1134,45 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(eq(issueRecoveryActions.sourceIssueId, blockedIssueId));
     expect(actionRows).toHaveLength(1);
     expect(actionRows[0]).toMatchObject({ kind: "stranded_assigned_issue", status: "active" });
+  });
+
+  it("Class B durable-blocker sweep nudges a missing-edge issue after 25 hours (AUR-4712)", async () => {
+    const { companyId, coderId, prefix } = await seedCompany();
+    const blockedIssueId = randomUUID();
+    const twentyFiveHoursAgo = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    await db.insert(issues).values({
+      id: blockedIssueId,
+      companyId,
+      title: "Blocked with no blocker edge",
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      issueNumber: 3,
+      identifier: `${prefix}-3`,
+      createdAt: twentyFiveHoursAgo,
+      updatedAt: twentyFiveHoursAgo,
+    });
+
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+    const result = await recovery.reconcileIssueGraphLiveness({ force: true });
+
+    expect(result.classBNudged).toBe(1);
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.sourceIssueId, blockedIssueId),
+          eq(issueRecoveryActions.kind, "issue_graph_liveness"),
+          eq(issueRecoveryActions.status, "active"),
+        ),
+      );
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({
+      ownerType: "agent",
+      ownerAgentId: coderId,
+      evidence: expect.objectContaining({ stage: "wake_assignee" }),
+    });
   });
 
   it("Class B durable-blocker sweep proceeds once the guarding recovery action's one-shot wake goes dormant (AUR-4300)", async () => {

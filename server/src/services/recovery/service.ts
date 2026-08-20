@@ -78,7 +78,9 @@ const DIRECT_BLOCKER_TERMINAL_STATUSES = new Set(["done", "cancelled"]);
 // dormancy window, so this is ~3 days of daily retries before the durable AUR-4168 missing-edge
 // sweep takes over.
 const MAX_DISPATCHABLE_STRANDED_RECOVERY_ATTEMPTS = 3;
-const MISSING_BLOCKER_EDGE_REMINDER_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+// AUR-4712: lowered from 7 days so the existing stranded backlog is nudged by the
+// normal sweep instead of waiting a week for a durable-blocker reminder.
+const MISSING_BLOCKER_EDGE_REMINDER_AGE_MS = 24 * 60 * 60 * 1000;
 const MISSING_BLOCKER_EDGE_ESCALATION_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 // Class A (terminal_only) auto-recovery flips an issue blocked -> todo. The
 // status change is its own guard only while the issue stays out of `blocked`.
@@ -1890,7 +1892,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       failureSummary ? `- Failure: ${failureSummary.trim()}` : "- Failure: none recorded",
       "- Guard: recovery issues do not create nested `stranded_issue_recovery` issues.",
       "",
-      "Next action: the current recovery owner should inspect the failed run evidence, restore a live execution path or record the manual resolution, then move this recovery issue out of `blocked`.",
+      "Next action: the current recovery owner should inspect the failed run evidence, restore a live execution path or record the manual resolution, and keep this recovery issue in an explicit actionable state instead of parking it in `blocked`.",
     ].join("\n");
   }
 
@@ -1913,7 +1915,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       return null;
     }
 
-    const updated = await issuesSvc.update(input.issue.id, { status: "blocked" });
+    // AUR-4712: `blocked` now requires a first-class edge, and this reconciler doesn't
+    // attach one. Send the issue back to `todo` so it stays dispatchable instead of
+    // failing the new write-path guard.
+    const updated = await issuesSvc.update(input.issue.id, { status: "todo" });
     if (!updated) return null;
 
     const prefix = await getCompanyIssuePrefix(input.issue.companyId);
@@ -1939,7 +1944,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       entityId: input.issue.id,
       details: {
         identifier: input.issue.identifier,
-        status: "blocked",
+        status: "todo",
         previousStatus: input.previousStatus,
         source: "recovery.reconcile_stranded_recovery_issue",
         latestRunId: input.latestRun?.id ?? null,

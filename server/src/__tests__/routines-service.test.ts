@@ -14,7 +14,6 @@ import {
   issueComments,
   issueInboxArchives,
   issueReadStates,
-  issueRelations,
   issues,
   projectWorkspaces,
   projects,
@@ -295,7 +294,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     const strandedIssue = await issueSvc.create(companyId, {
       projectId: routine.projectId,
       title: routine.title,
-      description: routine.description,
+      description: `${routine.description}\n\nExternal owner: routine-recovery\nExternal action: awaiting manual triage of the stranded execution issue`,
       status: "blocked",
       priority: routine.priority,
       assigneeAgentId: routine.assigneeAgentId,
@@ -344,7 +343,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     const strandedIssue = await issueSvc.create(companyId, {
       projectId: routine.projectId,
       title: routine.title,
-      description: routine.description,
+      description: `${routine.description}\n\nExternal owner: routine-recovery\nExternal action: awaiting manual triage of the stranded execution issue`,
       status: "blocked",
       priority: routine.priority,
       assigneeAgentId: routine.assigneeAgentId,
@@ -397,12 +396,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       originKind: "routine_execution",
       originId: routine.id,
       originRunId: randomUUID(),
-    });
-    await db.insert(issueRelations).values({
-      companyId,
-      issueId: blockerIssue.id,
-      relatedIssueId: blockedIssue.id,
-      type: "blocks",
+      blockedByIssueIds: [blockerIssue.id],
     });
 
     const wakeupsBefore = wakeups.length;
@@ -526,12 +520,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       originId: routine.id,
       originRunId: randomUUID(),
       originFingerprint: "occurrence-held",
-    });
-    await db.insert(issueRelations).values({
-      companyId,
-      issueId: blockerIssue.id,
-      relatedIssueId: heldUmbrella.id,
-      type: "blocks",
+      blockedByIssueIds: [blockerIssue.id],
     });
 
     const run = await svc.runRoutine(routine.id, { source: "manual" });
@@ -625,7 +614,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     const strandedIssue = await issueSvc.create(companyId, {
       projectId: routine.projectId,
       title: routine.title,
-      description: routine.description,
+      description: `${routine.description}\n\nExternal owner: routine-recovery\nExternal action: awaiting manual triage of the stranded execution issue`,
       status: "blocked",
       priority: routine.priority,
       assigneeAgentId: routine.assigneeAgentId,

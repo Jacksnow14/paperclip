@@ -62,8 +62,23 @@ export interface AgentInstructionsBundle {
 export interface AgentAccessState {
   canAssignTasks: boolean;
   taskAssignSource: "explicit_grant" | "agent_creator" | "ceo_role" | "none";
+  canManageRoutines: boolean;
+  routineManageSource: "explicit_grant" | "ceo_role" | "none";
   membership: CompanyMembership | null;
   grants: PrincipalPermissionGrant[];
+}
+
+export interface AgentAccessSummary {
+  id: string;
+  name: string;
+  urlKey: string;
+  role: AgentRole;
+  title: string | null;
+  status: AgentStatus;
+  canManageRoutines: boolean;
+  routineManageSource: "explicit_grant" | "ceo_role" | "none";
+  canAssignTasks: boolean;
+  taskAssignSource: "explicit_grant" | "agent_creator" | "ceo_role" | "none";
 }
 
 export interface AgentChainOfCommandEntry {

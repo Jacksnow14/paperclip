@@ -6,7 +6,7 @@ import {
   type Agent,
   type PermissionKey,
 } from "@paperclipai/shared";
-import { ShieldCheck, Trash2, Users } from "lucide-react";
+import { Bot, ShieldCheck, Trash2, Users } from "lucide-react";
 import { accessApi, type CompanyMember } from "@/api/access";
 import { agentsApi } from "@/api/agents";
 import { ApiError } from "@/api/client";
@@ -22,6 +22,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
+import { ToggleSwitch } from "@/components/ui/toggle-switch";
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
 import { useCompany } from "@/context/CompanyContext";
 import { useToast } from "@/context/ToastContext";
@@ -89,6 +90,42 @@ export function CompanyAccess() {
     queryKey: queryKeys.agents.list(selectedCompanyId ?? ""),
     queryFn: () => agentsApi.list(selectedCompanyId!),
     enabled: !!selectedCompanyId,
+  });
+
+  const agentsAccessQuery = useQuery({
+    queryKey: queryKeys.agents.access(selectedCompanyId ?? ""),
+    queryFn: () => agentsApi.listAccess(selectedCompanyId!),
+    enabled: !!selectedCompanyId,
+  });
+
+  const updateAgentRoutinesGrantMutation = useMutation({
+    mutationFn: async (input: { agentId: string; canCreateAgents: boolean; canAssignTasks: boolean; canManageRoutines: boolean }) => {
+      return agentsApi.updatePermissions(
+        input.agentId,
+        {
+          canCreateAgents: input.canCreateAgents,
+          canAssignTasks: input.canAssignTasks,
+          canManageRoutines: input.canManageRoutines,
+        },
+        selectedCompanyId!,
+      );
+    },
+    onSuccess: async () => {
+      if (!selectedCompanyId) return;
+      await queryClient.invalidateQueries({ queryKey: queryKeys.agents.access(selectedCompanyId) });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(selectedCompanyId) });
+      pushToast({
+        title: "Agent grant updated",
+        tone: "success",
+      });
+    },
+    onError: (error) => {
+      pushToast({
+        title: "Failed to update agent grant",
+        body: error instanceof Error ? error.message : "Unknown error",
+        tone: "error",
+      });
+    },
   });
 
   const joinRequestsQuery = useQuery({
@@ -394,6 +431,82 @@ export function CompanyAccess() {
                     {removalReason ? (
                       <div className="text-xs text-muted-foreground">{removalReason}</div>
                     ) : null}
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+      </section>
+
+      <section className="space-y-4">
+        <div className="space-y-1">
+          <div className="flex items-center gap-2">
+            <Bot className="h-4 w-4 text-muted-foreground" />
+            <h2 className="text-base font-semibold">Agents</h2>
+          </div>
+          <p className="max-w-3xl text-sm text-muted-foreground">
+            Agent principals and their {permissionLabels["routines:manage"]} grant. CEO-role agents manage routines
+            implicitly and cannot be revoked from this screen.
+          </p>
+        </div>
+
+        <div className="overflow-hidden rounded-xl border border-border">
+          <div className="grid grid-cols-[minmax(0,1.5fr)_120px_minmax(0,1.5fr)_160px] gap-3 border-b border-border px-4 py-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            <div>Agent</div>
+            <div>Role</div>
+            <div>Manage routines</div>
+            <div className="text-right">Action</div>
+          </div>
+          {agentsAccessQuery.isLoading ? (
+            <div className="px-4 py-8 text-sm text-muted-foreground">Loading agents…</div>
+          ) : agentsAccessQuery.error ? (
+            <div className="px-4 py-8 text-sm text-destructive">
+              {agentsAccessQuery.error instanceof ApiError && agentsAccessQuery.error.status === 403
+                ? "You do not have permission to view agent grants."
+                : agentsAccessQuery.error instanceof Error
+                  ? agentsAccessQuery.error.message
+                  : "Failed to load agents."}
+            </div>
+          ) : (agentsAccessQuery.data ?? []).length === 0 ? (
+            <div className="px-4 py-8 text-sm text-muted-foreground">No agents found for this company yet.</div>
+          ) : (
+            (agentsAccessQuery.data ?? []).map((agentAccess) => {
+              const fullAgent = agentsQuery.data?.find((agent) => agent.id === agentAccess.id);
+              const isCeoRole = agentAccess.routineManageSource === "ceo_role";
+              const pendingThisAgent =
+                updateAgentRoutinesGrantMutation.isPending &&
+                updateAgentRoutinesGrantMutation.variables?.agentId === agentAccess.id;
+              return (
+                <div
+                  key={agentAccess.id}
+                  className="grid grid-cols-[minmax(0,1.5fr)_120px_minmax(0,1.5fr)_160px] gap-3 border-b border-border px-4 py-3 last:border-b-0"
+                >
+                  <div className="min-w-0">
+                    <div className="truncate font-medium">{agentAccess.name}</div>
+                    <div className="truncate text-xs text-muted-foreground">{agentAccess.title || agentAccess.urlKey}</div>
+                  </div>
+                  <div className="text-sm capitalize">{agentAccess.role}</div>
+                  <div className="min-w-0 text-sm text-muted-foreground">
+                    {agentAccess.canManageRoutines
+                      ? isCeoRole
+                        ? "Enabled automatically for CEO agents."
+                        : "Enabled via explicit grant."
+                      : "Not granted."}
+                  </div>
+                  <div className="flex items-center justify-end gap-2">
+                    <ToggleSwitch
+                      checked={agentAccess.canManageRoutines}
+                      onCheckedChange={() =>
+                        updateAgentRoutinesGrantMutation.mutate({
+                          agentId: agentAccess.id,
+                          canCreateAgents: Boolean(fullAgent?.permissions?.canCreateAgents),
+                          canAssignTasks: agentAccess.canAssignTasks,
+                          canManageRoutines: !agentAccess.canManageRoutines,
+                        })
+                      }
+                      disabled={isCeoRole || pendingThisAgent}
+                    />
                   </div>
                 </div>
               );

@@ -311,6 +311,7 @@ export type {
   BackupRetentionPolicy,
   Agent,
   AgentAccessState,
+  AgentAccessSummary,
   AgentChainOfCommandEntry,
   AgentDetail,
   AgentPermissions,

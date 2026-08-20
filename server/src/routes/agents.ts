@@ -17,6 +17,7 @@ import {
   normalizeIssueIdentifier,
   resetAgentSessionSchema,
   testAdapterEnvironmentSchema,
+  type AgentAccessSummary,
   type AgentSkillSnapshot,
   type InstanceSchedulerHeartbeatAgent,
   upsertAgentInstructionsFileSchema,
@@ -1768,6 +1769,35 @@ export function agentRoutes(
       return;
     }
     res.json(result.map((agent) => redactForRestrictedAgentView(agent)));
+  });
+
+  // AUR-5836: exposes agent principals + their routines:manage grant so the
+  // Access screen can show what the generic companyGrants mechanism (AUR-5396)
+  // would have, scoped to the one narrow grant that actually shipped (AUR-5170).
+  // Gated the same as the mutation (PATCH /agents/:id/permissions) so nobody
+  // sees a revoke control they can't actually use.
+  router.get("/companies/:companyId/agents/access", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    await assertBoardCanManageAgentsForCompany(req, companyId);
+    const allAgents = await svc.list(companyId);
+    const agentsWithAccess: AgentAccessSummary[] = await Promise.all(
+      allAgents.map(async (agent) => {
+        const accessState = await buildAgentAccessState(agent);
+        return {
+          id: agent.id,
+          name: agent.name,
+          urlKey: agent.urlKey,
+          role: agent.role as AgentAccessSummary["role"],
+          title: agent.title,
+          status: agent.status as AgentAccessSummary["status"],
+          canManageRoutines: accessState.canManageRoutines,
+          routineManageSource: accessState.routineManageSource,
+          canAssignTasks: accessState.canAssignTasks,
+          taskAssignSource: accessState.taskAssignSource,
+        };
+      }),
+    );
+    res.json(agentsWithAccess);
   });
 
   router.get("/instance/scheduler-heartbeats", async (req, res) => {

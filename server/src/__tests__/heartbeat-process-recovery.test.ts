@@ -2972,6 +2972,123 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(creatorWakeups).toHaveLength(0);
   });
 
+  it("does not reassign an unassigned blocker while the mention handoff wake is already claimed (AUR-5881 FIRE)", async () => {
+    // Regression for the PENDING_WAKE_STATUSES gap: agentWakeupRequests.status flips
+    // "queued" -> "claimed" the instant the mentioned agent's run is admitted (often
+    // within seconds per this ticket's own reproduction), so a check that only treats
+    // "queued" as pending stops protecting the handoff almost immediately.
+    const companyId = randomUUID();
+    const creatorAgentId = randomUUID();
+    const mentionedAgentId = randomUUID();
+    const blockedAssigneeAgentId = randomUUID();
+    const blockerIssueId = randomUUID();
+    const blockedIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: creatorAgentId,
+        companyId,
+        name: "CTO",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: mentionedAgentId,
+        companyId,
+        name: "CTO Ops",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: blockedAssigneeAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: blockerIssueId,
+        companyId,
+        title: "Fix blocker",
+        status: "todo",
+        priority: "high",
+        createdByAgentId: creatorAgentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked work",
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: blockedAssigneeAgentId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+      createdByAgentId: creatorAgentId,
+    });
+    // The mentioned agent's run has already been admitted and is actively executing —
+    // the wake is "claimed", not "queued" — still well inside the grace window.
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: mentionedAgentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_comment_mentioned",
+      payload: { issueId: blockerIssueId, commentId: randomUUID() },
+      status: "claimed",
+      requestedAt: new Date(),
+      claimedAt: new Date(),
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.orphanBlockersAssigned).toBe(0);
+    expect(result.issueIds).not.toContain(blockerIssueId);
+
+    const blocker = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, blockerIssueId))
+      .then((rows) => rows[0] ?? null);
+    expect(blocker?.assigneeAgentId).toBeNull();
+    expect(blocker?.status).toBe("todo");
+
+    const creatorWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, creatorAgentId));
+    expect(creatorWakeups).toHaveLength(0);
+  });
+
   it("still reassigns the blocker once the mention handoff grace window has elapsed (AUR-5830 PASS)", async () => {
     const companyId = randomUUID();
     const creatorAgentId = randomUUID();

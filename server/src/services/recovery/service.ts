@@ -107,7 +107,14 @@ const ISSUE_GRAPH_LIVENESS_RESULT_ID_ARRAY_LIMIT = 50;
 // abandoned handoff still falls back to normal reconciliation instead of orphaning the
 // issue forever.
 export const ORPHAN_BLOCKER_MENTION_HANDOFF_GRACE_MS = 2 * 60 * 1000;
-const PENDING_WAKE_STATUSES = ["queued", "running"] as const;
+// agentWakeupRequests.status never actually takes the value "running" — a wake flips
+// from "queued" straight to "claimed" the instant its run is admitted (claimQueuedRun's
+// setWakeupStatus(..., "claimed", ...) in heartbeat.ts), which given this ticket's own
+// reproduction (<1s to ~30s after the mention) is usually already true by the time this
+// sweep runs. "deferred_issue_execution" is the third live state a wake can sit in while
+// the mentioned agent is busy on another issue. Mirrors the live-wake-for-issue status
+// set heartbeat.ts's own dispatch-duplicate check uses for agentWakeupRequests.status.
+const PENDING_WAKE_STATUSES = ["queued", "claimed", "deferred_issue_execution"] as const;
 
 function pushBoundedIssueId(ids: string[], issueId: string) {
   if (ids.length < ISSUE_GRAPH_LIVENESS_RESULT_ID_ARRAY_LIMIT) ids.push(issueId);

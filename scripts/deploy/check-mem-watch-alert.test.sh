@@ -4,9 +4,15 @@
 # What this locks down: AUR-3924's sampler logged the 2026-07-25 16:02 UTC
 # breach correctly the whole time -- the bug was that nothing read the log, so
 # it woke no one. These cases assert the read-and-escalate path actually fires,
-# stays quiet when healthy, survives the sampler's known row-splitting defect,
-# rate-limits instead of paging every 5 minutes, and never swallows a delivery
-# failure.
+# stays quiet when healthy, rate-limits instead of paging every 5 minutes, and
+# never swallows a delivery failure.
+#
+# AUR-4086: AUR-4056 fixed the sampler so it can no longer split a row across
+# two physical lines, so the old "trust only the split-safe prefix" workaround
+# is now dead weight that permanently locked this reader out of columns 10-18.
+# Case 5 asserts the inverse of what it used to: a ragged row (one that
+# doesn't match the header's column count) is real corruption post-fix and
+# must error loudly, not be silently tolerated as a split write.
 #
 # AUR-4489 adds the owed-page cases: the 2026-07-29 11:52Z host OOM was
 # detected but its page was refused by the fleet-wide send-rate guard and never
@@ -129,20 +135,23 @@ else
   fail "oom_5min breach (2 > 0) pages with host-integrity --override" "alerts=$(alerts) sink=$(cat "$SINK" 2>/dev/null) out=$out"
 fi
 
-# 5. THE SPLIT-ROW DEFECT (real, observed in the live log since ~17:06 UTC):
-#    columns 10+ land on a following line starting with a bare "0", not a
-#    timestamp. The breach must still be detected from the intact prefix.
+# 5. AUR-4086: post-AUR-4056 the sampler cannot emit a row narrower than its
+#    own header, so a ragged row (the historical split-row shape: columns 10+
+#    land on a following line starting with a bare "0", not a timestamp) is
+#    real corruption. It must be a loud error and must NOT page -- the old
+#    behavior of silently trusting the intact prefix and paging anyway is
+#    exactly the workaround this issue removes.
 reset
 {
   printf '%s\n' "$HEADER"
   printf '2026-07-25T21:10:00Z,1200,6800,2100,6000,8095,0.50,0,0\n'
   printf '0,0,0,0,3859857,2026-07-25T16:30:26,-800,d5c37635bb00,yes\n'
 } > "$LOG"
-out=$(run_check)
-if [[ "$(alerts)" == "1" ]] && grep -q "mem_avail_mb=1200" "$SINK"; then
-  ok "breach on a split (row-corrupted) log line is still detected"
+out=$(run_check); rc=$?
+if [[ "$rc" == "1" && "$(alerts)" == "0" ]] && grep -q "columns, expected" <<<"$out"; then
+  ok "ragged (split-row-shaped) log line errors loudly instead of silently paging"
 else
-  fail "breach on a split (row-corrupted) log line is still detected" "alerts=$(alerts) sink=$(cat "$SINK" 2>/dev/null) out=$out"
+  fail "ragged (split-row-shaped) log line errors loudly instead of silently paging" "rc=$rc alerts=$(alerts) out=$out"
 fi
 
 # 6. Rate limiting: a still-breaching next sample within the cooldown window

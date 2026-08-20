@@ -232,5 +232,5 @@ fi
 [[ -s "$LOG" ]] || echo "$HEADER" >> "$LOG"
 printf '%s\n' "$row" >> "$LOG"
 
-tail -n 5000 "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
+{ echo "$HEADER"; tail -n 5000 "$LOG" | grep -Fxv "$HEADER"; } > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
 exit 0

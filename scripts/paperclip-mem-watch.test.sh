@@ -133,6 +133,41 @@ MEMWATCH_FIXTURE_KERNEL="$TMP/kernel_kill.log"
 check_ge "gen-2 grep over-counts the single kill (would fail ==1 bar)" \
                                                  "$(old_derivation)" 2
 
+echo "== header survives rotation past 5000 lines (AUR-4086 prod finding) =="
+# Reproduces the defect found live 2026-08-20: the rotation step used to be a
+# bare `tail -n 5000 "$LOG"`. The header is written only once, on first ever
+# run (`[[ -s "$LOG" ]] || echo "$HEADER" >> "$LOG"`), so it always sits at
+# line 1 -- the OLDEST line. The moment the file first crosses 5000 lines,
+# a bare tail keeps the newest 5000 and drops line 1 forever: the header is
+# gone for the rest of that log's life, and every consumer that trusts
+# `head -1` for column positions (check-mem-watch-alert.sh, swap-trend.sh)
+# silently loses the ability to name a column by header from that point on.
+# This is the root cause the split-row workarounds this issue targets were
+# actually compensating for.
+HEADER="$(grep -m1 '^HEADER=' "$SCRIPT" | cut -d'"' -f2)"  # read from the canonical source, not duplicated
+seed_rotation_fixture() { # $1 = path, seeds HEADER + 4999 dummy rows (5000 lines)
+  { echo "$HEADER"; for i in $(seq 1 4999); do echo "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,$i"; done; } > "$1"
+}
+old_rotate() { tail -n 5000 "$1" > "$1.tmp" && mv "$1.tmp" "$1"; }  # retired gen-1 rotation, verbatim
+
+MEMWATCH_FIXTURE_KERNEL="$TMP/kernel_benign.log"
+MEMWATCH_FIXTURE_APP="$TMP/app_benign.log"
+: > "$TMP/kernel_benign.log"; : > "$TMP/app_benign.log"
+
+seed_rotation_fixture "$TMP/rot.csv"          # 5000 lines, header at line 1
+run_sampler "$TMP/rot.csv" >/dev/null         # appends row 5001, fixed rotation runs
+check "fixed rotation: header still at line 1 after crossing 5000 lines" \
+                                                 "$(head -1 "$TMP/rot.csv")" "$HEADER"
+check "fixed rotation: log still capped near 5000 lines" \
+                                                 "$([[ $(wc -l < "$TMP/rot.csv") -le 5001 ]] && echo yes)" "yes"
+
+echo "== discrimination: the retired gen-1 rotation loses the header =="
+seed_rotation_fixture "$TMP/rot_old.csv"
+printf '%s\n' "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,5000" >> "$TMP/rot_old.csv"  # simulate the appended row
+old_rotate "$TMP/rot_old.csv"
+check "gen-1 rotation drops the header once the file exceeds 5000 lines (would fail the check above)" \
+        "$([[ "$(head -1 "$TMP/rot_old.csv")" == "$HEADER" ]] && echo yes || echo no)" no
+
 echo "== canonical-source drift check (runs only on the prod host) =="
 LIVE=/usr/local/sbin/paperclip-mem-watch.sh
 if [[ -r "$LIVE" ]]; then

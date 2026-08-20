@@ -140,6 +140,22 @@ if [[ "${cp_pid:-0}" -gt 0 ]]; then
     esac
   fi
 fi
+# AUR-4338 defect 11 (2026-08-05). This branch matched ONLY the literal env-var
+# string. AUR-4536 refactored that literal into a named constant
+# (GLOBAL_MAX_CONCURRENT_RUNS_ENV_VAR) exported from @paperclipai/adapter-utils,
+# so from release 42e064b139da the literal no longer appears anywhere under
+# server/dist -- while the cap itself is still enforced
+# (heartbeat.js: resolveGlobalRunCap -> resolveGlobalMaxConcurrentRuns).
+# cap_deployed therefore flipped yes->no at 2026-08-05T12:18:44Z on a build whose
+# cap was fully intact: a false negative for a SYMBOL-LOCATION reason, which is
+# defect 1 returning by another door. It fails clause 1 of AUR-4338 rule 1 (a
+# false alarm, not a false all-clear) but it is ALSO an input to rule 2, where a
+# false "not deployed" during a low-swap moment would trigger an unnecessary
+# production dispatch-rate intervention.
+# Match the enforcement CALL, not one spelling of the env var. Deliberately scoped
+# to $dist_dir and NOT the release root: docs/ and scripts/ under the release both
+# contain the literal, so widening the search would return "yes" for every build
+# ever -- a false ALL-CLEAR, the dangerous direction.
 if [[ -z "$dist_dir" ]]; then
   cap_deployed=NA          # cannot locate the running artifact: report unknown, never "no"
 elif [[ ! -d "$dist_dir" ]]; then
@@ -152,7 +168,7 @@ elif [[ ! -d "$dist_dir" ]]; then
   # half-swapped. A vanished release must be LOUDER than a content regression,
   # not identical to one.
   cap_deployed=missing
-elif grep -rq "PAPERCLIP_GLOBAL_MAX_CONCURRENT_RUNS" "$dist_dir" 2>/dev/null; then
+elif grep -rqE "PAPERCLIP_GLOBAL_MAX_CONCURRENT_RUNS|GLOBAL_MAX_CONCURRENT_RUNS_ENV_VAR|resolveGlobalMaxConcurrentRuns" "$dist_dir" 2>/dev/null; then
   cap_deployed=yes
 else
   cap_deployed=no

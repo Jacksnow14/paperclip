@@ -425,6 +425,50 @@ describe.sequential("agent permission routes", () => {
     ]);
   });
 
+  it("returns agent access summaries including routines:manage grant source (AUR-5836)", async () => {
+    mockAccessService.listPrincipalGrants.mockResolvedValue([
+      { permissionKey: "routines:manage" },
+    ]);
+
+    const app = await createApp({
+      type: "board",
+      userId: "owner-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/companies/${companyId}/agents/access`));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([
+      expect.objectContaining({
+        id: agentId,
+        name: "Builder",
+        canManageRoutines: true,
+        routineManageSource: "explicit_grant",
+        canAssignTasks: false,
+        taskAssignSource: "none",
+      }),
+    ]);
+  });
+
+  it("blocks agent access summary listing for authenticated company members without agent admin permission (AUR-5836)", async () => {
+    mockAccessService.canUser.mockResolvedValue(false);
+
+    const app = await createApp({
+      type: "board",
+      userId: "member-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/companies/${companyId}/agents/access`));
+
+    expect(res.status).toBe(403);
+  });
+
   it("blocks agent updates for authenticated company members without agent admin permission", async () => {
     mockAccessService.canUser.mockResolvedValue(false);
 

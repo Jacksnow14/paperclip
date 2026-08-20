@@ -8654,6 +8654,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let runtimeSessionIdForAdapter =
       readNonEmptyString(runtimeSessionParams?.sessionId) ?? runtimeSessionFallback;
     let runtimeSessionParamsForAdapter = runtimeSessionParams;
+    // Mirrors previousSessionDisplayId's rotation reset below. previousSessionParams
+    // itself is const, so a rotation followed by an adapter-throw launch failure would
+    // otherwise persist it via upsertTaskSession and resurrect the session the rotation
+    // just retired (AUR-4598).
+    let previousSessionParamsForFailurePersist = previousSessionParams;
 
     const sessionCompaction = await evaluateSessionCompaction({
       agent,
@@ -8668,6 +8673,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       runtimeSessionIdForAdapter = null;
       runtimeSessionParamsForAdapter = null;
       previousSessionDisplayId = null;
+      previousSessionParamsForFailurePersist = null;
       if (sessionCompaction.reason) {
         runtimeWorkspaceWarnings.push(
           `Starting a fresh session because ${sessionCompaction.reason}.`,
@@ -9381,13 +9387,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           legacySessionId: runtimeForAdapter.sessionId,
         });
 
-        if (taskKey && (previousSessionParams || previousSessionDisplayId || taskSession)) {
+        if (taskKey && (previousSessionParamsForFailurePersist || previousSessionDisplayId || taskSession)) {
           await upsertTaskSession({
             companyId: agent.companyId,
             agentId: agent.id,
             adapterType: agent.adapterType,
             taskKey,
-            sessionParamsJson: previousSessionParams,
+            sessionParamsJson: previousSessionParamsForFailurePersist,
             sessionDisplayId: previousSessionDisplayId,
             lastRunId: failedRun.id,
             lastError: message,

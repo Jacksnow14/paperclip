@@ -1146,6 +1146,10 @@ export function routineService(
     triggeredAt: Date;
     liveRunAgeMs?: number | null;
     scheduleIntervalMs?: number | null;
+    // AUR-5786: a reuse_and_rewake reopen with no live assignee to wake is
+    // unconditionally a fault, not a "maybe" gated behind the doubling
+    // threshold — raise immediately regardless of countRaise/ageRaise.
+    forceRaise?: boolean;
   }, executor: Db) {
     const count = input.consecutiveCoalesceCount;
     const ageMs = input.liveRunAgeMs ?? null;
@@ -1157,15 +1161,19 @@ export function routineService(
     // second fold costs another whole interval of silent darkness — for a daily
     // routine that is another lost send-day.
     const ageRaise = ageMs !== null && intervalMs !== null && ageMs > intervalMs;
-    if (!countRaise && !ageRaise) return;
+    if (!countRaise && !ageRaise && !input.forceRaise) return;
     const lastCompletion = await findLastSuccessfulCompletionAt(input.routine, executor);
-    const headline = countRaise
-      ? `⚠️ **Routine wedge suspected: ${count} consecutive fires coalesced into this issue.**`
-      : `⚠️ **Routine wedge suspected: this issue's execution run has been live for ${formatApproxDuration(ageMs!)}, longer than the routine's ${formatApproxDuration(intervalMs!)} schedule interval.**`;
+    const headline = input.forceRaise
+      ? `⚠️ **Routine wedge: reopened execution issue has no live assignee to wake.**`
+      : countRaise
+        ? `⚠️ **Routine wedge suspected: ${count} consecutive fires coalesced into this issue.**`
+        : `⚠️ **Routine wedge suspected: this issue's execution run has been live for ${formatApproxDuration(ageMs!)}, longer than the routine's ${formatApproxDuration(intervalMs!)} schedule interval.**`;
     const body = [
       headline,
       "",
-      `Routine "${input.routine.title}" (\`${input.routine.id}\`) fired at ${input.triggeredAt.toISOString()} and folded into this issue instead of dispatching new work — consecutive fold #${count}. This issue has held the routine's execution slot the whole time. Last successful completion of a run of this routine: ${lastCompletion ? lastCompletion.toISOString() : "none on record"}.`,
+      input.forceRaise
+        ? `Routine "${input.routine.title}" (\`${input.routine.id}\`) fired at ${input.triggeredAt.toISOString()} and reopened this issue from a terminal status, but it has no assignee — the wakeup silently no-ops, so nothing was actually dispatched even though this reads like a successful rewake. Consecutive fold count: ${count}. Last successful completion of a run of this routine: ${lastCompletion ? lastCompletion.toISOString() : "none on record"}.`
+        : `Routine "${input.routine.title}" (\`${input.routine.id}\`) fired at ${input.triggeredAt.toISOString()} and folded into this issue instead of dispatching new work — consecutive fold #${count}. This issue has held the routine's execution slot the whole time. Last successful completion of a run of this routine: ${lastCompletion ? lastCompletion.toISOString() : "none on record"}.`,
       "",
       ...(ageRaise
         ? [
@@ -1173,7 +1181,9 @@ export function routineService(
           "",
         ]
         : []),
-      "If this issue is wedged rather than legitimately busy, the routine's output has silently stopped: close or unblock this issue so the next fire can dispatch. (Coalesce-anomaly guard, raised at 2 consecutive folds, at each doubling, and on the first fold into a run older than one schedule interval.)",
+      input.forceRaise
+        ? "Assign this issue to a live agent so the next fire can actually dispatch, or close it so a fresh issue is created instead. (Coalesce-anomaly guard, raised immediately on a terminal reopen with no assignee.)"
+        : "If this issue is wedged rather than legitimately busy, the routine's output has silently stopped: close or unblock this issue so the next fire can dispatch. (Coalesce-anomaly guard, raised at 2 consecutive folds, at each doubling, and on the first fold into a run older than one schedule interval.)",
     ].join("\n");
     await executor.insert(issueComments).values({
       companyId: input.routine.companyId,
@@ -1193,7 +1203,7 @@ export function routineService(
         routineTitle: input.routine.title,
         consecutiveCoalesceCount: count,
         lastSuccessfulCompletionAt: lastCompletion ? lastCompletion.toISOString() : null,
-        raiseReason: countRaise && ageRaise ? "count_and_age" : countRaise ? "count" : "age",
+        raiseReason: input.forceRaise ? "no_assignee" : countRaise && ageRaise ? "count_and_age" : countRaise ? "count" : "age",
         liveRunAgeMs: ageMs,
         scheduleIntervalMs: intervalMs,
       },
@@ -1205,6 +1215,46 @@ export function routineService(
       triggeredAt: input.triggeredAt,
       lastCompletion,
     }, executor);
+  }
+
+  // AUR-5786: durable forensic evidence for every reuse_and_rewake terminal→reopen
+  // event, dispatched or not — the piece genuinely missing during the AUR-5412
+  // incident review, where the dispatch-record reconciliation table had to be
+  // hand-built after the fact because nothing recorded the reopens themselves.
+  async function recordTerminalReopenAudit(input: {
+    routine: RoutineRow;
+    targetIssue: { id: string; identifier: string | null };
+    previousStatus: string;
+    consecutiveCoalesceCount: number;
+    hadAssignee: boolean;
+    triggeredAt: Date;
+  }, executor: Db) {
+    const body = [
+      `Rolling execution issue found in a terminal status (\`${input.previousStatus}\`) and reopened by routine "${input.routine.title}" (\`${input.routine.id}\`) at ${input.triggeredAt.toISOString()}.`,
+      "",
+      `Assignee at reopen: ${input.hadAssignee ? "present" : "none"}. Consecutive coalesce count after this event: ${input.consecutiveCoalesceCount}.`,
+    ].join("\n");
+    await executor.insert(issueComments).values({
+      companyId: input.routine.companyId,
+      issueId: input.targetIssue.id,
+      authorType: "system",
+      body,
+    });
+    await logActivity(executor, {
+      companyId: input.routine.companyId,
+      actorType: "system",
+      actorId: "routine-scheduler",
+      action: "routine.terminal_reopen",
+      entityType: "issue",
+      entityId: input.targetIssue.id,
+      details: {
+        routineId: input.routine.id,
+        routineTitle: input.routine.title,
+        previousStatus: input.previousStatus,
+        consecutiveCoalesceCount: input.consecutiveCoalesceCount,
+        hadAssignee: input.hadAssignee,
+      },
+    });
   }
 
   function routineExecutionFingerprintCondition(dispatchFingerprint?: string | null) {
@@ -1853,6 +1903,7 @@ export function routineService(
             // the fold case should count toward the wedge counter — see
             // updateRoutineTouchedState's foldedWithoutDispatch.
             const wasAlreadyOpen = OPEN_ISSUE_STATUSES.includes(rollingIssue.status as typeof OPEN_ISSUE_STATUSES[number]);
+            const previousStatus = rollingIssue.status;
             if (!wasAlreadyOpen) {
               // Reopen outside the transaction so the row lock is released before
               // queueIssueAssignmentWakeup's wakeup callback can update the same row.
@@ -1875,6 +1926,13 @@ export function routineService(
               status: "issue_created",
               linkedIssueId: rollingIssue.id,
             }, txDb);
+            // AUR-5786: a terminal-status reopen with no live assignee is
+            // unconditionally a fault — queueIssueAssignmentWakeup no-ops silently
+            // on a missing assignee, so nothing was actually dispatched even though
+            // this branch otherwise reads exactly like a successful rewake. Status
+            // is always "todo" right after the reopen above, so the assignee is the
+            // only thing left to check.
+            const reopenDispatched = wasAlreadyOpen || Boolean(rollingIssue.assigneeAgentId);
             const touched = await updateRoutineTouchedState({
               routineId: input.routine.id,
               triggerId: input.trigger?.id ?? null,
@@ -1882,14 +1940,32 @@ export function routineService(
               status: "issue_created",
               issueId: rollingIssue.id,
               nextRunAt,
-              foldedWithoutDispatch: wasAlreadyOpen,
+              foldedWithoutDispatch: wasAlreadyOpen || !reopenDispatched,
             }, txDb);
+            if (!wasAlreadyOpen) {
+              await recordTerminalReopenAudit({
+                routine: input.routine,
+                targetIssue: rollingIssue,
+                previousStatus,
+                consecutiveCoalesceCount: touched.consecutiveCoalesceCount,
+                hadAssignee: Boolean(rollingIssue.assigneeAgentId),
+                triggeredAt,
+              }, txDb);
+            }
             if (wasAlreadyOpen) {
               await maybeRaiseCoalesceAnomaly({
                 routine: input.routine,
                 targetIssue: rollingIssue,
                 consecutiveCoalesceCount: touched.consecutiveCoalesceCount,
                 triggeredAt,
+              }, txDb);
+            } else if (!reopenDispatched) {
+              await maybeRaiseCoalesceAnomaly({
+                routine: input.routine,
+                targetIssue: rollingIssue,
+                consecutiveCoalesceCount: touched.consecutiveCoalesceCount,
+                triggeredAt,
+                forceRaise: true,
               }, txDb);
             }
             return updated ?? createdRun;

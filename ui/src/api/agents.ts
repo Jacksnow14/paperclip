@@ -1,5 +1,6 @@
 import type {
   Agent,
+  AgentAccessSummary,
   AgentDetail,
   AgentInstructionsBundle,
   AgentInstructionsFileDetail,
@@ -67,6 +68,7 @@ export interface AgentHireResponse {
 export interface AgentPermissionUpdate {
   canCreateAgents: boolean;
   canAssignTasks: boolean;
+  canManageRoutines?: boolean;
 }
 
 export interface AgentWakeRequest {
@@ -90,6 +92,7 @@ function agentPath(id: string, companyId?: string, suffix = "") {
 
 export const agentsApi = {
   list: (companyId: string) => api.get<Agent[]>(`/companies/${companyId}/agents`),
+  listAccess: (companyId: string) => api.get<AgentAccessSummary[]>(`/companies/${companyId}/agents/access`),
   org: (companyId: string) => api.get<OrgNode[]>(`/companies/${companyId}/org`),
   listConfigurations: (companyId: string) =>
     api.get<Record<string, unknown>[]>(`/companies/${companyId}/agent-configurations`),

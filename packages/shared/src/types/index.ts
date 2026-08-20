@@ -72,6 +72,7 @@ export type {
 export type {
   Agent,
   AgentAccessState,
+  AgentAccessSummary,
   AgentChainOfCommandEntry,
   AgentDetail,
   AgentModelProfileConfig,
@@ -83,6 +84,8 @@ export type {
   AgentInstructionsBundle,
   AgentKeyCreated,
   AgentConfigRevision,
+  AgentQuotaState,
+  AgentQuotaStateReason,
   AdapterEnvironmentCheckLevel,
   AdapterEnvironmentTestStatus,
   AdapterEnvironmentCheck,

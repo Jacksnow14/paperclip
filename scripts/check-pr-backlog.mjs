@@ -393,7 +393,7 @@ function saveState(stateDir, state) {
   writeFileSync(join(stateDir, 'state.json'), `${JSON.stringify(state, null, 2)}\n`);
 }
 
-async function api(args, method, path, body) {
+export async function api(args, method, path, body) {
   const res = await fetch(`${args.apiBase}${path}`, {
     method,
     headers: {
@@ -402,7 +402,13 @@ async function api(args, method, path, body) {
     },
     body: body ? JSON.stringify(body) : undefined,
   });
-  if (!res.ok) throw new Error(`${method} ${path} → ${res.status}`);
+  if (!res.ok) {
+    // Response body is the server's stated reason (e.g. "Missing permission:
+    // tasks:assign") — without it a 403/400 leaves the next responder to
+    // re-derive the cause from scratch.
+    const detail = await res.text().catch(() => '');
+    throw new Error(`${method} ${path} → ${res.status}${detail ? `: ${detail}` : ''}`);
+  }
   return res.json();
 }
 

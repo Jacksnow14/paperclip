@@ -1086,6 +1086,76 @@ describe("claude execute", () => {
     }
   });
 
+  // AUR-5863 end-to-end: the verbatim production shape from specimen run
+  // 7a0e35c9-035a-4d75-89d0-e192a3189ef3 (2026-08-16T06:30:22Z) -- a `type: "result"`
+  // event with the misleading `subtype: "success"` (despite `is_error: true`) that made
+  // this indistinguishable from an ordinary transient failure before this fix. Asserts
+  // both that the new code is stamped AND that the errorFamily/retryNotBefore wiring
+  // that gives it the bounded 2m/10m/30m/2h retry ladder (AUR-5847) is unchanged.
+  it("classifies the OAuth credential-refresh failure as its own code with a bounded transient ladder and no invented reset time", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-oauth-refresh-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeFailingClaudeCommand(commandPath, {
+      resultEvent: {
+        type: "result",
+        subtype: "success",
+        session_id: "claude-session-oauth-refresh",
+        is_error: true,
+        terminal_reason: "api_error",
+        result: "Failed to authenticate: OAuth session expired and could not be refreshed",
+      },
+    });
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+
+    try {
+      const result = await execute({
+        runId: "run-claude-oauth-refresh",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBe("claude_oauth_refresh_failed");
+      expect(result.errorCode).not.toBe("claude_auth_required");
+      expect(result.errorCode).not.toBe("claude_transient_upstream");
+      // The distinct code still inherits the bounded transient-upstream retry ladder
+      // rather than falling through to the short default ladder (the AUR-5847 root
+      // cause: unmatched text fell to `adapter_failed` and exhausted retries in ~30m).
+      expect(result.errorFamily).toBe("transient_upstream");
+      expect(result.resultJson?.errorFamily).toBe("transient_upstream");
+      // No known reset time exists in this wording -- must not invent one.
+      expect(result.retryNotBefore ?? null).toBeNull();
+      expect(result.resultJson?.retryNotBefore ?? null).toBeNull();
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("classifies rate-limit / overloaded failures without reset metadata as transient", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-rate-limit-"));
     const workspace = path.join(root, "workspace");

@@ -506,6 +506,62 @@ describe("createGmailService", () => {
       }
     });
 
+    // AUR-5807 PASS: "own domain" is the opposite axis from the AUR-5734
+    // risk — it marks a domain we deliberately allow-list as a standing
+    // relationship (a supplier/co-packer), not a cold-prospecting target.
+    // An unapproved send to such an address must NOT be blocked, unlike the
+    // "still blocks" case above (source: suppression) which is the actual
+    // risk this guard exists to catch.
+    it("does not block an unapproved send to an own-domain non-prospect-flagged address (AUR-5807)", async () => {
+      vi.mocked(checkProspectSendability).mockResolvedValue({
+        address: "coffee@temeculacoffeeroasters.com",
+        sendable: false,
+        reason: "own domain: temeculacoffeeroasters.com",
+        source: "non-prospect",
+      });
+      mockMessagesSend.mockResolvedValue({ data: { id: "sent-own-domain" } });
+      const service = createGmailService();
+      try {
+        await expect(
+          service.sendMessage("alex", {
+            to: "coffee@temeculacoffeeroasters.com",
+            subject: "Compliant Business Address Program",
+            body: "Could you share the details of your program and sign off on our label wording?",
+          }),
+        ).resolves.toEqual({ id: "sent-own-domain" });
+        expect(mockMessagesSend).toHaveBeenCalledOnce();
+      } finally {
+        vi.mocked(checkProspectSendability).mockReset().mockResolvedValue(null);
+      }
+    });
+
+    // AUR-5807: role/system mailbox and denylisted-recipient non-prospect
+    // verdicts are NOT relationship signals like "own domain" — they flag an
+    // agent sending unsupervised into a queue nobody reads, or onto a
+    // deliberately curated do-not-contact list. Those stay hard-blocked
+    // without an explicit approval, same as before this change.
+    it("still blocks an unapproved send to a role/system-mailbox non-prospect-flagged address (AUR-5807)", async () => {
+      vi.mocked(checkProspectSendability).mockResolvedValue({
+        address: "billing@example.com",
+        sendable: false,
+        reason: "role/system mailbox: billing@",
+        source: "non-prospect",
+      });
+      const service = createGmailService();
+      try {
+        await expect(
+          service.sendMessage("board", {
+            to: "billing@example.com",
+            subject: "Following up",
+            body: "Checking in.",
+          }),
+        ).rejects.toMatchObject({ name: "GmailProspectSuppressedError" });
+        expect(mockMessagesSend).not.toHaveBeenCalled();
+      } finally {
+        vi.mocked(checkProspectSendability).mockReset().mockResolvedValue(null);
+      }
+    });
+
     // AUR-3628: approvalVerified alone (no matching scope, or a scope for a
     // different mailbox/recipient) must NOT satisfy the gate — otherwise any
     // approved approval in the company could be replayed against any send.

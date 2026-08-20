@@ -665,6 +665,25 @@ export function createGmailService(db?: Db) {
     // for approved business correspondence (compliance, fraud reports,
     // support escalations) — that is not the class of mistake this guard is
     // for, and a human sign-off on this specific recipient outranks it.
+    //
+    // AUR-5807: "own domain" is a DIFFERENT axis from the risk this guard
+    // exists to stop. `nonProspectOwnDomains` in Auranode's email-policy.json
+    // marks a domain we deliberately allow-list as a standing relationship
+    // (a supplier/co-packer we already do business with) so the COLD
+    // dispatcher keeps it out of prospecting queues — see AUR-3749. On the
+    // Gmail route, that same "own domain" verdict means the opposite of cold
+    // outreach: it is the set of recipients we are MOST entitled to
+    // correspond with, not least. Hard-blocking it here made every address at
+    // an allow-listed supplier domain unreachable by construction (AUR-5807),
+    // including the guard's own remediation advice to "use a different,
+    // verified human contact" within that same domain. Downgrade "own
+    // domain" to a logged warning; still hard-block `suppression` (the actual
+    // AUR-5734 risk — a recipient with bounce/machine-only evidence) and the
+    // other `non-prospect` reasons (`role/system mailbox`, `denylisted
+    // recipient`): those are not relationship signals, they are heuristics
+    // that an agent might be sending unsupervised into a queue nobody reads
+    // or onto a deliberately curated do-not-contact list, which is exactly
+    // the class of mistake this guard is for.
     if (!isApprovalScopedToSend(guard, alias, opts)) {
       const ccList = Array.isArray(opts.cc) ? opts.cc : opts.cc ? [opts.cc] : [];
       const externalRecipients = new Set(
@@ -672,13 +691,21 @@ export function createGmailService(db?: Db) {
       );
       for (const address of externalRecipients) {
         const verdict = await checkProspectSendability(address);
-        if (verdict && !verdict.sendable) {
-          logger.error(
+        if (!verdict || verdict.sendable) continue;
+        const isOwnDomainNonProspect =
+          verdict.source === "non-prospect" && (verdict.reason ?? "").startsWith("own domain:");
+        if (isOwnDomainNonProspect) {
+          logger.warn(
             { alias, to: opts.to, cc: opts.cc, address, reason: verdict.reason, source: verdict.source },
-            "gmail-guard: BLOCKED prospect-suppressed recipient at service chokepoint (AUR-5734)",
+            "gmail-guard: own-domain non-prospect recipient — WARN only, not blocked (AUR-5807)",
           );
-          throw new GmailProspectSuppressedError(verdict);
+          continue;
         }
+        logger.error(
+          { alias, to: opts.to, cc: opts.cc, address, reason: verdict.reason, source: verdict.source },
+          "gmail-guard: BLOCKED prospect-suppressed recipient at service chokepoint (AUR-5734)",
+        );
+        throw new GmailProspectSuppressedError(verdict);
       }
     }
 

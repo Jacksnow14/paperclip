@@ -21,14 +21,16 @@
 # /usr/local/sbin rather than from an app release. A host monitor that depends on
 # the thing it might need to alert about (a broken deploy) is not a monitor.
 #
-# Log format note: as of 2026-07-25 the sampler intermittently splits a data row
-# across two physical lines (columns 10+ land on a following line that starts
-# with a bare "0", not a timestamp -- see the AUR-4025 follow-up issue on the
-# sampler itself). The three trigger fields (oom_5min, swap_free_mb,
-# mem_avail_mb) always live within the first 9 comma fields of the line that
-# starts with the ISO-8601 timestamp, so this reader only trusts that prefix and
-# is unaffected by the split. Do not "fix" this by joining lines here -- see the
-# follow-up issue before changing sampler output shape.
+# Log format note: AUR-4056 (deployed/verified 2026-07-25 21:00 UTC) fixed the
+# sampler to write each record atomically -- it can no longer split a row
+# across two physical lines. AUR-4086 lifts the SPLIT_SAFE_MAX_COL freeze this
+# reader carried while that bug was live (it refused to trust any column past
+# the pre-split-fix "safe" prefix, which meant it could never read columns
+# 10-18 -- including build_rss_mb, the sampler's own v4 header calls out as
+# "the actual spike driver ... invisible in every prior schema"). Any header
+# column can now be trusted; a row whose field count doesn't match the header
+# is real corruption, not the old split-write race, and is a loud error below
+# rather than a silent fallback.
 #
 # AUR-4489: the 2026-07-29 11:52Z host OOM was detected on the very next tick,
 # but the page was refused by the fleet-wide send-rate guard and then dropped
@@ -67,9 +69,6 @@ MAX_RETRIES=${PAPERCLIP_MEM_WATCH_ALERT_MAX_RETRIES:-8}
 ISSUE_URL=${PAPERCLIP_MEM_WATCH_ISSUE_URL:-https://paperclip/AUR/issues/AUR-3924}
 SWAP_FREE_MIN_MB=${PAPERCLIP_MEM_WATCH_SWAP_FREE_MIN_MB:-2000}
 MEM_AVAIL_MIN_MB=${PAPERCLIP_MEM_WATCH_MEM_AVAIL_MIN_MB:-1500}
-# Columns beyond this index can land on the corrupted second half of a split
-# row, so any trigger field must resolve at or below it (see note above).
-SPLIT_SAFE_MAX_COL=9
 
 now_epoch=$(date -u +%s)
 
@@ -214,10 +213,6 @@ for want in ts mem_avail_mb swap_free_mb oom_5min; do
     echo "paperclip-mem-watch-alert: log header missing column '$want': $header" >&2
     exit 1
   fi
-  if (( idx[$want] > SPLIT_SAFE_MAX_COL )); then
-    echo "paperclip-mem-watch-alert: column '$want' moved past the split-safe prefix (col ${idx[$want]} > ${SPLIT_SAFE_MAX_COL}) -- reader needs updating before this is safe to trust" >&2
-    exit 1
-  fi
 done
 
 last_row=$(grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z,' "$LOG" | tail -n1) || true
@@ -228,6 +223,13 @@ if [[ -z "$last_row" ]]; then
 fi
 
 IFS=',' read -r -a fields <<< "$last_row"
+if [[ ${#fields[@]} -ne ${#cols[@]} ]]; then
+  # AUR-4056 fixed the sampler so it never emits a row narrower than its own
+  # header; a mismatch here is real corruption, not the old split-write race,
+  # and must be loud rather than silently tolerated (AUR-4086).
+  echo "paperclip-mem-watch-alert: row has ${#fields[@]} columns, expected ${#cols[@]} (header: $header) -- treating as corrupt, not evaluating: $last_row" >&2
+  exit 1
+fi
 ts="${fields[$((idx[ts]-1))]:-}"
 mem_avail="${fields[$((idx[mem_avail_mb]-1))]:-}"
 swap_free="${fields[$((idx[swap_free_mb]-1))]:-}"

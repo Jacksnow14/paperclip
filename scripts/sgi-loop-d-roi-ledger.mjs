@@ -226,6 +226,11 @@ export function computeRoi(all, issueProjects) {
   for (const r of all) {
     if (cat(r) !== 'scorecard_adjusted') continue;
     const f = fields(r);
+    // AUR-5410: a row with no measured cost at close time carries
+    // exclude_from_aggregates/metrics_lost and token_cost: 0 — folding it in
+    // here would add its full adjValue to the numerator while adding nothing
+    // to tokenCost, silently inflating value-per-1K-tokens for the project.
+    if (f.exclude_from_aggregates === true || f.metrics_lost === true) continue;
     const ident = f.issue_id;
     const resolved = ident ? issueProjects.get(ident) : null;
     const pid = resolved && resolved.projectId;

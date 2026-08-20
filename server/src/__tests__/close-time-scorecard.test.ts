@@ -58,9 +58,32 @@ describe("buildCloseTimeScorecardCaptures", () => {
     });
   });
 
-  it("never divides by zero when there is no recorded token cost", () => {
-    const { scorecardAdjusted } = buildCloseTimeScorecardCaptures(ISSUE, 0, closedAt);
-    expect(Number.isFinite(scorecardAdjusted.metadata.score_adjusted)).toBe(true);
+  it("AUR-5410: suppresses the score instead of fabricating one when there is no recorded token cost", () => {
+    // FIRING case: the pre-fix clamp (`Math.max(safeTokenCost, 1)`) turned an
+    // unmeasured close into score_adjusted: 9.0 — the single best score
+    // obtainable in the registry. Re-running the pre-fix formula here proves
+    // the defect this guard exists to catch: `(3 * 3) / Math.max(0, 1) === 9`.
+    expect((3 * 3) / Math.max(0, 1)).toBe(9);
+
+    const { performanceScorecard, scorecardAdjusted } = buildCloseTimeScorecardCaptures(ISSUE, 0, closedAt);
+
+    expect(scorecardAdjusted.metadata).not.toHaveProperty("score_adjusted");
+    expect(scorecardAdjusted.metadata.token_cost).toBe(0);
+    expect(scorecardAdjusted.metadata.metrics_lost).toBe(true);
+    expect(scorecardAdjusted.metadata.exclude_from_aggregates).toBe(true);
+    expect(performanceScorecard.metadata.token_cost).toBe(0);
+    expect(performanceScorecard.metadata.metrics_lost).toBe(true);
+    expect(performanceScorecard.metadata.exclude_from_aggregates).toBe(true);
+  });
+
+  it("AUR-5410: PASSING case — a normal measured close still scores and carries no exclude flags", () => {
+    const { performanceScorecard, scorecardAdjusted } = buildCloseTimeScorecardCaptures(ISSUE, 15000, closedAt);
+
+    expect(scorecardAdjusted.metadata.score_adjusted).toBe((3 * 3) / 15000);
+    expect(scorecardAdjusted.metadata).not.toHaveProperty("metrics_lost");
+    expect(scorecardAdjusted.metadata).not.toHaveProperty("exclude_from_aggregates");
+    expect(performanceScorecard.metadata).not.toHaveProperty("metrics_lost");
+    expect(performanceScorecard.metadata).not.toHaveProperty("exclude_from_aggregates");
   });
 
   it("distinguishes same-day closures by the assignee by appending the issue identifier, not colliding into one title", () => {

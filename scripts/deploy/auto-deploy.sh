@@ -26,6 +26,17 @@
 # /api/health cannot answer it in this deployment: the run-count block is gated
 # behind PAPERCLIP_DEV_SERVER_STATUS_FILE, which is unset on the live server.
 #
+#   Health self-heal (2026-08-19, ENABLED by default: PAPERCLIP_AUTO_HEALTH_RESTART_ENABLED=0
+#   to disable): when probe_health fails on an UNCHANGED activated sha (no new
+#   deploy involved — stage 2 above only touches running != activated), a
+#   sustained-unreachable window past a short threshold triggers a plain
+#   `systemctl --user restart` and a health gate, independent of the
+#   RESTART_ENABLED flag above. This exists because an idle-in-transaction
+#   Postgres backend once wedged the heartbeat sweep and every DB-bound route
+#   for 1.5 days while the process stayed alive (TCP open, static routes
+#   served) — no existing mechanism restarts a hung-but-not-crashed unit, and
+#   the drift detector (AUR-3937) only pages after 2h. See try_health_self_heal.
+#
 # State: every tick writes a world-readable state file consumed by
 # check-deploy-drift.sh. A STALE state file is itself the "automation is dead"
 # signal — deliberate: the daemon's death is detected by the same mechanism that
@@ -84,12 +95,29 @@ MAX_BUILD_FAILURES=${PAPERCLIP_DEPLOY_MAX_BUILD_FAILURES:-3}
 # ${VAR-default} (not :-) so tests can set SUDO= to run unprivileged on
 # user-owned scratch roots.
 SUDO=${PAPERCLIP_DEPLOY_SUDO-sudo -n}
+# Health self-heal (2026-08-19 outage): probe_health failing does not imply a
+# bad deploy — an idle-in-transaction Postgres backend once wedged the
+# heartbeat sweep and every DB-bound route (incl. /api/health) for 1.5 days on
+# an UNCHANGED activated sha, and nothing restarted it (stage 2 below only
+# fires on running != activated; the drift detector, AUR-3937, only alerts).
+# A same-sha restart has none of stage 2's rollback risk, so it defaults ON.
+HEALTH_RESTART_ENABLED=${PAPERCLIP_AUTO_HEALTH_RESTART_ENABLED:-1}
+# Tick spacing is 10min (OnUnitActiveSec); anything under one tick period just
+# filters a single-tick flap — the earliest this can act is the 2nd
+# consecutive unreachable tick, ~10min of confirmed downtime.
+HEALTH_RESTART_THRESHOLD_SEC=${PAPERCLIP_AUTO_HEALTH_RESTART_THRESHOLD_SEC:-60}
+# If a restart doesn't hold, back off and let the drift detector's sustained
+# provenance alert (SEV2) be the escalation path instead of restart-looping a
+# genuinely broken process.
+HEALTH_RESTART_COOLDOWN_SEC=${PAPERCLIP_AUTO_HEALTH_RESTART_COOLDOWN_SEC:-1800}
 
 STATE_FILE=$STATE_DIR/auto-deploy.state
 QUAR_FILE=$STATE_DIR/auto-deploy.quarantine
 FAIL_FILE=$STATE_DIR/auto-deploy.build-failures
 HALT_FILE=$STATE_DIR/auto-deploy.halt
 BUILD_OUT=$STATE_DIR/auto-deploy.last-build.out
+HEALTH_UNREACHABLE_SINCE_FILE=$STATE_DIR/auto-deploy.health-unreachable-since
+HEALTH_RESTART_LAST_FILE=$STATE_DIR/auto-deploy.health-restart-last
 GATE_OUT=$STATE_DIR/auto-deploy.last-migration-gate.out
 GATE_FAIL_FILE=$STATE_DIR/auto-deploy.gate-infra-failures
 
@@ -223,6 +251,54 @@ health_gate() { # $1=intended sha
 repoint_current() { # $1=release dir name (sha12)
   run_priv ln -sfn "releases/$1" "$APP_ROOT/current.next" && \
   run_priv mv -T "$APP_ROOT/current.next" "$APP_ROOT/current"
+}
+
+# Same-sha restart when /api/health is unreachable (2026-08-19 outage). Only
+# called from the probe_health failure branch below, where activated_sha is
+# already known good (it is what `current` points to right now — there is no
+# new SHA involved, so none of stage 2's rollback machinery applies here).
+try_health_self_heal() {
+  if [[ "$HEALTH_RESTART_ENABLED" != "1" ]]; then
+    log "health self-heal disabled (PAPERCLIP_AUTO_HEALTH_RESTART_ENABLED=0)"
+    rm -f "$HEALTH_UNREACHABLE_SINCE_FILE" 2>/dev/null || true
+    return
+  fi
+  if [[ "$activated_sha" == "none" ]]; then
+    log "health self-heal: activated sha unreadable ($APP_ROOT/current/build-info.json) — refusing to restart into an unknown release"
+    return
+  fi
+
+  local now since sustained
+  now=$(date -u +%s)
+  since=$(cat "$HEALTH_UNREACHABLE_SINCE_FILE" 2>/dev/null || echo "")
+  [[ "$since" =~ ^[0-9]+$ ]] || { since=$now; echo "$since" > "$HEALTH_UNREACHABLE_SINCE_FILE" 2>/dev/null || true; }
+  sustained=$(( now - since ))
+
+  if (( sustained < HEALTH_RESTART_THRESHOLD_SEC )); then
+    log "health self-heal: not restarting yet (unreachable ${sustained}s < ${HEALTH_RESTART_THRESHOLD_SEC}s threshold)"
+    return
+  fi
+
+  local last=0
+  last=$(cat "$HEALTH_RESTART_LAST_FILE" 2>/dev/null || echo 0)
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  if (( last > 0 && now - last < HEALTH_RESTART_COOLDOWN_SEC )); then
+    log "health self-heal: not restarting (last attempt $(( now - last ))s ago < ${HEALTH_RESTART_COOLDOWN_SEC}s cooldown) — a prior restart didn't hold; leaving this to the drift detector's escalation"
+    return
+  fi
+
+  log "health self-heal: $UNIT unreachable for ${sustained}s on unchanged activated sha ${activated_sha:0:12} — restarting"
+  echo "$now" > "$HEALTH_RESTART_LAST_FILE" 2>/dev/null || true
+  systemctl --user restart "$UNIT" 2>>"$LOG_FILE" || log "systemctl restart returned nonzero (health gate decides)"
+
+  if health_gate "$activated_sha"; then
+    log "health self-heal SUCCESS: $UNIT healthy again on ${activated_sha:0:12}"
+    rm -f "$HEALTH_UNREACHABLE_SINCE_FILE" 2>/dev/null || true
+    notify INFO "$UNIT was unreachable for ${sustained}s (process alive but DB-bound routes wedged) and SELF-RECOVERED via restart — same release ${activated_sha:0:12}, no rollback needed. No action needed."
+  else
+    log "health self-heal FAILED: $UNIT still not healthy on ${activated_sha:0:12} after ${HEALTH_TIMEOUT}s"
+    notify SEV2 "$UNIT was unreachable and a self-heal restart did NOT bring it back healthy within ${HEALTH_TIMEOUT}s on unchanged release ${activated_sha:0:12}. A restart alone was not enough this time — needs manual investigation."
+  fi
 }
 
 # ================================================================================
@@ -401,9 +477,11 @@ fi
 if ! probe_health; then
   PHASE=health-unreachable ARMED_SHA=$activated_sha NOTE="cannot determine running sha via $HEALTH_URL"
   write_state
-  log "stage 2 skipped: $NOTE (the drift detector owns alerting for an unreachable server)"
+  log "stage 2: $NOTE — the drift detector (AUR-3937) still owns ALERTING; this tick also attempts a same-sha self-heal restart (see try_health_self_heal)"
+  try_health_self_heal
   exit 0
 fi
+rm -f "$HEALTH_UNREACHABLE_SINCE_FILE" 2>/dev/null || true
 running_sha=$H_SHA
 RUNNING_SHA_S=$running_sha
 

@@ -8,8 +8,10 @@ import {
   extractClaudeRateLimitEvents,
   claudeQuotaExhaustionResultJson,
   resolveClaudeFailureErrorCode,
+  isClaudeOAuthRefreshFailedError,
   CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE,
   CLAUDE_QUOTA_EXHAUSTED_ERROR_CODE,
+  CLAUDE_OAUTH_REFRESH_FAILED_ERROR_CODE,
 } from "./parse.js";
 
 // AUR-4144 changed the contract these tests assert. Quota exhaustion used to be a SUBSET
@@ -629,6 +631,7 @@ describe("resolveClaudeFailureErrorCode / claudeQuotaExhaustionResultJson (AUR-4
         requiresLogin: false,
         contextOverflow: false,
         quotaExhausted: true,
+        oauthRefreshFailed: false,
         transientUpstream: false,
       }),
     ).toBe(CLAUDE_QUOTA_EXHAUSTED_ERROR_CODE);
@@ -638,6 +641,7 @@ describe("resolveClaudeFailureErrorCode / claudeQuotaExhaustionResultJson (AUR-4
         requiresLogin: false,
         contextOverflow: false,
         quotaExhausted: true,
+        oauthRefreshFailed: false,
         transientUpstream: true,
       }),
     ).toBe(CLAUDE_QUOTA_EXHAUSTED_ERROR_CODE);
@@ -648,6 +652,7 @@ describe("resolveClaudeFailureErrorCode / claudeQuotaExhaustionResultJson (AUR-4
       requiresLogin: false,
       contextOverflow: false,
       quotaExhausted: false,
+      oauthRefreshFailed: false,
       transientUpstream: false,
     };
     expect(resolveClaudeFailureErrorCode({ ...base, requiresLogin: true, quotaExhausted: true }))
@@ -659,6 +664,29 @@ describe("resolveClaudeFailureErrorCode / claudeQuotaExhaustionResultJson (AUR-4
     expect(resolveClaudeFailureErrorCode({ ...base, transientUpstream: true }))
       .toBe("claude_transient_upstream");
     expect(resolveClaudeFailureErrorCode(base)).toBeNull();
+  });
+
+  // AUR-5863: the OAuth credential-refresh failure gets its own code, ranked between
+  // quota and the transient catch-all.
+  it("maps oauthRefreshFailed to claude_oauth_refresh_failed, ahead of the transient catch-all but behind quota", () => {
+    expect(
+      resolveClaudeFailureErrorCode({
+        requiresLogin: false,
+        contextOverflow: false,
+        quotaExhausted: false,
+        oauthRefreshFailed: true,
+        transientUpstream: true,
+      }),
+    ).toBe(CLAUDE_OAUTH_REFRESH_FAILED_ERROR_CODE);
+    expect(
+      resolveClaudeFailureErrorCode({
+        requiresLogin: false,
+        contextOverflow: false,
+        quotaExhausted: true,
+        oauthRefreshFailed: true,
+        transientUpstream: false,
+      }),
+    ).toBe(CLAUDE_QUOTA_EXHAUSTED_ERROR_CODE);
   });
 
   it("persists the structured quota metadata verbatim, and nothing when there is no wall", () => {
@@ -677,6 +705,70 @@ describe("resolveClaudeFailureErrorCode / claudeQuotaExhaustionResultJson (AUR-4
       },
     });
     expect(claudeQuotaExhaustionResultJson(null)).toEqual({});
+  });
+});
+
+// AUR-5863: the CLI's own credential-refresh failure (distinct from `claude_auth_required`,
+// which needs a human `claude login`, and from ordinary `claude_transient_upstream` weather).
+// The positive fixture is the verbatim production string -- specimen run
+// 7a0e35c9-035a-4d75-89d0-e192a3189ef3 -- confirmed by AUR-5847 as the sole wording variant
+// across every retained AUR-5412 run log.
+describe("isClaudeOAuthRefreshFailedError (AUR-5863)", () => {
+  it("FIRES on the exact production wording", () => {
+    const input = {
+      errorMessage: "Failed to authenticate: OAuth session expired and could not be refreshed",
+    };
+    expect(isClaudeOAuthRefreshFailedError(input)).toBe(true);
+    // Not lumped into the generic transient bucket -- it has its own code.
+    expect(isClaudeTransientUpstreamError(input)).toBe(false);
+  });
+
+  it("FIRES when the wording arrives on trusted stderr/stdout instead of errorMessage", () => {
+    expect(
+      isClaudeOAuthRefreshFailedError({
+        stderr: "Failed to authenticate: OAuth session expired and could not be refreshed",
+      }),
+    ).toBe(true);
+    expect(
+      isClaudeOAuthRefreshFailedError({
+        stdout: "Failed to authenticate: OAuth session expired and could not be refreshed",
+      }),
+    ).toBe(true);
+  });
+
+  it("PASS: does not fire on ordinary claude_auth_required wording, and does not regress that classification", () => {
+    const input = { stderr: "Please log in. Run `claude login` first." };
+    expect(isClaudeOAuthRefreshFailedError(input)).toBe(false);
+    // The existing login-required path is untouched by this classifier.
+    expect(isClaudeTransientUpstreamError(input)).toBe(false);
+  });
+
+  it("PASS: does not fire on unrelated transient or quota wording", () => {
+    expect(
+      isClaudeOAuthRefreshFailedError({ stderr: "HTTP 429: Too Many Requests" }),
+    ).toBe(false);
+    expect(
+      isClaudeOAuthRefreshFailedError({
+        errorMessage: "You've hit your session limit · resets 7:40pm (UTC)",
+      }),
+    ).toBe(false);
+  });
+
+  it("resolves to CLAUDE_OAUTH_REFRESH_FAILED_ERROR_CODE via resolveClaudeFailureErrorCode, and the code is disjoint from every existing code", () => {
+    expect(CLAUDE_OAUTH_REFRESH_FAILED_ERROR_CODE).toBe("claude_oauth_refresh_failed");
+    expect(CLAUDE_OAUTH_REFRESH_FAILED_ERROR_CODE).not.toBe("claude_auth_required");
+    expect(CLAUDE_OAUTH_REFRESH_FAILED_ERROR_CODE).not.toBe("claude_transient_upstream");
+    expect(CLAUDE_OAUTH_REFRESH_FAILED_ERROR_CODE).not.toBe(CLAUDE_QUOTA_EXHAUSTED_ERROR_CODE);
+    expect(CLAUDE_OAUTH_REFRESH_FAILED_ERROR_CODE).not.toBe(CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE);
+    expect(
+      resolveClaudeFailureErrorCode({
+        requiresLogin: false,
+        contextOverflow: false,
+        quotaExhausted: false,
+        oauthRefreshFailed: true,
+        transientUpstream: false,
+      }),
+    ).toBe(CLAUDE_OAUTH_REFRESH_FAILED_ERROR_CODE);
   });
 });
 

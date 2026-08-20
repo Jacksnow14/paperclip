@@ -129,6 +129,14 @@ export interface FleetCapacityRow {
   queueDepth: number;
   lastSuccessfulRunAt: string | null;
   consecutiveFailures: number;
+  /**
+   * Parsed provider reset boundary for a quota wall (`quota_exhausted` /
+   * `quota_reset_unverified`), structured — not just embedded in
+   * `reasonDetail` prose — so callers (AUR-4604: the agent record) can surface
+   * it without re-parsing text. `null` for every other reason, including
+   * `entitlement_revoked`, which has no reset boundary to parse.
+   */
+  resetAt: string | null;
 }
 
 export interface FleetCapacitySnapshot {
@@ -201,6 +209,7 @@ export function classifyAgentCapacity(
     queueDepth,
     lastSuccessfulRunAt,
     consecutiveFailures,
+    resetAt: null as string | null,
   };
 
   if (agent.pausedAt != null) {
@@ -245,6 +254,7 @@ export function classifyAgentCapacity(
         ...base,
         canExecuteNow: true,
         reason: "quota_reset_unverified",
+        resetAt: resetAt.toISOString(),
         reasonDetail:
           `Quota tail of ${consecutiveFailures} failure(s); reset boundary ${resetAt.toISOString()} has passed ` +
           `but nothing has succeeded since — recovery unproven (advisory, not a block).`,
@@ -254,6 +264,7 @@ export function classifyAgentCapacity(
       ...base,
       canExecuteNow: false,
       reason: "quota_exhausted",
+      resetAt: resetAt ? resetAt.toISOString() : null,
       reasonDetail:
         `${consecutiveFailures} consecutive quota-signature failure(s), newest at ` +
         `${toIso(newestFailure.createdAt) ?? "unknown"}, no succeeded run since; reset ` +

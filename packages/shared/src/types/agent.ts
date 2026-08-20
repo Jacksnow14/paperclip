@@ -73,6 +73,25 @@ export interface AgentChainOfCommandEntry {
   title: string | null;
 }
 
+/**
+ * AUR-4604: derived-at-read-time execution-blocking state, distinct from
+ * `pauseReason`. Unlike `pauseReason` (operator/budget-set, cleared only by
+ * an explicit resume), this is recomputed from run history and the clock on
+ * every read — `null` the instant a run succeeds or the reset boundary
+ * passes, with no writer involved. Deliberately just the two per-agent
+ * reasons the classifier can derive from one agent's own run history;
+ * `"lane_down"` (a whole provider lane circuit-broken) is a separate,
+ * multi-agent rollup exposed on the dedicated `/fleet-capacity` route, not
+ * here.
+ */
+export type AgentQuotaStateReason = "quota_exhausted" | "entitlement_revoked";
+
+export interface AgentQuotaState {
+  reason: AgentQuotaStateReason;
+  resetAt: string | null;
+  detail: string | null;
+}
+
 export interface Agent {
   id: string;
   companyId: string;
@@ -92,6 +111,10 @@ export interface Agent {
   spentMonthlyCents: number;
   pauseReason: PauseReason | null;
   pausedAt: Date | null;
+  // Optional (like `defaultEnvironmentId`) so pre-existing fixtures/mocks
+  // across the codebase don't need updating; the real agent service always
+  // sets it explicitly (AUR-4604).
+  quotaState?: AgentQuotaState | null;
   permissions: AgentPermissions;
   lastHeartbeatAt: Date | null;
   metadata: Record<string, unknown> | null;

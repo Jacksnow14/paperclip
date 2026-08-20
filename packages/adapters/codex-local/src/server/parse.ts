@@ -5,6 +5,29 @@ import {
   parseJson,
 } from "@paperclipai/adapter-utils/server-utils";
 
+// AUR-4598 (carried from the AUR-4557 adversarial review): investigated whether
+// codex_local needs a context-overflow classifier analogous to claude_local's
+// isClaudeContextOverflowMessage/CLAUDE_CONTEXT_OVERFLOW_RE (session-compaction.ts).
+// Finding: it does not, and none was added. Evidence:
+//   1. Architectural -- codex_local is registered with nativeContextManagement:
+//      "confirmed" and a zero-threshold ADAPTER_MANAGED_SESSION_POLICY (session-
+//      compaction.ts). Paperclip deliberately does not threshold-rotate codex
+//      sessions; it trusts the codex CLI to manage its own context growth, unlike
+//      claude_local, which needs client-side rotation because its CLI is pinned to
+//      a 200K context.
+//   2. Empirical -- queried all 576 failed codex_local heartbeat_runs in production
+//      (2026-08-20) for context/overflow/"too long"/"exceeds"/"maximum context"
+//      wording in `error` and `stderr_excerpt`: zero matches. The 508 rows under
+//      errorCode "adapter_failed" bucket entirely into usage-limit exhaustion (331,
+//      matched by CODEX_USAGE_LIMIT_RE below), unsupported-model-for-plan 400s
+//      (176), and one upstream 503 -- no context-length rejection of any kind. The
+//      remaining failures are process_lost (42) and codex_transient_upstream (26,
+//      matched below). Codex has never surfaced a distinguishable overflow error in
+//      this codebase's production history.
+// If codex ever starts emitting one, add a CODEX_CONTEXT_OVERFLOW_RE here following
+// the same trusted/contaminable split as CODEX_USAGE_LIMIT_RE (AUR-4557's rule:
+// substring-match only fields the model cannot author; anchor anything that can
+// carry free-form model prose).
 const CODEX_TRANSIENT_UPSTREAM_RE =
   /(?:we(?:'|’)re\s+currently\s+experiencing\s+high\s+demand|temporary\s+errors|rate[-\s]?limit(?:ed)?|too\s+many\s+requests|\b429\b|server\s+overloaded|service\s+unavailable|try\s+again\s+later)/i;
 const CODEX_REMOTE_COMPACTION_RE = /remote\s+compact\s+task/i;

@@ -750,11 +750,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   };
 
   const parseFallbackErrorMessage = (proc: RunProcessResult) => {
-    const stderrLine =
-      proc.stderr
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .find(Boolean) ?? "";
+    const stderrLines = proc.stderr
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    // AUR-4598: the CLI can print a banner/warning line before the actual
+    // failure (e.g. a Node deprecation notice), so the first non-empty line is
+    // not reliably the informative one. The real rejection is what the process
+    // printed immediately before exiting, so prefer the last non-empty line.
+    const stderrLine = stderrLines.length > 0 ? stderrLines[stderrLines.length - 1] : "";
 
     if ((proc.exitCode ?? 0) === 0) {
       return "Failed to parse claude JSON output";

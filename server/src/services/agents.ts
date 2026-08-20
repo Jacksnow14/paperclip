@@ -401,7 +401,9 @@ export function agentService(db: Db) {
       }
     }
 
-    return normalizedUpdated;
+    if (!normalizedUpdated) return null;
+    const updatedQuotaStates = await getAgentQuotaStates(db, normalizedUpdated.companyId, [normalizedUpdated.id]);
+    return { ...normalizedUpdated, quotaState: updatedQuotaStates.get(normalizedUpdated.id) ?? null };
   }
 
   return {
@@ -580,7 +582,10 @@ export function agentService(db: Db) {
         .returning()
         .then((rows) => rows[0] ?? null);
 
-      return updated ? normalizeAgentRow(updated) : null;
+      if (!updated) return null;
+      const normalizedUpdated = normalizeAgentRow(updated);
+      const quotaStates = await getAgentQuotaStates(db, normalizedUpdated.companyId, [normalizedUpdated.id]);
+      return { ...normalizedUpdated, quotaState: quotaStates.get(normalizedUpdated.id) ?? null };
     },
 
     listConfigRevisions: async (id: string) =>

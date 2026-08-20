@@ -320,6 +320,8 @@ export type {
   AgentInstructionsBundle,
   AgentKeyCreated,
   AgentConfigRevision,
+  AgentQuotaState,
+  AgentQuotaStateReason,
   AdapterEnvironmentCheckLevel,
   AdapterEnvironmentTestStatus,
   AdapterEnvironmentCheck,

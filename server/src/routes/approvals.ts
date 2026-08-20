@@ -19,6 +19,7 @@ import {
 } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { redactEventPayload } from "../redaction.js";
+import { unprocessable } from "../errors.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
 function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(approval: T): T {
@@ -26,6 +27,43 @@ function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(a
     ...approval,
     payload: redactEventPayload(approval.payload) ?? {},
   };
+}
+
+const BOARD_APPROVAL_TYPE = "request_board_approval";
+const BOARD_APPROVAL_REQUIRED_FIELDS = ["valueAtStake", "costOfInaction", "title"] as const;
+
+function isBlankApprovalPayloadValue(value: unknown): boolean {
+  return value === undefined || value === null || (typeof value === "string" && value.trim().length === 0);
+}
+
+/**
+ * AUR-5353/AUR-5383. Pending row `3c0226f0` had no title and rendered as a
+ * blank line in the board queue; other rows carried no statement of what the
+ * founder wins or loses by deciding. Scoped to `request_board_approval` only
+ * — `hire_agent`, `approve_ceo_strategy`, and `budget_override_required` have
+ * their own established payload shapes and are untouched. Returns an empty
+ * array when `type` isn't `request_board_approval`, or when every check
+ * passes.
+ */
+export function checkBoardApprovalPayloadViolations(
+  type: string,
+  payload: Record<string, unknown> | undefined,
+): string[] {
+  if (type !== BOARD_APPROVAL_TYPE) return [];
+
+  const errors: string[] = [];
+  for (const field of BOARD_APPROVAL_REQUIRED_FIELDS) {
+    const value = payload?.[field];
+    if (isBlankApprovalPayloadValue(value)) {
+      errors.push(
+        `payload.${field} is required for type '${BOARD_APPROVAL_TYPE}' — ` +
+          "a board approval must state what is at stake and what a non-decision costs.",
+      );
+    } else if (typeof value !== "string") {
+      errors.push(`payload.${field} must be a string`);
+    }
+  }
+  return errors;
 }
 
 export function approvalRoutes(
@@ -81,9 +119,29 @@ export function approvalRoutes(
     res.json(redactApprovalPayload(approval));
   });
 
-  router.post("/companies/:companyId/approvals", validate(createApprovalSchema), async (req, res) => {
+  router.post("/companies/:companyId/approvals", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+
+    // AUR-5383 review fix: the board-approval guard must see the raw request
+    // body BEFORE `createApprovalSchema` runs. The schema requires `payload`
+    // to be present, so a request that omits `payload` entirely (e.g. just
+    // `{ type: "request_board_approval" }`) used to fail Zod validation
+    // first and surface as a generic 400, never reaching this guard.
+    const rawType = typeof req.body?.type === "string" ? req.body.type : undefined;
+    const rawPayload =
+      req.body?.payload && typeof req.body.payload === "object" && !Array.isArray(req.body.payload)
+        ? (req.body.payload as Record<string, unknown>)
+        : undefined;
+    const payloadErrors = checkBoardApprovalPayloadViolations(rawType, rawPayload);
+    if (payloadErrors.length > 0) {
+      throw unprocessable(
+        `Invalid '${rawType}' approval: ${payloadErrors.length} validation error(s)`,
+        { errors: payloadErrors },
+      );
+    }
+
+    req.body = createApprovalSchema.parse(req.body);
     const rawIssueIds = req.body.issueIds;
     const issueIds = Array.isArray(rawIssueIds)
       ? rawIssueIds.filter((value: unknown): value is string => typeof value === "string")

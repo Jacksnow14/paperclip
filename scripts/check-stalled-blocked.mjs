@@ -530,6 +530,74 @@ export function resolveFlagOwner(issue) {
   return issue.assigneeAgentId ?? CEO_AGENT_ID;
 }
 
+// ── Dead pending-approval detection (AUR-5353/AUR-5383) ─────────────────────
+//
+// A `pending` board-approval row whose linked issues have ALL already
+// shipped (`done`/`cancelled`) is dead by construction — the decision it was
+// asking for no longer has anything left to decide. Left `pending`, it
+// teaches the founder the approval queue is noise. Flagged in place via a
+// comment on the approval itself (idempotent, marker-checked), never a new
+// ticket per row — this is deliberately NOT a fourth issue-flagging phase
+// like A/B/B2, because there is no "target issue" to file a flag against;
+// the approval IS the target.
+
+/** Age threshold, in days, past which a pending approval is a candidate. */
+export const DEAD_APPROVAL_AGE_DAYS = 14;
+
+/** Idempotency marker checked in existing approval comments before re-flagging. */
+export const DEAD_APPROVAL_COMMENT_MARKER = 'stalled-blocked-watchdog: dead pending approval (AUR-5353)';
+
+export function daysSince(isoTimestamp, now = new Date()) {
+  return hoursSince(isoTimestamp, now) / 24;
+}
+
+/**
+ * True when a pending approval is dead by construction: older than
+ * DEAD_APPROVAL_AGE_DAYS and every one of its linked issues is already
+ * done/cancelled.
+ *
+ * An approval with ZERO linked issues is deliberately NOT "all closed" —
+ * `[].every(...)` is vacuously true, which would misclassify every
+ * unlinked pending approval (nothing to check) as dead. Zero linked issues
+ * means "no evidence either way", not "confirmed dead", so it is excluded.
+ *
+ * @param {{ approval: object, linkedIssues: unknown, now?: Date }} opts
+ */
+export function isDeadPendingApproval({ approval, linkedIssues, now = new Date() }) {
+  if (approval.status !== 'pending') return false;
+  if (daysSince(approval.createdAt, now) < DEAD_APPROVAL_AGE_DAYS) return false;
+  const issues = Array.isArray(linkedIssues) ? linkedIssues : (linkedIssues?.issues ?? []);
+  if (issues.length === 0) return false;
+  return issues.every((issue) => issue.status === 'done' || issue.status === 'cancelled');
+}
+
+export function buildDeadApprovalComment(approval, linkedIssues, now = new Date()) {
+  const issues = Array.isArray(linkedIssues) ? linkedIssues : (linkedIssues?.issues ?? []);
+  const days = Math.round(daysSince(approval.createdAt, now));
+  const title = approval.payload?.title || '(untitled)';
+  const issueList = issues.map((issue) => `${issue.identifier ?? issue.id} (${issue.status})`).join(', ');
+  return [
+    '## Pending approval is dead by construction',
+    '',
+    `This \`request_board_approval\` row ("${title}") has been \`pending\` for ${days} day(s), and every ` +
+      `issue linked to it is already closed: ${issueList}.`,
+    '',
+    'Per AUR-5353: a pending approval whose work has already shipped is worse than no approval, because ' +
+      'it teaches the founder the queue is noise. Please withdraw this row, or resolve it, rather than ' +
+      'leaving it pending.',
+    '',
+    DEAD_APPROVAL_COMMENT_MARKER,
+  ].join('\n');
+}
+
+/** True when an approval's comment list already carries the dead-approval marker (idempotency). */
+export function hasDeadApprovalComment(commentsResponse) {
+  const list = Array.isArray(commentsResponse)
+    ? commentsResponse
+    : (commentsResponse?.comments ?? commentsResponse?.items ?? []);
+  return list.some((comment) => (comment.body ?? '').includes(DEAD_APPROVAL_COMMENT_MARKER));
+}
+
 // ── Main routine ──────────────────────────────────────────────────────────────
 
 export const ISSUE_STATUS_FILTER = 'backlog,todo,in_progress,in_review,blocked';
@@ -844,6 +912,44 @@ export async function main({ apply, apiUrl, apiKey, companyId, maxFlagsPerRun = 
     console.log();
   }
 
+  // ── Phase C: Dead pending-approval detection (AUR-5353/AUR-5383) ──────────
+  console.log('── Phase C: Dead pending-approval detection ──');
+  const pendingApprovalsBatch = await apiGet(`/api/companies/${companyId}/approvals?status=pending`);
+  const pendingApprovals = Array.isArray(pendingApprovalsBatch)
+    ? pendingApprovalsBatch
+    : (pendingApprovalsBatch?.approvals ?? []);
+  const ageCandidates = pendingApprovals.filter((approval) => daysSince(approval.createdAt) >= DEAD_APPROVAL_AGE_DAYS);
+
+  let deadApprovalsFlagged = 0;
+  let deadApprovalsSkippedDedup = 0;
+  if (ageCandidates.length === 0) {
+    console.log(`  No pending approval(s) older than ${DEAD_APPROVAL_AGE_DAYS}d.\n`);
+  } else {
+    for (const approval of ageCandidates) {
+      const linkedIssues = await apiGet(`/api/approvals/${approval.id}/issues`);
+      if (!isDeadPendingApproval({ approval, linkedIssues })) continue;
+      const comments = await apiGet(`/api/approvals/${approval.id}/comments`);
+      if (hasDeadApprovalComment(comments)) {
+        deadApprovalsSkippedDedup += 1;
+        console.log(`    - ${approval.id} already flagged — skipping (idempotent).`);
+        continue;
+      }
+      deadApprovalsFlagged += 1;
+      console.log(`  FLAG ${approval.id}: pending ${Math.round(daysSince(approval.createdAt))}d, all linked issues closed.`);
+      if (apply) {
+        const ok = await runMutation(
+          `comment dead-approval flag on ${approval.id}`,
+          () => apiPost(`/api/approvals/${approval.id}/comments`, {
+            body: buildDeadApprovalComment(approval, linkedIssues),
+          }),
+          failedMutations,
+        );
+        if (ok) console.log('    → commented.');
+      }
+    }
+    console.log();
+  }
+
   console.log('── Summary ──');
   console.log(`  Candidates:         ${candidatesAll.length} (own-output=${ownOutputCandidates.length}, routine-umbrella=${umbrellaCandidates.length}, stalled=${graded.filter((g) => g.grade === 'stalled').length}, human-gated=${graded.filter((g) => g.grade === 'human-gated').length})`);
   console.log(`  Awaiting-human:     ${awaitingHuman.length} (correctly modelled, not filed)`);
@@ -853,6 +959,7 @@ export async function main({ apply, apiUrl, apiKey, companyId, maxFlagsPerRun = 
   console.log(`  Umbrella aggregate: ${umbrellaAction}${umbrellaCandidates.length > 0 ? ` (${umbrellaCandidates.length} umbrella(s))` : ''}`);
   console.log(`  Skipped-dedup:      ${skippedDedup.length}`);
   console.log(`  Stranded-routine:   ${strandedRoutineCandidates.length} (resolved=${toCancelStranded.length}, filed=${strandedToFile.length}, dropped=${strandedDroppedByCap.length}, skipped-dedup=${strandedSkippedDedup})`);
+  console.log(`  Dead approvals:     ${deadApprovalsFlagged} flagged, ${deadApprovalsSkippedDedup} already-flagged (of ${ageCandidates.length} pending ≥${DEAD_APPROVAL_AGE_DAYS}d, ${pendingApprovals.length} pending total)`);
   console.log(`  Failed:             ${failedMutations.length}`);
   if (failedMutations.length > 0) {
     for (const { label, status } of failedMutations) console.log(`    - ${label} → ${status}`);
@@ -860,14 +967,14 @@ export async function main({ apply, apiUrl, apiKey, companyId, maxFlagsPerRun = 
   }
 
   const umbrellaPending = umbrellaCandidates.length > 0;
-  const hasPendingActions = toCancel.length > 0 || toFile.length > 0 || umbrellaPending || toCancelStranded.length > 0 || strandedToFile.length > 0;
+  const hasPendingActions = toCancel.length > 0 || toFile.length > 0 || umbrellaPending || toCancelStranded.length > 0 || strandedToFile.length > 0 || deadApprovalsFlagged > 0;
   if (!apply && hasPendingActions) {
     console.log('\n[DRY-RUN] Pass --apply to execute the above actions.');
     return 1;
   }
 
   const attemptedMutations = apply
-    ? toCancel.length + toFile.length + (umbrellaCandidates.length > 0 ? 1 : 0) + toCancelStranded.length + strandedToFile.length
+    ? toCancel.length + toFile.length + (umbrellaCandidates.length > 0 ? 1 : 0) + toCancelStranded.length + strandedToFile.length + deadApprovalsFlagged
     : 0;
   if (attemptedMutations > 0 && failedMutations.length === attemptedMutations) {
     console.log('\nERROR: every intended mutation failed this run — see Failed list above.');

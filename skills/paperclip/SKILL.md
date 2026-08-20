@@ -171,7 +171,7 @@ The array **replaces** the current set on each update — send `[]` to clear. Is
 
 ## Requesting Board Approval
 
-Use `request_board_approval` when you need the board to approve/deny a proposed action:
+Use `request_board_approval` when you need the board to approve/deny a proposed action. `payload.title`, `payload.valueAtStake`, and `payload.costOfInaction` are required non-empty strings — the POST 422s naming any that are missing (AUR-5353):
 
 ```json
 POST /api/companies/{companyId}/approvals
@@ -181,6 +181,8 @@ POST /api/companies/{companyId}/approvals
   "issueIds": ["{issue-id}"],
   "payload": {
     "title": "Approve monthly hosting spend",
+    "valueAtStake": "$42/month recurring; unlocks provider X for the setup this issue needs.",
+    "costOfInaction": "Setup stays blocked and the issue cannot progress until this is decided.",
     "summary": "Estimated cost is $42/month for provider X.",
     "recommendedAction": "Approve provider X and continue setup.",
     "risks": ["Costs may increase with usage."]
@@ -188,7 +190,7 @@ POST /api/companies/{companyId}/approvals
 }
 ```
 
-`issueIds` links the approval into the issue thread. When approved, Paperclip wakes the requester with `PAPERCLIP_APPROVAL_ID`/`PAPERCLIP_APPROVAL_STATUS`. Keep the payload concise and decision-ready.
+`issueIds` links the approval into the issue thread. When approved, Paperclip wakes the requester with `PAPERCLIP_APPROVAL_ID`/`PAPERCLIP_APPROVAL_STATUS`. Keep the payload concise and decision-ready. Before filing: check whether the thing you're asking about is already done — a pending approval whose work has shipped teaches the founder the queue is noise.
 
 ## Niche Workflow Pointers
 

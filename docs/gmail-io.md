@@ -265,10 +265,13 @@ present, subject) of the send being made:
 {
   "type": "request_board_approval",
   "payload": {
-    "gmailOutbound": { "mailbox": "board", "to": "report@bunq.com" }
+    "gmailOutbound": { "mailbox": "board", "to": "report@bunq.com" },
+    "title": "...", "valueAtStake": "...", "costOfInaction": "..."
   }
 }
 ```
+(`title`/`valueAtStake`/`costOfInaction` are required non-empty strings on every
+`request_board_approval` — AUR-5353 — omitted above for brevity.)
 An approval that is `approved` but was granted for a different
 mailbox/recipient (or isn't `request_board_approval` with a `gmailOutbound`
 block at all) is treated the same as no approval — it cannot be reused to

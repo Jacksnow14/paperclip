@@ -161,8 +161,9 @@ export class GmailOutboundBlockedError extends Error {
     super(
       `BLOCKED: Gmail ${categoryDesc} to a third party requires explicit CEO approval ` +
         `(AUR-2525 guardrail). Signals: ${decision.reasons.join(", ")}. ` +
-        `Obtain board approval via request_board_approval and attach the returned approvalId as ` +
-        `ceoApprovalId in the request body.`,
+        `Obtain board approval via request_board_approval (payload requires non-empty title, ` +
+        `valueAtStake, and costOfInaction, or the POST 422s — AUR-5353) and attach the returned ` +
+        `approvalId as ceoApprovalId in the request body.`,
     );
     this.name = "GmailOutboundBlockedError";
     this.decision = decision;

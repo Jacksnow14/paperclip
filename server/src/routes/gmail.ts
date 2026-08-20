@@ -197,7 +197,8 @@ function fileBlockedSendIncident(
         `The send was hard-blocked. To proceed:\n` +
         `1. Verify this is a legitimate report (check memory / prior board decisions).\n` +
         `2. Create a board approval via \`POST /api/companies/{co}/approvals\` with type \`request_board_approval\` and a payload ` +
-        `containing \`gmailOutbound: { mailbox: "${mailbox}", to: "${context.to ?? "<target recipient>"}" }\` ` +
+        `containing \`gmailOutbound: { mailbox: "${mailbox}", to: "${context.to ?? "<target recipient>"}" }\`, ` +
+        `\`title\`, \`valueAtStake\`, and \`costOfInaction\` (all three required non-empty strings, or the POST 422s — AUR-5353) ` +
         `(the approval must be scoped to this exact mailbox + recipient — AUR-3628).\n` +
         `3. After CEO approves, re-send with \`ceoApprovalId\` in the request body.`,
       priority: "high",

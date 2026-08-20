@@ -58,6 +58,7 @@ import {
   isClaudeTransientUpstreamError,
   isClaudeUnknownSessionError,
   isClaudeContextOverflowError,
+  isClaudeOAuthRefreshFailedError,
   detectClaudeQuotaExhaustion,
   claudeQuotaExhaustionResultJson,
   resolveClaudeFailureErrorCode,
@@ -873,8 +874,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         !loginMeta.requiresLogin && !contextOverflow && (proc.exitCode ?? 0) !== 0
           ? detectClaudeQuotaExhaustion(failureFields)
           : null;
+      // AUR-5863: the CLI's own credential-refresh failure -- checked before the
+      // transient catch-all (more specific) and after quota (mutually exclusive
+      // wording, but quota is the established precedent for "more specific").
+      const oauthRefreshFailed =
+        !loginMeta.requiresLogin &&
+        !contextOverflow &&
+        quotaExhaustion == null &&
+        (proc.exitCode ?? 0) !== 0 &&
+        isClaudeOAuthRefreshFailedError(failureFields);
       const transientUpstream =
         !loginMeta.requiresLogin &&
+        !oauthRefreshFailed &&
         (proc.exitCode ?? 0) !== 0 &&
         isClaudeTransientUpstreamError(failureFields);
       // AUR-4144: a quota wall KEEPS `errorFamily: "transient_upstream"` on purpose.
@@ -885,7 +896,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // admission gate AND the reset-time parking -- i.e. it would reintroduce the outage
       // this ticket exists to end. The distinct errorCode + structured metadata is what
       // makes the class observable without touching scheduling.
-      const retryableUpstream = transientUpstream || quotaExhaustion != null;
+      // AUR-5863: the OAuth-refresh failure joins this same family so it inherits the
+      // bounded, longer-spaced retry ladder instead of falling through to whatever
+      // shorter-cadence backstop otherwise picks up an opaque `adapter_failed` run --
+      // that gap is what let AUR-5847's outreach routine exhaust its retries inside
+      // ~30 minutes without ever landing outside the 05:00-11:59 UTC dead window.
+      const retryableUpstream = transientUpstream || quotaExhaustion != null || oauthRefreshFailed;
       const transientRetryNotBefore = retryableUpstream
         ? quotaExhaustion?.resetAt ?? extractClaudeRetryNotBefore(failureFields)
         : null;
@@ -893,6 +909,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         requiresLogin: loginMeta.requiresLogin,
         contextOverflow,
         quotaExhausted: quotaExhaustion != null,
+        oauthRefreshFailed,
         transientUpstream,
       });
       return {
@@ -975,17 +992,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       failed && !loginMeta.requiresLogin && !clearSessionForMaxTurns && !contextOverflow
         ? detectClaudeQuotaExhaustion(failureFields)
         : null;
+    // AUR-5863: see the mirrored comment in the no-parse branch above -- checked
+    // before the transient catch-all and after quota (mutually exclusive wording).
+    const oauthRefreshFailed =
+      failed &&
+      !loginMeta.requiresLogin &&
+      !clearSessionForMaxTurns &&
+      !contextOverflow &&
+      quotaExhaustion == null &&
+      isClaudeOAuthRefreshFailedError(failureFields);
     const transientUpstream =
       failed &&
       !loginMeta.requiresLogin &&
       !clearSessionForMaxTurns &&
+      !oauthRefreshFailed &&
       isClaudeTransientUpstreamError(failureFields);
     // AUR-4144: the quota wall deliberately keeps `errorFamily: "transient_upstream"`.
     // `server/src/services/quota-pause.ts` and the park-at-reset scheduling in
     // `server/src/services/heartbeat.ts` both gate on that family plus the presence of
     // `transientRetryNotBefore`; a new family would silently switch both off. Only the
-    // errorCode and the structured metadata differ.
-    const retryableUpstream = transientUpstream || quotaExhaustion != null;
+    // errorCode and the structured metadata differ. AUR-5863: the OAuth-refresh failure
+    // joins the same family for the same reason -- see the no-parse branch above.
+    const retryableUpstream = transientUpstream || quotaExhaustion != null || oauthRefreshFailed;
     const transientRetryNotBefore = retryableUpstream
       ? quotaExhaustion?.resetAt ?? extractClaudeRetryNotBefore(failureFields)
       : null;
@@ -994,6 +1022,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       maxTurnsExhausted: failed && clearSessionForMaxTurns,
       contextOverflow,
       quotaExhausted: quotaExhaustion != null,
+      oauthRefreshFailed,
       transientUpstream,
     });
     const mergedResultJson: Record<string, unknown> = {

@@ -1,5 +1,6 @@
 import {
   CLAUDE_QUOTA_EXHAUSTED_ERROR_CODE,
+  CLAUDE_OAUTH_REFRESH_FAILED_ERROR_CODE,
   extractClaudeRetryNotBefore,
 } from "@paperclipai/adapter-claude-local/server";
 import { extractCodexRetryNotBefore } from "@paperclipai/adapter-codex-local/server";
@@ -94,12 +95,29 @@ if (typeof (CLAUDE_QUOTA_EXHAUSTED_ERROR_CODE as unknown) !== "string" || CLAUDE
 
 const QUOTA_EXHAUSTED_ERROR_CODES = new Set<string>([CLAUDE_QUOTA_EXHAUSTED_ERROR_CODE]);
 
+// AUR-5863: same fail-at-load discipline as CLAUDE_QUOTA_EXHAUSTED_ERROR_CODE above —
+// a silently-undefined import here would make every OAuth-refresh-failure row fold
+// back into `consecutive_failures` (or `adapter_failed` noise upstream), exactly the
+// blind spot this errorCode exists to close.
+if (
+  typeof (CLAUDE_OAUTH_REFRESH_FAILED_ERROR_CODE as unknown) !== "string" ||
+  CLAUDE_OAUTH_REFRESH_FAILED_ERROR_CODE.length === 0
+) {
+  throw new Error(
+    "fleet-capacity: CLAUDE_OAUTH_REFRESH_FAILED_ERROR_CODE resolved to a non-string — " +
+      "oauth-refresh-failure classification would silently degrade to consecutive_failures",
+  );
+}
+
+const OAUTH_REFRESH_FAILED_ERROR_CODES = new Set<string>([CLAUDE_OAUTH_REFRESH_FAILED_ERROR_CODE]);
+
 export type FleetCapacityReason =
   | "ok"
   | "paused"
   | "quota_exhausted"
   | "quota_reset_unverified"
   | "entitlement_revoked"
+  | "oauth_refresh_failed"
   | "consecutive_failures"
   | "lane_down"
   | "no_recent_runs";
@@ -239,6 +257,31 @@ export function classifyAgentCapacity(
     };
   }
 
+  // AUR-5863: OAuth credential-refresh failure, checked BEFORE quota for the same
+  // reason as entitlement revocation above — the adapter now stamps this its own
+  // dedicated errorCode (`claude_oauth_refresh_failed`) so it stops folding into
+  // the opaque `adapter_failed`/`consecutive_failures` bucket a router can mistake
+  // for ordinary flakiness or, worse, a healthy `idle` lane. Unlike entitlement
+  // revocation this DOES self-heal on its own schedule (observed clearing by
+  // ~12:00 UTC most days), but no reset boundary is parseable from the error text,
+  // so — same as entitlement — only a succeeded run after the failure clears the
+  // tail; there is no reset-passed branch to compute.
+  if (
+    newestFailure &&
+    OAUTH_REFRESH_FAILED_ERROR_CODES.has(newestFailure.errorCode ?? "")
+  ) {
+    return {
+      ...base,
+      canExecuteNow: false,
+      reason: "oauth_refresh_failed",
+      reasonDetail:
+        `Provider CLI reports OAuth session expired and could not be refreshed; ` +
+        `${consecutiveFailures} consecutive failure(s), newest at ` +
+        `${toIso(newestFailure.createdAt) ?? "unknown"}, no succeeded run since. ` +
+        `Self-heals on its own schedule (no parseable reset boundary) — only a successful probe re-arms.`,
+    };
+  }
+
   const newestFailureIsQuota =
     newestFailure != null &&
     (QUOTA_EXHAUSTED_ERROR_CODES.has(newestFailure.errorCode ?? "") ||
@@ -302,12 +345,18 @@ export function classifyAgentCapacity(
 
 /**
  * Lane rollup: when a lane has >= 2 non-dormant agents and every one of them
- * is starved by the provider (`quota_exhausted` or, since AUR-5464,
+ * is starved by the provider (`quota_exhausted`; since AUR-5464,
  * `entitlement_revoked` — an org block starves every agent on the account at
- * once, exactly like quota), the lane itself is down. Overrides the per-agent
- * reason; `canExecuteNow` stays false.
+ * once, exactly like quota; since AUR-5863, `oauth_refresh_failed` — the
+ * credential is per-account, so a stale refresh starves every claude_local
+ * agent on it simultaneously too), the lane itself is down. Overrides the
+ * per-agent reason; `canExecuteNow` stays false.
  */
-const LANE_DOWN_ROLLUP_REASONS = new Set<FleetCapacityReason>(["quota_exhausted", "entitlement_revoked"]);
+const LANE_DOWN_ROLLUP_REASONS = new Set<FleetCapacityReason>([
+  "quota_exhausted",
+  "entitlement_revoked",
+  "oauth_refresh_failed",
+]);
 
 export function applyLaneDownRollup(rows: FleetCapacityRow[]): FleetCapacityRow[] {
   const byLane = new Map<string, FleetCapacityRow[]>();
@@ -319,12 +368,13 @@ export function applyLaneDownRollup(rows: FleetCapacityRow[]): FleetCapacityRow[
   for (const [lane, laneRows] of byLane) {
     const active = laneRows.filter((row) => row.reason !== "no_recent_runs");
     if (active.length >= 2 && active.every((row) => LANE_DOWN_ROLLUP_REASONS.has(row.reason))) {
-      const anyEntitlement = active.some((row) => row.reason === "entitlement_revoked");
+      const distinctReasons = new Set(active.map((row) => row.reason));
       for (const row of active) {
         row.reason = "lane_down";
-        row.reasonDetail = anyEntitlement
-          ? `Every non-dormant ${lane} agent is provider-starved (entitlement revoked and/or quota-exhausted) — the lane is down, not just this agent.`
-          : `Every non-dormant ${lane} agent is quota-exhausted — the lane is down, not just this agent.`;
+        row.reasonDetail =
+          distinctReasons.size > 1
+            ? `Every non-dormant ${lane} agent is provider-starved (${[...distinctReasons].sort().join(", ")}) — the lane is down, not just this agent.`
+            : `Every non-dormant ${lane} agent is ${[...distinctReasons][0]} — the lane is down, not just this agent.`;
       }
     }
   }

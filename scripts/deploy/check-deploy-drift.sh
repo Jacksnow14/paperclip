@@ -123,6 +123,31 @@
 #               debt character as checkout-debt: a unit change can legitimately
 #               lag a merge by hours until someone re-runs the relevant
 #               install-*.sh. Threshold: 24h.
+#
+# TIMER-LIVENESS AXIS (AUR-5885, follow-up to AUR-5866): every axis above
+# answers "is the right code on disk / running" — none of them can see a
+# timer/service pair that is simply DEAD. AUR-5866 found
+# paperclip-pr-review.timer disabled and paperclip-pr-review.service failed
+# for 13 days with zero signal: unit-drift's own check-deploy-drift.sh copy on
+# disk matched the release the whole time (status=ok every tick), because
+# "the unit FILE is correct" and "the unit is ENABLED and its service is
+# SUCCEEDING" are different axes entirely. This axis answers the second
+# question directly against the live systemd state (not a file compare), for
+# a configured list of `(timer_unit, service_unit, max_staleness)` triples.
+#
+#   timer-liveness (timer-disabled:<label>, timer-service-failed:<label>,
+#                    timer-service-stale:<label>)
+#               A watched timer's UnitFileState/ActiveState is not
+#               enabled/active, or its paired service's last run Result was
+#               not success, or the last successful completion is older than
+#               that target's configured max_staleness. Same escalation
+#               character as provenance/dark-armed (this is "automation is
+#               silently dead", not fleet-internal debt telemetry): SEV2, not
+#               INFO. Sustained-before-paging threshold defaults to 90 min
+#               (PAPERCLIP_DRIFT_TIMER_THRESHOLD_SEC) — 2x the pr-review
+#               timer's own 30-min OnUnitActiveSec, floored at 90 min so a
+#               faster-cadence timer added later still gets a sane grace
+#               window instead of paging on a single missed tick.
 set -uo pipefail
 
 HEALTH_URL=${PAPERCLIP_HEALTH_URL:-http://127.0.0.1:3100/api/health}
@@ -173,6 +198,16 @@ CHECKOUT_REFRESH=${PAPERCLIP_DRIFT_CHECKOUT_REFRESH:-1}
 UNITS=${PAPERCLIP_DRIFT_UNITS-}
 UNIT_DEBT_THRESHOLD_SEC=${PAPERCLIP_DRIFT_UNIT_DEBT_THRESHOLD_SEC:-86400}
 UNIT_ISSUE_URL=${PAPERCLIP_DRIFT_UNIT_ISSUE_URL:-https://paperclip/AUR/issues/AUR-5648}
+# timer-liveness axis (AUR-5885): `label:timer_unit:service_unit:max_staleness_sec`,
+# one entry per line. DELIBERATELY EMPTY by default — opt-in via
+# PAPERCLIP_DRIFT_TIMERS, same reasoning as CHECKOUTS/UNITS above. max_staleness_sec
+# is per-target (a timer's own cadence decides how stale is stale); the
+# sustained-before-paging threshold below is one policy constant applied to every
+# watched timer, same posture as CHECKOUT_DEBT_THRESHOLD_SEC/UNIT_DEBT_THRESHOLD_SEC.
+TIMERS=${PAPERCLIP_DRIFT_TIMERS-}
+TIMER_LIVENESS_THRESHOLD_SEC=${PAPERCLIP_DRIFT_TIMER_THRESHOLD_SEC:-5400}
+TIMER_ISSUE_URL=${PAPERCLIP_DRIFT_TIMER_ISSUE_URL:-https://paperclip/AUR/issues/AUR-5885}
+SYSTEMCTL_BIN=${PAPERCLIP_DRIFT_SYSTEMCTL:-systemctl}
 
 ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -325,6 +360,7 @@ run_drift_gate() {
   CHECKOUT_DEBT_THRESHOLD_SEC="$CHECKOUT_DEBT_THRESHOLD_SEC" \
   CHECKOUT_ISSUE_URL="$CHECKOUT_ISSUE_URL" CONTEXT="$gate_context" \
   UNIT_DEBT_THRESHOLD_SEC="$UNIT_DEBT_THRESHOLD_SEC" UNIT_ISSUE_URL="$UNIT_ISSUE_URL" \
+  TIMER_LIVENESS_THRESHOLD_SEC="$TIMER_LIVENESS_THRESHOLD_SEC" TIMER_ISSUE_URL="$TIMER_ISSUE_URL" \
   ALERT_COOLDOWN_SEC="$ALERT_COOLDOWN_SEC" RUNNING_SHA="${running_sha:0:12}" \
   MASTER_SHA="${master_sha:0:12}" ISSUE_URL="$ISSUE_URL" \
   python3 -c '
@@ -352,6 +388,11 @@ elif reason.startswith("unit-behind:") or reason.startswith("unit-missing:"):
     # AUR-5648: same debt character as checkout-debt — a unit change can
     # legitimately lag a merge by hours until someone re-runs the installer.
     klass, threshold = "unit-debt", int(os.environ["UNIT_DEBT_THRESHOLD_SEC"])
+elif reason.startswith("timer-disabled:") or reason.startswith("timer-service-failed:") \
+        or reason.startswith("timer-service-stale:"):
+    # AUR-5885: a dead timer/service is the same "automation silently dead"
+    # class as provenance/dark-armed, not fleet-internal debt telemetry.
+    klass, threshold = "timer-liveness", int(os.environ["TIMER_LIVENESS_THRESHOLD_SEC"])
 else:
     print("QUIET\tunclassified-reason:%s" % reason); raise SystemExit(0)
 
@@ -471,6 +512,16 @@ elif reason.startswith("unit-behind:") or reason.startswith("unit-missing:"):
         "Paperclip unit drift sustained %dh (%s): %s. %s %s%s"
         % (hours, klass, reason, os.environ.get("CONTEXT", ""),
            os.environ["UNIT_ISSUE_URL"], note)
+    )
+elif reason.startswith("timer-disabled:") or reason.startswith("timer-service-failed:") \
+        or reason.startswith("timer-service-stale:"):
+    # AUR-5885: the silent-dead-unit class — a disabled timer or a service
+    # that stopped succeeding produces zero signal anywhere else (AUR-5866
+    # sat 13 days this way). Page names the reason and the live state.
+    text = (
+        "Paperclip timer liveness sustained %dh (%s): %s. %s %s%s"
+        % (hours, klass, reason, os.environ.get("CONTEXT", ""),
+           os.environ["TIMER_ISSUE_URL"], note)
     )
 else:
     text = (
@@ -643,6 +694,59 @@ while IFS=: read -r un_label un_src un_installed un_level; do
       "Unit $un_label ($un_level) at $un_installed does not match the active release's $un_release_src."
   fi
 done <<< "$UNITS"
+
+# --- timer-liveness axis (AUR-5885) -----------------------------------------
+# No existing axis asks systemd directly whether a watched timer/service pair
+# is actually alive: unit-drift only compares the FILE on disk (which stayed
+# correct for the full 13 days paperclip-pr-review.timer sat disabled). Each
+# watched triple gets its own (log, state) pair, exactly like the checkout and
+# unit axes, so one dead timer can never mask or reset another's clock. A
+# systemctl call that fails outright (binary missing, systemd unreachable) is
+# reported and skipped — not alarmed — same posture as an unreachable
+# checkout: this axis reports what it can prove.
+while IFS=: read -r tl_label tl_timer tl_service tl_max_staleness; do
+  [[ -n "$tl_label" ]] || continue
+
+  if ! tl_timer_show=$("$SYSTEMCTL_BIN" show "$tl_timer" -p UnitFileState -p ActiveState --value 2>/dev/null); then
+    echo "timer liveness: $tl_label ($tl_timer) systemctl show failed, skipping (systemd unreachable)" >&2
+    continue
+  fi
+  if ! tl_service_show=$("$SYSTEMCTL_BIN" show "$tl_service" -p Result -p ExecMainExitTimestamp --value 2>/dev/null); then
+    echo "timer liveness: $tl_label ($tl_service) systemctl show failed, skipping (systemd unreachable)" >&2
+    continue
+  fi
+
+  tl_unit_file_state=$(sed -n '1p' <<<"$tl_timer_show")
+  tl_timer_active=$(sed -n '2p' <<<"$tl_timer_show")
+  tl_result=$(sed -n '1p' <<<"$tl_service_show")
+  tl_exit_ts=$(sed -n '2p' <<<"$tl_service_show")
+  tl_exit_epoch=$(date -u -d "$tl_exit_ts" +%s 2>/dev/null || echo 0)
+  tl_age=$(( $(date -u +%s) - tl_exit_epoch ))
+
+  if [[ "$tl_unit_file_state" != "enabled" || "$tl_timer_active" != "active" ]]; then
+    tl_status=DRIFT tl_reason="timer-disabled:${tl_label}"
+  elif [[ "$tl_result" != "success" ]]; then
+    tl_status=DRIFT tl_reason="timer-service-failed:${tl_label}"
+  elif (( tl_age > tl_max_staleness )); then
+    tl_status=DRIFT tl_reason="timer-service-stale:${tl_label}"
+  else
+    tl_status=ok tl_reason=-
+  fi
+  [[ "$tl_status" == "DRIFT" ]] && overall_drift=1
+
+  tl_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  tl_line="$tl_ts timer=$tl_label unit_file_state=$tl_unit_file_state timer_active=$tl_timer_active result=$tl_result age_s=$tl_age status=$tl_status reason=$tl_reason"
+  echo "$tl_line"
+  tl_log="${DRIFT_LOG}.timer-${tl_label}"
+  tl_state="${ALERT_STATE}.timer-${tl_label}"
+  echo "$tl_line" >> "$tl_log" 2>/dev/null || true
+
+  if [[ "$tl_status" == "DRIFT" ]]; then
+    echo "paperclip timer liveness: $tl_label ($tl_timer / $tl_service) unhealthy: $tl_reason" >&2
+    run_drift_gate "$tl_log" "$tl_state" "$tl_reason" \
+      "Timer $tl_label: timer unit_file_state=$tl_unit_file_state active=$tl_timer_active; service result=$tl_result last-exit-age=${tl_age}s (max ${tl_max_staleness}s)."
+  fi
+done <<< "$TIMERS"
 
 [[ "$overall_drift" == "1" ]] && exit 1
 exit 0

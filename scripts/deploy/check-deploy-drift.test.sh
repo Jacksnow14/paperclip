@@ -144,6 +144,10 @@ run_check() {
   PAPERCLIP_DRIFT_CHECKOUTS="${PAPERCLIP_DRIFT_CHECKOUTS-}" \
   PAPERCLIP_DRIFT_CHECKOUT_REFRESH="${PAPERCLIP_DRIFT_CHECKOUT_REFRESH-}" \
   PAPERCLIP_DRIFT_UNITS="${PAPERCLIP_DRIFT_UNITS-}" \
+  PAPERCLIP_DRIFT_TIMERS="${PAPERCLIP_DRIFT_TIMERS-}" \
+  PAPERCLIP_DRIFT_SYSTEMCTL="${PAPERCLIP_DRIFT_SYSTEMCTL-}" \
+  PAPERCLIP_DRIFT_TIMER_THRESHOLD_SEC="${PAPERCLIP_DRIFT_TIMER_THRESHOLD_SEC-}" \
+  FAKE_SYSTEMCTL_DIR="${FAKE_SYSTEMCTL_DIR-}" \
   FAKE_TIP_DATE="${FAKE_TIP_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
   FAKE_PR_DIR="${FAKE_PR_DIR:-$TMP/prs-none}" \
   NOTIFY_SINK="$SINK" \
@@ -819,6 +823,180 @@ if [[ "$rc" == "0" && "$(alerts)" == "0" ]] && ! grep -q "unit=" <<<"$out"; then
   ok "empty unit list disables the axis entirely"
 else
   fail "empty unit list disables the axis entirely" "rc=$rc alerts=$(alerts) out=$out"
+fi
+
+# --- timer-liveness axis (AUR-5885, follow-up to AUR-5866) ------------------
+# Every axis above answers "is the right code on disk / running" — none of
+# them can see a timer/service pair that is simply DEAD. AUR-5866 found
+# paperclip-pr-review.timer disabled and its service failed for 13 days while
+# unit-drift's own on-disk copy matched the release every tick. These cases
+# prove the axis both FIRES on a genuinely disabled timer + failed service and
+# PASSES on an enabled timer + successful recent service (acceptance
+# criteria) — a check that can never return STALE is exactly the bug being
+# fixed (artifact-provenance doctrine). Hermetic `systemctl` stub below reads
+# `show <unit> -p PROP...` requests from fixture files, one per unit, holding
+# `PROP=value` lines — no real systemd anywhere in this run.
+#
+# Fixture protocol (env):
+#   FAKE_SYSTEMCTL_DIR   directory with one file per unit; `PROP=value` lines
+#                        answer `systemctl show <unit> -p PROP1 -p PROP2`.
+#                        A missing file models `systemctl show` failing
+#                        outright (unit doesn't exist / systemd unreachable).
+SYSTEMCTL="$TMP/systemctl"
+cat > "$SYSTEMCTL" <<'STUB'
+#!/usr/bin/env bash
+set -u
+[[ "${1:-}" == "show" ]] || exit 1
+shift
+unit=$1; shift
+props=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p) props+=("$2"); shift 2 ;;
+    *) shift ;;
+  esac
+done
+fixture="${FAKE_SYSTEMCTL_DIR:?}/$unit"
+[[ -f "$fixture" ]] || exit 1
+for p in "${props[@]}"; do
+  sed -n "s/^${p}=//p" "$fixture"
+done
+STUB
+chmod +x "$SYSTEMCTL"
+
+TL_DIR="$TMP/systemctl-fixtures"
+mkdir -p "$TL_DIR"
+set_tl_timer() { # $1=unit $2=UnitFileState $3=ActiveState
+  printf 'UnitFileState=%s\nActiveState=%s\n' "$2" "$3" > "$TL_DIR/$1"
+}
+set_tl_service() { # $1=unit $2=Result $3=age_seconds_since_last_exit
+  local ts
+  ts=$(date -u -d "@$(( $(date -u +%s) - $3 ))" '+%a %Y-%m-%d %H:%M:%S UTC')
+  printf 'Result=%s\nExecMainExitTimestamp=%s\n' "$2" "$ts" > "$TL_DIR/$1"
+}
+# A single old-timestamped line already sets the gate's sustained-since clock
+# (same property cases 21/22 rely on for the checkout axis) — no need to
+# replay a whole trailing run.
+tl_seed_at() { # $1=reason $2=seconds-ago
+  local stamp
+  stamp=$(date -u -d "@$(( $(date -u +%s) - $2 ))" +%Y-%m-%dT%H:%M:%SZ)
+  printf '%s timer=fixture status=DRIFT reason=%s\n' "$stamp" "$1" >> "$TL_LOG"
+}
+
+TL_LOG="$LOG.timer-fixture"
+TL_STATE="$STATE.timer-fixture"
+
+run_check_tl() {
+  PAPERCLIP_DRIFT_TIMERS="fixture:tl.timer:tl.service:5400" \
+  PAPERCLIP_DRIFT_SYSTEMCTL="$SYSTEMCTL" \
+  FAKE_SYSTEMCTL_DIR="$TL_DIR" \
+    run_check
+}
+
+# 40. PASS: enabled/active timer + a service that succeeded a minute ago
+#     reports ok and pages no one.
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"; clear_ad_state
+rm -f "$TL_LOG" "$TL_STATE"
+set_tl_timer tl.timer enabled active
+set_tl_service tl.service success 60
+out=$(run_check_tl); rc=$?
+if [[ "$rc" == "0" && "$(alerts)" == "0" ]] && grep -q "timer=fixture .*status=ok" <<<"$out"; then
+  ok "enabled timer + recently-successful service reports ok and exits 0"
+else
+  fail "enabled timer + recently-successful service reports ok and exits 0" "rc=$rc alerts=$(alerts) out=$out"
+fi
+
+# 41. FIRE (below threshold): disabled timer + failed service, sustained 30min
+#     — below the 90min threshold, so it drifts (nonzero exit) but does not
+#     yet page. Also proves precedence: disabled wins over service-failed.
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+set_tl_timer tl.timer disabled inactive
+set_tl_service tl.service failed 60
+: > "$TL_LOG"; : > "$TL_STATE"
+tl_seed_at "timer-disabled:fixture" 1800
+out=$(run_check_tl); rc=$?
+if [[ "$rc" == "1" && "$(alerts)" == "0" ]] && grep -q "reason=timer-disabled:fixture" <<<"$out"; then
+  ok "disabled timer + failed service at 30min drifts but does not yet page (90min threshold)"
+else
+  fail "disabled timer + failed service at 30min drifts but does not yet page (90min threshold)" "rc=$rc alerts=$(alerts) out=$out"
+fi
+
+# 42. FIRE (sustained past threshold, THE ACCEPTANCE-CRITERIA CASE): the same
+#     disabled timer + failed service, sustained 100min, pages — and at SEV2,
+#     the same "automation is silently dead" class as provenance/dark-armed,
+#     not INFO-graded fleet debt.
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+: > "$TL_LOG"; : > "$TL_STATE"
+tl_seed_at "timer-disabled:fixture" 6000
+out=$(run_check_tl); rc=$?
+if [[ "$(alerts)" == "1" ]] && grep -q "timer-disabled:fixture" "$SINK"; then
+  ok "disabled timer + failed service sustained past 90min pages, naming the timer"
+else
+  fail "disabled timer + failed service sustained past 90min pages, naming the timer" "rc=$rc alerts=$(alerts) sink=$(cat "$SINK" 2>/dev/null) out=$out"
+fi
+if grep -q "^SEV2 .*timer-disabled:fixture" "$SINK" && ! grep -q "^INFO " "$SINK"; then
+  ok "timer-liveness (timer-disabled) escalates at SEV2, not INFO (silent-dead-unit class)"
+else
+  fail "timer-liveness (timer-disabled) escalates at SEV2, not INFO (silent-dead-unit class)" "sink=$(cat "$SINK" 2>/dev/null)"
+fi
+
+# 43. FIRE (service-failed only): timer itself enabled/active, but the paired
+#     service's last run Result != success — pages with reason
+#     timer-service-failed, distinct from timer-disabled.
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+set_tl_timer tl.timer enabled active
+set_tl_service tl.service failed 60
+: > "$TL_LOG"; : > "$TL_STATE"
+tl_seed_at "timer-service-failed:fixture" 6000
+out=$(run_check_tl); rc=$?
+if [[ "$(alerts)" == "1" ]] && grep -q "reason=timer-service-failed:fixture" <<<"$out" \
+   && grep -q "timer-service-failed:fixture" "$SINK"; then
+  ok "enabled timer with a failed service last-run pages, reason=timer-service-failed"
+else
+  fail "enabled timer with a failed service last-run pages, reason=timer-service-failed" "rc=$rc alerts=$(alerts) out=$out"
+fi
+
+# 44. FIRE (service-stale only): timer healthy, service Result=success, but
+#     the last successful completion is older than this target's configured
+#     max_staleness (5400s here) — pages with reason timer-service-stale.
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+set_tl_timer tl.timer enabled active
+set_tl_service tl.service success $(( 3 * 3600 ))
+: > "$TL_LOG"; : > "$TL_STATE"
+tl_seed_at "timer-service-stale:fixture" 6000
+out=$(run_check_tl); rc=$?
+if [[ "$(alerts)" == "1" ]] && grep -q "reason=timer-service-stale:fixture" <<<"$out" \
+   && grep -q "timer-service-stale:fixture" "$SINK"; then
+  ok "enabled timer whose service last succeeded beyond max_staleness pages, reason=timer-service-stale"
+else
+  fail "enabled timer whose service last succeeded beyond max_staleness pages, reason=timer-service-stale" "rc=$rc alerts=$(alerts) out=$out"
+fi
+
+# 45. A systemctl call that fails outright (unit unreachable/nonexistent) is
+#     skipped, not alarmed — this axis reports what it can prove, same
+#     posture as an unreachable checkout (case 24) / missing unit source
+#     (case 38).
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+rm -f "$TL_DIR/tl.timer" "$TL_DIR/tl.service"
+out=$(run_check_tl); rc=$?
+if [[ "$rc" == "0" && "$(alerts)" == "0" ]] && grep -q "systemctl show failed, skipping" <<<"$out"; then
+  ok "systemctl unreachable for a watched timer is skipped, not alarmed"
+else
+  fail "systemctl unreachable for a watched timer is skipped, not alarmed" "rc=$rc alerts=$(alerts) out=$out"
+fi
+
+# 46. Feature off by default: no PAPERCLIP_DRIFT_TIMERS, no timer lines, exit
+#     still 0 on a converged deploy — opt-in for the same reason as
+#     PAPERCLIP_DRIFT_CHECKOUTS/PAPERCLIP_DRIFT_UNITS (cases 25/39). This is
+#     the exact shape of the AUR-4187 "shipped dark" bug one axis over: a
+#     wrong hardcoded default here would either perpetually page on hosts
+#     without the pr-review unit, or (worse) silently watch nothing.
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+out=$(run_check); rc=$?
+if [[ "$rc" == "0" && "$(alerts)" == "0" ]] && ! grep -q "timer=" <<<"$out"; then
+  ok "empty timer list disables the axis entirely"
+else
+  fail "empty timer list disables the axis entirely" "rc=$rc alerts=$(alerts) out=$out"
 fi
 
 echo

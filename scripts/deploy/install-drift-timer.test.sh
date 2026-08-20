@@ -23,6 +23,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 INSTALL="$SCRIPT_DIR/install-drift-timer.sh"
 REPO_DROPIN="$SCRIPT_DIR/systemd/paperclip-deploy-drift.service.d/10-checkouts.conf"
 REPO_UNITS_DROPIN="$SCRIPT_DIR/systemd/paperclip-deploy-drift.service.d/20-units.conf"
+REPO_TIMERS_DROPIN="$SCRIPT_DIR/systemd/paperclip-deploy-drift.service.d/30-timers.conf"
 [[ -f "$INSTALL" ]] || { echo "missing $INSTALL" >&2; exit 1; }
 
 TMP=$(mktemp -d)
@@ -89,13 +90,14 @@ else
 fi
 
 # 2. Control: the same installer, same stubs, WITH a watch list, succeeds. Case
-#    1 must fail for the empty list and nothing else. Also carries a
-#    PAPERCLIP_DRIFT_UNITS entry — since AUR-5648 both watch lists are
-#    required for a clean install, so every case past this point that expects
-#    success supplies both.
+#    1 must fail for the empty list and nothing else. Also carries
+#    PAPERCLIP_DRIFT_UNITS and PAPERCLIP_DRIFT_TIMERS entries — since
+#    AUR-5648/AUR-5885 all three watch lists are required for a clean install,
+#    so every case past this point that expects success supplies all three.
 run_install '[Service]
 Environment="PAPERCLIP_DRIFT_CHECKOUTS=alpha:/tmp/alpha:main\nbeta:/tmp/beta:master"
-Environment="PAPERCLIP_DRIFT_UNITS=svc:foo.service:/tmp/foo.service:system"'; rc=$?
+Environment="PAPERCLIP_DRIFT_UNITS=svc:foo.service:/tmp/foo.service:system"
+Environment="PAPERCLIP_DRIFT_TIMERS=t:t.timer:t.service:5400"'; rc=$?
 if [[ "$rc" == "0" ]] && grep -q "armed for: alpha beta" "$OUT"; then
   ok "install with a watch list succeeds and names the armed checkouts"
 else
@@ -175,11 +177,12 @@ else
   fail "install with no unit watch list fails loudly" "rc=$rc out=$(cat "$OUT")"
 fi
 
-# 7. Control: WITH a unit watch list (and a checkout list, so only the unit
-#    guard is under test), install succeeds and names the armed units.
+# 7. Control: WITH a unit watch list (and checkout/timer lists, so only the
+#    unit guard is under test), install succeeds and names the armed units.
 run_install '[Service]
 Environment="PAPERCLIP_DRIFT_CHECKOUTS=alpha:/tmp/alpha:main"
-Environment="PAPERCLIP_DRIFT_UNITS=gamma:foo.service:/tmp/foo.service:system\ndelta:bar.timer:/tmp/bar.timer:user"'; rc=$?
+Environment="PAPERCLIP_DRIFT_UNITS=gamma:foo.service:/tmp/foo.service:system\ndelta:bar.timer:/tmp/bar.timer:user"
+Environment="PAPERCLIP_DRIFT_TIMERS=t:t.timer:t.service:5400"'; rc=$?
 if [[ "$rc" == "0" ]] && grep -q "unit-drift axis armed for: gamma delta" "$OUT"; then
   ok "install with a unit watch list succeeds and names the armed units"
 else
@@ -235,6 +238,90 @@ else
     ok "repo ships a non-empty unit watch list ($ucount entries, all label:src:installed:level)"
   else
     fail "repo ships a non-empty unit watch list" "count=$ucount malformed=$ubad entries=$uentries"
+  fi
+fi
+
+# --- timer-liveness axis wiring (AUR-5885, follow-up to AUR-5866) ----------
+# Mirrors cases 6-10 above, one level up from unit-drift: PAPERCLIP_DRIFT_TIMERS
+# ships dark by the same construction (empty opt-in default, nothing sets it)
+# unless this installer refuses to leave it that way — the exact class of bug
+# that let paperclip-pr-review.timer sit disabled for 13 days unnoticed.
+
+# 11. The dark state is refused for timers too. Checkout and unit watch lists
+#     alone are not enough — all three guards must independently hold.
+run_install '[Service]
+Environment="PAPERCLIP_DRIFT_CHECKOUTS=alpha:/tmp/alpha:main"
+Environment="PAPERCLIP_DRIFT_UNITS=gamma:foo.service:/tmp/foo.service:system"'; rc=$?
+if [[ "$rc" != "0" ]] && grep -q "PAPERCLIP_DRIFT_TIMERS is empty" "$OUT"; then
+  ok "install with no timer watch list fails loudly"
+else
+  fail "install with no timer watch list fails loudly" "rc=$rc out=$(cat "$OUT")"
+fi
+
+# 12. Control: WITH a timer watch list (and checkout/unit lists, so only the
+#     timer guard is under test), install succeeds and names the armed timers.
+run_install '[Service]
+Environment="PAPERCLIP_DRIFT_CHECKOUTS=alpha:/tmp/alpha:main"
+Environment="PAPERCLIP_DRIFT_UNITS=gamma:foo.service:/tmp/foo.service:system"
+Environment="PAPERCLIP_DRIFT_TIMERS=epsilon:e.timer:e.service:5400\nzeta:z.timer:z.service:3600"'; rc=$?
+if [[ "$rc" == "0" ]] && grep -q "timer-liveness axis armed for: epsilon zeta" "$OUT"; then
+  ok "install with a timer watch list succeeds and names the armed timers"
+else
+  fail "install with a timer watch list succeeds and names the armed timers" "rc=$rc out=$(cat "$OUT")"
+fi
+
+# 13. Every armed timer gets its own pre-created (log, state) pair — same
+#     silent-disable hazard as the checkout/unit axes: the unit runs as
+#     $UNIT_USER against root-owned /var/log.
+missing=()
+for label in epsilon zeta; do
+  [[ -f "${LOG_BASE}.timer-${label}" ]] || missing+=("log:$label")
+  [[ -f "${LOG_BASE%.log}.alert-state.timer-${label}" ]] || missing+=("state:$label")
+done
+if [[ ${#missing[@]} -eq 0 ]]; then
+  ok "each armed timer gets a pre-created (log, state) pair"
+else
+  fail "each armed timer gets a pre-created (log, state) pair" "missing: ${missing[*]}"
+fi
+
+# 14. Two drop-ins setting PAPERCLIP_DRIFT_TIMERS: the installer must read the
+#     LAST assignment, exactly as systemd does and exactly as cases 5/9 proved
+#     for PAPERCLIP_DRIFT_CHECKOUTS/PAPERCLIP_DRIFT_UNITS.
+run_install '[Service]
+Environment="PAPERCLIP_DRIFT_CHECKOUTS=alpha:/tmp/alpha:main"
+Environment="PAPERCLIP_DRIFT_UNITS=gamma:foo.service:/tmp/foo.service:system"
+Environment="PAPERCLIP_DRIFT_TIMERS=stale:s.timer:s.service:5400"'
+extra="$TMP/stage.$CASE/systemd/paperclip-deploy-drift.service.d/40-later-timers.conf"
+printf '%s\n' '[Service]
+Environment="PAPERCLIP_DRIFT_TIMERS=winner:w.timer:w.service:5400"' > "$extra"
+PATH="$BIN:$PATH" \
+PAPERCLIP_DRIFT_UNIT_DIR="$TMP/units.$CASE" \
+PAPERCLIP_DRIFT_LOG="$LOG_BASE" \
+PAPERCLIP_DRIFT_ALERT_STATE="${LOG_BASE%.log}.alert-state" \
+PAPERCLIP_DRIFT_UNIT_USER="$(id -un)" \
+PAPERCLIP_DRIFT_INSTALL_NO_SYSTEMD=1 \
+  bash "$TMP/stage.$CASE/install-drift-timer.sh" >"$OUT" 2>&1
+if grep -qx "timer-liveness axis armed for: winner " "$OUT"; then
+  ok "with two drop-ins the installer reads the last timer assignment, as systemd does"
+else
+  fail "with two drop-ins the installer reads the last timer assignment, as systemd does" "out=$(cat "$OUT")"
+fi
+
+# 15. The checked-in timer watch list is real: non-empty and every entry
+#     parses as label:timer_unit:service_unit:max_staleness_sec, and it names
+#     paperclip-pr-review as the first target (the acceptance criterion this
+#     issue exists to satisfy).
+if [[ ! -f "$REPO_TIMERS_DROPIN" ]]; then
+  fail "repo ships a non-empty timer watch list" "missing $REPO_TIMERS_DROPIN"
+else
+  tentries=$(sed -n 's/^Environment="\?PAPERCLIP_DRIFT_TIMERS=//p' "$REPO_TIMERS_DROPIN" | sed 's/"$//')
+  tentries=$(printf '%b' "$tentries" | grep -v '^[[:space:]]*$' || true)
+  tcount=$(printf '%s\n' "$tentries" | grep -c . || true)
+  tbad=$(printf '%s\n' "$tentries" | grep -vcE '^[A-Za-z0-9._-]+:[^:]+:[^:]+:[0-9]+$' || true)
+  if [[ "$tcount" -gt 0 && "$tbad" == "0" ]] && printf '%s\n' "$tentries" | grep -q '^pr-review:paperclip-pr-review\.timer:paperclip-pr-review\.service:'; then
+    ok "repo ships a non-empty timer watch list ($tcount entries, all label:timer:service:staleness) including pr-review"
+  else
+    fail "repo ships a non-empty timer watch list including pr-review" "count=$tcount malformed=$tbad entries=$tentries"
   fi
 fi
 

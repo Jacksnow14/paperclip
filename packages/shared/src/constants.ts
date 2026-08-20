@@ -424,7 +424,6 @@ export const APPROVAL_STATUSES = [
   // Terminal, requester-initiated (AUR-5344). Distinct from "rejected": the
   // board judged nothing, the requester retired its own defective request.
   "withdrawn",
-  "cancelled",
 ] as const;
 export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
 

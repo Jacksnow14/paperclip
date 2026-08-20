@@ -1,0 +1,18 @@
+# Every ~2 minutes, always — including through the 00:00-05:00 UTC overnight
+# quiet window that AUR-5857 measured as the dead spot. The CLI's own refresh
+# window is a hard 5 minutes before expiresAt (decompiled + verified live on
+# AUR-5864); a 2-minute tick keeps at most ~2min slack against that window so
+# a warming call always lands before real morning traffic does. Independent
+# of paperclip-fleet-refresh.timer (06:30 UTC, CLI/model version refresh —
+# different purpose, too late for this one).
+[Unit]
+Description=Run the claude_local OAuth warmer every ~2 minutes (AUR-5864)
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

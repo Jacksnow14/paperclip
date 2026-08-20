@@ -1,0 +1,22 @@
+# AUR-5864: proactively warm the shared claude_local OAuth session so it is
+# never caught fully expired by real fleet traffic (AUR-5857). No-ops on
+# every tick except the one that lands inside the CLI's own 5-minute
+# pre-expiry refresh window (see AUR-5864 verification comment for how that
+# threshold was confirmed) — cheap local JSON read the rest of the time.
+# Never writes .credentials.json directly; only invokes the claude CLI.
+[Unit]
+Description=Warm the shared claude_local OAuth session (AUR-5864)
+Documentation=https://paperclip/AUR/issues/AUR-5864
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ievgen
+Group=ievgen
+Environment=HOME=/home/ievgen
+Environment=PATH=/home/ievgen/.local/bin:/home/ievgen/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/node /opt/paperclip/app/current/scripts/oauth-warm.mjs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=paperclip-oauth-warm

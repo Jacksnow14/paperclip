@@ -771,6 +771,39 @@ export function isClaudeQuotaExhaustedError(input: ClaudeFailureFields): boolean
   return detectClaudeQuotaExhaustion(input) !== null;
 }
 
+// AUR-5863: the CLI's own credential-refresh failure, distinct from both
+// `claude_auth_required` (needs a human to run `claude login`) and ordinary
+// transient upstream weather. Verbatim production wording -- specimen run
+// 7a0e35c9-035a-4d75-89d0-e192a3189ef3 (2026-08-16T06:30:02Z), and identical
+// across every AUR-5412 run log that retains one (grepped 2026-08-20 against
+// instances/default/data/run-logs/: no other variant observed):
+//
+//   "Failed to authenticate: OAuth session expired and could not be refreshed"
+//
+// This self-heals on its own schedule (the credential recovers without human
+// action, typically by ~12:00 UTC) rather than needing a human `claude
+// login`, so it must NOT be folded into CLAUDE_AUTH_REQUIRED_RE -- doing so
+// would route it to a founder-escalation path that does not apply here, and
+// conversely widening CLAUDE_AUTH_REQUIRED_RE itself would risk suppressing a
+// genuine login-required case. Broaden this regex only against a second
+// confirmed production sample, not speculatively.
+const CLAUDE_OAUTH_REFRESH_FAILED_RE =
+  /failed\s+to\s+authenticate:?\s*oauth\s+session\s+expired(?:\s+and\s+could\s+not\s+be\s+refreshed)?/i;
+
+export const CLAUDE_OAUTH_REFRESH_FAILED_ERROR_CODE = "claude_oauth_refresh_failed";
+
+export function isClaudeOAuthRefreshFailedError(input: ClaudeFailureFields): boolean {
+  const parsed = input.parsed ?? null;
+  const haystack = normalizeHaystack([
+    input.errorMessage ?? "",
+    parsed ? asString(parsed.result, "") : "",
+    ...(parsed ? extractClaudeErrorMessages(parsed) : []),
+    input.stdout ?? "",
+    input.stderr ?? "",
+  ]);
+  return CLAUDE_OAUTH_REFRESH_FAILED_RE.test(haystack);
+}
+
 /**
  * AUR-4144: the `resultJson` payload for a quota wall. A follow-up issue reads this to
  * surface quota state on the agent record and to escalate `out_of_credits` (which is NOT
@@ -803,12 +836,14 @@ export function resolveClaudeFailureErrorCode(input: {
   maxTurnsExhausted?: boolean;
   contextOverflow: boolean;
   quotaExhausted: boolean;
+  oauthRefreshFailed: boolean;
   transientUpstream: boolean;
 }): string | null {
   if (input.requiresLogin) return "claude_auth_required";
   if (input.maxTurnsExhausted) return "max_turns_exhausted";
   if (input.contextOverflow) return CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE;
   if (input.quotaExhausted) return CLAUDE_QUOTA_EXHAUSTED_ERROR_CODE;
+  if (input.oauthRefreshFailed) return CLAUDE_OAUTH_REFRESH_FAILED_ERROR_CODE;
   if (input.transientUpstream) return "claude_transient_upstream";
   return null;
 }
@@ -886,6 +921,11 @@ export function isClaudeTransientUpstreamError(input: {
     stderr: input.stderr ?? "",
   });
   if (loginMeta.requiresLogin) return false;
+
+  // AUR-5863: the OAuth credential-refresh failure gets its own error code (see
+  // `isClaudeOAuthRefreshFailedError`) so it must not also match here as an
+  // undifferentiated `claude_transient_upstream`.
+  if (isClaudeOAuthRefreshFailedError(input)) return false;
 
   // AUR-4144: QUOTA WINS. A quota wall is not a transient upstream hiccup -- it is a
   // deterministic wall with a known reset instant, and conflating the two is what made

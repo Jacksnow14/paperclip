@@ -22,6 +22,7 @@ import {
   issueTreeHolds,
   issueWorkProducts,
   issues,
+  routines,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -3676,6 +3677,52 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       // Exactly one dispatch: the second issue was cancelled before its enqueue
       // and the revalidation refused it.
       expect(dispatched).toHaveLength(1);
+    });
+  });
+
+  // AUR-5846: an issue that owns a `reuse_and_rewake` routine never gets woken
+  // directly by that routine (the routine fires against its own separate
+  // routine_execution issue instead), so hasActiveExecutionPath used to always
+  // miss it between fires even though the routine will legitimately re-fire
+  // later. This widened hasActiveExecutionPath to also treat a still-active
+  // owning routine (routines.parentIssueId) as a live path. Exercised through
+  // isRecoveryDispatchStillValid, one of the two call sites, the same way the
+  // AUR-5102 suite above exercises the pre-existing branches.
+  describe("AUR-5846 hasActiveExecutionPath via owning routine", () => {
+    it("treats a still-active owning routine as a live path (positive case)", async () => {
+      const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+        status: "todo",
+        runStatus: "failed",
+      });
+      await db.insert(routines).values({
+        id: randomUUID(),
+        companyId,
+        parentIssueId: issueId,
+        title: "Owning routine (AUR-5846 fixture)",
+        status: "active",
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: (async () => null) as never });
+      await expect(
+        recovery.isRecoveryDispatchStillValid({ issueId, agentId, expectedStatus: "todo" }),
+      ).resolves.toBe(false);
+    });
+
+    it("does not treat a paused owning routine as a live path (negative case)", async () => {
+      const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+        status: "todo",
+        runStatus: "failed",
+      });
+      await db.insert(routines).values({
+        id: randomUUID(),
+        companyId,
+        parentIssueId: issueId,
+        title: "Paused owning routine (AUR-5846 fixture)",
+        status: "paused",
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: (async () => null) as never });
+      await expect(
+        recovery.isRecoveryDispatchStillValid({ issueId, agentId, expectedStatus: "todo" }),
+      ).resolves.toBe(true);
     });
   });
 

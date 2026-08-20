@@ -23,6 +23,7 @@ import {
   issueThreadInteractions,
   issues,
   projects,
+  routines,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
@@ -536,7 +537,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function hasActiveExecutionPath(companyId: string, issueId: string) {
-    const [run, deferredWake] = await Promise.all([
+    const [run, deferredWake, ownedActiveRoutine] = await Promise.all([
       db
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
@@ -561,9 +562,25 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         )
         .limit(1)
         .then((rows) => rows[0] ?? null),
+      // AUR-5846: an issue that owns a `reuse_and_rewake` routine never gets woken
+      // directly (the routine fires against its own routine_execution issue instead),
+      // so the checks above always miss it between fires even though the routine will
+      // legitimately re-fire later. A still-active owning routine is itself a live path.
+      db
+        .select({ id: routines.id })
+        .from(routines)
+        .where(
+          and(
+            eq(routines.companyId, companyId),
+            eq(routines.parentIssueId, issueId),
+            eq(routines.status, "active"),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
     ]);
 
-    return Boolean(run || deferredWake);
+    return Boolean(run || deferredWake || ownedActiveRoutine);
   }
 
   async function hasQueuedIssueWake(companyId: string, issueId: string) {

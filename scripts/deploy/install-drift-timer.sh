@@ -94,6 +94,33 @@ while IFS= read -r label; do
 done <<<"$unit_labels"
 echo "unit-drift axis armed for: $(printf '%b' "$units" | cut -d: -f1 | tr '\n' ' ')"
 
+# --- timer-liveness axis wiring (AUR-5885, follow-up to AUR-5866) ----------
+# Same "shipped dark" hazard as the checkout/unit axes above, one level
+# further: paperclip-pr-review.timer sat disabled for 13 days with zero
+# signal because nothing anywhere asked systemd whether it was actually
+# alive. The watch list ships as a sibling drop-in (30-timers.conf) already
+# copied by the DROPIN_SRC block above, so this script refuses to leave it
+# in the dark (empty) state, exactly as for PAPERCLIP_DRIFT_CHECKOUTS/UNITS.
+timers=$(sudo cat "$UNIT_DIR/paperclip-deploy-drift.service.d"/*.conf 2>/dev/null |
+  sed -n 's/^Environment="\?PAPERCLIP_DRIFT_TIMERS=//p' | sed 's/"$//' | tail -n 1 || true)
+if [[ -z "$timers" ]]; then
+  echo "install-drift-timer: FATAL — PAPERCLIP_DRIFT_TIMERS is empty after install." >&2
+  echo "  The timer-liveness axis (AUR-5885) would watch zero timers and report a" >&2
+  echo "  clean fleet forever, exactly the silent-dead-unit class it exists to" >&2
+  echo "  catch. Add entries to" >&2
+  echo "  scripts/deploy/systemd/paperclip-deploy-drift.service.d/30-timers.conf" >&2
+  echo "  as label:timer_unit:service_unit:max_staleness_sec. See AUR-5866." >&2
+  exit 1
+fi
+
+timer_labels=$(printf '%b' "$timers" | cut -d: -f1 | grep -v '^[[:space:]]*$' || true)
+while IFS= read -r label; do
+  [[ -n "$label" ]] || continue
+  sudo touch "${LOG_BASE}.timer-${label}" "${STATE_BASE}.timer-${label}"
+  sudo chown "$UNIT_USER:$UNIT_USER" "${LOG_BASE}.timer-${label}" "${STATE_BASE}.timer-${label}"
+done <<<"$timer_labels"
+echo "timer-liveness axis armed for: $(printf '%b' "$timers" | cut -d: -f1 | tr '\n' ' ')"
+
 if [[ "$NO_SYSTEMD" != "1" ]]; then
   sudo systemctl daemon-reload
   sudo systemctl enable --now paperclip-deploy-drift.timer

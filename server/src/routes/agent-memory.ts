@@ -22,7 +22,7 @@ export function agentMemoryRoutes(db: Db, opts?: { embedder?: Embedder }) {
   const memory = agentMemoryService(db, () => opts?.embedder ?? resolveDefaultEmbedder());
 
   function requireAgentActor(req: import("express").Request) {
-    if (req.actor.type !== "agent" || !req.actor.agentId) {
+    if (req.actor.type !== "agent" || !req.actor.agentId || !req.actor.companyId) {
       throw forbidden("Agent API key required");
     }
     return { agentId: req.actor.agentId, companyId: req.actor.companyId };

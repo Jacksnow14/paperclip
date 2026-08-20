@@ -30,27 +30,35 @@ const attachmentInputSchema = z.object({
 
 const ccSchema = z.union([z.string(), z.array(z.string())]).optional();
 
-const sendMessageBodySchema = z.object({
-  to: z.string().min(1),
-  subject: z.string().min(1),
-  body: z.string().min(1),
-  replyToMessageId: z.string().optional(),
-  cc: ccSchema,
-  replyTo: z.string().email().optional(),
-  attachments: z.array(attachmentInputSchema).optional(),
-  ceoApprovalId: z.string().optional(),
-  // AUR-5732: cold prospecting must prove it is reaching a human, and that the
-  // human is the one recorded on the tracker row.
-  prospecting: z.boolean().optional(),
-  recipientPersonName: z.string().optional(),
-  queueJustification: z.string().optional(),
-  // AUR-5735/AUR-5737: recipientPersonName alone proves nothing about
-  // whether the mailbox belongs to that person — evidenceGrade asserts how
-  // the caller knows.
-  evidenceGrade: z.string().optional(),
-  evidenceJustification: z.string().optional(),
-  intendedRecipient: z.string().optional(),
-});
+const sendMessageBodySchema = z
+  .object({
+    to: z.string().min(1),
+    subject: z.string().min(1),
+    body: z.string().min(1),
+    replyToMessageId: z.string().optional(),
+    cc: ccSchema,
+    replyTo: z.string().email().optional(),
+    attachments: z.array(attachmentInputSchema).optional(),
+    ceoApprovalId: z.string().optional(),
+    // AUR-5732: cold prospecting must prove it is reaching a human, and that the
+    // human is the one recorded on the tracker row.
+    prospecting: z.boolean().optional(),
+    recipientPersonName: z.string().optional(),
+    queueJustification: z.string().optional(),
+    // AUR-5735/AUR-5737: recipientPersonName alone proves nothing about
+    // whether the mailbox belongs to that person — evidenceGrade asserts how
+    // the caller knows.
+    evidenceGrade: z.string().optional(),
+    evidenceJustification: z.string().optional(),
+    intendedRecipient: z.string().optional(),
+    // AUR-5891: declared-intent opt-out for a buyer-side vendor inquiry to a
+    // role mailbox, mirroring allowSelfAddressed. Requires outboundJustification.
+    outboundKind: z.literal("vendor_inquiry").optional(),
+    outboundJustification: z.string().optional(),
+  })
+  .refine((v) => !v.outboundKind || (v.outboundJustification ?? "").trim().length >= 20, {
+    message: "outboundJustification (>=20 chars) is required when outboundKind is set",
+  });
 
 const replyBodySchema = z
   .object({
@@ -73,9 +81,15 @@ const replyBodySchema = z
     evidenceGrade: z.string().optional(),
     evidenceJustification: z.string().optional(),
     intendedRecipient: z.string().optional(),
+    // AUR-5891: see sendMessageBodySchema.
+    outboundKind: z.literal("vendor_inquiry").optional(),
+    outboundJustification: z.string().optional(),
   })
   .refine((v) => Boolean(v.replyToMessageId || v.threadId), {
     message: "replyToMessageId or threadId is required",
+  })
+  .refine((v) => !v.outboundKind || (v.outboundJustification ?? "").trim().length >= 20, {
+    message: "outboundJustification (>=20 chars) is required when outboundKind is set",
   });
 
 const modifyLabelsBodySchema = z.object({

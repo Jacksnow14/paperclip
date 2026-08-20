@@ -254,6 +254,20 @@ export interface GmailSendOptions {
    * proved the recipient was not us; this proves it is the prospect.
    */
   intendedRecipient?: string;
+  /**
+   * AUR-5891: declare this a BUYER-side send to a vendor/supplier role
+   * mailbox (e.g. requesting pricing from admin@ a data vendor), the opposite
+   * direction from AUR-5732's `prospecting`. The AUR-5734 guard's
+   * role/system-mailbox refusal exists to catch unsupervised COLD prospecting
+   * into a queue nobody reads — but a role mailbox is routinely the ONLY
+   * correct address for legitimate procurement correspondence. Only the
+   * "role/system mailbox" reason is downgraded; suppression (machine-only/
+   * bounce evidence) and denylist verdicts stay hard-blocked regardless.
+   * Requires `outboundJustification`.
+   */
+  outboundKind?: "vendor_inquiry";
+  /** AUR-5891: why this role mailbox is the correct address for this send (>=20 chars). */
+  outboundJustification?: string;
 }
 
 export interface GmailReplyOptions {
@@ -281,6 +295,10 @@ export interface GmailReplyOptions {
    * queue auto-responder can silently take the conversation over.
    */
   intendedRecipient?: string;
+  /** AUR-5891: see GmailSendOptions.outboundKind. */
+  outboundKind?: "vendor_inquiry";
+  /** AUR-5891: see GmailSendOptions.outboundJustification. */
+  outboundJustification?: string;
 }
 
 export interface GmailListOptions {
@@ -684,11 +702,31 @@ export function createGmailService(db?: Db) {
     // that an agent might be sending unsupervised into a queue nobody reads
     // or onto a deliberately curated do-not-contact list, which is exactly
     // the class of mistake this guard is for.
+    //
+    // AUR-5891: "role/system mailbox" is ALSO not always a cold-prospecting
+    // mistake. `nonProspectReason()` answers "is this a good address for cold
+    // prospecting?" — correctly "no" for a role inbox. But a BUYER-side
+    // vendor inquiry (e.g. requesting pricing from a data vendor's admin@) is
+    // the opposite direction, and a role mailbox is routinely the ONLY
+    // correct address for that: FranChimp's admin@ blocked AUR-5869 even
+    // though its web contact form was unreachable (reCAPTCHA) and admin@ was
+    // the only channel in. Do NOT widen DEFAULT_ROLE_PATTERN in Auranode —
+    // that would reopen cold prospecting into every admin@ mailbox in the
+    // corpus. Instead, a deliberate, per-send, justified opt-out
+    // (`outboundKind: "vendor_inquiry"` + `outboundJustification`, mirroring
+    // `allowSelfAddressed`) downgrades ONLY the role-mailbox refusal to a
+    // logged warning — never `suppression` (machine-only/bounce evidence)
+    // and never `denylisted recipient:`, both of which stay hard-blocked
+    // regardless of declared intent.
     if (!isApprovalScopedToSend(guard, alias, opts)) {
       const ccList = Array.isArray(opts.cc) ? opts.cc : opts.cc ? [opts.cc] : [];
       const externalRecipients = new Set(
         [opts.to, ...ccList].flatMap((v) => extractEmailAddresses(v)).filter((addr) => !isOwnDomain(addr)),
       );
+      const hasVendorInquiryJustification =
+        opts.outboundKind === "vendor_inquiry" &&
+        typeof opts.outboundJustification === "string" &&
+        opts.outboundJustification.trim().length >= 20;
       for (const address of externalRecipients) {
         const verdict = await checkProspectSendability(address);
         if (!verdict || verdict.sendable) continue;
@@ -698,6 +736,23 @@ export function createGmailService(db?: Db) {
           logger.warn(
             { alias, to: opts.to, cc: opts.cc, address, reason: verdict.reason, source: verdict.source },
             "gmail-guard: own-domain non-prospect recipient — WARN only, not blocked (AUR-5807)",
+          );
+          continue;
+        }
+        const isRoleMailboxNonProspect =
+          verdict.source === "non-prospect" && (verdict.reason ?? "").startsWith("role/system mailbox:");
+        if (isRoleMailboxNonProspect && hasVendorInquiryJustification) {
+          logger.warn(
+            {
+              alias,
+              to: opts.to,
+              cc: opts.cc,
+              address,
+              reason: verdict.reason,
+              source: verdict.source,
+              outboundJustification: opts.outboundJustification,
+            },
+            "gmail-guard: role-mailbox non-prospect recipient — WARN only, declared vendor_inquiry (AUR-5891)",
           );
           continue;
         }
@@ -866,6 +921,10 @@ export function createGmailService(db?: Db) {
         evidenceGrade: opts.evidenceGrade,
         evidenceJustification: opts.evidenceJustification,
         intendedRecipient: opts.intendedRecipient,
+        // AUR-5891: see AUR-5732 comment above — same reasoning applies to
+        // the declared-intent role-mailbox opt-out.
+        outboundKind: opts.outboundKind,
+        outboundJustification: opts.outboundJustification,
       },
       guard,
       tracking,

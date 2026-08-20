@@ -562,6 +562,95 @@ describe("createGmailService", () => {
       }
     });
 
+    // AUR-5891 FIRES: a cold-prospecting send to a role mailbox with no
+    // declared outboundKind is still refused, identical to the AUR-5807 test
+    // above. This is the control — proves the new opt-out did not weaken the
+    // default-refused behavior.
+    it("still blocks an unapproved send to a role-mailbox non-prospect-flagged address with no outboundKind declared (AUR-5891)", async () => {
+      vi.mocked(checkProspectSendability).mockResolvedValue({
+        address: "admin@franchimp.com",
+        sendable: false,
+        reason: "role/system mailbox: admin@",
+        source: "non-prospect",
+      });
+      const service = createGmailService();
+      try {
+        await expect(
+          service.sendMessage("alex", {
+            to: "admin@franchimp.com",
+            subject: "Pricing request",
+            body: "Could you share your current pricing?",
+          }),
+        ).rejects.toMatchObject({ name: "GmailProspectSuppressedError" });
+        expect(mockMessagesSend).not.toHaveBeenCalled();
+      } finally {
+        vi.mocked(checkProspectSendability).mockReset().mockResolvedValue(null);
+      }
+    });
+
+    // AUR-5891 PASSES: the same role-mailbox recipient sends when the caller
+    // declares outboundKind: "vendor_inquiry" with a valid (>=20 char)
+    // justification — the exact FranChimp pricing-request scenario from
+    // AUR-5869/AUR-5888. The resolved To: must read back as the vendor
+    // address.
+    it("allows an unapproved send to a role-mailbox non-prospect-flagged address when a justified vendor_inquiry is declared (AUR-5891)", async () => {
+      vi.mocked(checkProspectSendability).mockResolvedValue({
+        address: "admin@franchimp.com",
+        sendable: false,
+        reason: "role/system mailbox: admin@",
+        source: "non-prospect",
+      });
+      mockMessagesSend.mockResolvedValue({ data: { id: "sent-vendor-inquiry" } });
+      const service = createGmailService();
+      try {
+        await expect(
+          service.sendMessage("alex", {
+            to: "admin@franchimp.com",
+            subject: "Pricing request",
+            body: "Could you share your current pricing for the franchise data set?",
+            outboundKind: "vendor_inquiry",
+            outboundJustification: "FranChimp's web contact form is CF-blocked; admin@ is their only channel.",
+          }),
+        ).resolves.toEqual({ id: "sent-vendor-inquiry" });
+        expect(mockMessagesSend).toHaveBeenCalledOnce();
+        const callArgs = mockMessagesSend.mock.calls[0][0];
+        const raw = Buffer.from(callArgs.requestBody.raw as string, "base64url").toString("utf-8");
+        expect(raw).toContain("To: admin@franchimp.com");
+      } finally {
+        vi.mocked(checkProspectSendability).mockReset().mockResolvedValue(null);
+      }
+    });
+
+    // AUR-5891 STILL FIRES: a declared vendor_inquiry must not become a
+    // blanket bypass. An address on the machine-only suppression list
+    // (source: "suppression") stays hard-blocked regardless of intent — a
+    // vendor that only ever answers with a robot should still be retired,
+    // per the counterparty-reality doctrine's rule that a queue mailbox is
+    // never entitled to repeated unsupervised sends.
+    it("still blocks a declared vendor_inquiry to a machine-only-suppressed address (AUR-5891)", async () => {
+      vi.mocked(checkProspectSendability).mockResolvedValue({
+        address: "queue@example.com",
+        sendable: false,
+        reason: "machine-only mailbox: 2 automated replies, 0 human",
+        source: "suppression",
+      });
+      const service = createGmailService();
+      try {
+        await expect(
+          service.sendMessage("alex", {
+            to: "queue@example.com",
+            subject: "Pricing request",
+            body: "Could you share your current pricing?",
+            outboundKind: "vendor_inquiry",
+            outboundJustification: "This is the only published address for this vendor's sales team.",
+          }),
+        ).rejects.toMatchObject({ name: "GmailProspectSuppressedError" });
+        expect(mockMessagesSend).not.toHaveBeenCalled();
+      } finally {
+        vi.mocked(checkProspectSendability).mockReset().mockResolvedValue(null);
+      }
+    });
+
     // AUR-3628: approvalVerified alone (no matching scope, or a scope for a
     // different mailbox/recipient) must NOT satisfy the gate — otherwise any
     // approved approval in the company could be replayed against any send.

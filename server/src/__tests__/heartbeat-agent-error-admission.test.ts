@@ -168,6 +168,59 @@ describeEmbeddedPostgres("agent status=error admission (AUR-5644)", () => {
     expect(request?.status).not.toBe("skipped");
   });
 
+  it("C/FIRE: a comment wake (source: automation, reason: issue_commented) self-heals an error agent and proceeds (AUR-5927)", async () => {
+    const { companyId, issuePrefix } = await seedCompany();
+    const agentId = await seedAgent(companyId, "error");
+    const issueId = await seedIssue(companyId, issuePrefix, agentId);
+    const heartbeat = heartbeatService(db);
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId, mutation: "comment" },
+    });
+
+    expect(run).not.toBeNull();
+    expect(await agentStatus(agentId)).not.toBe("error");
+
+    const request = await latestWakeupRequest(companyId, agentId);
+    expect(request?.status).not.toBe("skipped");
+  });
+
+  it("C/FIRE: a mention wake (source: automation, reason: issue_comment_mentioned) self-heals an error agent (AUR-5927)", async () => {
+    const { companyId, issuePrefix } = await seedCompany();
+    const agentId = await seedAgent(companyId, "error");
+    const issueId = await seedIssue(companyId, issuePrefix, agentId);
+    const heartbeat = heartbeatService(db);
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_comment_mentioned",
+      payload: { issueId, mutation: "comment" },
+    });
+
+    expect(run).not.toBeNull();
+    expect(await agentStatus(agentId)).not.toBe("error");
+  });
+
+  it("C/CLEARING: a reconciliation/liveness automation wake (reason: issue_monitor_recovery) does NOT self-heal an error agent (no dead-lane re-flood; AUR-5927)", async () => {
+    const { companyId } = await seedCompany();
+    const agentId = await seedAgent(companyId, "error");
+    const heartbeat = heartbeatService(db);
+
+    await expect(
+      heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_monitor_recovery",
+      }),
+    ).rejects.toBeInstanceOf(HttpError);
+
+    expect(await agentStatus(agentId)).toBe("error");
+  });
+
   it("B/CLEARING: an ordinary on_demand wake does NOT self-heal an error agent (no dead-lane re-flood)", async () => {
     const { companyId } = await seedCompany();
     const agentId = await seedAgent(companyId, "error");

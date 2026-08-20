@@ -222,6 +222,21 @@ const HEARTBEAT_ADMISSION_INELIGIBLE_AGENT_STATUS_SET = new Set(HEARTBEAT_ADMISS
 const HEARTBEAT_SCHEDULED_RETRY_PROMOTION_INELIGIBLE_AGENT_STATUS_SET = new Set(
   HEARTBEAT_ADMISSION_INELIGIBLE_AGENT_STATUSES.filter((status) => status !== "error"),
 );
+// AUR-5927: comment/mention wakes are dispatched via heartbeat.wakeup directly
+// (routes/issues.ts) with source:"automation", not through
+// queueIssueAssignmentWakeup — so despite the AUR-5644 comment below naming
+// "comment" as covered by its `error`-recovery carve-out, they never actually
+// hit the source==="assignment" branch and a stuck `error` agent silently
+// never wakes on a new comment. Recover on these specific reasons too, but
+// NOT source==="automation" wholesale: that source also carries bulk-ish
+// reconciliation/retry/liveness wakes (issue_monitor_recovery,
+// PROCESS_LOST_RETRY_WAKE_REASON, RUN_LIVENESS_CONTINUATION_REASON) that
+// AUR-4680 deliberately keeps out of admission on a dead lane.
+const AUTOMATION_SOURCE_ERROR_RECOVERABLE_WAKE_REASONS = new Set([
+  "issue_commented",
+  "issue_reopened_via_comment",
+  "issue_comment_mentioned",
+]);
 // Per-tick issue cap for the stranded deferred-wake reaper. Draining promotes runs,
 // so bound how much work a single sweep can start; the remainder drains next tick.
 const DEFERRED_WAKE_REAP_ISSUE_LIMIT = 25;
@@ -10332,7 +10347,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
     }
 
-    if (agent.status === "error" && source === "assignment") {
+    if (
+      agent.status === "error" &&
+      (source === "assignment" ||
+        (source === "automation" &&
+          reason !== null &&
+          AUTOMATION_SOURCE_ERROR_RECOVERABLE_WAKE_REASONS.has(reason)))
+    ) {
       // AUR-5644: `error` is otherwise a permanent absorbing state — the only
       // other automatic exit is a due scheduled_retry promotion (:5463),
       // justified there because a due retry is an explicit, single, bounded
@@ -10343,7 +10364,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // does NOT re-admit any other stale queued/scheduled work on the
       // agent — it only lets *this* wake proceed; a genuinely dead lane with
       // no new assignments stays in `error` and is caught by the AUR-5644
-      // detector instead.
+      // detector instead. AUR-5927 extends this to the comment/mention wake
+      // reasons above for the same justification — see the constant comment.
       const recovered = await db
         .update(agents)
         .set({ status: "idle", updatedAt: new Date() })

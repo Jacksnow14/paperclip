@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   fetchWindowedRecords,
+  coveredSpan,
+  buildRunOutcome,
   aggregateScores,
   quartileThreshold,
   hasLoopCRecord,
@@ -124,6 +126,99 @@ test('fetchWindowedRecords hits MAX_PAGES cap and reports it (no silent truncati
   assert.equal(result.pages, 3);
   assert.ok(result.hitPageCap);
   assert.equal(result.accumulated.length, 3 * pageLimit);
+});
+
+// ── buildRunOutcome: fail-closed on a runaway-guard trip (AUR-4496 #3) ─────
+
+test('buildRunOutcome fails closed when hitPageCap is true: zero proposals, no full-window claim', async () => {
+  const allRecords = Array.from({ length: 2000 }, (_, i) => makeRecord('agent-a', i));
+  const pageLimit = 50;
+  const get = async (path) => {
+    const offset = Number(/offset=(\d+)/.exec(path)[1]);
+    return { records: allRecords.slice(offset, offset + pageLimit) };
+  };
+
+  const paged = await fetchWindowedRecords(get, 'co-1', {
+    refDate: REF_DATE, windowDays: 1000, cooldownDays: 1000, pageLimit, maxPages: 3,
+  });
+  assert.ok(paged.hitPageCap, 'fixture must actually trip the cap for this test to be meaningful');
+
+  const outcome = buildRunOutcome({
+    hitPageCap: paged.hitPageCap,
+    pages: paged.pages,
+    maxPages: 3,
+    accumulated: paged.accumulated,
+    fetchCutoffIso: paged.fetchCutoffIso,
+    dateStr: '2026-07-06',
+  });
+
+  assert.equal(outcome.failClosed, true);
+  assert.equal(outcome.result.proposed, 0, 'a truncated scan must never post proposals');
+  assert.equal(outcome.result.hitPageCap, true);
+  assert.equal(outcome.result.recordsAccumulated, paged.accumulated.length);
+  // Covered range must reflect what was actually read (record 0 = today, record 149 = 149 days ago),
+  // never the unread windowDays=1000 target.
+  assert.equal(outcome.coveredNewest, paged.accumulated[0].createdAt);
+  assert.equal(outcome.coveredOldest, paged.accumulated.at(-1).createdAt);
+  assert.ok(!outcome.commentBody.includes('1000'), 'must not cite the unread configured window in the abort message');
+  assert.ok(outcome.commentBody.includes('No proposals were evaluated or posted'));
+});
+
+test('buildRunOutcome does not fail closed when hitPageCap is false', () => {
+  const outcome = buildRunOutcome({
+    hitPageCap: false,
+    pages: 2,
+    maxPages: 200,
+    accumulated: [],
+    fetchCutoffIso: '2026-06-01T00:00:00.000Z',
+    dateStr: '2026-07-06',
+  });
+  assert.equal(outcome.failClosed, false);
+  assert.equal(outcome.result, undefined);
+});
+
+test('coveredSpan reports the real oldest/newest createdAt of a record set', () => {
+  const records = [
+    { createdAt: '2026-07-01T00:00:00.000Z' },
+    { createdAt: '2026-07-15T00:00:00.000Z' },
+    { createdAt: '2026-06-20T00:00:00.000Z' },
+  ];
+  const { oldest, newest } = coveredSpan(records);
+  assert.equal(oldest, '2026-06-20T00:00:00.000Z');
+  assert.equal(newest, '2026-07-15T00:00:00.000Z');
+});
+
+test('coveredSpan returns empty strings for an empty record set', () => {
+  const { oldest, newest } = coveredSpan([]);
+  assert.equal(oldest, '');
+  assert.equal(newest, '');
+});
+
+test('fetchWindowedRecords pages past the old 20-page cap to reach the cutoff at realistic scorecard volume (AUR-4496)', async () => {
+  // ~140 records/day (current live volume per AUR-4496) over a 35-day history,
+  // fetching out to the 30-day cooldown window: 140*30/200 ≈ 21 pages — more
+  // than the old hardcoded MAX_PAGES=20, but well under the new 200-page guard.
+  const perDay = 140;
+  const totalDays = 35;
+  const allRecords = [];
+  for (let day = 0; day < totalDays; day++) {
+    for (let i = 0; i < perDay; i++) {
+      allRecords.push(makeRecord('agent-a', day));
+    }
+  }
+  const pageLimit = 200;
+  const get = async (path) => {
+    const offset = Number(/offset=(\d+)/.exec(path)[1]);
+    return { records: allRecords.slice(offset, offset + pageLimit) };
+  };
+
+  const result = await fetchWindowedRecords(get, 'co-1', {
+    refDate: REF_DATE, windowDays: 28, cooldownDays: 30, pageLimit, maxPages: 200,
+  });
+
+  assert.ok(result.pages > 20, `expected paging past the old 20-page cap, got ${result.pages}`);
+  assert.ok(!result.hitPageCap, 'the 200-page runaway guard must not trip at realistic volume');
+  assert.ok(result.accumulated.length >= perDay * 30, 'must accumulate at least the 30-day cooldown window');
 });
 
 test('fetchWindowedRecords returns empty sets when the API has no records', async () => {

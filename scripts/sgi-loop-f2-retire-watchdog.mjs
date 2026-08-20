@@ -56,6 +56,7 @@
  *   node scripts/sgi-loop-f2-retire-watchdog.mjs --dry-run       # print, do not post
  *   node scripts/sgi-loop-f2-retire-watchdog.mjs --date=2026-06-09
  *   node scripts/sgi-loop-f2-retire-watchdog.mjs --window-days=14 # override scoring window
+ *   node scripts/sgi-loop-f2-retire-watchdog.mjs --max-pages=400  # override pagination runaway guard
  */
 
 import { resolveApiBase } from './lib/paperclip-api-base.mjs';
@@ -72,14 +73,24 @@ const DRY_RUN = argv.includes('--dry-run');
 const dateArg = (argv.find(a => a.startsWith('--date=')) || '').split('=')[1];
 const REF_DATE = dateArg ? new Date(dateArg + 'T00:00:00Z') : new Date();
 const windowDaysArg = (argv.find(a => a.startsWith('--window-days=')) || '').split('=')[1];
+const maxPagesArg = (argv.find(a => a.startsWith('--max-pages=')) || '').split('=')[1];
 
 // Scoring window in days — how far back records must fall to count toward the
 // sample-count / quality / quartile gates. Default 28 (see AUR-3287).
 const WINDOW_DAYS = windowDaysArg ? Number(windowDaysArg) : 28;
 
-// Records per page and runaway guard for the offset-pagination loop.
+// Records per page and runaway guard for the offset-pagination loop. The cap
+// is a backstop only — normal operation always stops earlier via the
+// fetch-cutoff-date check inside fetchWindowedRecords (page until the oldest
+// record in a batch is older than the cutoff, or the endpoint runs dry).
+// 200 pages x 200/page = 40,000 records is far above any realistic scorecard
+// volume; if it's ever hit the scan is genuinely truncated and the run fails
+// closed (AUR-4496) instead of silently reporting a partial window as full.
+// Override via --max-pages=N or SGI_LOOP_F2_MAX_PAGES for exceptional cases.
 const SCAN_PAGE_LIMIT = 200;
-const MAX_PAGES = 20;
+const MAX_PAGES = maxPagesArg
+  ? Number(maxPagesArg)
+  : (process.env.SGI_LOOP_F2_MAX_PAGES ? Number(process.env.SGI_LOOP_F2_MAX_PAGES) : 200);
 
 // Min scorecards per agent to qualify for quartile ranking.
 const MIN_SAMPLE_COUNT = 8;
@@ -193,6 +204,64 @@ async function fetchWindowedRecords(get, companyId, { refDate, windowDays, coold
   const windowed = accumulated.filter(r => (r.createdAt || '') >= scoreCutoffIso);
 
   return { accumulated, windowed, pages, hitPageCap, scoreCutoffIso, fetchCutoffIso };
+}
+
+/**
+ * Real oldest/newest `createdAt` span of a record set — what was actually
+ * read, as opposed to the configured WINDOW_DAYS/COOLDOWN_DAYS targets
+ * (AUR-4496: a board-approval artifact must not cite a window it did not
+ * read).
+ */
+function coveredSpan(records) {
+  const oldest = records.reduce((min, r) => {
+    const ts = r.createdAt || '';
+    return (!min || ts < min) ? ts : min;
+  }, '');
+  const newest = records.reduce((max, r) => {
+    const ts = r.createdAt || '';
+    return (!max || ts > max) ? ts : max;
+  }, '');
+  return { oldest, newest };
+}
+
+/**
+ * Decides whether a run must fail closed (AUR-4496 required-fix #3). If the
+ * pagination runaway guard was hit, the fetch never reached its cutoff date,
+ * so the scan is genuinely truncated — the run must not post proposals and
+ * must not report a full window. Pure/no I/O so it is directly testable
+ * without stubbing the API.
+ */
+function buildRunOutcome({ hitPageCap, pages, maxPages, accumulated, fetchCutoffIso, dateStr }) {
+  if (!hitPageCap) return { failClosed: false };
+
+  const { oldest, newest } = coveredSpan(accumulated);
+  const commentBody = [
+    `## SGI Loop F-2 — Watchdog run ABORTED (pagination runaway guard hit)`,
+    ``,
+    `Hit the ${maxPages}-page runaway guard after ${pages} page(s) — the fetch cutoff \`${fetchCutoffIso}\` was never reached.`,
+    `**Actual covered range:** ${oldest.slice(0, 10) || 'n/a'} → ${newest.slice(0, 10) || 'n/a'} (${accumulated.length} record(s), ${pages} page(s)).`,
+    ``,
+    `No proposals were evaluated or posted this run — a truncated scan must not be reported as a full window (artifact-provenance doctrine).`,
+    `Re-run with a higher \`--max-pages\` (or \`SGI_LOOP_F2_MAX_PAGES\`) once record volume is understood.`,
+  ].join('\n');
+
+  return {
+    failClosed: true,
+    coveredOldest: oldest,
+    coveredNewest: newest,
+    commentBody,
+    result: {
+      date: dateStr,
+      failClosed: true,
+      hitPageCap: true,
+      pagesFetched: pages,
+      maxPages,
+      recordsAccumulated: accumulated.length,
+      coveredOldest: oldest,
+      coveredNewest: newest,
+      proposed: 0,
+    },
+  };
 }
 
 // ---- ISO week helpers ------------------------------------------------------
@@ -332,15 +401,23 @@ async function main() {
   console.log(`Mode: ${DRY_RUN ? 'DRY-RUN (no writes)' : 'LIVE'}`);
   console.log(`Scoring window: ${WINDOW_DAYS} days\n`);
 
-  const { accumulated, windowed, pages, hitPageCap } = await fetchWindowedRecords(
+  const { accumulated, windowed, pages, hitPageCap, fetchCutoffIso } = await fetchWindowedRecords(
     (path) => apiFetch(path),
     COMPANY_ID,
-    { refDate: REF_DATE, windowDays: WINDOW_DAYS }
+    { refDate: REF_DATE, windowDays: WINDOW_DAYS, maxPages: MAX_PAGES }
   );
 
-  if (hitPageCap) {
-    console.log(`[WARN] Hit MAX_PAGES cap (${MAX_PAGES}) after ${pages} page(s) while paging memory records — scan may be truncated before the full window was reached.`);
+  const outcome = buildRunOutcome({ hitPageCap, pages, maxPages: MAX_PAGES, accumulated, fetchCutoffIso, dateStr: refDateStr });
+  if (outcome.failClosed) {
+    console.error(`[FAIL-CLOSED] Hit the ${MAX_PAGES}-page runaway guard after ${pages} page(s) — fetch cutoff ${fetchCutoffIso} was never reached.`);
+    console.error(`Actual covered range: ${outcome.coveredOldest.slice(0, 10) || 'n/a'} -> ${outcome.coveredNewest.slice(0, 10) || 'n/a'} (${accumulated.length} records).`);
+    console.error('Refusing to score or post proposals on a truncated scan. Re-run with a higher --max-pages.');
+    if (TASK_ID) {
+      await postComment(TASK_ID, outcome.commentBody);
+    }
+    return outcome.result;
   }
+
   console.log(`Pagination: ${pages} page(s) fetched, ${accumulated.length} record(s) accumulated, ${windowed.length} within the ${WINDOW_DAYS}-day scoring window.`);
 
   const windowOldest = windowed.reduce((min, r) => {
@@ -352,6 +429,13 @@ async function main() {
     return (!max || ts > max) ? ts : max;
   }, '');
   console.log(`Scoring window: ${windowed.length} records  oldest=${windowOldest.slice(0,10)}  newest=${windowNewest.slice(0,10)}`);
+
+  // Real span of the scoring window actually read, not just the configured
+  // target — reported instead of the static WINDOW_DAYS wherever this run
+  // describes what it scanned (AUR-4496).
+  const actualWindowDays = windowOldest
+    ? Math.max(0, Math.round((REF_DATE - new Date(windowOldest)) / 86400000))
+    : 0;
 
   const { isoYear, isoWeek, agents, qualifying, lowQuality, exemptedByQuality, q1, bottomQ, proposals, skipped } =
     evaluateGates(windowed, accumulated, REF_DATE);
@@ -378,7 +462,7 @@ async function main() {
   }
 
   console.log(`\n--- Summary ---`);
-  console.log(`Window: ${windowOldest.slice(0, 10)} → ${windowNewest.slice(0, 10)} (${windowed.length} records scanned, ${WINDOW_DAYS}-day window)`);
+  console.log(`Window: ${windowOldest.slice(0, 10)} → ${windowNewest.slice(0, 10)} (${windowed.length} records scanned, ${actualWindowDays}-day actual span, ${WINDOW_DAYS}-day target)`);
   console.log(`Agents scored: ${agents.length}  Qualifying (n≥${MIN_SAMPLE_COUNT}): ${qualifying.length}  Low-quality: ${lowQuality.length}  Bottom-Q: ${bottomQ.length}`);
   console.log(`Q1 threshold: ${q1.toExponential(4)}`);
   console.log(`\nExempted by quality guard (${exemptedByQuality.length}):`);
@@ -401,7 +485,7 @@ async function main() {
       `## Loop F-2 Retire/Repurpose Proposal`,
       ``,
       `**Agent:** \`${p.agentId}\``,
-      `**Scorecard window:** ${p.oldest.slice(0, 10)} → ${p.newest.slice(0, 10)} (n=${p.n}, ${WINDOW_DAYS}-day scan)`,
+      `**Scorecard window:** ${p.oldest.slice(0, 10)} → ${p.newest.slice(0, 10)} (n=${p.n}, ${actualWindowDays}-day actual scan, target ${WINDOW_DAYS})`,
       `**Mean cost-adjusted score:** ${p.meanScore.toExponential(4)} (Q1 threshold: ${p.q1.toExponential(4)})`,
       `**Mean quality_signal:** ${p.meanQuality.toFixed(2)} (below exemption threshold ${QUALITY_EXEMPTION_THRESHOLD})`,
       `**Task-type distribution:** ${taskDist}`,
@@ -411,7 +495,7 @@ async function main() {
       `### What happened`,
       `This agent ranks in the cost-adjusted bottom quartile (score ≤ Q1) among agents`,
       `with sufficient sample size (n ≥ ${MIN_SAMPLE_COUNT}) and low mean quality (< ${QUALITY_EXEMPTION_THRESHOLD})`,
-      `sustained over a ${WINDOW_DAYS}-day window.`,
+      `sustained over a ${actualWindowDays}-day actual window (target ${WINDOW_DAYS}).`,
       `A Loop C self-edit was already attempted and approved. The 30-day cooldown has cleared.`,
       ``,
       `### Board action required`,
@@ -429,7 +513,7 @@ async function main() {
     for (const p of proposalBodies) {
       console.log(`\n--- Proposal for ${p.agentId} ---\n${p.body}`);
     }
-    return { dryRun: true, proposals: proposals.length, skipped: skipped.length, q1, exemptedByQuality: exemptedByQuality.length, windowDays: WINDOW_DAYS, recordsScanned: windowed.length, pagesFetched: pages, hitPageCap };
+    return { dryRun: true, proposals: proposals.length, skipped: skipped.length, q1, exemptedByQuality: exemptedByQuality.length, windowDays: WINDOW_DAYS, actualWindowDays, recordsScanned: windowed.length, pagesFetched: pages, hitPageCap };
   }
 
   // Live mode: post interactions and write cooldown records.
@@ -479,7 +563,7 @@ async function main() {
       `## SGI Loop F-2 — Retire/Repurpose Watchdog Run`,
       ``,
       `**Date:** ${refDateStr} · **ISO week:** ${isoYear}-W${String(isoWeek).padStart(2, '0')}`,
-      `**Scoring window:** ${WINDOW_DAYS} days (${windowOldest.slice(0,10)} → ${windowNewest.slice(0,10)}) · **Records scanned:** ${windowed.length} (${pages} page(s), ${accumulated.length} accumulated)`,
+      `**Scoring window:** ${actualWindowDays} actual day(s), target ${WINDOW_DAYS} (${windowOldest.slice(0,10)} → ${windowNewest.slice(0,10)}) · **Records scanned:** ${windowed.length} (${pages} page(s), ${accumulated.length} accumulated)`,
       `**Agents scored:** ${agents.length} total · ${qualifying.length} with n≥${MIN_SAMPLE_COUNT} · Q1 threshold: \`${q1.toExponential(4)}\``,
       ``,
       `### Exempted by value-signal bias guard (quality ≥ ${QUALITY_EXEMPTION_THRESHOLD})`,
@@ -498,6 +582,7 @@ async function main() {
     date: refDateStr,
     isoWeek: `${isoYear}-W${String(isoWeek).padStart(2, '0')}`,
     windowDays: WINDOW_DAYS,
+    actualWindowDays,
     recordsScanned: windowed.length,
     recordsAccumulated: accumulated.length,
     pagesFetched: pages,
@@ -515,6 +600,8 @@ async function main() {
 
 export {
   fetchWindowedRecords,
+  coveredSpan,
+  buildRunOutcome,
   aggregateScores,
   quartileThreshold,
   hasLoopCRecord,
@@ -527,6 +614,7 @@ const isMain = process.argv[1] && import.meta.url.endsWith(process.argv[1].repla
 if (isMain) {
   main().then(result => {
     console.log('\nResult:', JSON.stringify(result, null, 2));
+    if (result.failClosed) process.exitCode = 1;
   }).catch(err => {
     console.error('SGI Loop F-2 error:', err.message);
     process.exit(1);

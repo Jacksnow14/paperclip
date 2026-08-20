@@ -11,6 +11,8 @@ const listJoinRequestsMock = vi.hoisted(() => vi.fn());
 const updateMemberAccessMock = vi.hoisted(() => vi.fn());
 const archiveMemberMock = vi.hoisted(() => vi.fn());
 const listAgentsMock = vi.hoisted(() => vi.fn());
+const listAgentsAccessMock = vi.hoisted(() => vi.fn());
+const updateAgentPermissionsMock = vi.hoisted(() => vi.fn());
 const listIssuesMock = vi.hoisted(() => vi.fn());
 
 vi.mock("@/api/access", () => ({
@@ -31,6 +33,9 @@ vi.mock("@/api/access", () => ({
 vi.mock("@/api/agents", () => ({
   agentsApi: {
     list: (companyId: string) => listAgentsMock(companyId),
+    listAccess: (companyId: string) => listAgentsAccessMock(companyId),
+    updatePermissions: (id: string, data: unknown, companyId?: string) =>
+      updateAgentPermissionsMock(id, data, companyId),
   },
 }));
 
@@ -156,6 +161,21 @@ describe("CompanyAccess", () => {
         status: "active",
       },
     ]);
+    listAgentsAccessMock.mockResolvedValue([
+      {
+        id: "agent-1",
+        name: "Codex Worker",
+        urlKey: "codex-worker",
+        role: "engineer",
+        title: null,
+        status: "active",
+        canManageRoutines: false,
+        routineManageSource: "none",
+        canAssignTasks: false,
+        taskAssignSource: "none",
+      },
+    ]);
+    updateAgentPermissionsMock.mockResolvedValue({});
     listIssuesMock.mockResolvedValue([
       {
         id: "issue-1",
@@ -192,7 +212,7 @@ describe("CompanyAccess", () => {
     expect(container.textContent).toContain("Humans");
     expect(container.textContent).toContain("Pending human joins");
     expect(container.textContent).toContain("User account");
-    expect(container.textContent).not.toContain("Agents");
+    expect(container.textContent).toContain("Agents");
     expect(container.textContent).not.toContain("Pending agent joins");
     expect(container.textContent).not.toContain("Open join request queue");
     expect(container.textContent).not.toContain("Manage invites");
@@ -317,6 +337,93 @@ describe("CompanyAccess", () => {
     expect(archiveMemberMock).toHaveBeenCalledWith("company-1", "member-1", {
       reassignment: { assigneeAgentId: null, assigneeUserId: "user-2" },
     });
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("shows agent principals with their routines:manage grant and can grant/revoke it (AUR-5836)", async () => {
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <CompanyAccess />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    expect(listAgentsAccessMock).toHaveBeenCalledWith("company-1");
+    expect(container.textContent).toContain("Codex Worker");
+    expect(container.textContent).toContain("Not granted.");
+
+    const agentSection = Array.from(container.querySelectorAll("section")).find((section) =>
+      section.textContent?.includes("Manage routines"),
+    );
+    expect(agentSection).toBeTruthy();
+    const toggle = agentSection!.querySelector("button[role='switch'], input[type='checkbox']");
+    expect(toggle).toBeTruthy();
+
+    await act(async () => {
+      toggle!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    expect(updateAgentPermissionsMock).toHaveBeenCalledWith(
+      "agent-1",
+      { canCreateAgents: false, canAssignTasks: false, canManageRoutines: true },
+      "company-1",
+    );
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("locks the routines:manage toggle for CEO-role agents (AUR-5836)", async () => {
+    listAgentsAccessMock.mockResolvedValueOnce([
+      {
+        id: "agent-ceo",
+        name: "Chief Executive",
+        urlKey: "chief-executive",
+        role: "ceo",
+        title: "CEO",
+        status: "active",
+        canManageRoutines: true,
+        routineManageSource: "ceo_role",
+        canAssignTasks: true,
+        taskAssignSource: "ceo_role",
+      },
+    ]);
+
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <CompanyAccess />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    expect(container.textContent).toContain("Enabled automatically for CEO agents.");
+    const agentSection = Array.from(container.querySelectorAll("section")).find((section) =>
+      section.textContent?.includes("Manage routines"),
+    );
+    expect(agentSection).toBeTruthy();
+    const toggle = agentSection!.querySelector("button[role='switch'], input[type='checkbox']");
+    expect(toggle).toHaveProperty("disabled", true);
 
     await act(async () => {
       root.unmount();

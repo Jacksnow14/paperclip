@@ -499,4 +499,113 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
       executionWorkspaceSettings: { mode: "isolated_workspace" },
     });
   });
+
+  describe("routines:manage grant boundary", () => {
+    async function seedOtherAgent(companyId: string, name: string) {
+      const otherAgentId = randomUUID();
+      await db.insert(agents).values({
+        id: otherAgentId,
+        companyId,
+        name,
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      return otherAgentId;
+    }
+
+    it("allows an agent holding an explicit routines:manage grant to reassign a routine it does not own", async () => {
+      const { companyId, agentId, projectId, userId } = await seedFixture();
+      const managerAgentId = await seedOtherAgent(companyId, "Manager");
+      const newOwnerAgentId = await seedOtherAgent(companyId, "NewOwner");
+
+      const access = accessService(db);
+      await access.setPrincipalPermission(
+        companyId,
+        "agent",
+        managerAgentId,
+        "routines:manage",
+        true,
+        userId,
+      );
+
+      const boardApp = await createApp({
+        type: "board",
+        userId,
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [companyId],
+      });
+      const createRes = await request(boardApp)
+        .post(`/api/companies/${companyId}/routines`)
+        .send({
+          projectId,
+          title: "Owned by another agent",
+          assigneeAgentId: agentId,
+        });
+      expect([200, 201], JSON.stringify(createRes.body)).toContain(createRes.status);
+      const routineId = createRes.body.id as string;
+
+      const managerApp = await createApp({
+        type: "agent",
+        agentId: managerAgentId,
+        companyId,
+      });
+      const patchRes = await request(managerApp)
+        .patch(`/api/routines/${routineId}`)
+        .send({ assigneeAgentId: newOwnerAgentId });
+
+      expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(200);
+      expect(patchRes.body.assigneeAgentId).toBe(newOwnerAgentId);
+
+      const [persisted] = await db
+        .select({ assigneeAgentId: routines.assigneeAgentId })
+        .from(routines)
+        .where(eq(routines.id, routineId));
+      expect(persisted?.assigneeAgentId).toBe(newOwnerAgentId);
+    }, 20000);
+
+    it("blocks an agent without the routines:manage grant (and not CEO) from reassigning a routine it does not own", async () => {
+      const { companyId, agentId, projectId, userId } = await seedFixture();
+      const bystanderAgentId = await seedOtherAgent(companyId, "Bystander");
+      const newOwnerAgentId = await seedOtherAgent(companyId, "NewOwner");
+
+      const boardApp = await createApp({
+        type: "board",
+        userId,
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [companyId],
+      });
+      const createRes = await request(boardApp)
+        .post(`/api/companies/${companyId}/routines`)
+        .send({
+          projectId,
+          title: "Owned by another agent",
+          assigneeAgentId: agentId,
+        });
+      expect([200, 201], JSON.stringify(createRes.body)).toContain(createRes.status);
+      const routineId = createRes.body.id as string;
+
+      const bystanderApp = await createApp({
+        type: "agent",
+        agentId: bystanderAgentId,
+        companyId,
+      });
+      const patchRes = await request(bystanderApp)
+        .patch(`/api/routines/${routineId}`)
+        .send({ assigneeAgentId: newOwnerAgentId });
+
+      expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(403);
+
+      const [persisted] = await db
+        .select({ assigneeAgentId: routines.assigneeAgentId })
+        .from(routines)
+        .where(eq(routines.id, routineId));
+      expect(persisted?.assigneeAgentId).toBe(agentId);
+    });
+  });
 });

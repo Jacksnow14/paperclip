@@ -46,19 +46,34 @@
 # git was invoked, and is installed independently per clone (its own common
 # .git/hooks), so it does not share this list-vs-single-var problem.
 #
+# AUR-6017 (continued): while installing into /home/ievgen/Auranode, this
+# same investigation found a THIRD shared clone -- the "_default" project
+# working directory the harness hands out per company+project
+# (paperclip-data/instances/default/projects/<companyId>/<projectId>/_default).
+# It is a real main-worktree root (own common .git, own linked-worktree
+# family under /home/ievgen/auranode-aurNNNN -- a different naming convention
+# than /home/ievgen/Auranode's /home/ievgen/auranode-worktrees/<branch>), and
+# it is the EXACT path the AUR-6017 incident report names as where the
+# AUR-6012/AUR-6011 collision actually happened -- not /home/ievgen/Auranode.
+# It's added below for this one company's project, but the path is
+# necessarily company/project-specific (embeds both UUIDs); a different
+# company or project whose own "_default" is shared the same way needs its
+# own entry via SCG_MAIN_CLONES -- this default can't generalize to paths
+# this script has no way to discover.
+#
 # Install (per shell profile), typically after any existing
 # git-safety-guard.sh line:
 #   source /path/to/dev-guards/shared-clone-guard.sh
 #
 # Configure which clones are guarded (colon-separated absolute paths):
-#   SCG_MAIN_CLONES=/home/ievgen/paperclip:/home/ievgen/Auranode
+#   SCG_MAIN_CLONES=/home/ievgen/paperclip:/home/ievgen/Auranode:/path/to/_default
 # Defaults to that same list. A legacy single SCG_MAIN_CLONE, if set, is
 # folded in too so old callers/tests keep working.
 #
 # Override once ownership of a stash entry is verified by hand:
 #   SCG_STASH_FORCE=1 git stash pop
 
-SCG_MAIN_CLONES_DEFAULT="/home/ievgen/paperclip:/home/ievgen/Auranode"
+SCG_MAIN_CLONES_DEFAULT="/home/ievgen/paperclip:/home/ievgen/Auranode:/home/ievgen/paperclip-data/instances/default/projects/b26d3647-3e6c-4a28-9c25-e9315696484d/71e3873d-8d60-4038-94fa-14cc464d8b16/_default"
 __scg_clone_list_raw="${SCG_MAIN_CLONES:-$SCG_MAIN_CLONES_DEFAULT}"
 if [[ -n "${SCG_MAIN_CLONE:-}" ]]; then
   __scg_clone_list_raw="${__scg_clone_list_raw}:${SCG_MAIN_CLONE}"

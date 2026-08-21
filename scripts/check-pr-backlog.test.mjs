@@ -206,11 +206,31 @@ test('issue title is per-repo-per-PR-per-sha (the idempotency key)', () => {
 });
 
 test('issue body forbids founder code review and demands loop closure', () => {
-  const body = issueBody({ number: 7, sha7: 'abc1234', title: 't' }, 'o/r');
+  const body = issueBody({ number: 7, sha7: 'abc1234', title: 't' }, 'o/r', true);
   assert.match(body, /never ask the founder to review/i);
   assert.match(body, /FINAL review authority/);
   assert.match(body, /never batch/i);
   assert.match(body, /merged or closed/);
+  assert.match(body, /check-trunk-ci-red/);
+});
+
+// ---------------------------------------------------------------------------
+// AUR-5995: check-trunk-ci-red.mjs is Paperclip-only. Step 1 must not
+// unconditionally reference it for a repo (e.g. Auranode) that doesn't have
+// it — that 404s the reviewer's very first step.
+// ---------------------------------------------------------------------------
+
+test('issue body step 1 falls back to a repo-agnostic gh command when check-trunk-ci-red.mjs is absent', () => {
+  const body = issueBody({ number: 7, sha7: 'abc1234', title: 't' }, 'Jacksnow14/Auranode', false);
+  assert.doesNotMatch(body, /node scripts\/check-trunk-ci-red\.mjs/);
+  assert.match(body, /gh pr checks --repo Jacksnow14\/Auranode/);
+  // The rest of the procedure (mandate, verdict/act, loop closure) is unaffected.
+  assert.match(body, /FINAL review authority/);
+  assert.match(body, /merged or closed/);
+});
+
+test('issue body defaults to referencing check-trunk-ci-red.mjs when hasTrunkCiScript is omitted', () => {
+  const body = issueBody({ number: 7, sha7: 'abc1234', title: 't' }, 'Jacksnow14/paperclip');
   assert.match(body, /check-trunk-ci-red/);
 });
 

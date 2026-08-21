@@ -110,18 +110,21 @@ function main() {
     expiresAt = readExpiresAtFromDisk(credPath);
   } catch (err) {
     alert(`SEV3 oauth-warm: ${err.message} — cannot determine token freshness.`);
-    process.exit(2);
+    process.exitCode = 2;
+    return;
   }
 
   if (expiresAt === null) {
     alert(`SEV3 oauth-warm: ${credPath} has no claudeAiOauth.expiresAt — cannot determine token freshness.`);
-    process.exit(2);
+    process.exitCode = 2;
+    return;
   }
 
   const msLeft = expiresAt - nowMs;
   if (!needsWarming({ expiresAt, nowMs })) {
     console.log(`oauth-warm: fresh, ${Math.round(msLeft / 60_000)}min left — no-op.`);
-    process.exit(0);
+    process.exitCode = 0;
+    return;
   }
 
   console.log(
@@ -129,7 +132,8 @@ function main() {
       (args.dryRun ? 'dry-run, would warm now.' : 'warming now.'),
   );
   if (args.dryRun) {
-    process.exit(0);
+    process.exitCode = 0;
+    return;
   }
 
   let stdout = '';
@@ -152,14 +156,16 @@ function main() {
     newExpiresAt = readExpiresAtFromDisk(credPath);
   } catch (err) {
     alert(`SEV3 oauth-warm: warming call finished (exit ${exitCode}) but ${err.message} on re-read.`);
-    process.exit(2);
+    process.exitCode = 2;
+    return;
   }
 
   const refreshed = newExpiresAt !== null && newExpiresAt > expiresAt;
   if (exitCode === 0 && refreshed) {
     const newMsLeft = newExpiresAt - Date.now();
     console.log(`oauth-warm: refreshed OK — new expiry ${Math.round(newMsLeft / 60_000)}min out.`);
-    process.exit(0);
+    process.exitCode = 0;
+    return;
   }
 
   alert(
@@ -167,7 +173,7 @@ function main() {
       `(exit=${exitCode}, expiresAt before=${expiresAt} after=${newExpiresAt}). ` +
       `stdout=${stdout.slice(0, 300)} stderr=${stderr.slice(0, 300)}`,
   );
-  process.exit(2);
+  process.exitCode = 2;
 }
 
 const invokedDirectly =

@@ -68,6 +68,13 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
 const mockIssueRecoveryActionService = vi.hoisted(() => ({
   getActiveForIssue: vi.fn(async () => null),
 }));
+const mockHeartbeatService = vi.hoisted(() => ({
+  wakeup: vi.fn(async () => undefined),
+  reportRunActivity: vi.fn(async () => undefined),
+  getRun: vi.fn(async () => null),
+  getActiveRunForAgent: vi.fn(async () => null),
+  cancelRun: vi.fn(async () => null),
+}));
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 
 function registerRouteMocks() {
@@ -115,13 +122,7 @@ function registerRouteMocks() {
       saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
     }),
     goalService: () => ({}),
-    heartbeatService: () => ({
-      wakeup: vi.fn(async () => undefined),
-      reportRunActivity: vi.fn(async () => undefined),
-      getRun: vi.fn(async () => null),
-      getActiveRunForAgent: vi.fn(async () => null),
-      cancelRun: vi.fn(async () => null),
-    }),
+    heartbeatService: () => mockHeartbeatService,
     instanceSettingsService: () => ({
       get: vi.fn(async () => ({
         id: "instance-settings-1",
@@ -284,6 +285,8 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.listWakeableBlockedDependents.mockReset();
     mockIssueRecoveryActionService.getActiveForIssue.mockReset();
     mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(null);
+    mockHeartbeatService.wakeup.mockReset();
+    mockHeartbeatService.wakeup.mockResolvedValue(undefined);
     mockLogActivity.mockReset();
     mockLogActivity.mockResolvedValue(undefined);
     mockIssueService.remove.mockReset();
@@ -632,6 +635,27 @@ describe("agent issue mutation checkout ownership", () => {
 
       expect(res.status, JSON.stringify(res.body)).toBe(201);
       expect(mockIssueService.update).not.toHaveBeenCalledWith(issueId, expect.objectContaining({ status: "todo" }));
+    });
+
+    it("AUR-6027: does not wake the owner when a mention-reply lands on a closed issue with no resume intent", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "done", assigneeAgentId: ownerAgentId }));
+      mockIssueService.wasAgentMentionedInThread.mockResolvedValue(true);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "77777777-7777-4777-8777-777777777777",
+        issueId,
+        companyId,
+        body: "ack on closed",
+        metadata: { version: 1, mentionReply: true, mentionRepliedByAgentId: peerAgentId },
+      });
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "ack on closed" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
     });
 
     it("rejects non-mentioned non-owner with 403", async () => {

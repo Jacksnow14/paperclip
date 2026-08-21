@@ -937,6 +937,90 @@ describe.sequential("issue comment reopen routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
+  describe("AUR-6027: machine-authored comments on closed issues do not fan out mention wakes", () => {
+    const mentionedAgentId = "44444444-4444-4444-8444-444444444444";
+
+    it("does not wake a mentioned agent when a same-agent comment on a closed issue carries no resume intent (POST)", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue("done"));
+      mockIssueService.findMentionedAgents.mockResolvedValue([mentionedAgentId]);
+
+      const res = await request(await installActor(createApp(), agentActor()))
+        .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+        .send({ body: "already resolved, cc @peer" });
+
+      expect(res.status).toBe(201);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      // The mentionedIds lookup itself should be skipped, not just the wake — a
+      // machine ack on a closed, non-resumed issue is inert end to end.
+      expect(mockIssueService.findMentionedAgents).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("does not wake a mentioned agent when a same-agent comment on a closed issue carries no resume intent (PATCH)", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue("done"));
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...makeIssue("done"),
+        ...patch,
+      }));
+      mockIssueService.findMentionedAgents.mockResolvedValue([mentionedAgentId]);
+
+      const res = await request(await installActor(createApp(), agentActor()))
+        .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+        .send({ comment: "already resolved, cc @peer" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).not.toHaveBeenCalledWith(
+        "11111111-1111-4111-8111-111111111111",
+        expect.objectContaining({ status: "todo" }),
+      );
+      expect(mockIssueService.findMentionedAgents).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("still wakes a mentioned agent when a human comments on a closed issue (no assignee to auto-reopen)", async () => {
+      mockIssueService.getById.mockResolvedValue({ ...makeIssue("done"), assigneeAgentId: null });
+      mockIssueService.findMentionedAgents.mockResolvedValue([mentionedAgentId]);
+
+      const res = await request(await installActor(createApp()))
+        .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+        .send({ body: "please take a look @peer" });
+
+      expect(res.status).toBe(201);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        mentionedAgentId,
+        expect.objectContaining({ reason: "issue_comment_mentioned" }),
+      ));
+    });
+
+    it("still wakes a mentioned agent when the same-agent comment carries explicit resume:true", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue("done"));
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...makeIssue("done"),
+        ...patch,
+      }));
+      mockIssueService.findMentionedAgents.mockResolvedValue([mentionedAgentId]);
+
+      const res = await request(await installActor(createApp(), agentActor()))
+        .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+        .send({ body: "resuming, looping in @peer", resume: true });
+
+      expect(res.status).toBe(201);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        "11111111-1111-4111-8111-111111111111",
+        { status: "todo" },
+      );
+      await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        mentionedAgentId,
+        expect.objectContaining({ reason: "issue_comment_mentioned" }),
+      ));
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({ reason: "issue_reopened_via_comment" }),
+      );
+    });
+  });
+
   it("explicit same-agent resume comments reopen closed issues and mark the wake payload", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("done"));
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({

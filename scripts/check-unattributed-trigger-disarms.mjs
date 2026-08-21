@@ -82,6 +82,7 @@
 
 import { createRequire } from 'node:module';
 import { parseArgs } from 'node:util';
+import { readFileSync } from 'node:fs';
 import { resolveApiBase } from './lib/paperclip-api-base.mjs';
 
 // `postgres` is loaded lazily inside connectDb() below, not at module scope —
@@ -161,6 +162,58 @@ export function buildIssueBody(findings, now = new Date()) {
     'exec.routing-rationale: skip',
   );
   return lines.join('\n');
+}
+
+// ── Founder routine-allowlist policy-disarm exemption (AUR-6058) ───────────
+//
+// `/home/ievgen/.paperclip/bin/enforce-routine-allowlist.mjs` runs ~every 15
+// min and disarms any schedule trigger whose routine title misses
+// `routine-allowlist.json` via a raw UPDATE that never writes a
+// `routine_revisions` row — the exact same shape this watchdog exists to
+// catch, except it's deliberate, continuously-enforced founder policy, not
+// an unexplained write. Without this exemption a policy-disarmed trigger is
+// indistinguishable from a genuinely unattributed one and buries the real
+// case in noise (measured: 17 of 24 active-routine findings on 2026-08-21
+// were exact matches to a `DISARM "<title>"` line in the enforcer's own log
+// within seconds of the trigger's `updated_at`).
+
+/** Default path to the routine-allowlist enforcer's append-only log. */
+export const DEFAULT_ALLOWLIST_LOG_PATH = '/home/ievgen/.paperclip/routine-allowlist.log';
+
+/** Parses `DISARM "<title>"` lines (format: `<ISO ts> DISARM "<title>"`) out of the enforcer's log text; ignores every other line (e.g. `ok: N armed, all on policy`). */
+export function parseAllowlistDisarmLog(logText) {
+  const entries = [];
+  const re = /^(\S+)\s+DISARM\s+"(.*)"\s*$/;
+  for (const line of (logText ?? '').split('\n')) {
+    const match = re.exec(line.trim());
+    if (!match) continue;
+    const ts = Date.parse(match[1]);
+    if (Number.isNaN(ts)) continue;
+    entries.push({ ts, title: match[2] });
+  }
+  return entries;
+}
+
+/** Reads the allowlist enforcer's log, returning '' if the file doesn't exist on this host (log path is host-local, not every host runs the enforcer). */
+export function readAllowlistLogSafe(path = DEFAULT_ALLOWLIST_LOG_PATH) {
+  try {
+    return readFileSync(path, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * True when the routine-allowlist enforcer logged a `DISARM` for this exact
+ * routine title within `toleranceMs` of the trigger's own `updated_at` —
+ * i.e. the disarm is explained by founder policy, reusing the same
+ * same-transaction tolerance-gap pattern `classifyRow` uses for
+ * `routine_revisions`.
+ */
+export function isPolicyDisarm(entries, routineTitle, triggerUpdatedAt, toleranceMs = DEFAULT_TOLERANCE_MS) {
+  if (!routineTitle) return false;
+  const triggerMs = new Date(triggerUpdatedAt).getTime();
+  return entries.some((e) => e.title === routineTitle && Math.abs(e.ts - triggerMs) <= toleranceMs);
 }
 
 // ── DB access ────────────────────────────────────────────────────────────────
@@ -246,8 +299,38 @@ function makeApiHelpers(API_URL, headers) {
       headers,
       body: JSON.stringify(body),
     });
-    if (!res.ok) throw new Error(`POST ${path} → ${res.status} ${res.statusText}`);
-    return res.json();
+    if (res.ok) return res.json();
+
+    // AUR-6054: the host-cron credential this script runs under structurally
+    // lacks `tasks:assign` (verified live — zero permission grants, not
+    // `ceo` role, no legacy `canCreateAgents`), so a POST that carries
+    // `assigneeAgentId` always 403s with "Missing permission: tasks:assign".
+    // No agent can grant itself that permission mid-run, so retrying with
+    // the same body forever fails the same way. Match the accepted company
+    // pattern (aur5847-send-backstop.sh): file the issue UNASSIGNED instead
+    // of throwing, and rely on a separate actuator (a CTO-owned routine,
+    // AUR-6058) to reassign/wake it. Only this specific 403 is swallowed —
+    // any other status, or a 403 for a different reason, still throws.
+    if (res.status === 403 && body && typeof body === 'object' && 'assigneeAgentId' in body) {
+      const errorBody = await res.json().catch(() => null);
+      const message = typeof errorBody?.error === 'string' ? errorBody.error : '';
+      if (/tasks:assign/i.test(message)) {
+        const { assigneeAgentId, ...unassignedBody } = body;
+        console.log(`FILED UNASSIGNED (403 on assigneeAgentId — see AUR-6054): ${message}`);
+        const retryRes = await fetch(`${API_URL}${path}`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(unassignedBody),
+        });
+        if (!retryRes.ok) {
+          throw new Error(`POST ${path} (retry unassigned after 403 on assigneeAgentId) → ${retryRes.status} ${retryRes.statusText}`);
+        }
+        return retryRes.json();
+      }
+      throw new Error(`POST ${path} → ${res.status} ${res.statusText}: ${message || '(no error message)'}`);
+    }
+
+    throw new Error(`POST ${path} → ${res.status} ${res.statusText}`);
   }
 
   return { apiGet, apiPatch, apiPost };
@@ -526,6 +609,8 @@ export async function main({
   ownerAgentId = DEFAULT_OWNER_AGENT_ID,
   now = new Date(),
   fetchCandidateRows,
+  disarmLogEntries,
+  allowlistLogPath = DEFAULT_ALLOWLIST_LOG_PATH,
 }) {
   const headers = {
     Authorization: `Bearer ${apiKey}`,
@@ -548,14 +633,26 @@ export async function main({
     if (ownDb) await ownDb.end();
   }
 
+  const entries = disarmLogEntries ?? parseAllowlistDisarmLog(readAllowlistLogSafe(allowlistLogPath));
+
   const findings = [];
+  const policyDisarmed = [];
   for (const row of rows) {
     const classification = classifyRow(row, toleranceMs);
-    if (classification.unattributed) findings.push({ row, classification });
+    if (!classification.unattributed) continue;
+    if (isPolicyDisarm(entries, row.routineTitle, row.triggerUpdatedAt, toleranceMs)) {
+      policyDisarmed.push({ row, classification });
+      continue;
+    }
+    findings.push({ row, classification });
   }
 
-  console.log(`Disabled schedule triggers scanned: ${rows.length}. Unattributed: ${findings.length}.`);
+  console.log(
+    `Disabled schedule triggers scanned: ${rows.length}. Unattributed: ${findings.length}. ` +
+      `Policy-disarmed (routine-allowlist enforcer, excluded): ${policyDisarmed.length}.`,
+  );
   for (const f of findings) console.log(`  ${formatFinding(f.row, f.classification)}`);
+  for (const f of policyDisarmed) console.log(`  [policy-disarmed, skipped] ${formatFinding(f.row, f.classification)}`);
 
   const existing = await findFlagIssue({ companyId, apiGet });
 

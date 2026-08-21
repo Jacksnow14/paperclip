@@ -29,11 +29,33 @@ chmod +x "$dest"/*.sh
 
 hooks_dir="$common_dir/hooks"
 mkdir -p "$hooks_dir"
+chained="$dest/chained-pre-commit.sh"
 if [[ -e "$hooks_dir/pre-commit" ]] && ! grep -q "AUR-4564" "$hooks_dir/pre-commit" 2>/dev/null; then
-  echo "REFUSING to overwrite existing $hooks_dir/pre-commit (no AUR-4564 marker found) -- merge by hand." >&2
-  exit 1
+  # AUR-6017: a foreign (non-AUR-4564) pre-commit hook already exists -- e.g.
+  # the AUR-5652 PII guard, found live in /home/ievgen/Auranode. Chain rather
+  # than refuse: preserve it verbatim, then install a two-line hook that runs
+  # the shared-clone guard first and execs the preserved original after.
+  cp "$hooks_dir/pre-commit" "$chained"
+  chmod +x "$chained"
+  echo "Found pre-existing non-AUR-4564 $hooks_dir/pre-commit -- preserved verbatim at $chained and chaining ahead of it."
 fi
-cp "$dest/pre-commit-hook.sh" "$hooks_dir/pre-commit"
+# Else: no foreign hook was found this run. If $chained already exists from a
+# prior chaining install, keep chaining (re-installs must not silently drop
+# the preserved original); otherwise stay in plain-hook mode.
+
+if [[ -e "$chained" ]]; then
+  cat > "$hooks_dir/pre-commit" <<EOF
+#!/usr/bin/env bash
+# AUR-4564: shared-clone guard, chained ahead of a pre-existing pre-commit
+# hook found at install time (preserved verbatim at $chained) rather than
+# overwriting it.
+set -uo pipefail
+"$dest/pre-commit-hook.sh" || exit \$?
+exec "$chained" "\$@"
+EOF
+else
+  cp "$dest/pre-commit-hook.sh" "$hooks_dir/pre-commit"
+fi
 chmod +x "$hooks_dir/pre-commit"
 
 # `git config alias.checkout` / `alias.stash` do NOT work: git dispatches

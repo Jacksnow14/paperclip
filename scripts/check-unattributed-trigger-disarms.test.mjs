@@ -18,6 +18,9 @@ import {
   runBornDisabledCheck,
   BORN_DISABLED_FLAG_TITLE,
   DEFAULT_STALENESS_MS,
+  parseAllowlistDisarmLog,
+  isPolicyDisarm,
+  readAllowlistLogSafe,
 } from './check-unattributed-trigger-disarms.mjs';
 
 // ── classifyRow ──────────────────────────────────────────────────────────────
@@ -262,6 +265,7 @@ test('main() FIRES: a synthetic raw-SQL-style disarm (no revision, no identity) 
     apiKey: 'key',
     companyId: COMPANY_ID,
     fetchCandidateRows: async () => rows,
+    disarmLogEntries: [],
   });
 
   assert.equal(code, 0);
@@ -298,6 +302,7 @@ test('main() PASSES: a normal PATCH-shaped disarm (revision in the same transact
     apiKey: 'key',
     companyId: COMPANY_ID,
     fetchCandidateRows: async () => rows,
+    disarmLogEntries: [],
   });
 
   assert.equal(code, 0);
@@ -334,6 +339,7 @@ test('main() UPDATES: rewrites an existing open dedup issue in place instead of 
     apiKey: 'key',
     companyId: COMPANY_ID,
     fetchCandidateRows: async () => rows,
+    disarmLogEntries: [],
   });
 
   assert.equal(code, 0);
@@ -359,6 +365,7 @@ test('main() RESOLVES: auto-closes the dedup issue once no unattributed disarms 
     apiKey: 'key',
     companyId: COMPANY_ID,
     fetchCandidateRows: async () => [],
+    disarmLogEntries: [],
   });
 
   assert.equal(code, 0);
@@ -393,11 +400,257 @@ test('main() DRY-RUN: --apply=false computes findings but performs zero mutation
     apiKey: 'key',
     companyId: COMPANY_ID,
     fetchCandidateRows: async () => rows,
+    disarmLogEntries: [],
   });
 
   assert.equal(code, 0);
   const mutations = calls.filter((c) => c.method !== 'GET');
   assert.equal(mutations.length, 0, 'dry-run must never mutate');
+});
+
+// ── apiPost 403-on-assigneeAgentId retry (AUR-6054/AUR-6058) ────────────────
+
+function makeAssignRetryFetchStub({ findQuery, filePath, always403 = false }) {
+  const calls = [];
+  return {
+    calls,
+    fetchStub: async (url, init = {}) => {
+      const method = init.method ?? 'GET';
+      const path = url.replace(API_URL, '');
+      const body = init.body ? JSON.parse(init.body) : undefined;
+      calls.push({ method, path, body });
+      const key = `${method} ${path}`;
+      if (key === findQuery) return { ok: true, status: 200, statusText: 'OK', json: async () => [] };
+      if (method === 'POST' && path === filePath) {
+        if (always403 || (body && Object.prototype.hasOwnProperty.call(body, 'assigneeAgentId'))) {
+          return {
+            ok: false,
+            status: 403,
+            statusText: 'Forbidden',
+            json: async () => ({ error: 'Missing permission: tasks:assign' }),
+          };
+        }
+        return { ok: true, status: 201, statusText: 'Created', json: async () => ({ id: 'unassigned1' }) };
+      }
+      return { ok: false, status: 404, statusText: 'Not Found', json: async () => ({}) };
+    },
+  };
+}
+
+test('main(): a 403 on the assigneeAgentId POST retries once unassigned and succeeds instead of throwing', async () => {
+  const { fetchStub, calls } = makeAssignRetryFetchStub({
+    findQuery: FIND_QUERY,
+    filePath: `/api/companies/${COMPANY_ID}/issues`,
+  });
+  global.fetch = fetchStub;
+
+  const rows = [
+    {
+      triggerId: 't5',
+      routineId: 'r5',
+      label: 'nightly',
+      triggerUpdatedAt: '2026-08-15T00:00:00Z',
+      updatedByAgentId: null,
+      updatedByUserId: null,
+      routineTitle: 'Some routine',
+      revisionNumber: null,
+      revisionCreatedAt: null,
+    },
+  ];
+
+  const code = await main({
+    apply: true,
+    apiUrl: API_URL,
+    apiKey: 'key',
+    companyId: COMPANY_ID,
+    fetchCandidateRows: async () => rows,
+    disarmLogEntries: [],
+  });
+
+  assert.equal(code, 0, 'must not throw / must not surface a non-zero exit for the 403-then-retry path');
+  const posts = calls.filter((c) => c.method === 'POST' && c.path === `/api/companies/${COMPANY_ID}/issues`);
+  assert.equal(posts.length, 2, 'expected the original assigned attempt plus one unassigned retry');
+  assert.ok(Object.prototype.hasOwnProperty.call(posts[0].body, 'assigneeAgentId'), 'first attempt carries assigneeAgentId');
+  assert.ok(!Object.prototype.hasOwnProperty.call(posts[1].body, 'assigneeAgentId'), 'retry strips assigneeAgentId');
+});
+
+test('main(): a 403 that is NOT about assigneeAgentId (or not tasks:assign) is still thrown, not swallowed', async () => {
+  const calls = [];
+  global.fetch = async (url, init = {}) => {
+    const method = init.method ?? 'GET';
+    const path = url.replace(API_URL, '');
+    const body = init.body ? JSON.parse(init.body) : undefined;
+    calls.push({ method, path, body });
+    if (`${method} ${path}` === FIND_QUERY) return { ok: true, status: 200, statusText: 'OK', json: async () => [] };
+    if (method === 'POST' && path === `/api/companies/${COMPANY_ID}/issues`) {
+      return { ok: false, status: 403, statusText: 'Forbidden', json: async () => ({ error: 'Company access denied' }) };
+    }
+    return { ok: false, status: 404, statusText: 'Not Found', json: async () => ({}) };
+  };
+
+  const rows = [
+    {
+      triggerId: 't6',
+      routineId: 'r6',
+      label: null,
+      triggerUpdatedAt: '2026-08-15T00:00:00Z',
+      updatedByAgentId: null,
+      updatedByUserId: null,
+      routineTitle: null,
+      revisionNumber: null,
+      revisionCreatedAt: null,
+    },
+  ];
+
+  await assert.rejects(
+    () =>
+      main({
+        apply: true,
+        apiUrl: API_URL,
+        apiKey: 'key',
+        companyId: COMPANY_ID,
+        fetchCandidateRows: async () => rows,
+        disarmLogEntries: [],
+      }),
+    /403/,
+  );
+  const posts = calls.filter((c) => c.method === 'POST' && c.path === `/api/companies/${COMPANY_ID}/issues`);
+  assert.equal(posts.length, 1, 'must not retry a 403 unrelated to tasks:assign');
+});
+
+// ── routine-allowlist policy-disarm exemption (AUR-6058) ────────────────────
+
+test('parseAllowlistDisarmLog: extracts DISARM lines, ignores everything else', () => {
+  const logText = [
+    '2026-08-21T03:04:54.756Z ok: 38 armed, all on policy',
+    '2026-08-21T03:20:19.711Z DISARM "AEO design-partner supply build — drip to warmup depth (AUR-5817)"',
+    '',
+    'not a log line at all',
+    '2026-08-21T04:05:34.951Z DISARM "Delivery-claim verification watchdog (daily) — AUR-4613"',
+  ].join('\n');
+  const entries = parseAllowlistDisarmLog(logText);
+  assert.equal(entries.length, 2);
+  assert.equal(entries[0].title, 'AEO design-partner supply build — drip to warmup depth (AUR-5817)');
+  assert.equal(entries[1].title, 'Delivery-claim verification watchdog (daily) — AUR-4613');
+  assert.equal(entries[0].ts, Date.parse('2026-08-21T03:20:19.711Z'));
+});
+
+test('parseAllowlistDisarmLog: empty/missing log text yields zero entries', () => {
+  assert.deepEqual(parseAllowlistDisarmLog(''), []);
+  assert.deepEqual(parseAllowlistDisarmLog(undefined), []);
+});
+
+test('isPolicyDisarm: true when the enforcer disarmed this exact routine title within tolerance of the trigger update', () => {
+  const entries = [{ ts: Date.parse('2026-08-21T03:20:19.711Z'), title: 'Some routine' }];
+  assert.equal(isPolicyDisarm(entries, 'Some routine', '2026-08-21T03:20:19.900Z', 5000), true);
+});
+
+test('isPolicyDisarm: false when the title matches but the timestamp gap exceeds tolerance', () => {
+  const entries = [{ ts: Date.parse('2026-08-21T03:20:19.711Z'), title: 'Some routine' }];
+  assert.equal(isPolicyDisarm(entries, 'Some routine', '2026-08-21T03:30:00.000Z', 5000), false);
+});
+
+test('isPolicyDisarm: false when no entry matches the routine title', () => {
+  const entries = [{ ts: Date.parse('2026-08-21T03:20:19.711Z'), title: 'A different routine' }];
+  assert.equal(isPolicyDisarm(entries, 'Some routine', '2026-08-21T03:20:19.900Z', 5000), false);
+});
+
+test('isPolicyDisarm: false when routineTitle is null (nothing to match against)', () => {
+  const entries = [{ ts: Date.parse('2026-08-21T03:20:19.711Z'), title: 'Some routine' }];
+  assert.equal(isPolicyDisarm(entries, null, '2026-08-21T03:20:19.900Z', 5000), false);
+});
+
+test('main(): a trigger disarmed by the allowlist enforcer within tolerance is excluded from findings and files nothing', async () => {
+  const { fetchStub, calls } = makeFetchStub({
+    [FIND_QUERY]: [],
+  });
+  global.fetch = fetchStub;
+
+  const rows = [
+    {
+      triggerId: 't7',
+      routineId: 'r7',
+      label: 'nightly',
+      triggerUpdatedAt: '2026-08-21T03:20:19.756Z',
+      updatedByAgentId: null,
+      updatedByUserId: null,
+      routineTitle: 'AEO design-partner supply build — drip to warmup depth (AUR-5817)',
+      revisionNumber: null,
+      revisionCreatedAt: null,
+    },
+  ];
+  const disarmLogEntries = [
+    { ts: Date.parse('2026-08-21T03:20:19.711Z'), title: 'AEO design-partner supply build — drip to warmup depth (AUR-5817)' },
+  ];
+
+  const code = await main({
+    apply: true,
+    apiUrl: API_URL,
+    apiKey: 'key',
+    companyId: COMPANY_ID,
+    fetchCandidateRows: async () => rows,
+    disarmLogEntries,
+  });
+
+  assert.equal(code, 0);
+  const mutations = calls.filter((c) => c.method !== 'GET');
+  assert.equal(mutations.length, 0, 'a policy-disarmed trigger must not be filed as unattributed');
+});
+
+test('main(): a genuinely unattributed disarm (no matching enforcer log entry) still fires alongside an unrelated policy-disarmed one', async () => {
+  const { fetchStub, calls } = makeFetchStub({
+    [FIND_QUERY]: [],
+    [FILE_ROUTE]: { id: 'flag1' },
+  });
+  global.fetch = fetchStub;
+
+  const rows = [
+    {
+      triggerId: 't8',
+      routineId: 'r8',
+      label: null,
+      triggerUpdatedAt: '2026-08-21T05:00:00.000Z',
+      updatedByAgentId: null,
+      updatedByUserId: null,
+      routineTitle: 'A genuinely unexplained disarm',
+      revisionNumber: null,
+      revisionCreatedAt: null,
+    },
+    {
+      triggerId: 't9',
+      routineId: 'r9',
+      label: 'nightly',
+      triggerUpdatedAt: '2026-08-21T03:20:19.756Z',
+      updatedByAgentId: null,
+      updatedByUserId: null,
+      routineTitle: 'AEO design-partner supply build — drip to warmup depth (AUR-5817)',
+      revisionNumber: null,
+      revisionCreatedAt: null,
+    },
+  ];
+  const disarmLogEntries = [
+    { ts: Date.parse('2026-08-21T03:20:19.711Z'), title: 'AEO design-partner supply build — drip to warmup depth (AUR-5817)' },
+  ];
+
+  const code = await main({
+    apply: true,
+    apiUrl: API_URL,
+    apiKey: 'key',
+    companyId: COMPANY_ID,
+    fetchCandidateRows: async () => rows,
+    disarmLogEntries,
+  });
+
+  assert.equal(code, 0);
+  const filed = calls.filter((c) => c.method === 'POST' && c.path === `/api/companies/${COMPANY_ID}/issues`);
+  assert.equal(filed.length, 1);
+  assert.match(filed[0].body.description, /trigger t8/);
+  assert.doesNotMatch(filed[0].body.description, /trigger t9/);
+});
+
+test('readAllowlistLogSafe: returns empty string instead of throwing when the log file does not exist on this host', () => {
+  const text = readAllowlistLogSafe('/nonexistent/path/does-not-exist.log');
+  assert.equal(text, '');
 });
 
 // ── classifyBornDisabledRoutine (AUR-5780) ──────────────────────────────────

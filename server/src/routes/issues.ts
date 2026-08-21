@@ -4089,6 +4089,11 @@ export function issueRoutes(
         const actorIsAgent = actor.actorType === "agent";
         const selfComment = actorIsAgent && actor.actorId === assigneeId;
         const skipAssigneeCommentWake = selfComment || isClosed;
+        // AUR-6027: same closed-issue-inert policy as the POST /comments handler —
+        // a machine-authored comment on a closed issue with no resume/reopen
+        // intent must not fan out mention-wakes either, or a chain of agent acks
+        // that @mention each other can keep re-waking indefinitely.
+        const suppressClosedIssueMachineWake = actorIsAgent && isClosed && !reopened;
 
         if (assigneeId && !assigneeChanged && (reopened || !skipAssigneeCommentWake)) {
           addWakeup(assigneeId, {
@@ -4168,10 +4173,12 @@ export function issueRoutes(
         }
 
         let mentionedIds: string[] = [];
-        try {
-          mentionedIds = await svc.findMentionedAgents(issue.companyId, commentBody);
-        } catch (err) {
-          logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
+        if (!suppressClosedIssueMachineWake) {
+          try {
+            mentionedIds = await svc.findMentionedAgents(issue.companyId, commentBody);
+          } catch (err) {
+            logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
+          }
         }
 
         for (const mentionedId of mentionedIds) {
@@ -5382,7 +5389,17 @@ export function issueRoutes(
       const actorIsAgent = actor.actorType === "agent";
       const selfComment = actorIsAgent && actor.actorId === assigneeId;
       const skipWake = selfComment || isClosed;
-      if (assigneeId && (reopened || !skipWake || (mentionReply && isClosed))) {
+      // AUR-6027: a machine-authored comment on a closed issue that carries no
+      // explicit resume/reopen intent is inert by policy (see execution contract:
+      // "Generic agent comments on closed issues are inert by default"). Without
+      // this guard, an agent mention-replying to a closed issue it doesn't own
+      // (mentionReply is agent-only, see assertAgentCommentAllowed) would still
+      // wake the assignee via the isClosed carve-out below, and the assignee's own
+      // reply could mention the original agent back through the unconditional
+      // mentionedIds loop further down — a self-sustaining ack-wake loop with no
+      // resume ever requested on either side.
+      const suppressClosedIssueMachineWake = actorIsAgent && isClosed && !reopened;
+      if (assigneeId && (reopened || !skipWake)) {
         if (reopened) {
           wakeups.set(assigneeId, {
             source: "automation",
@@ -5483,10 +5500,12 @@ export function issueRoutes(
       }
 
       let mentionedIds: string[] = [];
-      try {
-        mentionedIds = await svc.findMentionedAgents(issue.companyId, req.body.body);
-      } catch (err) {
-        logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
+      if (!suppressClosedIssueMachineWake) {
+        try {
+          mentionedIds = await svc.findMentionedAgents(issue.companyId, req.body.body);
+        } catch (err) {
+          logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
+        }
       }
 
       for (const mentionedId of mentionedIds) {

@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# AUR-4564: shared detection library for the shared-clone guards.
+# AUR-4564 / AUR-6017: shared detection library for the shared-clone guards.
+# Installed per-repo (each shared clone -- /home/ievgen/paperclip,
+# /home/ievgen/Auranode -- gets its own copy in its own common git dir), so
+# nothing here needs to hardcode which clone it's protecting.
 #
-# The main clone (currently /home/ievgen/paperclip) is a git worktree like any
-# other, but it is the ONLY one whose .git is a real directory rather than a
-# `gitdir:` pointer file -- every linked worktree points back at it. That
-# makes "is this the main worktree" a path-identity check, not a naming
-# convention: worktree paths in this fleet are wildly inconsistent
-# (paperclip-aurNNNN, paperclip-wt-aurNNNN, paperclip-worktrees/aurNNNN,
-# pc-wt-aurNNNN, /tmp/aur-NNNN-*), so nothing that pattern-matches a path
-# would be reliable.
+# A main clone is a git worktree like any other, but it is the ONLY one
+# whose .git is a real directory rather than a `gitdir:` pointer file --
+# every linked worktree points back at it. That makes "is this the main
+# worktree" a path-identity check, not a naming convention: worktree paths
+# in this fleet are wildly inconsistent (paperclip-aurNNNN,
+# paperclip-wt-aurNNNN, paperclip-worktrees/aurNNNN, pc-wt-aurNNNN,
+# auranode-worktrees/aurNNNN, /tmp/aur-NNNN-*), so nothing that
+# pattern-matches a path would be reliable.
 set -uo pipefail
 
 # Absolute path to the main worktree's working directory, derived from the
@@ -41,7 +44,7 @@ with nothing warning either side. Only reads (log/diff/show/status) are safe
 here.
 
 Use a dedicated worktree instead:
-  git -C "$main_root" worktree add "$main_root-<issue>" -b <branch> origin/master
+  git -C "$main_root" worktree add "$main_root-<issue>" -b <branch> origin/<default-branch>
 then run "$verb" inside "$main_root-<issue>".
 
 To remove this worktree when done:

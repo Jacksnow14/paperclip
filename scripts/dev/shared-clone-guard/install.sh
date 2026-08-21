@@ -29,12 +29,32 @@ chmod +x "$dest"/*.sh
 
 hooks_dir="$common_dir/hooks"
 mkdir -p "$hooks_dir"
-if [[ -e "$hooks_dir/pre-commit" ]] && ! grep -q "AUR-4564" "$hooks_dir/pre-commit" 2>/dev/null; then
-  echo "REFUSING to overwrite existing $hooks_dir/pre-commit (no AUR-4564 marker found) -- merge by hand." >&2
-  exit 1
+hook="$hooks_dir/pre-commit"
+if [[ -e "$hook" ]] && grep -q "AUR-4564" "$hook" 2>/dev/null; then
+  echo "AUR-4564 guard already installed at $hook -- leaving as-is."
+elif [[ -e "$hook" ]]; then
+  # AUR-6017: a different pre-commit hook already owns this slot (e.g.
+  # AUR-5652's PII guard in the Auranode clone). Preserve it verbatim and
+  # chain the shared-clone-guard check ahead of it instead of clobbering it
+  # -- two independent guard packages can both need this one hook slot.
+  chained="$dest/chained-pre-commit.sh"
+  cp "$hook" "$chained"
+  chmod +x "$chained"
+  cat > "$hook" <<EOF
+#!/usr/bin/env bash
+# AUR-4564: shared-clone guard, chained ahead of a pre-existing pre-commit
+# hook found at install time (preserved verbatim at $chained) rather than
+# overwriting it.
+set -uo pipefail
+"$dest/pre-commit-hook.sh" || exit \$?
+exec "$chained" "\$@"
+EOF
+  chmod +x "$hook"
+  echo "Chained AUR-4564 guard ahead of the pre-existing hook (preserved copy: $chained)"
+else
+  cp "$dest/pre-commit-hook.sh" "$hook"
+  chmod +x "$hook"
 fi
-cp "$dest/pre-commit-hook.sh" "$hooks_dir/pre-commit"
-chmod +x "$hooks_dir/pre-commit"
 
 # `git config alias.checkout` / `alias.stash` do NOT work: git dispatches
 # known built-in subcommand names before it ever consults [alias] (verified
@@ -51,7 +71,8 @@ if [[ -f "$profile" ]] && grep -qF "$marker" "$profile" 2>/dev/null; then
 else
   {
     echo ""
-    echo "# $marker: checkout/stash guard for the /home/ievgen/paperclip shared clone"
+    echo "# $marker: checkout/stash guard, covers every shared clone listed in"
+    echo "# SCG_MAIN_CLONES (see shared-clone-guard.sh; defaults to paperclip + Auranode)"
     echo "$source_line"
   } >> "$profile"
   echo "Appended AUR-4564 guard source line to $profile"

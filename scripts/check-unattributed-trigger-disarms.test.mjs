@@ -11,6 +11,8 @@ import {
   FLAG_SEARCH_STATUSES,
   DEFAULT_TOLERANCE_MS,
   DEFAULT_OWNER_AGENT_ID,
+  HISTORICAL_DEBT_CUTOFF,
+  HISTORICAL_DEBT_CUTOFF_MS,
   classifyBornDisabledRoutine,
   formatBornDisabledFinding,
   buildBornDisabledIssueBody,
@@ -250,7 +252,7 @@ test('main() FIRES: a synthetic raw-SQL-style disarm (no revision, no identity) 
       triggerId: 't1',
       routineId: 'r1',
       label: 'nightly',
-      triggerUpdatedAt: '2026-08-15T00:00:00Z',
+      triggerUpdatedAt: '2026-08-16T00:00:00Z', // post-cutoff — active finding, not historical debt (AUR-6069)
       updatedByAgentId: null,
       updatedByUserId: null,
       routineTitle: 'Some routine',
@@ -324,7 +326,7 @@ test('main() UPDATES: rewrites an existing open dedup issue in place instead of 
       triggerId: 't3',
       routineId: 'r3',
       label: null,
-      triggerUpdatedAt: '2026-08-15T00:00:00Z',
+      triggerUpdatedAt: '2026-08-16T00:00:00Z', // post-cutoff — active finding, not historical debt (AUR-6069)
       updatedByAgentId: null,
       updatedByUserId: null,
       routineTitle: null,
@@ -385,7 +387,7 @@ test('main() DRY-RUN: --apply=false computes findings but performs zero mutation
       triggerId: 't4',
       routineId: 'r4',
       label: null,
-      triggerUpdatedAt: '2026-08-15T00:00:00Z',
+      triggerUpdatedAt: '2026-08-16T00:00:00Z', // post-cutoff — active finding, not historical debt (AUR-6069)
       updatedByAgentId: null,
       updatedByUserId: null,
       routineTitle: null,
@@ -449,7 +451,7 @@ test('main(): a 403 on the assigneeAgentId POST retries once unassigned and succ
       triggerId: 't5',
       routineId: 'r5',
       label: 'nightly',
-      triggerUpdatedAt: '2026-08-15T00:00:00Z',
+      triggerUpdatedAt: '2026-08-16T00:00:00Z', // post-cutoff — active finding, not historical debt (AUR-6069)
       updatedByAgentId: null,
       updatedByUserId: null,
       routineTitle: 'Some routine',
@@ -493,7 +495,7 @@ test('main(): a 403 that is NOT about assigneeAgentId (or not tasks:assign) is s
       triggerId: 't6',
       routineId: 'r6',
       label: null,
-      triggerUpdatedAt: '2026-08-15T00:00:00Z',
+      triggerUpdatedAt: '2026-08-16T00:00:00Z', // post-cutoff — active finding, not historical debt (AUR-6069)
       updatedByAgentId: null,
       updatedByUserId: null,
       routineTitle: null,
@@ -646,6 +648,84 @@ test('main(): a genuinely unattributed disarm (no matching enforcer log entry) s
   assert.equal(filed.length, 1);
   assert.match(filed[0].body.description, /trigger t8/);
   assert.doesNotMatch(filed[0].body.description, /trigger t9/);
+});
+
+// ── historical-debt cutoff (AUR-6069) ───────────────────────────────────────
+
+test('main(): a pre-cutoff unattributed disarm is accepted historical debt — excluded, files nothing', async () => {
+  const { fetchStub, calls } = makeFetchStub({
+    [FIND_QUERY]: [],
+  });
+  global.fetch = fetchStub;
+
+  const rows = [
+    {
+      // Matches the AUR-6062 mass-disarm timestamp (72 of the 86 findings).
+      triggerId: 't10',
+      routineId: 'r10',
+      label: null,
+      triggerUpdatedAt: '2026-08-07T08:56:52.540Z',
+      updatedByAgentId: null,
+      updatedByUserId: null,
+      routineTitle: null,
+      revisionNumber: null,
+      revisionCreatedAt: null,
+    },
+  ];
+
+  const code = await main({
+    apply: true,
+    apiUrl: API_URL,
+    apiKey: 'key',
+    companyId: COMPANY_ID,
+    fetchCandidateRows: async () => rows,
+    disarmLogEntries: [],
+  });
+
+  assert.equal(code, 0);
+  const mutations = calls.filter((c) => c.method !== 'GET');
+  assert.equal(mutations.length, 0, 'pre-cutoff historical debt must not be filed as an active finding');
+});
+
+test('main(): a post-cutoff unattributed disarm is still flagged normally (negative control — amnesty is not a loophole)', async () => {
+  const { fetchStub, calls } = makeFetchStub({
+    [FIND_QUERY]: [],
+    [FILE_ROUTE]: { id: 'flag1' },
+  });
+  global.fetch = fetchStub;
+
+  const rows = [
+    {
+      triggerId: 't11',
+      routineId: 'r11',
+      label: null,
+      triggerUpdatedAt: new Date(HISTORICAL_DEBT_CUTOFF_MS + 60_000).toISOString(), // 1 min after the cutoff
+      updatedByAgentId: null,
+      updatedByUserId: null,
+      routineTitle: null,
+      revisionNumber: null,
+      revisionCreatedAt: null,
+    },
+  ];
+
+  const code = await main({
+    apply: true,
+    apiUrl: API_URL,
+    apiKey: 'key',
+    companyId: COMPANY_ID,
+    fetchCandidateRows: async () => rows,
+    disarmLogEntries: [],
+  });
+
+  assert.equal(code, 0);
+  const filed = calls.filter((c) => c.method === 'POST' && c.path === `/api/companies/${COMPANY_ID}/issues`);
+  assert.equal(filed.length, 1, 'a genuinely new post-cutoff unattributed disarm must still open the issue');
+  assert.match(filed[0].body.description, /trigger t11/);
+});
+
+test('HISTORICAL_DEBT_CUTOFF_MS parses to a valid, sane timestamp', () => {
+  assert.equal(Number.isNaN(HISTORICAL_DEBT_CUTOFF_MS), false);
+  assert.equal(HISTORICAL_DEBT_CUTOFF_MS, Date.parse(HISTORICAL_DEBT_CUTOFF));
 });
 
 test('readAllowlistLogSafe: returns empty string instead of throwing when the log file does not exist on this host', () => {

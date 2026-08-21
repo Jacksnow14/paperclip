@@ -321,12 +321,12 @@ require_npm_publish_auth() {
     return
   fi
 
-  if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
-    release_info "  ✓ npm publish auth will be provided by GitHub Actions trusted publishing"
+  if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
+    release_info "  ✓ npm publish auth provided via NODE_AUTH_TOKEN"
     return
   fi
 
-  release_fail "npm publish auth is not available. Use 'npm login' locally or run from GitHub Actions with trusted publishing."
+  release_fail "npm publish auth is not available. Use 'npm login' locally, or set NODE_AUTH_TOKEN (wired from an NPM_TOKEN secret) when running from CI."
 }
 
 list_public_package_info() {

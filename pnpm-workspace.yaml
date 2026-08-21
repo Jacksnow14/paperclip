@@ -9,6 +9,9 @@ packages:
   # Keep this smoke fixture installable as a local plugin example without
   # forcing PRs to commit pnpm-lock.yaml for a new workspace importer.
   - "!packages/plugins/examples/plugin-orchestration-smoke-example"
+  # Keep the memory SDK installable as a standalone package without forcing
+  # PRs to commit pnpm-lock.yaml for a new workspace importer (AUR-5952).
+  - "!packages/memory-sdk"
   - server
   - ui
   - cli

@@ -118,5 +118,10 @@
     "dir": "ui",
     "name": "@paperclipai/ui",
     "publishFromCi": true
+  },
+  {
+    "dir": "packages/memory-sdk",
+    "name": "@paperclipai/memory-sdk",
+    "publishFromCi": false
   }
 ]

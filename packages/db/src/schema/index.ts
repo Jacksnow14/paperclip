@@ -79,6 +79,7 @@ export { pluginJobs, pluginJobRuns } from "./plugin_jobs.js";
 export { pluginWebhookDeliveries } from "./plugin_webhooks.js";
 export { pluginLogs } from "./plugin_logs.js";
 export { memoryRecords } from "./memory_records.js";
+export { agentMemories } from "./agent_memories.js";
 export { backgroundJobs, backgroundJobRuns, backgroundJobEvents, backgroundJobCostEvents } from "./background_jobs.js";
 export { memoryBindings } from "./memory_bindings.js";
 export { memoryBindingTargets } from "./memory_binding_targets.js";

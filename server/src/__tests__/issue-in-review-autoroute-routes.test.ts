@@ -30,6 +30,7 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
   getActiveForIssue: vi.fn(async () => null),
   listForIssue: vi.fn(async () => []),
   resolve: vi.fn(async () => undefined),
+  expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
 }));
 
 const mockAgentService = vi.hoisted(() => ({
@@ -377,6 +378,109 @@ describe("in_review auto-route guard", () => {
     expect(res.status).toBe(422);
     expect(res.body.error).toMatch(/in_review requires reassignment/);
     expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("AUR-5985: comment-only PATCH on an already-in_review creator-less issue with a scheduled assignee monitor keeps the assignment (no bounce to manager)", async () => {
+    const creatorlessInReviewIssue = {
+      ...BASE_ISSUE,
+      status: "in_review",
+      createdByUserId: null,
+      createdByAgentId: null,
+      executionPolicy: {
+        monitor: {
+          status: "scheduled",
+          scheduledBy: "assignee",
+          nextCheckAt: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString(),
+          maxAttempts: 4,
+        },
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(creatorlessInReviewIssue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...creatorlessInReviewIssue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    // If the guard incorrectly fired here, it would consult reportsTo to bounce to a manager.
+    mockAgentService.getById.mockResolvedValue({ id: "agent-1", reportsTo: "manager-agent-1" });
+    mockIssueService.addComment.mockResolvedValue({
+      id: "77777777-7777-4777-8777-777777777777",
+      issueId: BASE_ISSUE.id,
+      companyId: "company-1",
+      body: "still working the monitor wake, no status change",
+    });
+
+    const res = await request(await createAgentApp())
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ comment: "still working the monitor wake, no status change" });
+
+    expect(res.status).toBe(200);
+    const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+    // No status in updateFields (comment-only PATCH), and no auto-route reassignment.
+    expect(patch.status).toBeUndefined();
+    expect(patch.assigneeAgentId).toBeUndefined();
+    expect(patch.assigneeUserId).toBeUndefined();
+    expect(res.body.warnings).toBeUndefined();
+  });
+
+  it("AUR-5985: transitioning into in_review still fires the guard even with a stale monitor field present", async () => {
+    // Sanity check that the transition-based gate didn't accidentally disable the guard
+    // entirely — it must still fire the very first time status flips to in_review.
+    const creatorlessIssue = {
+      ...BASE_ISSUE,
+      createdByUserId: null,
+      createdByAgentId: null,
+      executionPolicy: null,
+    };
+    mockIssueService.getById.mockResolvedValue(creatorlessIssue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...creatorlessIssue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    mockAgentService.getById.mockResolvedValue({ id: "agent-1", reportsTo: "manager-agent-1" });
+
+    const res = await request(await createAgentApp())
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.objectContaining({
+        status: "in_review",
+        assigneeAgentId: "manager-agent-1",
+        assigneeUserId: null,
+      }),
+    );
+  });
+
+  it("AUR-5985: silently-discarded explicit assigneeAgentId is surfaced as a response warning", async () => {
+    const creatorlessIssue = {
+      ...BASE_ISSUE,
+      createdByUserId: null,
+      createdByAgentId: null,
+    };
+    mockIssueService.getById.mockResolvedValue(creatorlessIssue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...creatorlessIssue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    mockAgentService.getById.mockResolvedValue({ id: "agent-1", reportsTo: "manager-agent-1" });
+
+    const res = await request(await createAgentApp())
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_review", assigneeAgentId: "agent-1" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.objectContaining({ assigneeAgentId: "manager-agent-1" }),
+    );
+    expect(res.body.warnings).toEqual(
+      expect.arrayContaining([expect.stringMatching(/auto-route guard/)]),
+    );
   });
 
   it("rejects non-owner agent with 409 before guard fires", async () => {

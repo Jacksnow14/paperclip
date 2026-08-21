@@ -30,7 +30,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
@@ -176,8 +176,16 @@ function main() {
   process.exitCode = 2;
 }
 
+// Resolve symlinks on process.argv[1] before comparing: Node resolves
+// import.meta.url to the entry script's REAL path, but process.argv[1] keeps
+// whatever path was given on the command line. Production invokes this via
+// /opt/paperclip/app/current/scripts/oauth-warm.mjs, a symlink to a release
+// dir — without realpathSync() here the two never match, invokedDirectly is
+// always false, and main() silently never runs (AUR-5864 live-verified this
+// left the deployed timer a no-op for its first ~3.5h on the host).
 const invokedDirectly =
-  process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href;
+  process.argv[1] &&
+  import.meta.url === new URL(`file://${realpathSync(process.argv[1])}`).href;
 if (invokedDirectly) {
   main();
 }

@@ -31,8 +31,28 @@
  *      under the tolerance.
  *   3. Report (but do not additionally gate on) whether the trigger also
  *      carries no actor identity at all (`updated_by_agent_id IS NULL AND
- *      updated_by_user_id IS NULL`) — the strongest tell when there is no
- *      revision to compare against, surfaced in the finding for context.
+ *      updated_by_user_id IS NULL`) — surfaced in the finding for context
+ *      only, never as proof of who disarmed it (see the AUR-6058 note below).
+ *
+ * AUR-6058 (CMO review of AUR-6053/6054): the reported concept is
+ * deliberately named "needs attribution check", not "unattributed", both in
+ * `FLAG_TITLE` and the filed issue body. `classifyRow`'s `unattributed` field
+ * computes purely `!hasRevision || gapMs > toleranceMs` — "no revision row
+ * was written near the disarm" — which is not the same claim as "nobody
+ * owned this disarm" (a worked counterexample: a documented self-service
+ * escalation-clause disarm, independently endorsed after the fact, still has
+ * no revision row and would read as a confirmed problem under the old
+ * wording). The filed issue's headline count is reported as "N disarm(s)
+ * need attribution check", never as a confirmed anomaly count.
+ *
+ * `noActorIdentity` is a deliberate keep-but-don't-fold: it stays computed
+ * and surfaced in `formatFinding` for a human to look up, but it is NOT
+ * folded into the `unattributed` verdict and its presence is never reported
+ * as identifying who disarmed a trigger. `updated_by_agent_id` /
+ * `updated_by_user_id` are last-writer-wins columns — a later re-arm by a
+ * different agent overwrites them, so a non-null value can name whoever
+ * *fixed* the disarm rather than whoever caused it. Only "a revision row
+ * exists or it doesn't" is safe to cite as attribution evidence.
  *
  * Detection only — this script never mutates `routine_triggers` or
  * `routine_revisions`, matching the rest of the check-*.mjs family
@@ -99,8 +119,12 @@ export const DEFAULT_TOLERANCE_MS = 5000;
 /** Owner for a filed watchdog issue when the caller doesn't override it. */
 export const DEFAULT_OWNER_AGENT_ID = '371a1b08-0286-4a12-a516-f587f42df5eb'; // CTO
 
-/** Stable dedup title — find-or-create, rewritten in place, never one-per-gap. */
-export const FLAG_TITLE = 'Watchdog: unattributed schedule-trigger disarm(s) detected';
+/**
+ * Stable dedup title — find-or-create, rewritten in place, never one-per-gap.
+ * "needs attribution check", not "unattributed" (AUR-6058): the check only
+ * proves a revision row is missing, not that the disarm was illegitimate.
+ */
+export const FLAG_TITLE = 'Watchdog: schedule-trigger disarm(s) need attribution check';
 
 /** Statuses searched (and treated as "still open") when looking up the dedup issue. */
 export const FLAG_SEARCH_STATUSES = 'backlog,todo,in_progress,in_review,blocked';
@@ -127,9 +151,13 @@ export function formatFinding(row, classification) {
   const gapDesc = classification.hasRevision
     ? `${Math.round(classification.gapMs / 1000)}s after the latest revision (routine_revisions#${row.revisionNumber ?? '?'}, created_at=${new Date(row.revisionCreatedAt).toISOString()})`
     : 'no routine_revisions row exists for this routine at all';
+  // AUR-6058: reported as raw context only, never as attribution — these
+  // columns are last-writer-wins, so a non-null value can name whoever
+  // fixed the disarm rather than whoever caused it.
   const identityDesc = classification.noActorIdentity
-    ? 'updated_by_agent_id and updated_by_user_id are BOTH null'
-    : `updated_by_agent_id=${row.updatedByAgentId ?? 'null'}, updated_by_user_id=${row.updatedByUserId ?? 'null'}`;
+    ? 'no actor identity is recorded at all (updated_by_agent_id and updated_by_user_id are BOTH null)'
+    : `updated_by_agent_id=${row.updatedByAgentId ?? 'null'}, updated_by_user_id=${row.updatedByUserId ?? 'null'} ` +
+      '(last-writer-wins — not proof of who disarmed this; a later re-arm by a different agent overwrites it)';
   return (
     `trigger ${row.triggerId} (routine ${row.routineId} ${routineLabel}, label=${row.label ?? 'null'}): ` +
     `disabled at ${new Date(row.triggerUpdatedAt).toISOString()}, ${gapDesc}. ${identityDesc}.`
@@ -139,12 +167,16 @@ export function formatFinding(row, classification) {
 /** Builds the dedup issue body listing every current finding. */
 export function buildIssueBody(findings, now = new Date()) {
   const lines = [
-    `## Unattributed schedule-trigger disarm(s)`,
+    `## Schedule-trigger disarm(s) needing attribution check`,
     '',
-    `As of ${now.toISOString()}, ${findings.length} disabled schedule trigger(s) were disabled more recently ` +
-      'than the latest `routine_revisions` row for their routine was written (or have no revision at all) — ' +
-      'meaning whatever flipped `enabled = false` did not append a revision covering the change, the same ' +
-      'audit-trail gap root-caused on AUR-5744.',
+    `As of ${now.toISOString()}, ${findings.length} disabled schedule trigger(s) need an attribution check: ` +
+      'each was disabled more recently than the latest `routine_revisions` row for their routine was written ' +
+      '(or has no revision at all), meaning whatever flipped `enabled = false` did not append a revision ' +
+      'covering the change — the same audit-trail gap root-caused on AUR-5744. **This count is not a confirmed ' +
+      'anomaly count.** It proves only that a revision row is missing, not that the disarm was illegitimate or ' +
+      'unowned — a documented, deliberate disarm (e.g. a self-service escalation clause) can legitimately have ' +
+      'no revision row too (AUR-6058). Do not cite `updated_by_agent_id`/`updated_by_user_id` below as proof of ' +
+      'who disarmed a trigger — both are last-writer-wins and can instead name whoever re-armed it afterward.',
     '',
   ];
   for (const { row, classification } of findings) {
@@ -155,7 +187,7 @@ export function buildIssueBody(findings, now = new Date()) {
     'This is detection only — nothing here re-enables a trigger or writes a revision. Investigate the writer ' +
       '(most recent `activity_log` rows for the trigger, or the process that touched it) and either fix it to ' +
       'append a revision the way `PATCH /api/routine-triggers/:id` does, or confirm the disarm was legitimate ' +
-      'and record it properly.',
+      '(e.g. a documented escalation) and record it properly.',
     '',
     'This issue is rewritten in place every watchdog run and auto-closes once the list empties.',
     '',
@@ -648,7 +680,7 @@ export async function main({
   }
 
   console.log(
-    `Disabled schedule triggers scanned: ${rows.length}. Unattributed: ${findings.length}. ` +
+    `Disabled schedule triggers scanned: ${rows.length}. Need attribution check: ${findings.length}. ` +
       `Policy-disarmed (routine-allowlist enforcer, excluded): ${policyDisarmed.length}.`,
   );
   for (const f of findings) console.log(`  ${formatFinding(f.row, f.classification)}`);
@@ -658,16 +690,16 @@ export async function main({
 
   if (findings.length === 0) {
     if (existing && !['done', 'cancelled'].includes(existing.status)) {
-      console.log(`CLOSE ${existing.identifier ?? existing.id} — no outstanding unattributed disarms.`);
+      console.log(`CLOSE ${existing.identifier ?? existing.id} — no outstanding disarms need an attribution check.`);
       if (apply) {
         await apiPatch(`/api/issues/${existing.id}`, { status: 'done' });
         await apiPost(`/api/issues/${existing.id}/comments`, {
-          body: `Auto-closed by check-unattributed-trigger-disarms: 0 unattributed schedule-trigger disarms found as of ${now.toISOString()}.`,
+          body: `Auto-closed by check-unattributed-trigger-disarms: 0 schedule-trigger disarms need an attribution check as of ${now.toISOString()}.`,
         });
         console.log('  → closed.');
       }
     } else {
-      console.log('No outstanding unattributed disarms; nothing to sync.');
+      console.log('No outstanding disarms need an attribution check; nothing to sync.');
     }
     return 0;
   }
@@ -679,7 +711,7 @@ export async function main({
     if (apply) {
       await apiPatch(`/api/issues/${existing.id}`, { description: body });
       await apiPost(`/api/issues/${existing.id}/comments`, {
-        body: `Re-scanned ${now.toISOString()}: ${findings.length} unattributed disarm(s) still present.`,
+        body: `Re-scanned ${now.toISOString()}: ${findings.length} disarm(s) still need an attribution check.`,
       });
       console.log('  → updated.');
     }

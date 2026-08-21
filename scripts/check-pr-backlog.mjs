@@ -277,7 +277,18 @@ export function refileCapMessage(repo, capped) {
   );
 }
 
-export function issueBody(pr, repo) {
+/**
+ * hasTrunkCiScript: whether `scripts/check-trunk-ci-red.mjs` exists in the
+ * target repo's checkout (AUR-5995) — that script is Paperclip-only today;
+ * stamping its command unconditionally 404s step 1 of the procedure in every
+ * repo (e.g. Auranode) that doesn't have it. Callers resolve this once per
+ * repo (see hasTrunkCiScript() / ghRepoHasFile()) and pass it through.
+ */
+export function issueBody(pr, repo, hasTrunkCiScript = true) {
+  const trunkCheckStep = hasTrunkCiScript
+    ? '1. Check trunk first: `node scripts/check-trunk-ci-red.mjs --dry-run`.'
+    : '1. Check trunk first (repo-agnostic fallback — `scripts/check-trunk-ci-red.mjs` ' +
+      `does not exist in this repo): \`gh pr checks --repo ${repo} <trunk-branch-head-sha-or-latest-PR>\`.`;
   return [
     `Filed automatically by scripts/check-pr-backlog.mjs — the PR-backlog dispatcher.`,
     '',
@@ -302,7 +313,7 @@ export function issueBody(pr, repo) {
     '',
     '## Procedure (single PR — never batch)',
     '',
-    '1. Check trunk first: `node scripts/check-trunk-ci-red.mjs --dry-run`.',
+    trunkCheckStep,
     '   Do not merge over a red trunk — fix trunk first or park with a comment.',
     '2. Deep-review the diff against CURRENT origin/master: correctness, security,',
     '   supersession (is this already implemented on master? grep for its symbols),',
@@ -376,6 +387,29 @@ function parseArgs(argv) {
 function ghJson(path) {
   const out = execFileSync('gh', ['api', path], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
   return JSON.parse(out);
+}
+
+/** Does `path` exist in `repo`'s default branch? Used to decide whether the
+ * stamped procedure text can reference a Paperclip-only script (AUR-5995). */
+function ghRepoHasFile(repo, path) {
+  try {
+    execFileSync('gh', ['api', `repos/${repo}/contents/${path}`], {
+      encoding: 'utf8',
+      maxBuffer: 1024 * 1024,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const trunkCiScriptCache = new Map();
+/** Memoized per repo — filing loops call this once per issue, not once per gh api round trip. */
+function hasTrunkCiScript(repo) {
+  if (!trunkCiScriptCache.has(repo)) {
+    trunkCiScriptCache.set(repo, ghRepoHasFile(repo, 'scripts/check-trunk-ci-red.mjs'));
+  }
+  return trunkCiScriptCache.get(repo);
 }
 
 function loadState(stateDir) {
@@ -580,7 +614,7 @@ async function main() {
   for (const f of assigned) {
     const created = await api(args, 'POST', `/api/companies/${companyId}/issues`, {
       title: issueTitle(f, f.repo),
-      description: issueBody(f, f.repo),
+      description: issueBody(f, f.repo, hasTrunkCiScript(f.repo)),
       priority: 'high',
       assigneeAgentId: f.reviewerId,
     });

@@ -116,6 +116,23 @@ import { resolveApiBase } from './lib/paperclip-api-base.mjs';
 /** Default tolerance for "the revision landed in the same transaction". */
 export const DEFAULT_TOLERANCE_MS = 5000;
 
+/**
+ * One-time amnesty cutoff for pre-fix historical debt (AUR-6069, root-cause
+ * finding on AUR-6062): all 86 unattributed findings on AUR-6062 collapse
+ * into exactly 5 distinct disarm timestamps between 2026-04-19 and
+ * 2026-08-12T16:16:39.157Z — every one of them before
+ * `/home/ievgen/.paperclip/bin/enforce-routine-allowlist.mjs` (AUR-5744) was
+ * fixed and redeployed to write an attributable `routine_revisions` row /
+ * `activity_log` entry (confirmed via its file mtime,
+ * 2026-08-15T20:09:08.957Z). A pre-cutoff unattributed row can never gain a
+ * revision after the fact — nothing can retroactively write history — so the
+ * watchdog would otherwise re-flag the same rows forever. This cutoff is one
+ * second after that deploy: only a disarm at/after this instant is still an
+ * active finding.
+ */
+export const HISTORICAL_DEBT_CUTOFF = '2026-08-15T20:09:09Z';
+export const HISTORICAL_DEBT_CUTOFF_MS = Date.parse(HISTORICAL_DEBT_CUTOFF);
+
 /** Owner for a filed watchdog issue when the caller doesn't override it. */
 export const DEFAULT_OWNER_AGENT_ID = '371a1b08-0286-4a12-a516-f587f42df5eb'; // CTO
 
@@ -669,6 +686,7 @@ export async function main({
 
   const findings = [];
   const policyDisarmed = [];
+  const historicalDebt = [];
   for (const row of rows) {
     const classification = classifyRow(row, toleranceMs);
     if (!classification.unattributed) continue;
@@ -676,15 +694,24 @@ export async function main({
       policyDisarmed.push({ row, classification });
       continue;
     }
+    // AUR-6069: pre-cutoff unattributed rows are accepted historical debt
+    // (see HISTORICAL_DEBT_CUTOFF doc comment) — excluded from active
+    // findings but still counted/logged, never silently dropped.
+    if (new Date(row.triggerUpdatedAt).getTime() < HISTORICAL_DEBT_CUTOFF_MS) {
+      historicalDebt.push({ row, classification });
+      continue;
+    }
     findings.push({ row, classification });
   }
 
   console.log(
     `Disabled schedule triggers scanned: ${rows.length}. Need attribution check: ${findings.length}. ` +
-      `Policy-disarmed (routine-allowlist enforcer, excluded): ${policyDisarmed.length}.`,
+      `Policy-disarmed (routine-allowlist enforcer, excluded): ${policyDisarmed.length}. ` +
+      `Historical debt (pre-${HISTORICAL_DEBT_CUTOFF} cutoff, accepted amnesty, excluded): ${historicalDebt.length}.`,
   );
   for (const f of findings) console.log(`  ${formatFinding(f.row, f.classification)}`);
   for (const f of policyDisarmed) console.log(`  [policy-disarmed, skipped] ${formatFinding(f.row, f.classification)}`);
+  for (const f of historicalDebt) console.log(`  [historical-debt, accepted amnesty, skipped] ${formatFinding(f.row, f.classification)}`);
 
   const existing = await findFlagIssue({ companyId, apiGet });
 

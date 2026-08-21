@@ -54,6 +54,7 @@ const {
   isOwnOutboundCopy,
   isMarketingEmail,
   isColdOutreachOwnSend,
+  isShopifyInformationalNotification,
 } = await import("../services/gmail-intake.js");
 
 // Minimal Drizzle-like db mock that supports select/insert chaining.
@@ -824,6 +825,163 @@ describe("marketing/promotional email suppression (AUR-5831)", () => {
     expect(isMarketingEmail("<https://example.com/unsub>")).toBe(true);
     expect(isMarketingEmail("")).toBe(false);
     expect(isMarketingEmail("   ")).toBe(false);
+  });
+});
+
+describe("Shopify informational notification suppression (AUR-6074)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function makeShopifyMessage(id: string, threadId: string, from: string, subject: string) {
+    const msg = makeMessage(id, threadId, subject);
+    msg.payload.headers[0].value = from;
+    return msg;
+  }
+
+  // Simulates agent lookup returning a CMO agent id, mirroring the
+  // "routing: mailbox → agent role" and "sender-based routing" helpers above.
+  // Call order (after AUR-2674 dedupe): 1=msg-dedup, 2=thread-lookup,
+  // 3=sender+subject-lookup (no cross-thread match), 4=agent-lookup.
+  function makeAgentLookupDb() {
+    let selectCallCount = 0;
+    return {
+      select: vi.fn(() => {
+        selectCallCount++;
+        const rows = selectCallCount >= 3 ? [{ id: "agent-cmo-1" }] : [];
+        return {
+          from: vi.fn().mockReturnThis(),
+          leftJoin: vi.fn().mockReturnThis(),
+          where: vi.fn().mockReturnThis(),
+          orderBy: vi.fn().mockReturnThis(),
+          limit: vi.fn().mockResolvedValue(rows),
+        };
+      }),
+      insert: vi.fn(() => ({ values: vi.fn().mockResolvedValue(undefined) })),
+    } as unknown as Db;
+  }
+
+  it("skips issue creation for an informational mailer@shopify.com notification (AUR-6073)", async () => {
+    const msg = makeShopifyMessage(
+      "shop-1",
+      "thread-shop-1",
+      "Shopify <mailer@shopify.com>",
+      "Neue Zahlungsmethode aktiviert",
+    );
+    mockListMessages.mockResolvedValue({ messages: [{ id: "shop-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "should-not-exist" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "alex");
+
+    expect(mockIssueCreate).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(result.processed).toBe(1);
+
+    const insertValues = (db as ReturnType<typeof buildDbMock>)._insertChain.values.mock
+      .calls[0][0] as Record<string, unknown>;
+    expect(insertValues.issueId).toBeNull();
+  });
+
+  it("still mints a CMO-assigned issue for account-security@shopify.com (ticket 4a5cff83 must never be dampened)", async () => {
+    const msg = makeShopifyMessage(
+      "shop-2",
+      "thread-shop-2",
+      "Shopify <account-security@shopify.com>",
+      "Verify your recent login",
+    );
+    mockListMessages.mockResolvedValue({ messages: [{ id: "shop-2" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([]);
+    mockCreateLabel.mockResolvedValue({ id: "lbl-x" });
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-shop-2" });
+
+    const db = makeAgentLookupDb();
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "alex");
+
+    expect(mockIssueCreate).toHaveBeenCalledWith(
+      COMPANY_ID,
+      expect.objectContaining({ assigneeAgentId: "agent-cmo-1" }),
+    );
+    expect(result.created).toBe(1);
+  });
+
+  it("still mints an issue for a mailer@shopify.com message hitting an action/money keyword (escalation carve-out)", async () => {
+    const msg = makeShopifyMessage(
+      "shop-3",
+      "thread-shop-3",
+      "Shopify <mailer@shopify.com>",
+      "Payout on hold: chargeback received",
+    );
+    mockListMessages.mockResolvedValue({ messages: [{ id: "shop-3" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([]);
+    mockCreateLabel.mockResolvedValue({ id: "lbl-x" });
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-shop-3" });
+
+    const db = makeAgentLookupDb();
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "alex");
+
+    expect(mockIssueCreate).toHaveBeenCalledWith(
+      COMPANY_ID,
+      expect.objectContaining({ assigneeAgentId: "agent-cmo-1" }),
+    );
+    expect(result.created).toBe(1);
+  });
+
+  it("classifier: only matches mailer@/no-reply@shopify.com, never account-security@shopify.com", () => {
+    expect(isShopifyInformationalNotification("mailer@shopify.com", "Order shipped")).toBe(true);
+    expect(isShopifyInformationalNotification("Shopify <no-reply@shopify.com>", "New feature")).toBe(
+      true,
+    );
+    expect(
+      isShopifyInformationalNotification("account-security@shopify.com", "Order shipped"),
+    ).toBe(false);
+    expect(isShopifyInformationalNotification("someone@example.com", "Order shipped")).toBe(false);
+  });
+
+  it("classifier: rejects lookalike senders that only substring-match the real address", () => {
+    expect(
+      isShopifyInformationalNotification("attacker-mailer@shopify.com", "Order shipped"),
+    ).toBe(false);
+    expect(
+      isShopifyInformationalNotification("mailer@shopify.com.evil.net", "Order shipped"),
+    ).toBe(false);
+    expect(
+      isShopifyInformationalNotification(
+        "Fake Shopify <no-reply@shopify.com.attacker.net>",
+        "Order shipped",
+      ),
+    ).toBe(false);
+  });
+
+  it("classifier: an action/money keyword in the subject flips the result to escalate", () => {
+    expect(
+      isShopifyInformationalNotification("mailer@shopify.com", "Zahlung fehlgeschlagen"),
+    ).toBe(false);
+    expect(isShopifyInformationalNotification("mailer@shopify.com", "Auszahlung pausiert")).toBe(
+      false,
+    );
+    expect(isShopifyInformationalNotification("mailer@shopify.com", "Chargeback filed")).toBe(
+      false,
+    );
+    expect(
+      isShopifyInformationalNotification("no-reply@shopify.com", "Your account has been deaktiviert"),
+    ).toBe(false);
+    expect(isShopifyInformationalNotification("mailer@shopify.com", "Account suspended")).toBe(
+      false,
+    );
   });
 });
 

@@ -84,6 +84,34 @@ export function isColdOutreachOwnSend(from: string): boolean {
   return COLD_OUTREACH_SEND_ONLY_DOMAIN_RE.test(from);
 }
 
+// Shopify informational notifications are not actionable correspondence
+// (AUR-6074). account-security@shopify.com carried every decision on the
+// First Mile account-security case (ticket 4a5cff83, AUR-2156/AUR-5816/
+// AUR-6024/AUR-5938) and must never be dampened — it is deliberately
+// excluded from this check. mailer@/no-reply@shopify.com started emitting
+// continuous order/payout/product-feature notifications once the store
+// went public (AUR-6071): 5 triage issues in 24h on 2026-08-20, one whole
+// agent run to triage a Klarna auto-enrollment notice (AUR-6073). Suppress
+// those senders by default, but fail toward escalation on a genuine money/
+// account-action event so a real payout failure or chargeback is never
+// swallowed by the digest.
+// Anchored on both sides so a lookalike sender can't ride the plain substring
+// match: an unanchored `.includes("mailer@shopify.com")` also matches
+// "attacker-mailer@shopify.com" (local-part prefix) and
+// "mailer@shopify.com.evil.net" (domain suffix) — either would silently
+// suppress a spoofed/phishing message that impersonates Shopify instead of
+// routing it to CMO. Require the address to start right after a boundary
+// (string start, whitespace, `<`, or a quote) and end right after
+// "shopify.com" at a matching boundary.
+const SHOPIFY_INFORMATIONAL_SENDER_RE = /(?:^|[\s<"])(?:mailer|no-reply)@shopify\.com(?=[\s>"]|$)/i;
+const SHOPIFY_ACTION_SUBJECT_RE =
+  /zahlung fehlgeschlagen|auszahlung|chargeback|deaktiviert|suspended/i;
+
+export function isShopifyInformationalNotification(from: string, subject: string): boolean {
+  if (!SHOPIFY_INFORMATIONAL_SENDER_RE.test(from)) return false;
+  return !SHOPIFY_ACTION_SUBJECT_RE.test(subject);
+}
+
 // Our own outbound mail is not correspondence (AUR-5473). The intake listing
 // query is a plain Gmail search, which matches SENT as well as received mail —
 // so every cold email the outreach sequence sends from alex@ was minting an
@@ -464,6 +492,24 @@ export function createGmailIntakeService(db: Db) {
           logger.info(
             { mailbox, messageId: parsed.gmailMessageId, from: parsed.from, subject: parsed.subject },
             "gmail-intake: suppressed own cold-outreach send-only domain (no issue)",
+          );
+          skipped++;
+          continue;
+        }
+
+        // Shopify informational notifications are not actionable
+        // correspondence (AUR-6074). Record the intake so the message is
+        // not refetched on every poll, mint no issue, and leave the mail
+        // untouched — same suppress-in-place treatment as the cases above.
+        // account-security@shopify.com never matches this check (see
+        // isShopifyInformationalNotification) and falls through unchanged.
+        if (isShopifyInformationalNotification(parsed.from, parsed.subject)) {
+          await db.insert(gmailIntakeRecords).values(
+            buildIntakeRecordValues(companyId, mailbox, parsed, null),
+          );
+          logger.info(
+            { mailbox, messageId: parsed.gmailMessageId, from: parsed.from, subject: parsed.subject },
+            "gmail-intake: suppressed Shopify informational notification (no issue)",
           );
           skipped++;
           continue;

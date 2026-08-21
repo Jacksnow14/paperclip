@@ -65,6 +65,25 @@ export function isMarketingEmail(listUnsubscribe: string): boolean {
   return listUnsubscribe.trim().length > 0;
 }
 
+// Our own cold-outreach send-only identity (AUR-6042). `auranodehq.com` 550s
+// at its own MX, so no human or system legitimately sends *from* it except
+// the outreach campaign — mail arriving in the alex@ intake mailbox with
+// this From domain is our own ESP-sent (Resend/SES) cold email round-
+// tripping back in, not correspondence. Unlike tryauranode.com (see
+// isOwnOutboundCopy below), auranodehq.com never legitimately receives real
+// replies to itself, so a From-domain check alone is safe here — ESP sends
+// never pass through Gmail's own send path, so there is no SENT label to
+// discriminate on the way isOwnOutboundCopy does for tryauranode.com.
+export const COLD_OUTREACH_SEND_ONLY_DOMAIN = "auranodehq.com";
+const COLD_OUTREACH_SEND_ONLY_DOMAIN_RE = new RegExp(
+  `[@.]${COLD_OUTREACH_SEND_ONLY_DOMAIN.replace(/\./g, "\\.")}\\b`,
+  "i",
+);
+
+export function isColdOutreachOwnSend(from: string): boolean {
+  return COLD_OUTREACH_SEND_ONLY_DOMAIN_RE.test(from);
+}
+
 // Our own outbound mail is not correspondence (AUR-5473). The intake listing
 // query is a plain Gmail search, which matches SENT as well as received mail —
 // so every cold email the outreach sequence sends from alex@ was minting an
@@ -428,6 +447,23 @@ export function createGmailIntakeService(db: Db) {
           logger.info(
             { mailbox, messageId: parsed.gmailMessageId, from: parsed.from, subject: parsed.subject },
             "gmail-intake: suppressed marketing/promotional email (List-Unsubscribe present, no issue)",
+          );
+          skipped++;
+          continue;
+        }
+
+        // Our own cold-outreach sends round-tripping back into the alex@
+        // intake mailbox are not correspondence (AUR-6042). Record the
+        // intake so the message is not refetched on every poll, mint no
+        // issue, and leave the mail untouched — same suppress-in-place
+        // treatment as the DMARC and marketing cases above.
+        if (isColdOutreachOwnSend(parsed.from)) {
+          await db.insert(gmailIntakeRecords).values(
+            buildIntakeRecordValues(companyId, mailbox, parsed, null),
+          );
+          logger.info(
+            { mailbox, messageId: parsed.gmailMessageId, from: parsed.from, subject: parsed.subject },
+            "gmail-intake: suppressed own cold-outreach send-only domain (no issue)",
           );
           skipped++;
           continue;

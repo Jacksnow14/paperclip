@@ -53,6 +53,7 @@ const {
   isDmarcAggregateReport,
   isOwnOutboundCopy,
   isMarketingEmail,
+  isColdOutreachOwnSend,
 } = await import("../services/gmail-intake.js");
 
 // Minimal Drizzle-like db mock that supports select/insert chaining.
@@ -1245,6 +1246,114 @@ describe("own-outbound suppression (AUR-5473)", () => {
     expect(isOwnOutboundCopy([])).toBe(false);
     expect(isOwnOutboundCopy(null)).toBe(false);
     expect(isOwnOutboundCopy(undefined)).toBe(false);
+  });
+});
+
+describe("cold-outreach send-only domain suppression (AUR-6042)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("mints no issue for our own ESP-sent cold outreach landing back in alex@ (the AUR-6041 phantom)", async () => {
+    // Exact shape of live message 1a0238337fac560a that caused AUR-6041: no
+    // SENT label (ESP-sent mail never gets one), so isOwnOutboundCopy alone
+    // cannot catch it.
+    const msg = makeMessage(
+      "esp-cold-1",
+      "thread-esp-cold-1",
+      "Following up on after-hours coverage",
+    );
+    (msg as ReturnType<typeof makeMessage> & { labelIds?: string[] }).labelIds = [
+      "UNREAD",
+      "Label_1",
+      "INBOX",
+    ];
+    msg.payload.headers[0].value = "Alex at Auranode <alex@auranodehq.com>";
+    mockListMessages.mockResolvedValue({ messages: [{ id: "esp-cold-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "should-not-exist" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "alex");
+
+    expect(mockIssueCreate).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(result.processed).toBe(1);
+
+    // Intake is still recorded (issueId null) so the mail is not refetched on
+    // every poll, and it is left untouched — no label, no archive.
+    const insertValues = (db as ReturnType<typeof buildDbMock>)._insertChain.values.mock
+      .calls[0][0] as Record<string, unknown>;
+    expect(insertValues.gmailMessageId).toBe("esp-cold-1");
+    expect(insertValues.issueId).toBeNull();
+    expect(mockModifyMessageLabels).not.toHaveBeenCalled();
+  });
+
+  it("still mints an issue for genuine tryauranode.com self-addressed mail (AUR-5473 regression guard)", async () => {
+    // The single highest-risk regression: tryauranode.com must keep minting
+    // issues for real self-addressed sends (booking confirmations, internal
+    // verification). This message has no SENT label (so isOwnOutboundCopy
+    // does not suppress it) and a tryauranode.com From domain (so the new
+    // auranodehq.com check must not touch it either).
+    const msg = makeMessage(
+      "self-tryauranode-1",
+      "thread-self-tryauranode-1",
+      "AUR-4065 AC4 env-scrub verification",
+    );
+    (msg as ReturnType<typeof makeMessage> & { labelIds?: string[] }).labelIds = [
+      "UNREAD",
+      "INBOX",
+    ];
+    msg.payload.headers[0].value = "alex@tryauranode.com";
+    mockListMessages.mockResolvedValue({ messages: [{ id: "self-tryauranode-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-self-tryauranode-1" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "alex");
+
+    expect(mockIssueCreate).toHaveBeenCalledOnce();
+    expect(result.created).toBe(1);
+    expect(result.skipped).toBe(0);
+  });
+
+  it("still mints an issue for a genuine external prospect reply", async () => {
+    const msg = makeMessage("prospect-1", "thread-prospect-1", "Re: quick question about pricing");
+    msg.payload.headers[0].value = "Jane Prospect <jane@example.com>";
+    mockListMessages.mockResolvedValue({ messages: [{ id: "prospect-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-prospect-1" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "alex");
+
+    expect(mockIssueCreate).toHaveBeenCalledOnce();
+    expect(result.created).toBe(1);
+    expect(result.skipped).toBe(0);
+  });
+
+  it("classifier: matches auranodehq.com From domain, rejects tryauranode.com and other domains", () => {
+    expect(isColdOutreachOwnSend("Alex at Auranode <alex@auranodehq.com>")).toBe(true);
+    expect(isColdOutreachOwnSend("alex@auranodehq.com")).toBe(true);
+    expect(isColdOutreachOwnSend("ALEX@AURANODEHQ.COM")).toBe(true);
+    expect(isColdOutreachOwnSend("bounce@mail.auranodehq.com")).toBe(true);
+    expect(isColdOutreachOwnSend("alex@tryauranode.com")).toBe(false);
+    expect(isColdOutreachOwnSend("jane@example.com")).toBe(false);
+    expect(isColdOutreachOwnSend("someone@notauranodehq.com")).toBe(false);
   });
 });
 

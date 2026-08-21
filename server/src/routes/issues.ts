@@ -3404,12 +3404,22 @@ export function issueRoutes(
       }
     }
 
-    // Auto-route in_review: prevent agents from leaving themselves as assignee
+    // Auto-route in_review: prevent agents from leaving themselves as assignee.
+    // Gated on an actual *transition* into in_review (AUR-5985) — keying off the
+    // effective status alone re-ran this on every subsequent PATCH by the
+    // assignee while already in_review (a comment-only edit, a monitor-notes
+    // update, etc.), bouncing an assignee-scheduled monitor to the manager on
+    // every write instead of only on entry.
     const effectiveInReviewStatus =
       typeof updateFields.status === "string" ? updateFields.status : existing.status;
+    const isTransitionIntoReview =
+      typeof updateFields.status === "string" &&
+      updateFields.status === "in_review" &&
+      existing.status !== "in_review";
     let autoRoutedToManagerAgentId: string | null = null;
+    let autoRouteOverrodeExplicitAssignee = false;
     if (
-      effectiveInReviewStatus === "in_review" &&
+      isTransitionIntoReview &&
       req.actor.type === "agent" &&
       req.actor.agentId &&
       !transition.workflowControlledAssignment
@@ -3421,9 +3431,17 @@ export function issueRoutes(
           ? updateFields.assigneeAgentId
           : existing.assigneeAgentId;
       if (effectiveAssigneeAgentId === req.actor.agentId && explicitAssigneeUserId === undefined) {
+        // AUR-5985: an explicit assigneeAgentId in the same request is about to
+        // be discarded by the auto-route below — remember that so the response
+        // can say so instead of silently returning 200 with a different assignee.
+        const requestedAssigneeAgentId =
+          req.body.assigneeAgentId !== undefined ? (req.body.assigneeAgentId as string | null) : undefined;
         if (existing.createdByUserId) {
           updateFields.assigneeAgentId = null;
           updateFields.assigneeUserId = existing.createdByUserId;
+          if (requestedAssigneeAgentId !== undefined && requestedAssigneeAgentId === req.actor.agentId) {
+            autoRouteOverrodeExplicitAssignee = true;
+          }
         } else if (!existing.createdByAgentId) {
           // Creator-less issue (e.g. routine_execution origin, AUR-5832): there is
           // no createdByUserId/createdByAgentId to auto-route to, so fall back to
@@ -3436,6 +3454,9 @@ export function issueRoutes(
             updateFields.assigneeAgentId = managerAgentId;
             updateFields.assigneeUserId = null;
             autoRoutedToManagerAgentId = managerAgentId;
+            if (requestedAssigneeAgentId !== undefined && requestedAssigneeAgentId === req.actor.agentId) {
+              autoRouteOverrodeExplicitAssignee = true;
+            }
           } else {
             res.status(422).json({
               error: "in_review requires reassignment: set assigneeAgentId or assigneeUserId to a reviewer",
@@ -4241,11 +4262,22 @@ export function issueRoutes(
     })();
 
     // AUR-4171: additive, non-breaking diagnostic channel for a silently downgraded status.
+    const responseWarnings: string[] = [];
+    if (transition.notice) responseWarnings.push(transition.notice.message);
+    if (autoRouteOverrodeExplicitAssignee) {
+      // AUR-5985: the request explicitly asked to keep this agent as assignee
+      // while transitioning into in_review; the auto-route guard overrode it.
+      // Say so instead of returning 200 with a different assignee than asked for.
+      responseWarnings.push(
+        `Requested assigneeAgentId (${req.actor.agentId}) was overridden by the in_review auto-route guard; ` +
+          `issue was routed to ${String(issueResponse.assigneeAgentId ?? issueResponse.assigneeUserId)} instead.`,
+      );
+    }
     res.json({
       ...issueResponse,
       comment,
       executionStageNotice: transition.notice ?? null,
-      ...(transition.notice ? { warnings: [transition.notice.message] } : {}),
+      ...(responseWarnings.length > 0 ? { warnings: responseWarnings } : {}),
     });
   });
 

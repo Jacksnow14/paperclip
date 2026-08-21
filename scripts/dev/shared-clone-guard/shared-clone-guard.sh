@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AUR-4564 shared-clone guard.
+# AUR-4564 shared-clone guard (multi-clone: AUR-6017).
 #
 # /home/ievgen/paperclip is checked out by ~100 concurrent worktrees that all
 # point at the SAME .git; that main checkout itself is the only one where a
@@ -10,6 +10,18 @@
 # worktrees, so a `git stash pop`/`drop` run from ANY of them can consume
 # another agent's only copy of unrelated WIP (nearly happened live -- see the
 # AUR-4564 issue thread).
+#
+# AUR-6017: /home/ievgen/Auranode is the same shape (42 worktrees, one
+# common .git) and was NOT covered -- two agents collided in it live during
+# AUR-6012 (one agent's checkout/stash there switched HEAD and momentarily
+# lost the other's stash entry). A single hardcoded SCG_MAIN_CLONE could only
+# ever protect one clone at a time: since only one shell profile (~/.bashrc)
+# is sourced machine-wide, sourcing a second copy of this file for a second
+# clone does NOT add coverage -- `SCG_MAIN_CLONE=${SCG_MAIN_CLONE:-default}`
+# is a no-op once the variable is already set from the first sourcing, so
+# both "layers" would end up checking the SAME single path. The fix is to
+# guard a LIST of main-clone roots (SCG_MAIN_CLONES) instead of one path, so
+# ONE sourced instance covers every shared clone in the fleet.
 #
 # This was first attempted as `git config alias.checkout '!...'` /
 # `alias.stash '!...'`. That does not work: git dispatches known built-in
@@ -31,16 +43,28 @@
 # actual, dominant failure mode, not a kernel-level access-control boundary.
 # The pre-commit hook (installed separately, see install.sh) IS a hard
 # boundary for commits specifically, since git hooks fire regardless of how
-# git was invoked.
+# git was invoked, and is installed independently per clone (its own common
+# .git/hooks), so it does not share this list-vs-single-var problem.
 #
 # Install (per shell profile), typically after any existing
 # git-safety-guard.sh line:
 #   source /path/to/dev-guards/shared-clone-guard.sh
 #
+# Configure which clones are guarded (colon-separated absolute paths):
+#   SCG_MAIN_CLONES=/home/ievgen/paperclip:/home/ievgen/Auranode
+# Defaults to that same list. A legacy single SCG_MAIN_CLONE, if set, is
+# folded in too so old callers/tests keep working.
+#
 # Override once ownership of a stash entry is verified by hand:
 #   SCG_STASH_FORCE=1 git stash pop
 
-SCG_MAIN_CLONE=${SCG_MAIN_CLONE:-/home/ievgen/paperclip}
+SCG_MAIN_CLONES_DEFAULT="/home/ievgen/paperclip:/home/ievgen/Auranode"
+__scg_clone_list_raw="${SCG_MAIN_CLONES:-$SCG_MAIN_CLONES_DEFAULT}"
+if [[ -n "${SCG_MAIN_CLONE:-}" ]]; then
+  __scg_clone_list_raw="${__scg_clone_list_raw}:${SCG_MAIN_CLONE}"
+fi
+IFS=':' read -r -a SCG_MAIN_CLONE_LIST <<<"$__scg_clone_list_raw"
+unset __scg_clone_list_raw
 
 __scg_main_clone_root() {
   local common_dir
@@ -48,26 +72,41 @@ __scg_main_clone_root() {
   (cd "$common_dir" && cd .. && pwd)
 }
 
+# Prints the entry of SCG_MAIN_CLONE_LIST that matches the given root, if
+# any. Empty output + non-zero exit means no match.
+__scg_matching_clone() {
+  local root="$1" entry
+  for entry in "${SCG_MAIN_CLONE_LIST[@]}"; do
+    [[ -n "$entry" && "$root" == "$entry" ]] && { printf '%s\n' "$entry"; return 0; }
+  done
+  return 1
+}
+
 __scg_in_main_clone() {
-  local toplevel
+  local toplevel root
   toplevel=$(command git rev-parse --show-toplevel 2>/dev/null) || return 1
-  [[ "$toplevel" == "$SCG_MAIN_CLONE" ]] || return 1
-  [[ "$(__scg_main_clone_root 2>/dev/null)" == "$SCG_MAIN_CLONE" ]]
+  root=$(__scg_main_clone_root 2>/dev/null) || return 1
+  [[ "$toplevel" == "$root" ]] || return 1
+  __scg_matching_clone "$root" >/dev/null
 }
 
 # In scope for the stash guard: the main clone itself OR any of its linked
 # worktrees (they all share one stash stack).
 __scg_shares_main_clone_stash() {
-  [[ "$(__scg_main_clone_root 2>/dev/null)" == "$SCG_MAIN_CLONE" ]]
+  local root
+  root=$(__scg_main_clone_root 2>/dev/null) || return 1
+  __scg_matching_clone "$root" >/dev/null
 }
 
 __scg_refuse() {
+  local root
+  root=$(__scg_main_clone_root 2>/dev/null || echo "the shared clone")
   cat >&2 <<EOF
 REFUSED (AUR-4564): $1
 
-$SCG_MAIN_CLONE is the shared clone: every agent's checkout of that exact
-path is the SAME working tree (and, for stash, the same stack shared by all
-~100 of its worktrees too), so uncommitted or unstashed work there can be
+$root is a shared clone: every agent's checkout of that exact path is the
+SAME working tree (and, for stash, the same stack shared by all of its
+linked worktrees too), so uncommitted or unstashed work there can be
 destroyed by another agent with nothing warning either side.
 EOF
 }
@@ -123,7 +162,9 @@ git() {
   if [[ "$sub" == "checkout" ]] && __scg_in_main_clone; then
     shift
     if __scg_checkout_is_path_restricted "$@"; then
-      __scg_refuse "git checkout -- <path> (force-overwrites paths from another ref, bypassing git's own dirty-tree protection). Use a dedicated worktree: git -C \"$SCG_MAIN_CLONE\" worktree add \"$SCG_MAIN_CLONE-<issue>\" -b <branch> origin/master"
+      local root
+      root=$(__scg_main_clone_root 2>/dev/null || echo "the shared clone")
+      __scg_refuse "git checkout -- <path> (force-overwrites paths from another ref, bypassing git's own dirty-tree protection). Use a dedicated worktree: git -C \"$root\" worktree add \"$root-<issue>\" -b <branch> origin/<default-branch>"
       return 3
     fi
     __scg_next_git checkout "$@"

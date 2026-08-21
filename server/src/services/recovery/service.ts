@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -98,6 +98,23 @@ const CLASS_A_OSCILLATION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 // picks them up.
 export const CLASS_B_STRANDED_REARM_PER_RUN_CAP = 25;
 const ISSUE_GRAPH_LIVENESS_RESULT_ID_ARRAY_LIMIT = 50;
+// AUR-5830: an agent without tasks:assign hands a blocking issue to a specific other
+// agent by creating it unassigned + bracket-mentioning them (the sanctioned pattern in
+// the paperclip skill). reconcileUnassignedBlockingIssues previously raced that handoff
+// unconditionally, reassigning the candidate back to its creator before the mentioned
+// agent's issue_comment_mentioned wake could land (observed <1s apart live). Bound the
+// exemption to a short window keyed off the pending wake's own requestedAt so a stuck or
+// abandoned handoff still falls back to normal reconciliation instead of orphaning the
+// issue forever.
+export const ORPHAN_BLOCKER_MENTION_HANDOFF_GRACE_MS = 2 * 60 * 1000;
+// agentWakeupRequests.status never actually takes the value "running" — a wake flips
+// from "queued" straight to "claimed" the instant its run is admitted (claimQueuedRun's
+// setWakeupStatus(..., "claimed", ...) in heartbeat.ts), which given this ticket's own
+// reproduction (<1s to ~30s after the mention) is usually already true by the time this
+// sweep runs. "deferred_issue_execution" is the third live state a wake can sit in while
+// the mentioned agent is busy on another issue. Mirrors the live-wake-for-issue status
+// set heartbeat.ts's own dispatch-duplicate check uses for agentWakeupRequests.status.
+const PENDING_WAKE_STATUSES = ["queued", "claimed", "deferred_issue_execution"] as const;
 
 function pushBoundedIssueId(ids: string[], issueId: string) {
   if (ids.length < ISSUE_GRAPH_LIVENESS_RESULT_ID_ARRAY_LIMIT) ids.push(issueId);
@@ -600,6 +617,29 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => Boolean(rows[0]));
   }
 
+  // AUR-5830: true when a recent issue_comment_mentioned wake for someone other than
+  // the creator is still pending against this candidate — the in-flight half of a
+  // deliberate agent-to-agent blocker handoff. Bounded by
+  // ORPHAN_BLOCKER_MENTION_HANDOFF_GRACE_MS so an abandoned or never-processed mention
+  // doesn't orphan the candidate past the grace window.
+  async function hasPendingMentionHandoff(companyId: string, issueId: string, excludeAgentId: string) {
+    return db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.reason, "issue_comment_mentioned"),
+          inArray(agentWakeupRequests.status, PENDING_WAKE_STATUSES),
+          ne(agentWakeupRequests.agentId, excludeAgentId),
+          gte(agentWakeupRequests.requestedAt, new Date(Date.now() - ORPHAN_BLOCKER_MENTION_HANDOFF_GRACE_MS)),
+          sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
   // AUR-5102: revalidate a recovery dispatch decision immediately before the
   // enqueue. reconcileStrandedAssignedIssues decides off a candidates snapshot
   // taken at sweep start; under backlog a pass runs for minutes, and the issue
@@ -771,6 +811,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
       const creatorAgent = await getAgent(creatorAgentId);
       if (!creatorAgent || creatorAgent.companyId !== candidate.companyId || !isAgentInvokable(creatorAgent)) {
+        skipped += 1;
+        continue;
+      }
+
+      if (await hasPendingMentionHandoff(candidate.companyId, candidate.id, creatorAgentId)) {
         skipped += 1;
         continue;
       }

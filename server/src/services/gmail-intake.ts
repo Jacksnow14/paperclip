@@ -95,13 +95,20 @@ export function isColdOutreachOwnSend(from: string): boolean {
 // those senders by default, but fail toward escalation on a genuine money/
 // account-action event so a real payout failure or chargeback is never
 // swallowed by the digest.
-const SHOPIFY_INFORMATIONAL_SENDERS = ["mailer@shopify.com", "no-reply@shopify.com"];
+// Anchored on both sides so a lookalike sender can't ride the plain substring
+// match: an unanchored `.includes("mailer@shopify.com")` also matches
+// "attacker-mailer@shopify.com" (local-part prefix) and
+// "mailer@shopify.com.evil.net" (domain suffix) — either would silently
+// suppress a spoofed/phishing message that impersonates Shopify instead of
+// routing it to CMO. Require the address to start right after a boundary
+// (string start, whitespace, `<`, or a quote) and end right after
+// "shopify.com" at a matching boundary.
+const SHOPIFY_INFORMATIONAL_SENDER_RE = /(?:^|[\s<"])(?:mailer|no-reply)@shopify\.com(?=[\s>"]|$)/i;
 const SHOPIFY_ACTION_SUBJECT_RE =
   /zahlung fehlgeschlagen|auszahlung|chargeback|deaktiviert|suspended/i;
 
 export function isShopifyInformationalNotification(from: string, subject: string): boolean {
-  const fromLower = from.toLowerCase();
-  if (!SHOPIFY_INFORMATIONAL_SENDERS.some((s) => fromLower.includes(s))) return false;
+  if (!SHOPIFY_INFORMATIONAL_SENDER_RE.test(from)) return false;
   return !SHOPIFY_ACTION_SUBJECT_RE.test(subject);
 }
 

@@ -951,6 +951,21 @@ describe("Shopify informational notification suppression (AUR-6074)", () => {
     expect(isShopifyInformationalNotification("someone@example.com", "Order shipped")).toBe(false);
   });
 
+  it("classifier: rejects lookalike senders that only substring-match the real address", () => {
+    expect(
+      isShopifyInformationalNotification("attacker-mailer@shopify.com", "Order shipped"),
+    ).toBe(false);
+    expect(
+      isShopifyInformationalNotification("mailer@shopify.com.evil.net", "Order shipped"),
+    ).toBe(false);
+    expect(
+      isShopifyInformationalNotification(
+        "Fake Shopify <no-reply@shopify.com.attacker.net>",
+        "Order shipped",
+      ),
+    ).toBe(false);
+  });
+
   it("classifier: an action/money keyword in the subject flips the result to escalate", () => {
     expect(
       isShopifyInformationalNotification("mailer@shopify.com", "Zahlung fehlgeschlagen"),

@@ -235,6 +235,21 @@ test('issue body defaults to referencing check-trunk-ci-red.mjs when hasTrunkCiS
 });
 
 // ---------------------------------------------------------------------------
+// AUR-6102: give the reviewer a diff-anomaly tripwire (secrets/credential
+// access, new git remotes, unusual outbound calls) that doesn't require
+// re-trusting the source issue's text.
+// ---------------------------------------------------------------------------
+
+test('issue body instructs the reviewer to flag diff anomalies not explainable by the title', () => {
+  const body = issueBody({ number: 7, sha7: 'abc1234', title: 't' }, 'o/r', true);
+  assert.match(body, /Diff-anomaly flag/i);
+  assert.match(body, /secrets\/credential access/i);
+  assert.match(body, /git\s+remote/i);
+  assert.match(body, /outbound network call/i);
+  assert.match(body, /not an auto-block/i);
+});
+
+// ---------------------------------------------------------------------------
 // Defect 4 (AUR-5370): a cancelled/missing review issue must not permanently
 // suppress a PR. filedSha matching is no longer sufficient — the previously
 // filed issue's terminal state decides.

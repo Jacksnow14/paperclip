@@ -920,7 +920,7 @@ export function renderPaperclipWakePrompt(
       lines.push(
         "",
         "Review request instructions:",
-        executionStage.reviewRequest.instructions,
+        fenceTaskText(executionStage.reviewRequest.instructions),
       );
     }
     lines.push("");
@@ -945,7 +945,7 @@ export function renderPaperclipWakePrompt(
     lines.push(
       "",
       "Issue continuation summary:",
-      normalized.continuationSummary.body,
+      fenceTaskText(normalized.continuationSummary.body),
     );
     if (normalized.continuationSummary.bodyTruncated) {
       lines.push("[continuation summary truncated]");
@@ -979,10 +979,10 @@ export function renderPaperclipWakePrompt(
     for (const child of normalized.childIssueSummaries) {
       const label = child.identifier ?? child.id ?? "unknown";
       lines.push(
-        `- ${label}${child.title ? ` ${child.title}` : ""}${child.status ? ` (${child.status})` : ""}`,
+        `- ${label}${child.title ? ` ${quoteTaskScalar(child.title)}` : ""}${child.status ? ` (${child.status})` : ""}`,
       );
       if (child.summary) {
-        lines.push(`  ${child.summary}`);
+        lines.push(fenceTaskText(child.summary));
       }
     }
     if (normalized.childIssueSummaryTruncated) {

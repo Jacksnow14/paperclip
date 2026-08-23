@@ -781,6 +781,16 @@ export function readPaperclipIssueWorkModeFromContext(value: unknown): string | 
   return wake?.issue?.workMode ?? null;
 }
 
+// Fence sized longer than any backtick run in `value` so it can't forge a closing fence.
+export function fenceUntrustedContent(value: string): string {
+  const longestBacktickRun = Math.max(
+    2,
+    ...Array.from(value.matchAll(/`+/g), (match) => match[0].length),
+  );
+  const fence = "`".repeat(longestBacktickRun + 1);
+  return [fence + "text", value, fence].join("\n");
+}
+
 export function renderPaperclipWakePrompt(
   value: unknown,
   options: { resumedSession?: boolean } = {},
@@ -906,7 +916,7 @@ export function renderPaperclipWakePrompt(
       lines.push(
         "",
         "Review request instructions:",
-        executionStage.reviewRequest.instructions,
+        fenceUntrustedContent(executionStage.reviewRequest.instructions),
       );
     }
     lines.push("");
@@ -931,7 +941,7 @@ export function renderPaperclipWakePrompt(
     lines.push(
       "",
       "Issue continuation summary:",
-      normalized.continuationSummary.body,
+      fenceUntrustedContent(normalized.continuationSummary.body),
     );
     if (normalized.continuationSummary.bodyTruncated) {
       lines.push("[continuation summary truncated]");
@@ -995,7 +1005,7 @@ export function renderPaperclipWakePrompt(
       : comment.authorType ?? "unknown";
     lines.push(
       `${index + 1}. comment ${comment.id ?? "unknown"} at ${comment.createdAt ?? "unknown"} by ${authorLabel}`,
-      comment.body,
+      fenceUntrustedContent(comment.body),
     );
     if (comment.bodyTruncated) {
       lines.push("[comment body truncated]");

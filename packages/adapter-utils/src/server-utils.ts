@@ -890,7 +890,7 @@ export function renderPaperclipWakePrompt(
     lines.push("- execution scope: respond or triage the human comment; do not treat blocker-dependent deliverable work as unblocked");
     if (normalized.unresolvedBlockerSummaries.length > 0) {
       const blockers = normalized.unresolvedBlockerSummaries
-        .map((blocker) => `${blocker.identifier ?? blocker.id ?? "unknown"}${blocker.title ? ` ${blocker.title}` : ""}${blocker.status ? ` (${blocker.status})` : ""}`)
+        .map((blocker) => `${blocker.identifier ?? blocker.id ?? "unknown"}${blocker.title ? ` ${quoteTaskScalar(blocker.title)}` : ""}${blocker.status ? ` (${blocker.status})` : ""}`)
         .join("; ");
       lines.push(`- unresolved blockers: ${blockers}`);
     } else if (normalized.unresolvedBlockerIssueIds.length > 0) {
@@ -986,7 +986,7 @@ export function renderPaperclipWakePrompt(
         `- ${label}${child.title ? ` ${quoteTaskScalar(child.title)}` : ""}${child.status ? ` (${child.status})` : ""}`,
       );
       if (child.summary) {
-        lines.push(`  ${child.summary}`);
+        lines.push(fenceUntrustedContent(child.summary));
       }
     }
     if (normalized.childIssueSummaryTruncated) {

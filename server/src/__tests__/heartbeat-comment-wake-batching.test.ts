@@ -1238,7 +1238,7 @@ describe("heartbeat comment wake batching", () => {
       expect(String(firstPayload.message ?? "")).toContain(
         "The harness already checked out this issue for the current run.",
       );
-      expect(String(firstPayload.message ?? "")).toContain(`${issuePrefix}-1 Require a comment`);
+      expect(String(firstPayload.message ?? "")).toContain(`${issuePrefix}-1 ${JSON.stringify("Require a comment")}`);
       const checkedOutIssue = await db
         .select({
           status: issues.status,

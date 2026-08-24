@@ -781,6 +781,24 @@ export function readPaperclipIssueWorkModeFromContext(value: unknown): string | 
   return wake?.issue?.workMode ?? null;
 }
 
+// Fence sized longer than any backtick run in `value` so it can't forge a closing fence.
+export function fenceUntrustedContent(value: string): string {
+  const longestBacktickRun = Math.max(
+    2,
+    ...Array.from(value.matchAll(/`+/g), (match) => match[0].length),
+  );
+  const fence = "`".repeat(longestBacktickRun + 1);
+  return [fence + "text", value, fence].join("\n");
+}
+
+// JSON-quotes a short untrusted scalar (e.g. a title) so an embedded newline can't
+// spoof a new prompt line. Mirrors buildPaperclipTaskMarkdown's quoteTaskScalar in
+// server/src/services/heartbeat.ts — same threat class, block-fencing doesn't fit
+// an inline field.
+export function quoteTaskScalar(value: string): string {
+  return JSON.stringify(value);
+}
+
 export function renderPaperclipWakePrompt(
   value: unknown,
   options: { resumedSession?: boolean } = {},
@@ -811,7 +829,7 @@ export function renderPaperclipWakePrompt(
         "Execution contract: take concrete action in this heartbeat when the issue is actionable; do not stop at a plan unless planning was requested. Leave durable progress and then give the issue a clear final disposition before ending the heartbeat: `done`, `in_review` with a real reviewer/approval/interaction path, `blocked` with first-class blockers or a named unblock owner/action, delegated follow-up issues with blockers, or `in_progress` only when a live continuation path exists. Use child issues for long or parallel delegated work instead of polling. Comments, documents, screenshots, work products, and `Remaining` bullets are evidence, not valid liveness paths by themselves.",
         "",
         `- reason: ${normalized.reason ?? "unknown"}`,
-        `- issue: ${normalized.issue?.identifier ?? normalized.issue?.id ?? "unknown"}${normalized.issue?.title ? ` ${normalized.issue.title}` : ""}`,
+        `- issue: ${normalized.issue?.identifier ?? normalized.issue?.id ?? "unknown"}${normalized.issue?.title ? ` ${quoteTaskScalar(normalized.issue.title)}` : ""}`,
         `- pending comments: ${normalized.includedCount}/${normalized.requestedCount}`,
         `- latest comment id: ${normalized.latestCommentId ?? "unknown"}`,
         `- fallback fetch needed: ${normalized.fallbackFetchNeeded ? "yes" : "no"}`,
@@ -830,7 +848,7 @@ export function renderPaperclipWakePrompt(
         "Execution contract: take concrete action in this heartbeat when the issue is actionable; do not stop at a plan unless planning was requested. Leave durable progress and then give the issue a clear final disposition before ending the heartbeat: `done`, `in_review` with a real reviewer/approval/interaction path, `blocked` with first-class blockers or a named unblock owner/action, delegated follow-up issues with blockers, or `in_progress` only when a live continuation path exists. Use child issues for long or parallel delegated work instead of polling. Comments, documents, screenshots, work products, and `Remaining` bullets are evidence, not valid liveness paths by themselves.",
         "",
         `- reason: ${normalized.reason ?? "unknown"}`,
-        `- issue: ${normalized.issue?.identifier ?? normalized.issue?.id ?? "unknown"}${normalized.issue?.title ? ` ${normalized.issue.title}` : ""}`,
+        `- issue: ${normalized.issue?.identifier ?? normalized.issue?.id ?? "unknown"}${normalized.issue?.title ? ` ${quoteTaskScalar(normalized.issue.title)}` : ""}`,
         `- pending comments: ${normalized.includedCount}/${normalized.requestedCount}`,
         `- latest comment id: ${normalized.latestCommentId ?? "unknown"}`,
         `- fallback fetch needed: ${normalized.fallbackFetchNeeded ? "yes" : "no"}`,
@@ -872,7 +890,7 @@ export function renderPaperclipWakePrompt(
     lines.push("- execution scope: respond or triage the human comment; do not treat blocker-dependent deliverable work as unblocked");
     if (normalized.unresolvedBlockerSummaries.length > 0) {
       const blockers = normalized.unresolvedBlockerSummaries
-        .map((blocker) => `${blocker.identifier ?? blocker.id ?? "unknown"}${blocker.title ? ` ${blocker.title}` : ""}${blocker.status ? ` (${blocker.status})` : ""}`)
+        .map((blocker) => `${blocker.identifier ?? blocker.id ?? "unknown"}${blocker.title ? ` ${quoteTaskScalar(blocker.title)}` : ""}${blocker.status ? ` (${blocker.status})` : ""}`)
         .join("; ");
       lines.push(`- unresolved blockers: ${blockers}`);
     } else if (normalized.unresolvedBlockerIssueIds.length > 0) {
@@ -906,7 +924,7 @@ export function renderPaperclipWakePrompt(
       lines.push(
         "",
         "Review request instructions:",
-        executionStage.reviewRequest.instructions,
+        fenceUntrustedContent(executionStage.reviewRequest.instructions),
       );
     }
     lines.push("");
@@ -931,7 +949,7 @@ export function renderPaperclipWakePrompt(
     lines.push(
       "",
       "Issue continuation summary:",
-      normalized.continuationSummary.body,
+      fenceUntrustedContent(normalized.continuationSummary.body),
     );
     if (normalized.continuationSummary.bodyTruncated) {
       lines.push("[continuation summary truncated]");
@@ -965,10 +983,10 @@ export function renderPaperclipWakePrompt(
     for (const child of normalized.childIssueSummaries) {
       const label = child.identifier ?? child.id ?? "unknown";
       lines.push(
-        `- ${label}${child.title ? ` ${child.title}` : ""}${child.status ? ` (${child.status})` : ""}`,
+        `- ${label}${child.title ? ` ${quoteTaskScalar(child.title)}` : ""}${child.status ? ` (${child.status})` : ""}`,
       );
       if (child.summary) {
-        lines.push(`  ${child.summary}`);
+        lines.push(fenceUntrustedContent(child.summary));
       }
     }
     if (normalized.childIssueSummaryTruncated) {
@@ -995,7 +1013,7 @@ export function renderPaperclipWakePrompt(
       : comment.authorType ?? "unknown";
     lines.push(
       `${index + 1}. comment ${comment.id ?? "unknown"} at ${comment.createdAt ?? "unknown"} by ${authorLabel}`,
-      comment.body,
+      fenceUntrustedContent(comment.body),
     );
     if (comment.bodyTruncated) {
       lines.push("[comment body truncated]");

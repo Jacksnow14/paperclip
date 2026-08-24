@@ -167,6 +167,7 @@ import {
   writePaperclipSkillSyncPreference,
   GLOBAL_MAX_CONCURRENT_RUNS_ENV_VAR,
   resolveGlobalMaxConcurrentRuns,
+  fenceUntrustedContent,
 } from "@paperclipai/adapter-utils/server-utils";
 // Re-exported for existing importers of these two names from this module
 // (moved to adapter-utils under AUR-4536; see comment near PROCESS_LOST_RETRY_WAKE_REASON).
@@ -2343,14 +2344,7 @@ export function buildPaperclipTaskMarkdown(input: {
   } | null;
 }) {
   const quoteTaskScalar = (value: string) => JSON.stringify(value);
-  const fenceTaskText = (value: string) => {
-    const longestBacktickRun = Math.max(
-      2,
-      ...Array.from(value.matchAll(/`+/g), (match) => match[0].length),
-    );
-    const fence = "`".repeat(longestBacktickRun + 1);
-    return [fence + "text", value, fence].join("\n");
-  };
+  const fenceTaskText = fenceUntrustedContent;
   const issue = input.issue;
   const wakeComment = input.wakeComment ?? null;
   const acceptedPlanContinuation =

@@ -235,6 +235,20 @@ test('issue body defaults to referencing check-trunk-ci-red.mjs when hasTrunkCiS
 });
 
 // ---------------------------------------------------------------------------
+// AUR-6102: reviewer must flag (not auto-block) diff anomalies unexplained by
+// the PR/issue title — secrets/credential access, new/modified git remotes,
+// unusual outbound network calls.
+// ---------------------------------------------------------------------------
+
+test('issue body instructs the reviewer to flag unexplained diff anomalies rather than auto-block', () => {
+  const body = issueBody({ number: 7, sha7: 'abc1234', title: 't' }, 'o/r', true);
+  assert.match(body, /flag, don.t auto-block/i);
+  assert.match(body, /secrets\/credential access/i);
+  assert.match(body, /new or modified git remotes/i);
+  assert.match(body, /unusual outbound network calls/i);
+});
+
+// ---------------------------------------------------------------------------
 // Defect 4 (AUR-5370): a cancelled/missing review issue must not permanently
 // suppress a PR. filedSha matching is no longer sufficient — the previously
 // filed issue's terminal state decides.

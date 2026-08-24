@@ -791,6 +791,14 @@ export function fenceUntrustedContent(value: string): string {
   return [fence + "text", value, fence].join("\n");
 }
 
+// JSON-quotes a short untrusted scalar (e.g. a title) so an embedded newline can't
+// spoof a new prompt line. Mirrors buildPaperclipTaskMarkdown's quoteTaskScalar in
+// server/src/services/heartbeat.ts — same threat class, block-fencing doesn't fit
+// an inline field.
+export function quoteTaskScalar(value: string): string {
+  return JSON.stringify(value);
+}
+
 export function renderPaperclipWakePrompt(
   value: unknown,
   options: { resumedSession?: boolean } = {},
@@ -821,7 +829,7 @@ export function renderPaperclipWakePrompt(
         "Execution contract: take concrete action in this heartbeat when the issue is actionable; do not stop at a plan unless planning was requested. Leave durable progress and then give the issue a clear final disposition before ending the heartbeat: `done`, `in_review` with a real reviewer/approval/interaction path, `blocked` with first-class blockers or a named unblock owner/action, delegated follow-up issues with blockers, or `in_progress` only when a live continuation path exists. Use child issues for long or parallel delegated work instead of polling. Comments, documents, screenshots, work products, and `Remaining` bullets are evidence, not valid liveness paths by themselves.",
         "",
         `- reason: ${normalized.reason ?? "unknown"}`,
-        `- issue: ${normalized.issue?.identifier ?? normalized.issue?.id ?? "unknown"}${normalized.issue?.title ? ` ${normalized.issue.title}` : ""}`,
+        `- issue: ${normalized.issue?.identifier ?? normalized.issue?.id ?? "unknown"}${normalized.issue?.title ? ` ${quoteTaskScalar(normalized.issue.title)}` : ""}`,
         `- pending comments: ${normalized.includedCount}/${normalized.requestedCount}`,
         `- latest comment id: ${normalized.latestCommentId ?? "unknown"}`,
         `- fallback fetch needed: ${normalized.fallbackFetchNeeded ? "yes" : "no"}`,
@@ -840,7 +848,7 @@ export function renderPaperclipWakePrompt(
         "Execution contract: take concrete action in this heartbeat when the issue is actionable; do not stop at a plan unless planning was requested. Leave durable progress and then give the issue a clear final disposition before ending the heartbeat: `done`, `in_review` with a real reviewer/approval/interaction path, `blocked` with first-class blockers or a named unblock owner/action, delegated follow-up issues with blockers, or `in_progress` only when a live continuation path exists. Use child issues for long or parallel delegated work instead of polling. Comments, documents, screenshots, work products, and `Remaining` bullets are evidence, not valid liveness paths by themselves.",
         "",
         `- reason: ${normalized.reason ?? "unknown"}`,
-        `- issue: ${normalized.issue?.identifier ?? normalized.issue?.id ?? "unknown"}${normalized.issue?.title ? ` ${normalized.issue.title}` : ""}`,
+        `- issue: ${normalized.issue?.identifier ?? normalized.issue?.id ?? "unknown"}${normalized.issue?.title ? ` ${quoteTaskScalar(normalized.issue.title)}` : ""}`,
         `- pending comments: ${normalized.includedCount}/${normalized.requestedCount}`,
         `- latest comment id: ${normalized.latestCommentId ?? "unknown"}`,
         `- fallback fetch needed: ${normalized.fallbackFetchNeeded ? "yes" : "no"}`,
@@ -975,7 +983,7 @@ export function renderPaperclipWakePrompt(
     for (const child of normalized.childIssueSummaries) {
       const label = child.identifier ?? child.id ?? "unknown";
       lines.push(
-        `- ${label}${child.title ? ` ${child.title}` : ""}${child.status ? ` (${child.status})` : ""}`,
+        `- ${label}${child.title ? ` ${quoteTaskScalar(child.title)}` : ""}${child.status ? ` (${child.status})` : ""}`,
       );
       if (child.summary) {
         lines.push(`  ${child.summary}`);

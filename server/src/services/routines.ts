@@ -61,6 +61,7 @@ import { heartbeatService } from "./heartbeat.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
 import { logActivity } from "./activity-log.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
+import { assertAgentLaneAdmissible } from "./agent-lane-admission.js";
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
@@ -717,7 +718,7 @@ export function routineService(
   async function assertAssignableAgent(companyId: string, agentId: string | null | undefined) {
     if (!agentId) return;
     const agent = await db
-      .select({ id: agents.id, companyId: agents.companyId, status: agents.status })
+      .select({ id: agents.id, companyId: agents.companyId, status: agents.status, lastHeartbeatAt: agents.lastHeartbeatAt })
       .from(agents)
       .where(eq(agents.id, agentId))
       .then((rows) => rows[0] ?? null);
@@ -725,6 +726,9 @@ export function routineService(
     if (agent.companyId !== companyId) throw unprocessable("Assignee must belong to same company");
     if (agent.status === "pending_approval") throw conflict("Cannot assign routines to pending approval agents");
     if (agent.status === "terminated") throw conflict("Cannot assign routines to terminated agents");
+    // Routines only ever create live `todo` execution issues (dispatchRoutineRun),
+    // so there is no blocked-status escape hatch here — unlike issues.ts.
+    assertAgentLaneAdmissible(agent);
   }
 
   async function assertRestorableAssignee(

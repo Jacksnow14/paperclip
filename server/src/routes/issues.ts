@@ -1050,8 +1050,12 @@ export function issueRoutes(
     return (req.actor.companyIds ?? []).includes(companyId);
   }
 
-  function canCreateAgentsLegacy(agent: { permissions: Record<string, unknown> | null | undefined; role: string }) {
-    if (agent.role === "ceo") return true;
+  async function canCreateAgentsLegacy(
+    companyId: string,
+    agent: { id: string; permissions: Record<string, unknown> | null | undefined },
+  ) {
+    const allowedByGrant = await access.hasPermission(companyId, "agent", agent.id, "agents:create");
+    if (allowedByGrant) return true;
     if (!agent.permissions || typeof agent.permissions !== "object") return false;
     return Boolean((agent.permissions as Record<string, unknown>).canCreateAgents);
   }
@@ -1069,7 +1073,7 @@ export function issueRoutes(
       const allowedByGrant = await access.hasPermission(companyId, "agent", req.actor.agentId, "tasks:assign");
       if (allowedByGrant) return;
       const actorAgent = await agentsSvc.getById(req.actor.agentId);
-      if (actorAgent && actorAgent.companyId === companyId && canCreateAgentsLegacy(actorAgent)) return;
+      if (actorAgent && actorAgent.companyId === companyId && (await canCreateAgentsLegacy(companyId, actorAgent))) return;
       throw forbidden("Missing permission: tasks:assign");
     }
     throw unauthorized();
@@ -1100,7 +1104,7 @@ export function issueRoutes(
     const agentsById = new Map(companyAgents.map((agent) => [agent.id, agent]));
     const actorAgent = agentsById.get(actorAgentId);
     if (!actorAgent) return false;
-    if (canCreateAgentsLegacy(actorAgent)) return true;
+    if (await canCreateAgentsLegacy(companyId, actorAgent)) return true;
 
     // Reporting-chain managers may intervene in an agent's active checkout
     // without taking the task over. Peers must own the checkout/run first.
@@ -1116,10 +1120,7 @@ export function issueRoutes(
   }
 
   async function hasCrossIssueCommentPermission(actorAgentId: string, companyId: string): Promise<boolean> {
-    const allowedByGrant = await access.hasPermission(companyId, "agent", actorAgentId, "tasks:comment_cross_issue");
-    if (allowedByGrant) return true;
-    const actorAgent = await agentsSvc.getById(actorAgentId);
-    return actorAgent !== null && actorAgent.role === "ceo" && actorAgent.companyId === companyId;
+    return access.hasPermission(companyId, "agent", actorAgentId, "tasks:comment_cross_issue");
   }
 
   async function wouldOwnershipGateReject(

@@ -55,6 +55,7 @@ const {
   isMarketingEmail,
   isColdOutreachOwnSend,
   isShopifyInformationalNotification,
+  isSelfOriginatedAuditCopy,
 } = await import("../services/gmail-intake.js");
 
 // Minimal Drizzle-like db mock that supports select/insert chaining.
@@ -1404,6 +1405,124 @@ describe("own-outbound suppression (AUR-5473)", () => {
     expect(isOwnOutboundCopy([])).toBe(false);
     expect(isOwnOutboundCopy(null)).toBe(false);
     expect(isOwnOutboundCopy(undefined)).toBe(false);
+  });
+});
+
+describe("self-originated audit CC suppression (AUR-4673)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("mints no issue for board@ receiving alex@'s own outbound audit Cc (the AUR-4485/4486/4487 phantom)", async () => {
+    // Shape of the 2026-07-29 16:05:45Z batch: alex@ sent to an external
+    // recipient, Cc board@. board@'s own mailbox genuinely receives this (real
+    // INBOX delivery, no SENT label — it's not board@'s own sent mail), so
+    // isOwnOutboundCopy alone cannot catch it.
+    const msg = makeMessage(
+      "audit-cc-1",
+      "thread-audit-cc-1",
+      "Re: Account-access review escalation — ticket 4a5cff83",
+    );
+    (msg as ReturnType<typeof makeMessage> & { labelIds?: string[] }).labelIds = [
+      "UNREAD",
+      "INBOX",
+    ];
+    msg.payload.headers[0].value = "Alex at Auranode <alex@tryauranode.com>";
+    mockListMessages.mockResolvedValue({ messages: [{ id: "audit-cc-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "should-not-exist" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockIssueCreate).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+
+    // Intake is still recorded (issueId null) so the Cc is not refetched on
+    // every poll, and the mail itself is left untouched — no label, no
+    // archive — so it remains in board@ as case-file evidence.
+    const insertValues = (db as ReturnType<typeof buildDbMock>)._insertChain.values.mock
+      .calls[0][0] as Record<string, unknown>;
+    expect(insertValues.gmailMessageId).toBe("audit-cc-1");
+    expect(insertValues.issueId).toBeNull();
+    expect(mockModifyMessageLabels).not.toHaveBeenCalled();
+  });
+
+  it("still mints an issue for a genuine third-party inbound that also Cc's board@", async () => {
+    const msg = makeMessage(
+      "prospect-cc-board-1",
+      "thread-prospect-cc-board-1",
+      "Re: pricing question",
+    );
+    (msg as ReturnType<typeof makeMessage> & { labelIds?: string[] }).labelIds = [
+      "UNREAD",
+      "INBOX",
+    ];
+    msg.payload.headers[0].value = "Jane Prospect <jane@example.com>";
+    mockListMessages.mockResolvedValue({ messages: [{ id: "prospect-cc-board-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-prospect-cc-board-1" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockIssueCreate).toHaveBeenCalledOnce();
+    expect(result.created).toBe(1);
+    expect(result.skipped).toBe(0);
+  });
+
+  it("still mints an issue for alex@ receiving genuine self-addressed mail from alex@ (regression guard)", async () => {
+    // Same-mailbox self-send stays out of scope for this predicate — that
+    // case is the documented exception on isOwnOutboundCopy (booking
+    // confirmations, internal verification sends).
+    const msg = makeMessage(
+      "self-inbox-alex-1",
+      "thread-self-inbox-alex-1",
+      "AUR-4065 AC4 env-scrub verification",
+    );
+    (msg as ReturnType<typeof makeMessage> & { labelIds?: string[] }).labelIds = [
+      "UNREAD",
+      "INBOX",
+    ];
+    msg.payload.headers[0].value = "alex@tryauranode.com";
+    mockListMessages.mockResolvedValue({ messages: [{ id: "self-inbox-alex-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-self-inbox-alex-1" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "alex");
+
+    expect(mockIssueCreate).toHaveBeenCalledOnce();
+    expect(result.created).toBe(1);
+    expect(result.skipped).toBe(0);
+  });
+
+  it("classifier: matches owned-mailbox senders on a different mailbox, rejects same-mailbox and lookalikes", () => {
+    // Positive — alex@ Cc'd into board@, and vice versa.
+    expect(isSelfOriginatedAuditCopy("alex@tryauranode.com", "board")).toBe(true);
+    expect(isSelfOriginatedAuditCopy("Alex at Auranode <alex@tryauranode.com>", "board")).toBe(true);
+    expect(isSelfOriginatedAuditCopy("board@tryauranode.com", "alex")).toBe(true);
+    // Negative — same mailbox as the sender (the documented self-send exception).
+    expect(isSelfOriginatedAuditCopy("alex@tryauranode.com", "alex")).toBe(false);
+    expect(isSelfOriginatedAuditCopy("board@tryauranode.com", "board")).toBe(false);
+    // Negative — third-party senders, including lookalikes.
+    expect(isSelfOriginatedAuditCopy("jane@example.com", "board")).toBe(false);
+    expect(isSelfOriginatedAuditCopy("attacker-alex@tryauranode.com", "board")).toBe(false);
+    expect(isSelfOriginatedAuditCopy("alex@tryauranode.com.evil.net", "board")).toBe(false);
   });
 });
 

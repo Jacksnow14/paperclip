@@ -38,6 +38,12 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_OUTAGE_WINDOW_MS = 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_OUTAGE_MIN_DISTINCT_AGENTS = 2;
 export const DEFAULT_PRODUCTIVITY_REVIEW_OUTAGE_MIN_TERMINAL_RUNS = 5;
 export const DEFAULT_PRODUCTIVITY_REVIEW_OUTAGE_INFRA_SHARE = 0.5;
+// AUR-4111: how long an assignee must have been unreachable before we treat the issue as stuck
+// on a dead owner rather than a slow one. See resolveAssigneeUnavailability() -- `terminated` is
+// immediate (no duration test), `paused`/`error` both need to clear this threshold because both
+// are recoverable states an agent can be briefly in without being "unavailable" in the sense this
+// trigger cares about.
+export const DEFAULT_PRODUCTIVITY_REVIEW_ASSIGNEE_UNAVAILABLE_MINUTES = 30;
 
 const TERMINAL_RUN_STATUSES = ["succeeded", "failed", "cancelled", "timed_out"] as const;
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
@@ -241,6 +247,7 @@ type IssueRow = typeof issues.$inferSelect;
 type AgentRow = typeof agents.$inferSelect;
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
 type ProductivityReviewTrigger =
+  | "assignee_unavailable"
   | "no_comment_streak"
   | "long_active_duration"
   | "high_churn"
@@ -260,6 +267,17 @@ type ProductivityReviewThresholds = {
   outageMinDistinctAgents: number;
   outageMinTerminalRuns: number;
   outageInfraShare: number;
+  assigneeUnavailableMs: number;
+};
+
+// AUR-4111: the single notion of "is this assignee unavailable" shared by both the
+// assignee_unavailable trigger (collectEvidence) and isAgentInvokable (routing candidates away
+// from a dead owner). `reason` is null when unavailable is false.
+type AssigneeUnavailabilityFacts = {
+  unavailable: boolean;
+  reason: "terminated" | "paused" | "error" | null;
+  since: Date | null;
+  referenceRunId: string | null;
 };
 
 type ProductivityReviewEvidence = {
@@ -267,6 +285,10 @@ type ProductivityReviewEvidence = {
   triggerReasons: string[];
   sourceIssue: IssueRow;
   sourceAgent: AgentRow;
+  assigneeUnavailable: boolean;
+  assigneeUnavailableReason: AssigneeUnavailabilityFacts["reason"];
+  assigneeUnavailableSince: Date | null;
+  assigneeUnavailableReferenceRunId: string | null;
   noCommentStreak: number;
   totalRunCount: number;
   terminalRunCount: number;
@@ -409,15 +431,26 @@ function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): Pro
       overrides?.outageInfraShare ?? DEFAULT_PRODUCTIVITY_REVIEW_OUTAGE_INFRA_SHARE,
       DEFAULT_PRODUCTIVITY_REVIEW_OUTAGE_INFRA_SHARE,
     ),
+    assigneeUnavailableMs: readPositiveInteger(
+      overrides?.assigneeUnavailableMs ?? DEFAULT_PRODUCTIVITY_REVIEW_ASSIGNEE_UNAVAILABLE_MINUTES * 60 * 1000,
+      DEFAULT_PRODUCTIVITY_REVIEW_ASSIGNEE_UNAVAILABLE_MINUTES * 60 * 1000,
+    ),
   };
 }
 
 function choosePrimaryTrigger(input: {
+  assigneeUnavailable: boolean;
   noComment: boolean;
   longActive: boolean;
   highChurn: boolean;
   stalled: boolean;
 }): ProductivityReviewTrigger | null {
+  // AUR-4111: checked before every other axis, including no_comment_streak. Every other
+  // trigger's remedy menu presupposes an actor who can act -- "wake the agent", "decompose",
+  // "add a comment" are all wrong guidance when the assignee is terminated, long-paused, or
+  // stuck in error with no recent successful run and nothing currently in flight. An assignee
+  // that cannot act should never be diagnosed via a menu built for one that merely isn't acting.
+  if (input.assigneeUnavailable) return "assignee_unavailable";
   if (input.noComment) return "no_comment_streak";
   // AUR-4014: a long-running episode with zero runs, zero assignee comments, and zero active
   // runs in the last hour is a stall (the issue went dark), not churn -- report it as its own
@@ -437,10 +470,14 @@ function choosePrimaryTrigger(input: {
 }
 
 function isSoftStopTrigger(trigger: ProductivityReviewTrigger) {
+  // AUR-4111: assignee_unavailable is deliberately excluded. A continuation hold on an
+  // already-unavailable agent is meaningless and can only compound the outage -- there is no
+  // one left to resume the held work.
   return trigger === "no_comment_streak" || trigger === "high_churn";
 }
 
 function formatTrigger(trigger: ProductivityReviewTrigger) {
+  if (trigger === "assignee_unavailable") return "Assignee unavailable";
   if (trigger === "no_comment_streak") return "No-comment streak";
   if (trigger === "high_churn") return "High churn";
   if (trigger === "stalled_active_episode") return "Stalled active episode";
@@ -467,8 +504,103 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       .then((rows) => rows[0] ?? null);
   }
 
-  function isAgentInvokable(agent: AgentRow | null | undefined) {
-    return Boolean(agent && !["paused", "terminated", "pending_approval"].includes(agent.status));
+  // AUR-4111: `error` is sticky -- never cleared until the agent's next successful run -- so a
+  // bare `agent.status === "error"` check would treat an agent that errored weeks ago (and has
+  // run fine since) the same as one that is genuinely wedged right now. Discriminate using run
+  // history: unavailable only if the agent's most recent terminal run (across all issues, not
+  // just this one) is itself a failure or infra-kill, that run is older than
+  // assigneeUnavailableMs, and the agent has no currently-active run. This is the single
+  // definition of "is this agent stuck in error" -- reused by both resolveAssigneeUnavailability
+  // (the assignee_unavailable trigger) and isAgentInvokable (routing candidates) below so the two
+  // callers can never disagree about what "stuck" means.
+  async function resolveErrorUnavailability(
+    agent: AgentRow,
+    thresholds: ProductivityReviewThresholds,
+    now: Date,
+  ): Promise<AssigneeUnavailabilityFacts> {
+    const notUnavailable: AssigneeUnavailabilityFacts = {
+      unavailable: false,
+      reason: null,
+      since: null,
+      referenceRunId: null,
+    };
+    const hasActiveRun = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, agent.companyId),
+          eq(heartbeatRuns.agentId, agent.id),
+          inArray(heartbeatRuns.status, ACTIVE_RUN_STATUSES),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows.length > 0);
+    if (hasActiveRun) return notUnavailable;
+
+    const latestTerminalRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, agent.companyId),
+          eq(heartbeatRuns.agentId, agent.id),
+          inArray(heartbeatRuns.status, TERMINAL_RUN_STATUSES),
+        ),
+      )
+      .orderBy(
+        desc(sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt})`),
+        desc(heartbeatRuns.id),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!latestTerminalRun) return notUnavailable;
+    // A clean success since the error status was set means the agent has recovered -- the
+    // sticky `error` flag is now stale and must not gate anything.
+    if (latestTerminalRun.status === "succeeded") return notUnavailable;
+    if (latestTerminalRun.status !== "failed" && !isInfraKilledRun(latestTerminalRun)) return notUnavailable;
+
+    const runTimestamp =
+      latestTerminalRun.finishedAt ?? latestTerminalRun.startedAt ?? latestTerminalRun.createdAt;
+    if (now.getTime() - runTimestamp.getTime() <= thresholds.assigneeUnavailableMs) return notUnavailable;
+
+    return { unavailable: true, reason: "error", since: runTimestamp, referenceRunId: latestTerminalRun.id };
+  }
+
+  async function resolveAssigneeUnavailability(
+    agent: AgentRow,
+    thresholds: ProductivityReviewThresholds,
+    now: Date,
+  ): Promise<AssigneeUnavailabilityFacts> {
+    if (agent.status === "terminated") {
+      // Immediate -- no duration test. It is never coming back.
+      return { unavailable: true, reason: "terminated", since: null, referenceRunId: null };
+    }
+    if (agent.status === "paused") {
+      // pausedAt is precisely timestamped, unlike error's sticky status -- use it directly.
+      if (agent.pausedAt && now.getTime() - agent.pausedAt.getTime() > thresholds.assigneeUnavailableMs) {
+        return { unavailable: true, reason: "paused", since: agent.pausedAt, referenceRunId: null };
+      }
+      return { unavailable: false, reason: null, since: null, referenceRunId: null };
+    }
+    if (agent.status === "error") {
+      return resolveErrorUnavailability(agent, thresholds, now);
+    }
+    return { unavailable: false, reason: null, since: null, referenceRunId: null };
+  }
+
+  async function isAgentInvokable(
+    agent: AgentRow | null | undefined,
+    thresholds: ProductivityReviewThresholds,
+    now: Date,
+  ) {
+    if (!agent) return false;
+    if (["paused", "terminated", "pending_approval"].includes(agent.status)) return false;
+    if (agent.status === "error") {
+      const errorState = await resolveErrorUnavailability(agent, thresholds, now);
+      return !errorState.unavailable;
+    }
+    return true;
   }
 
   async function isProductivityReviewDescendant(issue: Pick<IssueRow, "companyId" | "parentId">) {
@@ -770,7 +902,14 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
       runCountLastSixHours >= thresholds.highChurnSixHours ||
       assigneeRunCommentCountLastSixHours >= thresholds.highChurnSixHours;
-    const trigger = choosePrimaryTrigger({ noComment, longActive, highChurn, stalled });
+    const assigneeUnavailability = await resolveAssigneeUnavailability(sourceAgent, thresholds, now);
+    const trigger = choosePrimaryTrigger({
+      assigneeUnavailable: assigneeUnavailability.unavailable,
+      noComment,
+      longActive,
+      highChurn,
+      stalled,
+    });
     if (!trigger) return null;
 
     // AUR-5008: a detector that can articulate why its own finding is probably wrong should
@@ -812,6 +951,19 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         `adapter quota pause active for ${sourceAgent.adapterType} until ${activeQuotaPause.scheduledRetryAt.toISOString()} (via agent ${activeQuotaPause.agentId}) -- this suppressed the long-active/stalled trigger for this episode`,
       );
     }
+    if (trigger === "assignee_unavailable") {
+      if (assigneeUnavailability.reason === "terminated") {
+        triggerReasons.push(`assignee agent status is \`terminated\` -- it is never coming back`);
+      } else if (assigneeUnavailability.reason === "paused" && assigneeUnavailability.since) {
+        triggerReasons.push(
+          `assignee agent has been \`paused\` since ${assigneeUnavailability.since.toISOString()} (${msToHuman(now.getTime() - assigneeUnavailability.since.getTime())} ago, past the ${msToHuman(thresholds.assigneeUnavailableMs)} unavailable threshold)`,
+        );
+      } else if (assigneeUnavailability.reason === "error" && assigneeUnavailability.since) {
+        triggerReasons.push(
+          `assignee agent status is \`error\`; its most recent terminal run (${assigneeUnavailability.referenceRunId}) finished ${assigneeUnavailability.since.toISOString()} (${msToHuman(now.getTime() - assigneeUnavailability.since.getTime())} ago, past the ${msToHuman(thresholds.assigneeUnavailableMs)} unavailable threshold) with no successful run or active run since`,
+        );
+      }
+    }
     if (noComment) triggerReasons.push(`${noCommentStreak} consecutive completed issue-linked runs had no run-created issue comment (${infraKilledTerminalRuns.length} infra-killed runs in the sampled window were excluded from this streak)`);
     if (trigger === "stalled_active_episode") {
       // Gated on the resolved `trigger`, not the raw `stalled` boolean: if a different trigger
@@ -844,6 +996,10 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       triggerReasons,
       sourceIssue,
       sourceAgent,
+      assigneeUnavailable: assigneeUnavailability.unavailable,
+      assigneeUnavailableReason: assigneeUnavailability.reason,
+      assigneeUnavailableSince: assigneeUnavailability.since,
+      assigneeUnavailableReferenceRunId: assigneeUnavailability.referenceRunId,
       noCommentStreak,
       totalRunCount: latestRuns.length,
       terminalRunCount: terminalRuns.length,
@@ -873,7 +1029,12 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     };
   }
 
-  async function resolveReviewOwnerAgentId(sourceIssue: IssueRow, sourceAgent: AgentRow) {
+  async function resolveReviewOwnerAgentId(
+    sourceIssue: IssueRow,
+    sourceAgent: AgentRow,
+    thresholds: ProductivityReviewThresholds,
+    now: Date,
+  ) {
     const candidateIds: string[] = [];
     if (sourceAgent.reportsTo) candidateIds.push(sourceAgent.reportsTo);
     if (sourceIssue.createdByAgentId) candidateIds.push(sourceIssue.createdByAgentId);
@@ -897,7 +1058,13 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       if (seen.has(agentId)) continue;
       seen.add(agentId);
       const candidate = await getAgent(agentId);
-      if (!candidate || candidate.companyId !== sourceIssue.companyId || !isAgentInvokable(candidate)) continue;
+      if (
+        !candidate ||
+        candidate.companyId !== sourceIssue.companyId ||
+        !(await isAgentInvokable(candidate, thresholds, now))
+      ) {
+        continue;
+      }
       const budgetBlock = await budgets.getInvocationBlock(sourceIssue.companyId, candidate.id, {
         issueId: sourceIssue.id,
         projectId: sourceIssue.projectId ?? null,
@@ -911,6 +1078,13 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
   // guidance for a stall -- nothing is churning, the issue just went dark. Give the manager
   // remedies that actually apply to each trigger instead of one generic list for all three.
   function buildManagerDecisionMenu(trigger: ProductivityReviewTrigger): string[] {
+    if (trigger === "assignee_unavailable") {
+      return [
+        "- Reassign to a live agent who can pick up the work.",
+        "- Escalate to the assignee's manager (`reportsTo`) if no other agent is available.",
+        "- Unassign the issue if no suitable agent exists right now.",
+      ];
+    }
     if (trigger === "stalled_active_episode") {
       return [
         "- Wake the assignee agent to resume work, or reassign to a live agent if it cannot resume.",
@@ -952,6 +1126,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       `- Assigned agent: ${evidence.sourceAgent.name} (${evidence.sourceAgent.role})`,
       `- Primary trigger: \`${evidence.trigger}\` (${formatTrigger(evidence.trigger)})`,
       `- Trigger reasons: ${evidence.triggerReasons.join("; ")}`,
+      `- Assignee availability: ${evidence.assigneeUnavailable ? `unavailable (${evidence.assigneeUnavailableReason})` : "available"}${evidence.assigneeUnavailableSince ? `, since ${evidence.assigneeUnavailableSince.toISOString()}` : ""}${evidence.assigneeUnavailableReferenceRunId ? `, reference run \`${evidence.assigneeUnavailableReferenceRunId}\`` : ""}`,
       `- Generated at: ${evidence.generatedAt.toISOString()}`,
       "",
       "## Evidence",
@@ -1061,7 +1236,12 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       return { kind: "creation_capped" as const, reviewIssueId: null };
     }
 
-    const ownerAgentId = await resolveReviewOwnerAgentId(evidence.sourceIssue, evidence.sourceAgent);
+    const ownerAgentId = await resolveReviewOwnerAgentId(
+      evidence.sourceIssue,
+      evidence.sourceAgent,
+      evidence.thresholds,
+      evidence.generatedAt,
+    );
     let review: Awaited<ReturnType<typeof issuesSvc.create>>;
     try {
       review = await issuesSvc.create(evidence.sourceIssue.companyId, {

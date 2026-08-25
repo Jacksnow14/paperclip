@@ -159,10 +159,26 @@ function ownedMailboxAddressRe(alias: GmailAlias): RegExp {
   );
 }
 
+// A "Display Name <email@example.com>" From header lets the sender put
+// arbitrary text — including a fake "alex@tryauranode.com" — in the display
+// name while the real, deliverable address is anything they control. Testing
+// the raw header (as the boundary-anchored regex above would, unguarded)
+// makes this predicate spoofable: an external sender crafting
+// `"alex@tryauranode.com" <attacker@evil.com>` would have their genuinely
+// external mail silently suppressed (case-file-only, no issue, no human
+// ever sees it) rather than merely misrouted. Evaluate only the actual
+// address — inside the angle brackets when present, else the whole trimmed
+// header — never the attacker-controlled display name.
+function extractSenderAddress(from: string): string {
+  const match = from.match(/<([^>]+)>/);
+  return (match?.[1] ?? from).trim();
+}
+
 export function isSelfOriginatedAuditCopy(from: string, mailbox: GmailAlias): boolean {
+  const address = extractSenderAddress(from);
   for (const alias of GMAIL_SUPPORTED_ALIASES) {
     if (alias === mailbox) continue;
-    if (ownedMailboxAddressRe(alias).test(from)) return true;
+    if (ownedMailboxAddressRe(alias).test(address)) return true;
   }
   return false;
 }

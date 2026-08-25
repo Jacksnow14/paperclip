@@ -1523,6 +1523,14 @@ describe("self-originated audit CC suppression (AUR-4673)", () => {
     expect(isSelfOriginatedAuditCopy("jane@example.com", "board")).toBe(false);
     expect(isSelfOriginatedAuditCopy("attacker-alex@tryauranode.com", "board")).toBe(false);
     expect(isSelfOriginatedAuditCopy("alex@tryauranode.com.evil.net", "board")).toBe(false);
+    // Negative — display-name spoof: an external sender can put an owned
+    // address in the display name while the real, deliverable address is
+    // theirs. The predicate must evaluate the actual address (inside the
+    // angle brackets), not the attacker-controlled display-name text, or
+    // genuinely external mail is silently suppressed with no issue minted.
+    expect(
+      isSelfOriginatedAuditCopy('"alex@tryauranode.com" <attacker@evil.com>', "board"),
+    ).toBe(false);
   });
 });
 

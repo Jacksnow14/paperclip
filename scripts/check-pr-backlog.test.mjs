@@ -249,6 +249,18 @@ test('issue body instructs the reviewer to flag unexplained diff anomalies rathe
 });
 
 // ---------------------------------------------------------------------------
+// AUR-6150: a changes_requested execution-review decision places nothing on
+// the PR by itself — the reviewer must run the draft-conversion gate so the
+// merge command actually refuses, and must not force a refused merge ready.
+// ---------------------------------------------------------------------------
+
+test('issue body wires the changes_requested decision to the execution-review draft gate', () => {
+  const body = issueBody({ number: 7, sha7: 'abc1234', title: 't' }, 'o/r', true);
+  assert.match(body, /enforce-execution-review-gate\.mjs --issue/);
+  assert.match(body, /Pull Request is still a draft/);
+});
+
+// ---------------------------------------------------------------------------
 // Defect 4 (AUR-5370): a cancelled/missing review issue must not permanently
 // suppress a PR. filedSha matching is no longer sufficient — the previously
 // filed issue's terminal state decides.

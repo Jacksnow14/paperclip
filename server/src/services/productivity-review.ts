@@ -20,7 +20,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
-import { findActiveAdapterQuotaPause } from "./quota-pause.js";
+import { findActiveAdapterQuotaPauseForStallExplanation } from "./quota-pause.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
 export const DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS = 10;
@@ -885,8 +885,15 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     // refusing to burn zero-token runs against a wall that hasn't cleared yet. Gate
     // longActive on the absence of an active pause so the stall watchdog doesn't
     // mistake a suppressed run queue for agent inactivity.
+    //
+    // AUR-4520: deliberately the *StallExplanation variant, not the admission-clamped
+    // findActiveAdapterQuotaPause. This call answers "is a real provider wall still up",
+    // not "should we admit work right now" -- reusing the 6h admission clamp here made a
+    // genuine 24h provider wall stop matching from t+6h onward, so the stall watchdog
+    // started firing false findings against an agent correctly waiting on a limit it
+    // cannot influence. Do not swap this back to the clamped helper.
     const activeQuotaPause = longActiveRaw
-      ? await findActiveAdapterQuotaPause(db, sourceIssue.companyId, sourceAgent.adapterType, now)
+      ? await findActiveAdapterQuotaPauseForStallExplanation(db, sourceIssue.companyId, sourceAgent.adapterType, now)
       : null;
     const quotaPaused = activeQuotaPause !== null;
     const longActive = longActiveRaw && !quotaPaused;

@@ -42,6 +42,7 @@
 # Related: AUR-3924 (incident), AUR-3937 (release layout), AUR-3929 (the cap),
 # AUR-4023 (do not rebuild the sampler -- this script only reads it).
 set -euo pipefail
+HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 
 APP_ROOT=${PAPERCLIP_DEPLOY_APP_ROOT:-/opt/paperclip/app}
 REPO=${PAPERCLIP_DEPLOY_SRC_REPO:-/home/ievgen/paperclip}
@@ -136,7 +137,13 @@ fi
 # 1. preflight
 # --------------------------------------------------------------------------
 log "=== preflight ==="
-git -C "$REPO" fetch --quiet origin
+# AUR-4034: $REPO may be a root-owned bare mirror this process cannot write
+# to. Skip the fetch in that case — a working checkout has its git dir at
+# $REPO/.git, a bare mirror IS the git dir. Mirror freshness comes from its
+# own refresh timer, not from a fetch here.
+if [[ -d "$REPO/.git" ]]; then
+  git -C "$REPO" fetch --quiet origin
+fi
 SHA=$(git -C "$REPO" rev-parse --verify "${REF}^{commit}")
 SHA12=${SHA:0:12}
 CURRENT_TARGET=$(readlink "$APP_ROOT/current" 2>/dev/null || true)   # releases/<sha12>
@@ -197,12 +204,17 @@ trap cleanup EXIT
 BUILD_RC=0
 # Future-proof the wrapper-owned activate path: build-release refuses direct
 # `--activate` unless the call is explicitly marked gated or break-glass.
+# AUR-4034: exec build-release.sh from $HERE (this script's own, pinned
+# release directory), not $REPO. $REPO is the deploy *source* (what SHA to
+# build) -- it must never also be where we load deploy-tooling *code* from,
+# or a bare mirror (no working tree) breaks this path entirely, and a mutable
+# checkout would run unpinned tooling code under the armed auto-deploy timer.
 PAPERCLIP_DEPLOY_GATED=1 systemd-run --user --scope --unit "$SCOPE" --nice=10 --quiet \
   -p MemoryHigh="$BUILD_MEM_HIGH" \
   -p MemoryMax="$BUILD_MEM_MAX" \
   -p MemorySwapMax="$BUILD_SWAP_MAX" \
   -p CPUWeight=20 \
-  -- "$REPO/scripts/deploy/build-release.sh" --ref "$SHA" || BUILD_RC=$?
+  -- "$HERE/build-release.sh" --ref "$SHA" || BUILD_RC=$?
 
 cleanup; trap - EXIT
 
@@ -251,7 +263,9 @@ fi
 if [[ "${PAPERCLIP_MIGRATION_GATE_ENABLED:-1}" == "1" ]]; then
   log "=== migration gate (AUR-5019): replaying pending migrations against a live-data snapshot ==="
   GATE_RC=0
-  "${PAPERCLIP_DEPLOY_NODE:-/usr/bin/node}" "$REPO/scripts/deploy/migration-gate.mjs" --release "$RELEASE" || GATE_RC=$?
+  # AUR-4034: same rationale as the build invocation above -- run the gate's
+  # own code from $HERE, not from the mutable/bare $REPO.
+  "${PAPERCLIP_DEPLOY_NODE:-/usr/bin/node}" "$HERE/migration-gate.mjs" --release "$RELEASE" || GATE_RC=$?
   if [[ "$GATE_RC" -eq 2 ]]; then
     die "migration gate BLOCKED activation of $SHA12: a pending migration aborts against live data. Fix the migration (or converge the data) instead of deploying the abort into boot. Break-glass: PAPERCLIP_MIGRATION_GATE_ENABLED=0"
   elif [[ "$GATE_RC" -ne 0 ]]; then

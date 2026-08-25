@@ -1,0 +1,26 @@
+# AUR-4034: refresh the root-owned bare git mirror
+# (/opt/paperclip/src.git) that build-release.sh clones from, decoupling
+# production builds from the shared, mutable /home/ievgen/paperclip
+# checkout. Installed by scripts/deploy/install-src-mirror-timer.sh to
+# /usr/local/sbin, same reasoning as paperclip-mem-watch-alert.service:
+# deliberately NOT run from an app release, so a broken deploy can't take
+# the mirror refresh down with it, and the mirror itself must exist before
+# any build can read it.
+#
+# Runs as root: the mirror is chown root:root / go-w so agents cannot write
+# to it (a deliberate second benefit alongside availability) -- the refresh
+# needs root to re-lock it after every fetch.
+[Unit]
+Description=Paperclip deploy-source bare mirror refresh (AUR-4034)
+Documentation=https://paperclip/AUR/issues/AUR-4034
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/sbin/paperclip-src-mirror-refresh.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=paperclip-src-mirror-refresh

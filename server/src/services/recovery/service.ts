@@ -1887,7 +1887,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           reason: "no_invokable_recovery_owner",
         },
       monitorPolicy: null,
-      maxAttempts: null,
+      // AUR-4719 #3: enforced (not just recorded) at the exhaustion check in
+      // escalateStrandedAssignedIssue via `recoveryAction.maxAttempts ?? MAX_DISPATCHABLE_STRANDED_RECOVERY_ATTEMPTS`.
+      maxAttempts: MAX_DISPATCHABLE_STRANDED_RECOVERY_ATTEMPTS,
       lastAttemptAt: now,
     });
 
@@ -1907,6 +1909,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       source: "assignment",
       triggerDetail: "system",
       reason: "source_scoped_recovery_action",
+      // AUR-4719 #1: attemptCount must stay in the key. The AUR-4250 cooldown
+      // re-escalates every ~24h and increments attemptCount each time — each
+      // new attempt needs its own wake to fire. A key without attemptCount
+      // would make the *second* real escalation dedupe against the first
+      // attempt's key forever, permanently breaking re-escalation. Same-attempt
+      // retries still collapse correctly since attemptCount is stable within
+      // one escalation call.
       idempotencyKey: `source_scoped_recovery_action:${input.action.id}:${input.action.attemptCount}`,
       payload: withRecoveryModelProfileHint({
         issueId: input.issue.id,
@@ -2098,12 +2107,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // candidate filter. That made `blocked` load-bearing as a loop-breaker, which is why the
     // no-blocker strand could not simply be removed.
     //
-    // The wake idempotency key embeds `attemptCount` (see enqueueSourceScopedStrandedRecoveryWake),
-    // so every re-escalation mints a fresh key and wake-dedup can never collapse the repeats;
-    // the escalation comment is gated on `attemptCount === 1`, so every repeat is silent. Each
-    // repeat also refreshes `lastAttemptAt`, which keeps the AUR-4168 durable `missing_edge`
-    // sweep suppressed (that sweep skips issues with a non-dormant recovery action), so the
-    // issue suppresses its own backstop indefinitely.
+    // AUR-4719 triaged the four latent defects this cooldown only partially masked:
+    // the wake idempotency key embedding `attemptCount` is intentional (see
+    // enqueueSourceScopedStrandedRecoveryWake) — same-attempt retries still
+    // collapse; the escalation comment now fires on every attempt, not just the
+    // first (see the comment block below); `maxAttempts` is now enforced from the
+    // persisted column, not just the module constant; and the `lastAttemptAt`
+    // self-suppression of the AUR-4168 durable `missing_edge` sweep is bounded
+    // (not indefinite) once combined with this cooldown and AUR-4996's rearm cap.
     //
     // Gate re-escalation on the same 24h dormancy window the rest of the liveness machinery
     // uses. This is what lets the status write below stop stranding the issue.
@@ -2141,7 +2152,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // that owner; the cooldown above (not the status) is now the loop-breaker. Once attempts are
     // exhausted, fall back to `blocked`: by then the action is >24h dormant, so the AUR-4168
     // sweep is no longer suppressed and re-arms at its 7d/30d stages.
-    const attemptsExhausted = recoveryAction.attemptCount > MAX_DISPATCHABLE_STRANDED_RECOVERY_ATTEMPTS;
+    // AUR-4719 #3: maxAttempts is now enforced (not just recorded) — read it
+    // off the row, falling back to the module constant for rows created
+    // before this fix (which have maxAttempts: null).
+    const attemptsExhausted = recoveryAction.attemptCount >
+      (recoveryAction.maxAttempts ?? MAX_DISPATCHABLE_STRANDED_RECOVERY_ATTEMPTS);
     const keepDispatchable = blockerIds.length === 0 &&
       Boolean(recoveryAction.ownerAgentId) &&
       !attemptsExhausted;
@@ -2235,16 +2250,23 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         sourceAssignee,
         recoveryIssue: null,
         recoveryActionId: recoveryAction.id,
+        recoveryActionAttempt: recoveryAction.attemptCount,
         recoveryOwner,
         latestIssueStatus: input.issue.status,
         latestHandoffRunStatus: input.latestRun?.status ?? "unknown",
         missingDisposition: input.successfulRunHandoffEvidence.missingDisposition,
       });
     }
+    // AUR-4719 #2: `maxAttempts` may be null on rows created before the AUR-4719
+    // enforcement fix; fall back to the module constant, same as the exhaustion
+    // check above, so the displayed ceiling always matches what actually gates it.
+    const effectiveMaxAttempts = recoveryAction.maxAttempts ?? MAX_DISPATCHABLE_STRANDED_RECOVERY_ATTEMPTS;
+    const attemptSummaryLine = `- Attempt: ${recoveryAction.attemptCount} of ${effectiveMaxAttempts}${attemptsExhausted ? " (exhausted)" : ""}.`;
     const recoveryLine = recoveryAction.ownerAgentId
       ? [
         "",
-        `- Recovery action: \`${recoveryAction.id}\``,
+        `- Recovery action: \`${recoveryAction.id}\` (attempt ${recoveryAction.attemptCount})`,
+        attemptSummaryLine,
         `- Recovery owner: ${agentUiLink(recoveryOwner, prefix)}`,
         `- Issue status: \`${nextStatus}\`${keepDispatchable
           ? " — left dispatchable and reassigned to the recovery owner, because nothing is actually blocking it. Retries are spaced by a 24h cooldown."
@@ -2253,13 +2275,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       ].join("\n")
       : [
         "",
-        `- Recovery action: \`${recoveryAction.id}\``,
+        `- Recovery action: \`${recoveryAction.id}\` (attempt ${recoveryAction.attemptCount})`,
+        attemptSummaryLine,
         "- Recovery owner: board escalation, because Paperclip could not find an invokable manager, creator, or executive owner with budget available.",
         "- Next action: a board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.",
       ].join("\n");
 
-    if (recoveryAction.attemptCount === 1) {
-      const escalationCommentMarker = `Recovery action: \`${recoveryAction.id}\``;
+    // AUR-4719 #2: post an escalation comment on EVERY attempt, not just the
+    // first — previously attempts 2+ (and the exhaustion-to-`blocked`
+    // transition) were completely silent in the issue thread. This path is
+    // capped at MAX_DISPATCHABLE_STRANDED_RECOVERY_ATTEMPTS (3), so at most a
+    // handful of comments total; no spam risk. The dedup marker below embeds
+    // the attempt number specifically so this check only suppresses a retry
+    // of THIS attempt, not every subsequent attempt (which would silently
+    // reintroduce the original bug via the anti-duplicate check itself).
+    {
+      const escalationCommentMarker = `Recovery action: \`${recoveryAction.id}\` (attempt ${recoveryAction.attemptCount})`;
 
       const hasEscalationComment = await db
         .select({ id: issueComments.id, body: issueComments.body, metadata: issueComments.metadata })
@@ -2274,7 +2305,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .limit(50)
         .then((rows) => rows.some((row) =>
           (row.body ?? "").includes(escalationCommentMarker) ||
-          noticeMetadataReferencesRecoveryAction(row.metadata, recoveryAction.id),
+          noticeMetadataReferencesRecoveryAction(row.metadata, recoveryAction.id, recoveryAction.attemptCount),
         ));
 
       if (!hasEscalationComment) {
@@ -3756,6 +3787,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           ? { type: "wake_owner", reason: "issue_graph_liveness", ownerAgentId, stage }
           : { type: "board_escalation", reason: "issue_graph_liveness", stage },
         monitorPolicy: null,
+        // AUR-4719 #3: intentionally left unset for this kind. `issue_graph_liveness`
+        // escalates on a time-based stage ladder (missingBlockerEdgeStageForAge),
+        // not an attempt-count ceiling, so there is no applicable value to enforce
+        // here (unlike `stranded_assigned_issue`, which persists and enforces
+        // MAX_DISPATCHABLE_STRANDED_RECOVERY_ATTEMPTS).
         maxAttempts: null,
         lastAttemptAt: input.now,
       });
@@ -3786,6 +3822,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           source: "assignment",
           triggerDetail: "system",
           reason: "source_scoped_recovery_action",
+          // AUR-4719 #1: attemptCount is intentional in this key too — see the
+          // matching comment on enqueueSourceScopedStrandedRecoveryWake.
           idempotencyKey: `issue_graph_liveness:${action.id}:${action.attemptCount}`,
           payload: withRecoveryModelProfileHint({
             issueId: classification.issue.id,

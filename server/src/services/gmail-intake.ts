@@ -135,6 +135,54 @@ export function isOwnOutboundCopy(labelIds: readonly string[] | null | undefined
   return labelIds.includes("SENT") && !labelIds.includes("INBOX");
 }
 
+// Our own persona-to-persona audit CCs are not correspondence (AUR-4673).
+// board@ is Cc'd on every substantive external send from the alex@ persona,
+// by design — it is our case file. That Cc copy is a genuine delivery to
+// board@'s own INBOX (board@ did not send it), so it carries no SENT label
+// and isOwnOutboundCopy above — which only discriminates the *sending*
+// mailbox's own view of its outbound mail — cannot catch it. One send batch
+// on 2026-07-29 (two outbound messages, both Cc board@) minted three
+// duplicate "[board@] alex@tryauranode.com — ..." issues from our own mail.
+//
+// What discriminates: the sender is one of our own persona mailboxes
+// (`${alias}@tryauranode.com`) AND it is a *different* mailbox than the one
+// currently being polled. Restricting to "different mailbox" is deliberate —
+// it preserves the exception documented on isOwnOutboundCopy above: alex@
+// genuinely receives real mail from alex@ (booking confirmations, internal
+// verification sends) and those must keep minting issues.
+const OWNED_MAILBOX_DOMAIN = "tryauranode.com";
+
+function ownedMailboxAddressRe(alias: GmailAlias): RegExp {
+  return new RegExp(
+    `(?:^|[\\s<"])${alias}@${OWNED_MAILBOX_DOMAIN.replace(/\./g, "\\.")}(?=[\\s>"]|$)`,
+    "i",
+  );
+}
+
+// A "Display Name <email@example.com>" From header lets the sender put
+// arbitrary text — including a fake "alex@tryauranode.com" — in the display
+// name while the real, deliverable address is anything they control. Testing
+// the raw header (as the boundary-anchored regex above would, unguarded)
+// makes this predicate spoofable: an external sender crafting
+// `"alex@tryauranode.com" <attacker@evil.com>` would have their genuinely
+// external mail silently suppressed (case-file-only, no issue, no human
+// ever sees it) rather than merely misrouted. Evaluate only the actual
+// address — inside the angle brackets when present, else the whole trimmed
+// header — never the attacker-controlled display name.
+function extractSenderAddress(from: string): string {
+  const match = from.match(/<([^>]+)>/);
+  return (match?.[1] ?? from).trim();
+}
+
+export function isSelfOriginatedAuditCopy(from: string, mailbox: GmailAlias): boolean {
+  const address = extractSenderAddress(from);
+  for (const alias of GMAIL_SUPPORTED_ALIASES) {
+    if (alias === mailbox) continue;
+    if (ownedMailboxAddressRe(alias).test(address)) return true;
+  }
+  return false;
+}
+
 // Gmail label names applied by the intake pipeline.
 export const INTAKE_LABELS = {
   TRIAGED: "paperclip/triaged",
@@ -442,6 +490,25 @@ export function createGmailIntakeService(db: Db) {
           logger.info(
             { mailbox, messageId: parsed.gmailMessageId, subject: parsed.subject },
             "gmail-intake: suppressed own outbound copy (SENT without INBOX, no issue)",
+          );
+          skipped++;
+          continue;
+        }
+
+        // Our own persona-to-persona audit CCs are not correspondence
+        // (AUR-4673) — see isSelfOriginatedAuditCopy above. Record the
+        // intake so the message is not refetched on every poll, mint no
+        // issue, and leave the mail untouched — same suppress-in-place
+        // treatment as the own-outbound case above. The audit CC itself
+        // stays in the mailbox as case-file evidence; it just must not mint
+        // a new top-level issue.
+        if (isSelfOriginatedAuditCopy(parsed.from, mailbox)) {
+          await db.insert(gmailIntakeRecords).values(
+            buildIntakeRecordValues(companyId, mailbox, parsed, null),
+          );
+          logger.info(
+            { mailbox, messageId: parsed.gmailMessageId, from: parsed.from, subject: parsed.subject },
+            "gmail-intake: suppressed self-originated audit CC (no issue)",
           );
           skipped++;
           continue;

@@ -18,14 +18,24 @@ export interface AgentLaneLivenessInput {
 /**
  * `lastHeartbeatAt === null` must NOT be treated as stale — it is the
  * legitimate signature of agents that never emit heartbeats at all (Wake
- * Watchdog Bot, the `http` adapter). Only `status: "error"` or a heartbeat
- * older than the threshold counts as a dead lane.
+ * Watchdog Bot, the `http` adapter). A heartbeat older than the threshold is
+ * the sole staleness signal.
+ *
+ * `status: "error"` is deliberately NOT an independent staleness trigger:
+ * AUR-4111 established that `error` is sticky (it is never cleared until the
+ * agent's next successful run), so a bare status check can't distinguish a
+ * genuinely wedged lane from one that errored once and has run fine since —
+ * `resolveErrorUnavailability` in productivity-review.ts is the run-history-aware
+ * resolver for that nuance. Gating admission on status alone regressed it: a
+ * manager stuck at `status: "error"` with no heartbeat recorded (never having
+ * heartbeated is not staleness — see above) but a recent successful run
+ * became permanently unassignable. A stale heartbeat still catches a truly
+ * dead lane regardless of what status it reports.
  */
 export function isAgentLaneStale(
   agent: AgentLaneLivenessInput,
   now: Date = new Date(),
 ): boolean {
-  if (agent.status === "error") return true;
   if (agent.lastHeartbeatAt == null) return false;
   return now.getTime() - agent.lastHeartbeatAt.getTime() > STALE_LANE_HEARTBEAT_THRESHOLD_MS;
 }

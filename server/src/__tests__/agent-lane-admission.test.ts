@@ -8,13 +8,26 @@ import {
 const NOW = new Date("2026-08-25T00:00:00.000Z");
 
 describe("isAgentLaneStale (AUR-4512)", () => {
-  it("treats status: error as stale regardless of heartbeat recency", () => {
+  it("does NOT treat status: error alone as stale when the heartbeat is fresh (AUR-4111 sticky-error recovery)", () => {
     expect(
       isAgentLaneStale(
         { id: "a1", status: "error", lastHeartbeatAt: new Date(NOW.getTime() - 60_000) },
         NOW,
       ),
+    ).toBe(false);
+  });
+
+  it("treats status: error combined with a stale heartbeat as stale", () => {
+    const staleHeartbeat = new Date(NOW.getTime() - STALE_LANE_HEARTBEAT_THRESHOLD_MS - 60_000);
+    expect(
+      isAgentLaneStale({ id: "a1", status: "error", lastHeartbeatAt: staleHeartbeat }, NOW),
     ).toBe(true);
+  });
+
+  it("does NOT treat status: error with a null heartbeat as stale (never heartbeated, not dead)", () => {
+    expect(
+      isAgentLaneStale({ id: "a1", status: "error", lastHeartbeatAt: null }, NOW),
+    ).toBe(false);
   });
 
   it("does NOT treat a null lastHeartbeatAt as stale (Wake Watchdog Bot / http adapter shape)", () => {

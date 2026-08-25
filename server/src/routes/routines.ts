@@ -214,7 +214,7 @@ export function routineRoutes(
       req.body.assigneeAgentId !== undefined &&
       req.body.assigneeAgentId !== actingAgentId
     ) {
-      const hasManage = await agentHasRoutinesManage(actingAgentId, routine.companyId);
+      const hasManage = await agentCanAdminRoutines(actingAgentId, routine.companyId);
       if (!hasManage) {
         throw forbidden("Agents can only assign routines to themselves");
       }

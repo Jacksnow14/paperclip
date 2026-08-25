@@ -1,4 +1,4 @@
-import { and, eq, isNotNull, notInArray, sql } from "drizzle-orm";
+import { and, eq, isNotNull, notInArray, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns } from "@paperclipai/db";
 
@@ -63,16 +63,28 @@ export const HEARTBEAT_ADMISSION_INELIGIBLE_AGENT_STATUSES = [
 // re-fail and re-arm a fresh anchored horizon; if the reset was misparsed they succeed.
 // That bounded re-admission is the intended behaviour — a handful of probe runs per day
 // instead of either a continuous burn or a silent multi-day fleet outage.
-export async function findActiveAdapterQuotaPause(
+//
+// AUR-4520: this clamped query has two shapes of consumer with opposite requirements.
+// Every *admission-gating* consumer (run admission, contended-ceiling denominator,
+// recovery's requeue-vs-hold decision) wants the bounded horizon above — that bound is
+// what makes them periodically re-probe a possibly-misparsed wall instead of either
+// burning zero-token runs or freezing for the reset's full stated duration. But
+// productivity-review's *stall explainer* wants the opposite: it isn't deciding whether
+// to admit work, it's deciding whether a `long_active` episode is explained by a real,
+// still-active provider wall. Reusing the clamped WHERE for that purpose means a genuine
+// 24h reset stops matching this query at t+6h even though the provider wall is still up,
+// and the stall watchdog starts filing false findings against an agent correctly waiting
+// on a limit it cannot influence — see AUR-4520. `findActiveAdapterQuotaPauseForStallExplanation`
+// below exists so that mistake can't be made by accident: the two query shapes are two
+// named functions, not one function plus a boolean/mode flag a future call site could
+// default the wrong way.
+async function queryActiveAdapterQuotaPause(
   db: Db,
   companyId: string,
   adapterType: string,
   now: Date,
+  horizon: SQL<Date>,
 ): Promise<ActiveAdapterQuotaPause | null> {
-  // Interval and comparison operand are rendered as literals/casts rather than bound
-  // Date/number params: the postgres driver will not bind a raw Date inside a sql`` tag.
-  const maxPauseInterval = sql.raw(`interval '${MAX_ADAPTER_QUOTA_PAUSE_MS / 1000} seconds'`);
-  const effectiveHorizon = sql<Date>`least(${heartbeatRuns.scheduledRetryAt}, ${heartbeatRuns.createdAt} + ${maxPauseInterval})`;
   const nowParam = sql`${now.toISOString()}::timestamptz`;
   const row = await db
     .select({
@@ -90,10 +102,10 @@ export async function findActiveAdapterQuotaPause(
         eq(heartbeatRuns.status, "scheduled_retry"),
         isNotNull(heartbeatRuns.scheduledRetryAt),
         sql`${heartbeatRuns.contextSnapshot} ->> 'transientRetryNotBefore' is not null`,
-        sql`${effectiveHorizon} > ${nowParam}`,
+        sql`${horizon} > ${nowParam}`,
       ),
     )
-    .orderBy(sql`${effectiveHorizon} desc`)
+    .orderBy(sql`${horizon} desc`)
     .limit(1)
     .then((rows) => rows[0] ?? null);
   if (!row?.scheduledRetryAt || !row.pauseRecordedAt) return null;
@@ -107,4 +119,42 @@ export async function findActiveAdapterQuotaPause(
     parsedResetAt: row.scheduledRetryAt,
     pauseRecordedAt: row.pauseRecordedAt,
   };
+}
+
+// Interval rendered as a literal/cast rather than a bound number param: the postgres
+// driver will not bind a raw Date inside a sql`` tag.
+const maxPauseInterval = sql.raw(`interval '${MAX_ADAPTER_QUOTA_PAUSE_MS / 1000} seconds'`);
+
+/**
+ * Admission-gating shape: the horizon is clamped to MAX_ADAPTER_QUOTA_PAUSE_MS from the
+ * row's `createdAt`. Use this for every consumer that decides whether to admit/requeue
+ * work right now — it is what bounds a misparsed multi-day reset to a handful of probe
+ * runs per day instead of a silent fleet-wide outage.
+ */
+export async function findActiveAdapterQuotaPause(
+  db: Db,
+  companyId: string,
+  adapterType: string,
+  now: Date,
+): Promise<ActiveAdapterQuotaPause | null> {
+  const effectiveHorizon = sql<Date>`least(${heartbeatRuns.scheduledRetryAt}, ${heartbeatRuns.createdAt} + ${maxPauseInterval})`;
+  return queryActiveAdapterQuotaPause(db, companyId, adapterType, now, effectiveHorizon);
+}
+
+/**
+ * Stall-explanation shape: the horizon is the provider's own unclamped parsed reset
+ * (`scheduledRetryAt` on the row), not the admission clamp. Use this ONLY to decide
+ * whether a `long_active` episode is explained by a still-active provider wall — never
+ * to gate admission/requeue, or a misparsed multi-day reset would silently suppress the
+ * whole fleet for its full duration again (the exact regression MAX_ADAPTER_QUOTA_PAUSE_MS
+ * exists to prevent). See AUR-4520.
+ */
+export async function findActiveAdapterQuotaPauseForStallExplanation(
+  db: Db,
+  companyId: string,
+  adapterType: string,
+  now: Date,
+): Promise<ActiveAdapterQuotaPause | null> {
+  const unclampedHorizon = sql<Date>`${heartbeatRuns.scheduledRetryAt}`;
+  return queryActiveAdapterQuotaPause(db, companyId, adapterType, now, unclampedHorizon);
 }

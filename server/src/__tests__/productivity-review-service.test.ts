@@ -834,6 +834,79 @@ describeEmbeddedPostgres("productivity review service", () => {
     });
   });
 
+  // AUR-4520: findActiveAdapterQuotaPause's admission clamp (MAX_ADAPTER_QUOTA_PAUSE_MS = 6h)
+  // must not leak into the stall explainer above -- a genuine 24h provider wall has to keep
+  // suppressing `stalled` past t+6h, even though admission is correctly re-probing the wall by
+  // then via the separate, still-clamped findActiveAdapterQuotaPause query.
+  describe("AUR-4520 quota-pause horizon in the stall explainer", () => {
+    it("does not fire stalled_active_episode past the 6h admission clamp while a genuine 24h provider wall is still up", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const pauseRecordedAt = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+      const seeded = await seedAssignedIssue({
+        status: "in_progress",
+        startedAt: pauseRecordedAt,
+      });
+      // A real 24h provider reset, recorded 7h ago -- past the 6h admission clamp (so admission
+      // is correctly re-probing the wall by `now`) but the provider's own reset is still 17h out.
+      const trueProviderResetAt = new Date(pauseRecordedAt.getTime() + 24 * 60 * 60 * 1000);
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "scheduled_retry",
+        scheduledRetryAt: trueProviderResetAt,
+        scheduledRetryReason: "transient_failure",
+        contextSnapshot: { transientRetryNotBefore: trueProviderResetAt.toISOString() },
+        createdAt: pauseRecordedAt,
+        updatedAt: pauseRecordedAt,
+      });
+
+      const service = productivityReviewService(db);
+      const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      // Before the AUR-4520 fix, the stall explainer reused the admission-clamped query, which
+      // stops matching this row at pauseRecordedAt + 6h -- well before `now`. That made
+      // `activeQuotaPause` null, `longActive` true, and `stalled_active_episode` fire against an
+      // agent correctly waiting on a provider wall it cannot influence.
+      expect(result.created).toBe(0);
+      expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+    });
+
+    it("still fires stalled_active_episode once the provider's own reset has actually passed", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const pauseRecordedAt = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+      const seeded = await seedAssignedIssue({
+        status: "in_progress",
+        startedAt: pauseRecordedAt,
+      });
+      // The provider reset itself is now in the past -- the wall genuinely cleared, so the stall
+      // explainer must not keep suppressing findings off a row with a lapsed real reset.
+      const lapsedProviderResetAt = new Date(now.getTime() - 60 * 1000);
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "scheduled_retry",
+        scheduledRetryAt: lapsedProviderResetAt,
+        scheduledRetryReason: "transient_failure",
+        contextSnapshot: { transientRetryNotBefore: lapsedProviderResetAt.toISOString() },
+        createdAt: pauseRecordedAt,
+        updatedAt: pauseRecordedAt,
+      });
+
+      const service = productivityReviewService(db);
+      const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `stalled_active_episode`");
+    });
+  });
+
   it("creates a high-churn review even when every sampled run has a progress comment", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();

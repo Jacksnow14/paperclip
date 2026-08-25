@@ -222,11 +222,19 @@ export async function tickCompany({ agents, runs, now, issuePrefix, sendAlert, p
     const finalState = dryRun ? tentativeState : finalizeDarkLaneState(tentativeState, alert, confirmed, nowIso);
 
     if (!dryRun) {
-      if (darkLaneStatesEqual(finalState, DEFAULT_DARK_LANE_STATE)) {
-        delete nextLocalState[agentId];
-      } else {
-        nextLocalState[agentId] = finalState;
-      }
+      // Never delete the entry: an agent this tick recognizes as quiescent
+      // must stay *recorded* as quiescent, not revert to "unseen." Deleting
+      // it here made the next tick's `localState[agentId] ?? agent.metadata
+      // ?.darkLane` fallback (above) fall through to metadata — which, per
+      // AUR-4532's live-probed PATCH /api/agents/:id semantics, merges
+      // rather than replaces, so an omitted key never actually clears
+      // server-side and stays stuck at the last non-default value forever.
+      // That resurrected a "recovered" alert on every subsequent tick
+      // (AC2/AC3 violation). Local state is the sole source of truth once an
+      // agent has been tracked; storing the explicit default keeps it that
+      // way regardless of whatever the metadata PATCH below does or doesn't
+      // persist.
+      nextLocalState[agentId] = finalState;
     }
 
     let patched = false;
@@ -234,7 +242,11 @@ export async function tickCompany({ agents, runs, now, issuePrefix, sendAlert, p
     if (!dryRun && !darkLaneStatesEqual(finalState, agent.metadata?.darkLane ?? null)) {
       const nextMetadata = { ...(agent.metadata ?? {}) };
       if (darkLaneStatesEqual(finalState, DEFAULT_DARK_LANE_STATE)) {
-        delete nextMetadata.darkLane;
+        // Explicit null, not key omission: PATCH /api/agents/:id merges the
+        // metadata object rather than replacing it (live-probed against the
+        // running API), so omitting the key leaves whatever was previously
+        // persisted in place. Only an explicit null actually clears it.
+        nextMetadata.darkLane = null;
       } else {
         nextMetadata.darkLane = finalState;
       }

@@ -123,10 +123,15 @@ test('AC3: recovery sends exactly one alert and clears darkLane metadata', async
   assert.equal(sent.length, 1);
   assert.match(sent[0], /Lane recovered: CTO Ops/);
   assert.equal(patched.length, 1);
-  assert.equal(patched[0].metadata.darkLane, undefined);
+  // Explicit null, not an omitted key: PATCH /api/agents/:id merges the
+  // metadata object rather than replacing it, so omitting the key would
+  // leave the stale `active: true` value in place server-side (AUR-4532).
+  assert.equal(patched[0].metadata.darkLane, null);
   assert.equal(patched[0].metadata.unrelatedKey, 'keep-me');
   assert.equal(results[0].alert, 'recovered');
-  assert.equal(localState.a1, undefined);
+  // Recorded as explicitly quiescent, not deleted, so a later tick never
+  // falls back to (possibly still-stale) agent.metadata.darkLane (AUR-4532).
+  assert.deepEqual(localState.a1, DEFAULT_DARK_LANE_STATE);
 });
 
 test('AC4: rate-window refusal ("blocked") leaves the guard unset for retry, never re-sends same tick', async () => {
@@ -333,7 +338,36 @@ test('AUR-5027 req7: dark -> recovered -> exactly one recovery alert, with the P
   assert.equal(sent.length, 2, 'exactly one opened + one recovered alert');
   assert.match(sent[1], /Lane recovered/);
   assert.equal(tick3.results[0].alert, 'recovered');
-  assert.deepEqual(tick3.localState, {}, 'fully quiescent again once the recovery alert confirms');
+  // AUR-4532 live-bug fix: the entry stays *recorded* as quiescent rather
+  // than being deleted. Deleting it made the next tick's `localState[id] ??
+  // agent.metadata?.darkLane` fallback fall through to metadata — which,
+  // because PATCH /api/agents/:id merges rather than replaces, never
+  // actually cleared and stayed stuck at the last non-default value,
+  // reproducing a "recovered" alert on every subsequent tick in production.
+  assert.deepEqual(
+    tick3.localState,
+    { a1: DEFAULT_DARK_LANE_STATE },
+    'quiescent state stays explicitly recorded, not deleted, so a later tick never falls back to stale metadata',
+  );
+
+  // Fourth tick: still not dark, metadata PATCH has 403'd on every prior
+  // tick so agent.metadata.darkLane is still stuck reporting the agent as
+  // active/alerted. This is the exact AUR-4532 regression: local state must
+  // stay authoritative and never resurrect the recovery alert.
+  const tick4 = await tickCompany({
+    agents: [makeAgent()],
+    runs: [{ agentId: 'a1', status: 'succeeded', scheduledRetryAt: null }],
+    now: new Date(NOW.getTime() + 45 * 60 * 1000),
+    issuePrefix: 'aur',
+    sendAlert: async (msg) => {
+      sent.push(msg);
+      return 'confirmed';
+    },
+    patchAgent,
+    localState: tick3.localState,
+  });
+  assert.equal(sent.length, 2, 'a later quiescent tick must not resend the recovery alert');
+  assert.equal(tick4.results.length, 0, 'agent is no longer a candidate at all once localState is quiescent');
 });
 
 test('AUR-5027 req8: send blocked by the rate window leaves the local guard unset so the next tick retries', async () => {

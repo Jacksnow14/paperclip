@@ -579,6 +579,261 @@ describeEmbeddedPostgres("productivity review service", () => {
     });
   });
 
+  describe("AUR-4111 assignee_unavailable trigger", () => {
+    it("does not fire assignee_unavailable for an errored agent with a recent successful run", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await db.update(agents).set({ status: "error" }).where(eq(agents.id, seeded.coderId));
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+        status: "succeeded",
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+      expect(review?.description).toContain("Assignee availability: available");
+    });
+
+    it("fires assignee_unavailable for an errored agent whose latest failed run is older than the threshold with no active run", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await db.update(agents).set({ status: "error" }).where(eq(agents.id, seeded.coderId));
+      const staleNow = new Date(now.getTime() - 40 * 60 * 1000);
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now: staleNow,
+        status: "failed",
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `assignee_unavailable`");
+      expect(review?.description).toContain("Assignee availability: unavailable (error)");
+      expect(review?.description).toContain("Reassign to a live agent who can pick up the work.");
+    });
+
+    it("does not fire assignee_unavailable for an errored agent whose latest failed run is under the threshold", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await db.update(agents).set({ status: "error" }).where(eq(agents.id, seeded.coderId));
+      const recentNow = new Date(now.getTime() - 90 * 1000);
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now: recentNow,
+        status: "failed",
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+      expect(review?.description).toContain("Assignee availability: available");
+    });
+
+    it("does not fire assignee_unavailable for a paused agent under the threshold, but fires once the threshold is exceeded", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+
+      const seededUnder = await seedAssignedIssue();
+      await db
+        .update(agents)
+        .set({ status: "paused", pausedAt: new Date(now.getTime() - 10 * 60 * 1000) })
+        .where(eq(agents.id, seededUnder.coderId));
+      await insertRuns({
+        companyId: seededUnder.companyId,
+        agentId: seededUnder.coderId,
+        issueId: seededUnder.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+      const underResult = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seededUnder.companyId,
+      });
+      expect(underResult.created).toBe(1);
+      const [underReview] = await listProductivityReviews(seededUnder.companyId);
+      expect(underReview?.description).toContain("Primary trigger: `no_comment_streak`");
+      expect(underReview?.description).toContain("Assignee availability: available");
+
+      const seededOver = await seedAssignedIssue();
+      await db
+        .update(agents)
+        .set({ status: "paused", pausedAt: new Date(now.getTime() - 40 * 60 * 1000) })
+        .where(eq(agents.id, seededOver.coderId));
+      await insertRuns({
+        companyId: seededOver.companyId,
+        agentId: seededOver.coderId,
+        issueId: seededOver.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+      const overResult = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seededOver.companyId,
+      });
+      expect(overResult.created).toBe(1);
+      const [overReview] = await listProductivityReviews(seededOver.companyId);
+      expect(overReview?.description).toContain("Primary trigger: `assignee_unavailable`");
+      expect(overReview?.description).toContain("Assignee availability: unavailable (paused)");
+    });
+
+    it("fires assignee_unavailable immediately for a terminated agent, with no duration test", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, seeded.coderId));
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `assignee_unavailable`");
+      expect(review?.description).toContain("Assignee availability: unavailable (terminated)");
+    });
+
+    it("wins precedence over simultaneously true high_churn and no_comment_streak, on the rendered markdown", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, seeded.coderId));
+      // 12 recent, uncommented runs genuinely clear both the no-comment streak threshold (10)
+      // and the high-churn hourly threshold (10) at once -- both axes are really true, not just
+      // asserted via the trigger enum, so a churn-shaped menu surviving here would be caught.
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 12,
+        now,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.description).toContain("Primary trigger: `assignee_unavailable`");
+      expect(review?.description).toContain("Assignee availability: unavailable (terminated)");
+      expect(review?.description).toContain("Reassign to a live agent who can pick up the work.");
+      expect(review?.description).toContain(
+        "Escalate to the assignee's manager (`reportsTo`) if no other agent is available.",
+      );
+      // The churn/no-comment-shaped menu and reasoning must not appear next to an
+      // unavailable-owner verdict -- see the AUR-4014 lesson this precedence rule generalizes.
+      expect(review?.description).not.toContain("Continue with a snooze window");
+      expect(review?.description).not.toContain("Request decomposition");
+    });
+
+    it("excludes an unavailable-errored candidate from review ownership, falling back to the next candidate", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      const ceoId = randomUUID();
+      await db.insert(agents).values({
+        id: ceoId,
+        companyId: seeded.companyId,
+        name: "CEO",
+        role: "ceo",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.update(agents).set({ status: "error" }).where(eq(agents.id, seeded.managerId));
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.managerId,
+        issueId: seeded.issueId,
+        count: 1,
+        now: new Date(now.getTime() - 40 * 60 * 1000),
+        status: "failed",
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.assigneeAgentId).toBe(ceoId);
+    });
+
+    it("keeps a stale-error candidate selectable for review ownership once it has run successfully since", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await db.update(agents).set({ status: "error" }).where(eq(agents.id, seeded.managerId));
+      // The sticky `error` status is stale: the manager's most recent terminal run succeeded,
+      // so resolveErrorUnavailability (and isAgentInvokable, which reuses it) must trust the run
+      // history over the stale status field and keep the manager selectable.
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.managerId,
+        issueId: seeded.issueId,
+        count: 1,
+        now,
+        status: "succeeded",
+      });
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      const [review] = await listProductivityReviews(seeded.companyId);
+      expect(review?.assigneeAgentId).toBe(seeded.managerId);
+    });
+  });
+
   it("creates a high-churn review even when every sampled run has a progress comment", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();

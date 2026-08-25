@@ -11333,6 +11333,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           claimedAt: agentWakeupRequests.claimedAt,
           finishedAt: agentWakeupRequests.finishedAt,
           error: agentWakeupRequests.error,
+          // AUR-4523: without createdAt/updatedAt, a wake that was enqueued and then
+          // skipped is indistinguishable from one that never happened -- there was no
+          // timestamp to sort or diff against run history.
+          createdAt: agentWakeupRequests.createdAt,
+          updatedAt: agentWakeupRequests.updatedAt,
         })
         .from(agentWakeupRequests)
         .where(and(...conditions))

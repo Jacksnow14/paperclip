@@ -35,7 +35,6 @@ export const issueRecoveryActions = pgTable(
     monitorPolicy: jsonb("monitor_policy").$type<Record<string, unknown>>(),
     attemptCount: integer("attempt_count").notNull().default(0),
     maxAttempts: integer("max_attempts"),
-    timeoutAt: timestamp("timeout_at", { withTimezone: true }),
     lastAttemptAt: timestamp("last_attempt_at", { withTimezone: true }),
     outcome: text("outcome"),
     resolutionNote: text("resolution_note"),

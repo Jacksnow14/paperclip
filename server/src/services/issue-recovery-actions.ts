@@ -52,7 +52,6 @@ export type UpsertIssueRecoveryActionInput = {
   wakePolicy?: Record<string, unknown> | null;
   monitorPolicy?: Record<string, unknown> | null;
   maxAttempts?: number | null;
-  timeoutAt?: Date | null;
   lastAttemptAt?: Date | null;
 };
 
@@ -115,7 +114,6 @@ function toReadModel(row: IssueRecoveryActionRow): IssueRecoveryAction {
     monitorPolicy: row.monitorPolicy,
     attemptCount: row.attemptCount,
     maxAttempts: row.maxAttempts,
-    timeoutAt: row.timeoutAt,
     lastAttemptAt: row.lastAttemptAt,
     outcome: row.outcome as IssueRecoveryAction["outcome"],
     resolutionNote: row.resolutionNote,
@@ -246,7 +244,6 @@ export function issueRecoveryActionService(db: Db) {
           monitorPolicy: input.monitorPolicy ?? null,
           attemptCount: existing.attemptCount + 1,
           maxAttempts: input.maxAttempts ?? null,
-          timeoutAt: input.timeoutAt ?? null,
           lastAttemptAt: input.lastAttemptAt ?? now,
           outcome: null,
           resolutionNote: null,
@@ -288,7 +285,6 @@ export function issueRecoveryActionService(db: Db) {
           monitorPolicy: input.monitorPolicy ?? null,
           attemptCount: 1,
           maxAttempts: input.maxAttempts ?? null,
-          timeoutAt: input.timeoutAt ?? null,
           lastAttemptAt: input.lastAttemptAt ?? now,
         })
         .returning();

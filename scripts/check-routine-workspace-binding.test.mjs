@@ -37,7 +37,7 @@ test('buildDigestComment: no drift renders a clean "no new drift" message', () =
   const body = buildDigestComment({ fresh: [], resolvedCount: 2, totalUnbound: 5 });
   assert.match(body, /No new drift this week\./);
   assert.match(body, /Resolved since last run: 2/);
-  assert.match(body, /Active\/draft unbound routines: 5/);
+  assert.match(body, /Active\/paused unbound routines: 5/);
 });
 
 test('buildDigestComment: fresh routines are each listed with id/title/assignee', () => {

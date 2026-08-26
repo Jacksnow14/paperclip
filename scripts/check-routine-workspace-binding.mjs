@@ -49,7 +49,7 @@ import { resolveApiBase } from './lib/paperclip-api-base.mjs';
  *  (no scope.projectId) so the titlePrefix read below — also unscoped — finds it. */
 export const STATE_TITLE = 'routine-binding-watchdog/last-seen';
 
-const ACTIVE_STATUSES = new Set(['active', 'draft']);
+const ACTIVE_STATUSES = new Set(['active', 'paused']);
 
 function makeApiHelpers(apiUrl, headers) {
   async function apiGet(path) {
@@ -67,7 +67,7 @@ function makeApiHelpers(apiUrl, headers) {
 
 const asArray = (d, key) => (Array.isArray(d) ? d : (d && d[key]) || []);
 
-/** Every active/draft routine with no projectId. The routines list endpoint
+/** Every active/paused (non-archived) routine with no projectId. The routines list endpoint
  *  does not paginate (no limit/offset support server-side) — it always
  *  returns the full company set in one call. */
 export async function fetchUnboundRoutines(apiGet, companyId) {
@@ -90,7 +90,7 @@ export function buildDigestComment({ fresh, resolvedCount, totalUnbound }) {
   const lines = [
     '## Routine workspace-binding drift — weekly audit (AUR-6167)',
     '',
-    `Active/draft unbound routines: ${totalUnbound}. New since last run: ${fresh.length}. ` +
+    `Active/paused unbound routines: ${totalUnbound}. New since last run: ${fresh.length}. ` +
       `Resolved since last run: ${resolvedCount}.`,
     '',
   ];
@@ -134,7 +134,7 @@ export async function main({ apply, apiUrl, apiKey, companyId, issueId }) {
 
   const { fresh, resolved, currentIds } = diffUnbound(current, previousIds);
 
-  console.log(`Active/draft unbound routines: ${current.length}`);
+  console.log(`Active/paused unbound routines: ${current.length}`);
   console.log(`New since last run: ${fresh.length}`);
   console.log(`Resolved since last run: ${resolved.length}`);
   for (const r of fresh) console.log(`  NEW: ${r.id} | ${r.title}`);
@@ -157,7 +157,7 @@ export async function main({ apply, apiUrl, apiKey, companyId, issueId }) {
   await apiPost(`/api/companies/${companyId}/memory/capture`, {
     title: STATE_TITLE,
     upsert: true,
-    content: `Unbound-routine watchdog state as of ${nowIso}: ${currentIds.length} active/draft unbound routine(s), ${fresh.length} new, ${resolved.length} resolved this run.`,
+    content: `Unbound-routine watchdog state as of ${nowIso}: ${currentIds.length} active/paused unbound routine(s), ${fresh.length} new, ${resolved.length} resolved this run.`,
     metadata: {
       category: 'synthesis',
       unbound_routine_ids: currentIds,

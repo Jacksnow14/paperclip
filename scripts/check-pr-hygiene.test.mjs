@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildHygieneIssuePayload,
   collisionKey,
   decideTerminalIssueAction,
   extractIssueRefs,
@@ -12,6 +13,7 @@ import {
   terminalIssueBody,
   terminalIssueTitle,
   terminalPrCommentBody,
+  PLATFORM_LABEL_ID,
 } from './check-pr-hygiene.mjs';
 
 const NOW = Date.parse('2026-08-12T12:00:00Z');
@@ -221,4 +223,30 @@ test('check-B message bodies demand renumbering, never dropping a side', () => {
   assert.match(body, /renumber/i);
   assert.match(body, /not by dropping/i);
   assert.equal(migrationIssueTitle(REPO, collision), `pr-hygiene/paperclip: duplicate migration idx 103 across ${REPO}#264, ${REPO}#266`);
+});
+
+// ---------------------------------------------------------------------------
+// AUR-6215: non-critical hygiene issues must file as backlog + platform
+// label, not todo — only `critical` (e.g. check-A) stays in the active queue.
+// ---------------------------------------------------------------------------
+
+test('non-critical hygiene issues are created as backlog with the platform label', () => {
+  const payload = buildHygieneIssuePayload('t', 'd', 'high');
+  assert.equal(payload.status, 'backlog');
+  assert.deepEqual(payload.labelIds, [PLATFORM_LABEL_ID]);
+  assert.notEqual(payload.status, 'todo');
+});
+
+test('default priority (no priority argument) also files as backlog', () => {
+  const payload = buildHygieneIssuePayload('t', 'd');
+  assert.equal(payload.priority, 'high');
+  assert.equal(payload.status, 'backlog');
+  assert.deepEqual(payload.labelIds, [PLATFORM_LABEL_ID]);
+});
+
+test('critical hygiene issues (check-A) are left in the active queue, no status/labelIds override', () => {
+  const payload = buildHygieneIssuePayload('t', 'd', 'critical');
+  assert.equal(payload.status, undefined);
+  assert.equal(payload.labelIds, undefined);
+  assert.equal(payload.priority, 'critical');
 });

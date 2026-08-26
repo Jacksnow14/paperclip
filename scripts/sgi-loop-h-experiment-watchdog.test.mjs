@@ -7,6 +7,8 @@ import {
   decideStaleApproval,
   scorecardsForAgent,
   measuredDeltaPct,
+  buildExperimentIssuePayload,
+  PLATFORM_LABEL_ID,
 } from "./sgi-loop-h-experiment-watchdog.mjs";
 
 // A scorecard fixture mirroring a raw performance/{agent}/{task_type}/{date} record.
@@ -261,4 +263,43 @@ test("decideStaleApproval: >=14d pending with escalation already stamped still f
   const result = decideStaleApproval(record, "pending", "2026-07-13T07:05:09.945Z", "2026-07-30");
   assert.equal(result.action, "founder_alert");
   assert.equal(result.ageDays, 16);
+});
+
+// ---------------------------------------------------------------------------
+// AUR-6215: both the Loop-C self-edit issue and the prompt-edit-gate issue
+// this watchdog files are self-improvement work, never critical, so they
+// must file as backlog + platform label, not todo.
+// ---------------------------------------------------------------------------
+
+test("Loop-C-issue payload (priority high) is created as backlog with the platform label, not todo", () => {
+  const payload = buildExperimentIssuePayload({
+    title: "Prompt self-edit required — agent-1 / experiment exp-1",
+    description: "desc",
+    assigneeAgentId: "agent-1",
+    projectId: "proj-1",
+    parentId: "parent-1",
+    priority: "high",
+  });
+  assert.equal(payload.status, "backlog");
+  assert.deepEqual(payload.labelIds, [PLATFORM_LABEL_ID]);
+  assert.notEqual(payload.status, "todo");
+  assert.equal(payload.priority, "high");
+  assert.equal(payload.assigneeAgentId, "agent-1");
+  assert.equal(payload.projectId, "proj-1");
+  assert.equal(payload.parentId, "parent-1");
+});
+
+test("gate-run issue payload (priority medium) is also created as backlog with the platform label", () => {
+  const payload = buildExperimentIssuePayload({
+    title: "Run the prompt-edit gate — prompt_edit experiment exp-1",
+    description: "desc",
+    assigneeAgentId: "agent-1",
+    projectId: "proj-1",
+    parentId: "parent-1",
+    priority: "medium",
+  });
+  assert.equal(payload.status, "backlog");
+  assert.deepEqual(payload.labelIds, [PLATFORM_LABEL_ID]);
+  assert.notEqual(payload.status, "todo");
+  assert.equal(payload.priority, "medium");
 });

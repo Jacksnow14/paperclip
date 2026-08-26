@@ -86,6 +86,12 @@ const DETECTOR_C_THRESHOLD = 2.5;
 const DETECTOR_D_MIN_REWORK = 3; // of the last RECENT_N
 const CREATE_CAP = 3;
 
+// AUR-6215: mirrors check-pr-backlog.mjs's PLATFORM_LABEL_ID (AUR-6213) — not
+// imported because that export may not have landed on master yet. Self-edit
+// issues are never critical, so they must file as backlog + platform, not
+// flood the active `todo` queue.
+export const PLATFORM_LABEL_ID = '83062a2e-aec5-4de2-9541-02d05641c246';
+
 // ---- Detector B false-positive gates (AUR-4233) ----------------------------
 
 // Absolute-quality floor: a window whose worst record is still >= this is good
@@ -458,6 +464,24 @@ function selectForCreation(eligible, cap) {
   return { selected: sorted.slice(0, cap), dropped: sorted.slice(cap) };
 }
 
+/**
+ * AUR-6215: self-edit issues are self-improvement work and never critical,
+ * so they must file as backlog + platform label (routed through the weekly
+ * platform-backlog drip) rather than flooding the active `todo` queue.
+ */
+export function buildSelfEditIssuePayload({ title, description, assigneeAgentId, projectId, parentId }) {
+  return {
+    title,
+    description,
+    assigneeAgentId,
+    projectId,
+    priority: 'high',
+    status: 'backlog',
+    labelIds: [PLATFORM_LABEL_ID],
+    ...(parentId ? { parentId } : {}),
+  };
+}
+
 async function main() {
   for (const [k, v] of Object.entries({ API_KEY, COMPANY_ID, AGENT_ID })) {
     if (!v) throw new Error(`Missing env ${k}`);
@@ -640,14 +664,13 @@ async function main() {
       'prompt-edit-gate verdict — plausible-sounding prose is not evidence.',
     ].join('\n');
 
-    const payload = {
+    const payload = buildSelfEditIssuePayload({
       title: `Prompt self-edit required — ${t.agent_id} / ${t.task_type}`,
       description,
       assigneeAgentId: t.agent_id,
       projectId: PROJECT_ID,
-      priority: 'high',
-      ...(parentId ? { parentId } : {}),
-    };
+      parentId,
+    });
 
     if (DRY_RUN) {
       console.log(`  [dry-run] would create: ${payload.title}`);

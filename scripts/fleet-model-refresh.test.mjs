@@ -9,6 +9,8 @@ import {
   bumpCandidates,
   resolveTarget,
   shouldTune,
+  buildTuningIssuePayload,
+  PLATFORM_LABEL_ID,
 } from './fleet-model-refresh.mjs';
 
 const CLAUDE = ['claude-haiku-4-5', 'claude-sonnet-5', 'claude-opus-4-8', 'claude-opus-5', 'claude-fable-5'];
@@ -115,4 +117,34 @@ test('tuning dispatch: on new models immediately, otherwise every N days', () =>
     shouldTune({ modelsChanged: false, lastTuningAt: null, nowMs: now, minDaysBetween: 6 }),
     true,
   );
+});
+
+// ---------------------------------------------------------------------------
+// AUR-6215: the daily fleet-tuning issue is self-improvement/platform work,
+// never critical, so it must file as backlog + platform label, not todo.
+// ---------------------------------------------------------------------------
+
+test('fleet-tuning issue is created as backlog with the platform label, not todo', () => {
+  const payload = buildTuningIssuePayload({
+    reviewerId: 'agent-1',
+    newModels: [],
+    minDays: 6,
+    nowIso: '2026-08-26T00:00:00Z',
+  });
+  assert.equal(payload.status, 'backlog');
+  assert.deepEqual(payload.labelIds, [PLATFORM_LABEL_ID]);
+  assert.notEqual(payload.status, 'todo');
+  assert.equal(payload.priority, 'medium');
+});
+
+test('fleet-tuning issue payload still carries title, description and assignee', () => {
+  const payload = buildTuningIssuePayload({
+    reviewerId: 'agent-1',
+    newModels: ['claude-fable-5'],
+    minDays: 6,
+    nowIso: '2026-08-26T00:00:00Z',
+  });
+  assert.match(payload.title, /fleet-tuning: re-evaluate agent models\/effort\/prompts.*2026-08-26/);
+  assert.match(payload.description, /newly available model\(s\): claude-fable-5/);
+  assert.equal(payload.assigneeAgentId, 'agent-1');
 });

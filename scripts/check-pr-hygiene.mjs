@@ -67,6 +67,9 @@ const HOUR_MS = 60 * 60 * 1000;
 const COOLDOWN_MS = 24 * HOUR_MS;
 const MIGRATIONS_JOURNAL_PATH = 'packages/db/src/migrations/meta/_journal.json';
 const CTO_AGENT_ID = '371a1b08-0286-4a12-a516-f587f42df5eb';
+// AUR-6215: mirrors check-pr-backlog.mjs's PLATFORM_LABEL_ID (AUR-6213) — not
+// imported because that export may not have landed on master yet.
+export const PLATFORM_LABEL_ID = '83062a2e-aec5-4de2-9541-02d05641c246';
 const TERMINAL_STATUSES = new Set(['cancelled', 'done']);
 
 // ---------------------------------------------------------------------------
@@ -314,13 +317,35 @@ async function api(args, method, path, body) {
   return res.json();
 }
 
-async function fileIssue(args, title, description, priority = 'high') {
-  const created = await api(args, 'POST', `/api/companies/${args.companyId}/issues`, {
+/**
+ * Pure: the create-issue request body for a filed hygiene issue. Non-critical
+ * issues file as `backlog` + the `platform` label (AUR-6215, following
+ * AUR-6213's fix to check-pr-backlog.mjs) so the weekly platform-drip routine
+ * controls admission instead of flooding the active queue. `critical` issues
+ * (e.g. check-A's cancelled-issue-with-open-PR alert) are left untouched —
+ * they must keep flowing into the active queue immediately.
+ */
+export function buildHygieneIssuePayload(title, description, priority = 'high') {
+  const payload = {
     title,
     description,
     priority,
     assigneeAgentId: CTO_AGENT_ID,
-  });
+  };
+  if (priority !== 'critical') {
+    payload.status = 'backlog';
+    payload.labelIds = [PLATFORM_LABEL_ID];
+  }
+  return payload;
+}
+
+async function fileIssue(args, title, description, priority = 'high') {
+  const created = await api(
+    args,
+    'POST',
+    `/api/companies/${args.companyId}/issues`,
+    buildHygieneIssuePayload(title, description, priority),
+  );
   // 201 is not proof — read the row back before recording the dispatch.
   await api(args, 'GET', `/api/issues/${created.id}`);
   return created.identifier ?? created.id;

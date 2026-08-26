@@ -109,6 +109,27 @@ const SCAN_LIMIT = 200;
 const DEFAULT_P95_PER_TASK_COST = 55000;
 const RUNAWAY_SAFETY_FACTOR = 1.5;
 
+// AUR-6215: mirrors check-pr-backlog.mjs's PLATFORM_LABEL_ID (AUR-6213) — not
+// imported because that export may not have landed on master yet. The
+// self-edit/gate issues this watchdog files are self-improvement work and
+// never critical, so they must file as backlog + platform, not flood the
+// active `todo` queue.
+export const PLATFORM_LABEL_ID = '83062a2e-aec5-4de2-9541-02d05641c246';
+
+/** AUR-6215: shared payload shape for the non-critical issues this watchdog files. */
+export function buildExperimentIssuePayload({ title, description, assigneeAgentId, projectId, parentId, priority }) {
+  return {
+    title,
+    description,
+    assigneeAgentId,
+    projectId,
+    parentId,
+    priority,
+    status: 'backlog',
+    labelIds: [PLATFORM_LABEL_ID],
+  };
+}
+
 function headers() {
   return {
     'Authorization': `Bearer ${API_KEY}`,
@@ -408,14 +429,14 @@ async function createLoopCIssue(exp) {
     '**Safety boundary:** propose edits to YOUR file ONLY. The board approves the actual change.',
   ].join('\n');
 
-  const payload = {
+  const payload = buildExperimentIssuePayload({
     title: `Prompt self-edit required — ${target} / experiment ${id}`,
     description,
     assigneeAgentId: target,
     projectId: PROJECT_ID,
     parentId: PARENT_ISSUE_ID,
     priority: 'high',
-  };
+  });
   if (DRY_RUN) return { identifier: '(dry-run)', id: null };
   const res = await apiFetch(`/api/companies/${COMPANY_ID}/issues`, { method: 'POST', body: JSON.stringify(payload) });
   const iss = res.issue || res;
@@ -470,14 +491,14 @@ async function createGateIssue(exp) {
     'credentials, legal, and irreversible changes.',
   ].join('\n');
 
-  const payload = {
+  const payload = buildExperimentIssuePayload({
     title: `Run the prompt-edit gate — ${m.change_type || 'prompt_edit'} experiment ${id}`,
     description,
     assigneeAgentId: target,
     projectId: PROJECT_ID,
     parentId: PARENT_ISSUE_ID,
     priority: 'medium',
-  };
+  });
   if (DRY_RUN) return { identifier: '(dry-run)', id: null };
   try {
     const res = await apiFetch(`/api/companies/${COMPANY_ID}/issues`, { method: 'POST', body: JSON.stringify(payload) });

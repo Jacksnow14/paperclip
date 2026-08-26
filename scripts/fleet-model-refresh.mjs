@@ -43,6 +43,9 @@ import process from 'node:process';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const PROBE_TTL_DAYS = 7;
+// AUR-6215: mirrors check-pr-backlog.mjs's PLATFORM_LABEL_ID (AUR-6213) — not
+// imported because that export may not have landed on master yet.
+export const PLATFORM_LABEL_ID = '83062a2e-aec5-4de2-9541-02d05641c246';
 
 // ---------- pure: model id parsing and ranking ----------
 
@@ -152,6 +155,42 @@ export function shouldTune({ modelsChanged, lastTuningAt, nowMs, minDaysBetween 
   const last = lastTuningAt ? Date.parse(lastTuningAt) : 0;
   if (modelsChanged) return true;
   return nowMs - last >= minDaysBetween * DAY_MS;
+}
+
+/**
+ * Pure: the create-issue request body for the daily fleet-tuning issue. This
+ * is self-improvement/platform work, never critical, so it always files as
+ * `backlog` + the `platform` label (AUR-6215, following AUR-6213's fix to
+ * check-pr-backlog.mjs) so the weekly platform-drip routine controls
+ * admission instead of flooding the active queue.
+ */
+export function buildTuningIssuePayload({ reviewerId, newModels, minDays, nowIso = new Date().toISOString() }) {
+  return {
+    title: `fleet-tuning: re-evaluate agent models/effort/prompts vs recent task mix (${nowIso.slice(0, 10)})`,
+    description: [
+      'Filed by scripts/fleet-model-refresh.mjs (daily fleet refresh — judgment half, budget-capped to one pass).',
+      '',
+      newModels.length
+        ? `Trigger: newly available model(s): ${newModels.join(', ')}.`
+        : `Trigger: scheduled (every ${minDays} days).`,
+      '',
+      'In ONE pass (no per-task deep dives):',
+      '1. Pull each active agent\'s last-7-days issue mix (titles + outcomes) from the board.',
+      '2. For each agent decide whether its model TIER, effort, and system prompt still fit',
+      '   the work it actually receives. scripts/fleet-model-policy.json pins CEO = frontier',
+      '   model at highest effort and Claude Code Max = latest fable — do not violate those;',
+      '   propose policy-file changes for anything else via a PR to fleet-model-policy.json.',
+      '3. Apply effort/system-prompt adjustments directly via PATCH /agents/:id and the',
+      '   instructions bundle API. Keep a one-line rationale per change in this issue.',
+      '4. Budget rule: this is a routine calibration, not research — cap at one focused run.',
+      '',
+      'The founder does not review these decisions — your judgment is final within policy.',
+    ].join('\n'),
+    priority: 'medium',
+    status: 'backlog',
+    labelIds: [PLATFORM_LABEL_ID],
+    assigneeAgentId: reviewerId,
+  };
 }
 
 // ---------- runtime ----------
@@ -364,30 +403,11 @@ async function main() {
       (a) => a.name === reviewerName && !['error', 'terminated'].includes(a.status),
     );
     if (reviewer && !args.dryRun) {
-      const created = await api('POST', `/api/companies/${companyId}/issues`, {
-        title: `fleet-tuning: re-evaluate agent models/effort/prompts vs recent task mix (${new Date().toISOString().slice(0, 10)})`,
-        description: [
-          'Filed by scripts/fleet-model-refresh.mjs (daily fleet refresh — judgment half, budget-capped to one pass).',
-          '',
-          newModels.length
-            ? `Trigger: newly available model(s): ${newModels.join(', ')}.`
-            : `Trigger: scheduled (every ${minDays} days).`,
-          '',
-          'In ONE pass (no per-task deep dives):',
-          '1. Pull each active agent\'s last-7-days issue mix (titles + outcomes) from the board.',
-          '2. For each agent decide whether its model TIER, effort, and system prompt still fit',
-          '   the work it actually receives. scripts/fleet-model-policy.json pins CEO = frontier',
-          '   model at highest effort and Claude Code Max = latest fable — do not violate those;',
-          '   propose policy-file changes for anything else via a PR to fleet-model-policy.json.',
-          '3. Apply effort/system-prompt adjustments directly via PATCH /agents/:id and the',
-          '   instructions bundle API. Keep a one-line rationale per change in this issue.',
-          '4. Budget rule: this is a routine calibration, not research — cap at one focused run.',
-          '',
-          'The founder does not review these decisions — your judgment is final within policy.',
-        ].join('\n'),
-        priority: 'medium',
-        assigneeAgentId: reviewer.id,
-      });
+      const created = await api(
+        'POST',
+        `/api/companies/${companyId}/issues`,
+        buildTuningIssuePayload({ reviewerId: reviewer.id, newModels, minDays }),
+      );
       state.lastTuningAt = new Date().toISOString();
       saveState(args.stateDir, state);
       console.log(`tuning issue filed: ${created.identifier ?? created.id}`);

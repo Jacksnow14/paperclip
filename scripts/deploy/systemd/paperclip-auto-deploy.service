@@ -23,6 +23,11 @@ ExecStart=/opt/paperclip/app/current/scripts/deploy/auto-deploy.sh
 # (systemctl --user edit paperclip-auto-deploy.service) — not by editing this
 # committed file.
 Environment=PAPERCLIP_AUTO_RESTART_ENABLED=0
+# AUR-4034: build from the root-owned bare mirror, not the shared, mutable
+# /home/ievgen/paperclip checkout. The mirror is refreshed independently
+# (paperclip-src-mirror-refresh.timer) and is not writable by this unit's
+# user, so build-release.sh/safe-deploy.sh skip fetching into it directly.
+Environment=PAPERCLIP_DEPLOY_SRC_REPO=/opt/paperclip/src.git
 # A tick can legitimately hold the lock for a full release build plus a
 # quiescence-gated restart; do not let systemd kill it mid-build.
 # AUR-5019: the migration gate adds up to PAPERCLIP_MIGRATION_GATE_TIMEOUT_SEC

@@ -57,7 +57,14 @@ EOF
   fi
 fi
 
-git -C "$REPO" fetch --quiet origin
+# AUR-4034: $REPO may be a root-owned bare mirror (/opt/paperclip/src.git)
+# that this process cannot write to. A working checkout has its git dir at
+# $REPO/.git; a bare mirror IS the git dir, so this only fires for the
+# checkout case. The mirror's freshness comes from its own refresh timer
+# (scripts/deploy/refresh-src-mirror.sh), not from a fetch here.
+if [[ -d "$REPO/.git" ]]; then
+  git -C "$REPO" fetch --quiet origin
+fi
 SHA=$(git -C "$REPO" rev-parse --verify "${REF}^{commit}")
 
 # Traceability gate: refuse anything not on the GitHub remote. This is what

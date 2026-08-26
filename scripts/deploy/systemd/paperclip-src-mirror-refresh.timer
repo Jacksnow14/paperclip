@@ -1,0 +1,13 @@
+# AUR-4034: refresh the deploy-source mirror every 5 minutes -- ahead of the
+# 10-minute paperclip-auto-deploy.timer cadence, so a build never blocks on a
+# stale mirror waiting for its own refresh tick.
+[Unit]
+Description=Run the Paperclip deploy-source bare mirror refresh every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

@@ -1120,7 +1120,16 @@ export function issueRoutes(
   }
 
   async function hasCrossIssueCommentPermission(actorAgentId: string, companyId: string): Promise<boolean> {
-    return access.hasPermission(companyId, "agent", actorAgentId, "tasks:comment_cross_issue");
+    const allowedByGrant = await access.hasPermission(companyId, "agent", actorAgentId, "tasks:comment_cross_issue");
+    if (allowedByGrant) return true;
+    // AUR-4135: migration 0108 only backfilled the grant for CEO agents that
+    // existed at migration time. Nothing seeds tasks:comment_cross_issue for
+    // a CEO agent hired afterward (unlike canCreateAgentsLegacy, which still
+    // falls back to agent.permissions.canCreateAgents), so this fallback
+    // stays until agent creation seeds the named grant directly.
+    const actorAgent = await agentsSvc.getById(actorAgentId);
+    if (!actorAgent) return false;
+    return actorAgent.role === "ceo" && actorAgent.companyId === companyId;
   }
 
   async function wouldOwnershipGateReject(

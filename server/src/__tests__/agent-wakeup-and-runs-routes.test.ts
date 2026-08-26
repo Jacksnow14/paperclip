@@ -92,6 +92,8 @@ describe("agent wakeup-requests and runs routes", () => {
         claimedAt: new Date("2026-05-18T01:00:01.000Z"),
         finishedAt: new Date("2026-05-18T01:00:10.000Z"),
         error: null,
+        createdAt: new Date("2026-05-18T01:00:00.000Z"),
+        updatedAt: new Date("2026-05-18T01:00:10.000Z"),
       },
       {
         id: "wake-2",
@@ -118,6 +120,11 @@ describe("agent wakeup-requests and runs routes", () => {
     expect(mockHeartbeatService.listWakeupRequests).toHaveBeenCalledWith(AGENT_ID, 20, {});
     expect(res.body).toHaveLength(2);
     expect(res.body[1]).toMatchObject({ status: "skipped", reason: "wakeup_skipped", runId: null });
+    // AUR-4523: an enqueued-then-skipped wake must carry a timestamp so it can be
+    // ordered against run history -- without it, it's indistinguishable from a
+    // wake that never happened.
+    expect(res.body[0].createdAt).toBe("2026-05-18T01:00:00.000Z");
+    expect(res.body[0].updatedAt).toBe("2026-05-18T01:00:10.000Z");
   });
 
   it("clamps wakeup-requests limit to 500 and defaults to 50", async () => {

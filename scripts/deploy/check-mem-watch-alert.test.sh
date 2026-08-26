@@ -298,6 +298,66 @@ else
   fail "a new oom breach behind a pending non-integrity page pages immediately via override and clears the pending" "rc1=$rc1 rc2=$rc2 delivered=$(delivered) pending=$([[ -f $PENDINGF ]] && cat "$PENDINGF") out1=$out1 out2=$out2 sink=$(cat "$SINK" 2>/dev/null)"
 fi
 
+# 14. AUR-6214: clear_pending() must converge even when the process lacks
+#     write permission on the PENDING file's containing directory (the live
+#     host shape: /var/log is root:syslog, the service's user is not in that
+#     group, so `rm -f` fails to unlink -- silently, since nothing checked its
+#     exit status). Reproduce that exact permission split: create the pending
+#     file while the directory is still writable (how write_pending's initial
+#     create succeeds in prod too), then lock the directory down and prove a
+#     successful retry still converges to "no pending" via truncation, so the
+#     next tick does not re-deliver the same stale record.
+reset
+LOCKED="$TMP/locked-pending-dir"
+mkdir -p "$LOCKED"
+PENDINGF="$LOCKED/alert-pending"
+printf '%s\n2026-08-25T16:04:09Z,916,7200,2100,6000,8095,0.50,0,4,2,2,0,0,3859857,2026-08-25T10:00:00,-800,d5c37635bb00,yes\n' "$HEADER" > "$LOG"
+out1=$(NOTIFY_EXIT=1 run_check); rc1=$?
+cond1=0
+[[ "$rc1" == "0" ]] && [[ -f "$PENDINGF" ]] && [[ "$(delivered)" == "0" ]] && cond1=1
+chmod 555 "$LOCKED"
+out2=$(run_check); rc2=$?
+cond2=0
+if [[ "$rc2" == "0" ]] && grep -q "delivered on retry 2" <<<"$out2" && [[ "$(delivered)" == "1" ]]; then
+  cond2=1
+fi
+# Directory is still locked (555): rm -f cannot unlink, so the file itself
+# must still exist -- but truncated to zero bytes, which read_pending's `-s`
+# check already treats as absent. This is what distinguishes "actually
+# converged" from the pre-fix bug (same file, same stale attempts, forever).
+cond3=0
+if [[ -e "$PENDINGF" && ! -s "$PENDINGF" ]]; then cond3=1; fi
+printf '2026-08-26T12:00:00Z,4300,2800,2100,6000,8095,0.50,0,4,2,2,0,0,3859857,2026-08-25T10:00:00,-800,d5c37635bb00,yes\n' >> "$LOG"
+out3=$(run_check); rc3=$?
+cond4=0
+if [[ "$rc3" == "0" && "$(alerts)" == "2" && "$(delivered)" == "1" ]] && ! grep -q "delivered on retry" <<<"$out3"; then
+  cond4=1
+fi
+chmod 755 "$LOCKED"
+if [[ "$cond1$cond2$cond3$cond4" == "1111" ]]; then
+  ok "clear_pending converges (truncates) when the pending dir is not writable, so a later healthy tick observes zero pending and does not re-send"
+else
+  fail "clear_pending converges (truncates) when the pending dir is not writable, so a later healthy tick observes zero pending and does not re-send" \
+    "c1=$cond1 c2=$cond2 c3=$cond3 c4=$cond4 rc1=$rc1 rc2=$rc2 rc3=$rc3 pending_exists=$([[ -e $PENDINGF ]] && echo yes || echo no) pending_size=$([[ -e $PENDINGF ]] && wc -c < "$PENDINGF") out2=$out2 out3=$out3"
+fi
+PENDINGF="$TMP/alert-pending"
+
+# 15. AUR-6214: a retry delivered via process_pending() must stamp STATE with
+#     the wall-clock ts of the delivery, not the stale first_ts of the
+#     original (possibly hours/days old) breach row -- otherwise STATE pairs
+#     a stale row_ts with a fresh epoch (confirmed live on the host: state
+#     read "2026-08-25T16:04:09Z\t<today's epoch>").
+reset
+printf '%s\n2026-07-25T21:35:00Z,900,7200,2100,6000,8095,0.50,0,4,2,2,0,0,3859857,2026-07-25T16:30:26,-800,d5c37635bb00,yes\n' "$HEADER" > "$LOG"
+NOTIFY_EXIT=1 run_check >/dev/null
+run_check >/dev/null
+state_ts=$([[ -f "$STATE" ]] && cut -f1 "$STATE")
+if [[ "$state_ts" != "2026-07-25T21:35:00Z" && "$state_ts" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+  ok "a delivered retry stamps STATE with the current wall-clock ts, not the stale pending first_ts"
+else
+  fail "a delivered retry stamps STATE with the current wall-clock ts, not the stale pending first_ts" "state_ts=$state_ts state=$([[ -f "$STATE" ]] && cat "$STATE")"
+fi
+
 echo
 if [[ "$FAILURES" -eq 0 ]]; then
   echo "check-mem-watch-alert: all cases passed"

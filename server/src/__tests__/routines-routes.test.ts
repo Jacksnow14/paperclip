@@ -7,6 +7,7 @@ const agentId = "11111111-1111-4111-8111-111111111111";
 const routineId = "33333333-3333-4333-8333-333333333333";
 const projectId = "44444444-4444-4444-8444-444444444444";
 const otherAgentId = "55555555-5555-4555-8555-555555555555";
+const thirdAgentId = "66666666-6666-4666-8666-666666666666";
 const revisionId = "77777777-7777-4777-8777-777777777777";
 
 const routine = {
@@ -606,6 +607,29 @@ describe("routine routes", () => {
 
     expect(res.status).toBe(200);
     expect(mockRoutineService.update).toHaveBeenCalledWith(routineId, expect.objectContaining({ assigneeAgentId: otherAgentId }), expect.anything());
+  });
+
+  it("allows a CEO-role agent to reassign another agent's routine to a THIRD agent without any explicit routines:manage grant", async () => {
+    // Regression test for AUR-5819: the CEO here (otherAgentId) is reassigning the
+    // routine to a different third agent (thirdAgentId), not to themselves — this is
+    // the scenario the third inline authorization check in the PATCH handler gates,
+    // and it previously called agentHasRoutinesManage (no CEO bypass) instead of
+    // agentCanAdminRoutines, so a CEO with no explicit routines:manage grant was
+    // wrongly forbidden from reassigning routines off themselves to other agents.
+    mockAccessService.hasPermission.mockResolvedValue(false);
+    mockAgentService.getById.mockResolvedValue({ id: otherAgentId, companyId, role: "ceo" });
+    const app = await createApp({
+      type: "agent",
+      agentId: otherAgentId,
+      companyId,
+    });
+
+    const res = await request(app)
+      .patch(`/api/routines/${routineId}`)
+      .send({ assigneeAgentId: thirdAgentId });
+
+    expect(res.status).toBe(200);
+    expect(mockRoutineService.update).toHaveBeenCalledWith(routineId, expect.objectContaining({ assigneeAgentId: thirdAgentId }), expect.anything());
   });
 
 });

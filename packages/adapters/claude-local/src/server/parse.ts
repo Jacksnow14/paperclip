@@ -836,7 +836,15 @@ export function detectClaudeQuotaExhaustion(
   const sourceText = trustedSource ?? contaminableSource;
   if (!sourceText) return null;
 
-  const match = sourceText.match(CLAUDE_EXTRA_USAGE_RESET_RE);
+  // AUR-4524 fix: the reset clock time can sit in either confirmed text -- a structured
+  // `errors[]` message rarely carries it, but the accompanying prose (already anchor-
+  // checked above, so not blind contamination) usually does. Search both confirmed texts
+  // rather than only the one that happened to win quota confirmation, or a genuine failure
+  // whose reset time lives in the other text loses its `resetAt` (regression caught by the
+  // "out of extra usage" test: structured `errors[]` confirmed the wall, but the reset
+  // clock only appeared in the anchored `parsed.result` prose alongside it).
+  const resetSearchText = [trustedSource, contaminableSource].filter(Boolean).join(" ");
+  const match = resetSearchText.match(CLAUDE_EXTRA_USAGE_RESET_RE);
   const resetAt = match ? parseClaudeResetClockTime(match[1] ?? "", now, match[2]) : null;
   return {
     resetAt,

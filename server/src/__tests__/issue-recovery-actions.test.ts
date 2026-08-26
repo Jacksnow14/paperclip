@@ -50,7 +50,6 @@ function makeRecoveryActionRow(overrides: Record<string, unknown> = {}) {
     monitorPolicy: null,
     attemptCount: 1,
     maxAttempts: null,
-    timeoutAt: null,
     lastAttemptAt: now,
     outcome: null,
     resolutionNote: null,
@@ -566,9 +565,16 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const [afterSecond] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
     expect(afterSecond?.status).toBe("todo");
 
-    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, sourceIssue.id));
-    expect(comments).toHaveLength(1);
-    expect(comments[0]?.body).toContain("Recovery action:");
+    // AUR-4719 #2: every escalation attempt now posts its own comment (previously only
+    // the first attempt did), so the second escalation above adds a second comment here.
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, sourceIssue.id))
+      .orderBy(issueComments.createdAt);
+    expect(comments).toHaveLength(2);
+    expect(comments[0]?.body).toContain("Recovery action: `" + actionRows[0]!.id + "` (attempt 1)");
+    expect(comments[1]?.body).toContain("Recovery action: `" + actionRows[0]!.id + "` (attempt 2)");
   });
 
   it("does not create nested recovery artifacts when issue-backed fallback work itself fails", async () => {

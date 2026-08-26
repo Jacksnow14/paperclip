@@ -147,7 +147,6 @@ describe("IssueBlockedNotice", () => {
               monitorPolicy: null,
               attemptCount: 1,
               maxAttempts: 3,
-              timeoutAt: null,
               lastAttemptAt: null,
               outcome: null,
               resolutionNote: null,

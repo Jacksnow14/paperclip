@@ -674,7 +674,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       returnOwnerAgentId: input.agentId,
       cause: input.cause ?? "stranded_assigned_issue",
       attemptCount: 1,
-      maxAttempts: null,
+      // AUR-4719 (defect 3): maxAttempts is now enforced at creation time, not
+      // left null forever — see MAX_DISPATCHABLE_STRANDED_RECOVERY_ATTEMPTS in
+      // service.ts.
+      maxAttempts: 3,
     });
     expect(action.evidence).toMatchObject({
       sourceIssueId: input.issueId,
@@ -768,8 +771,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     companyId: string;
     agentId: string;
     issueId: string;
+    offsetMinutes?: number;
   }) {
     const followUpRunId = randomUUID();
+    const offsetMs = (input.offsetMinutes ?? 0) * 60_000;
     await db.insert(heartbeatRuns).values({
       id: followUpRunId,
       companyId: input.companyId,
@@ -783,10 +788,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         wakeReason: "issue_assignment_recovery",
         retryReason: "assignment_recovery",
       },
-      startedAt: new Date("2030-03-19T00:10:00.000Z"),
-      finishedAt: new Date("2030-03-19T00:15:00.000Z"),
-      createdAt: new Date("2030-03-19T00:10:00.000Z"),
-      updatedAt: new Date("2030-03-19T00:15:00.000Z"),
+      startedAt: new Date(new Date("2030-03-19T00:10:00.000Z").getTime() + offsetMs),
+      finishedAt: new Date(new Date("2030-03-19T00:15:00.000Z").getTime() + offsetMs),
+      createdAt: new Date(new Date("2030-03-19T00:10:00.000Z").getTime() + offsetMs),
+      updatedAt: new Date(new Date("2030-03-19T00:15:00.000Z").getTime() + offsetMs),
       errorCode: "process_lost",
       error: "recovery wake run died again",
     });
@@ -2423,7 +2428,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       previousStatus: "todo",
       retryReason: "assignment_recovery",
     });
-    await expect(strandedRecoveryActionFor(companyId, issueId)).resolves.toMatchObject({ attemptCount: 1 });
+    const firstAction = await strandedRecoveryActionFor(companyId, issueId);
+    expect(firstAction?.attemptCount).toBe(1);
+    const lastAttemptAtAfterFirstEscalation = firstAction?.lastAttemptAt;
+    expect(lastAttemptAtAfterFirstEscalation).toBeTruthy();
 
     // Next scheduler tick, without advancing the clock: the issue is a candidate again.
     await restrandEscalatedIssueForNextSweep({ companyId, agentId, issueId });
@@ -2437,6 +2445,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // AUR-4168 durable `missing_edge` sweep is not re-suppressed.
     const action = await strandedRecoveryActionFor(companyId, issueId);
     expect(action?.attemptCount).toBe(1);
+
+    // AUR-4719 (defect 4): the cooldown check that suppresses re-escalation on a
+    // warm action is read-only — it must not refresh `lastAttemptAt` on a row it
+    // declines to touch. If it did, every no-op sweep tick would silently reset
+    // the dormancy clock and the action would never go dormant.
+    expect(action?.lastAttemptAt?.getTime()).toBe(lastAttemptAtAfterFirstEscalation?.getTime());
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(1);
@@ -2479,9 +2493,85 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const action = await strandedRecoveryActionFor(companyId, issueId);
     expect(action?.attemptCount).toBe(2);
+    // AUR-4719 (defect 3): maxAttempts used to be left null forever, so the
+    // exhaustion check on this action would never fire regardless of how many
+    // attempts piled up. It must be populated the moment the action is created.
+    expect(action?.maxAttempts).toBe(3);
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
     expect(issue?.status).toBe("todo");
+
+    // AUR-4719 (defect 2): escalation used to gate the recovery comment on
+    // `attemptCount === 1`, so every attempt after the first silently posted
+    // nothing. Each of the two escalations above must have left its own
+    // comment on the issue.
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(2);
+
+    await waitForHeartbeatIdle(db);
+  });
+
+  it("keeps posting a comment on every stranded-recovery attempt through exhaustion (AUR-4719 defect 2/3)", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "failed",
+      retryReason: "assignment_recovery",
+    });
+    const heartbeat = heartbeatService(db);
+
+    // Same bound the service enforces: MAX_DISPATCHABLE_STRANDED_RECOVERY_ATTEMPTS.
+    const MAX_DISPATCHABLE_STRANDED_RECOVERY_ATTEMPTS = 3;
+
+    const firstResult = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(firstResult.escalated).toBe(1);
+    await waitForHeartbeatIdle(db);
+
+    for (let attempt = 2; attempt <= MAX_DISPATCHABLE_STRANDED_RECOVERY_ATTEMPTS; attempt += 1) {
+      await restrandEscalatedIssueForNextSweep({ companyId, agentId, issueId, offsetMinutes: attempt * 10 });
+      await db
+        .update(issueRecoveryActions)
+        .set({ lastAttemptAt: new Date(Date.now() - 25 * 60 * 60 * 1000) })
+        .where(and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId),
+        ));
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.escalated).toBe(1);
+      await waitForHeartbeatIdle(db);
+
+      const action = await strandedRecoveryActionFor(companyId, issueId);
+      expect(action?.attemptCount).toBe(attempt);
+    }
+
+    // One more dormant-and-restrand cycle pushes attemptCount past maxAttempts,
+    // which must flip the issue to `blocked` and still leave a comment behind —
+    // before the fix, the exhaustion branch shared the same `attemptCount === 1`
+    // comment gate and silently skipped notifying anyone at exactly the moment
+    // the issue stopped being retried automatically.
+    await restrandEscalatedIssueForNextSweep({
+      companyId,
+      agentId,
+      issueId,
+      offsetMinutes: (MAX_DISPATCHABLE_STRANDED_RECOVERY_ATTEMPTS + 1) * 10,
+    });
+    await db
+      .update(issueRecoveryActions)
+      .set({ lastAttemptAt: new Date(Date.now() - 25 * 60 * 60 * 1000) })
+      .where(and(
+        eq(issueRecoveryActions.companyId, companyId),
+        eq(issueRecoveryActions.sourceIssueId, issueId),
+      ));
+
+    const exhaustionResult = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(exhaustionResult.escalated).toBe(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(MAX_DISPATCHABLE_STRANDED_RECOVERY_ATTEMPTS + 1);
+
     await waitForHeartbeatIdle(db);
   });
 

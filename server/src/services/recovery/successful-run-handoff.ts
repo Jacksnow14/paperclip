@@ -64,12 +64,26 @@ export type SuccessfulRunHandoffNotice = {
 export function noticeMetadataReferencesRecoveryAction(
   metadata: IssueCommentMetadata | null | undefined,
   recoveryActionId: string,
+  attempt?: number | null,
 ) {
-  return (metadata?.sections ?? []).some((section) =>
+  const sections = metadata?.sections ?? [];
+  const referencesAction = sections.some((section) =>
     section.rows.some((row) =>
       row.type === "key_value" &&
       row.label === "Recovery action" &&
       row.value === recoveryActionId,
+    ),
+  );
+  if (!referencesAction) return false;
+  // AUR-4719 #2: when an attempt is supplied, the notice must reference THIS
+  // attempt, not just this action id — otherwise attempt 1's notice would
+  // dedupe every later attempt's notice against the same action id forever.
+  if (attempt == null) return true;
+  return sections.some((section) =>
+    section.rows.some((row) =>
+      row.type === "key_value" &&
+      row.label === "Recovery attempt" &&
+      row.value === String(attempt),
     ),
   );
 }
@@ -195,6 +209,7 @@ export function buildSuccessfulRunHandoffExhaustedNotice(input: {
   sourceAssignee: NullableNoticeAgent;
   recoveryIssue: NullableNoticeIssue;
   recoveryActionId?: string | null;
+  recoveryActionAttempt?: number | null;
   recoveryOwner: NullableNoticeAgent;
   latestIssueStatus: string;
   latestHandoffRunStatus: string;
@@ -217,6 +232,9 @@ export function buildSuccessfulRunHandoffExhaustedNotice(input: {
             input.recoveryActionId
               ? keyValueRow("Recovery action", input.recoveryActionId)
               : issueLinkRow("Recovery issue", input.recoveryIssue),
+            ...(input.recoveryActionId && input.recoveryActionAttempt != null
+              ? [keyValueRow("Recovery attempt", input.recoveryActionAttempt)]
+              : []),
             agentLinkRow("Recovery owner", input.recoveryOwner),
             agentLinkRow("Source assignee", input.sourceAssignee),
             keyValueRow("Suggested action", "choose and record a valid issue disposition without copying transcript content"),

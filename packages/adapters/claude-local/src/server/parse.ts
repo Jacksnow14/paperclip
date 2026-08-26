@@ -1,6 +1,7 @@
 import { CLAUDE_CONTEXT_OVERFLOW_ERROR_CODE, type UsageSummary } from "@paperclipai/adapter-utils";
 import {
   CLAUDE_CONTEXT_OVERFLOW_RE,
+  CLAUDE_FAILURE_WRAPPER_RE,
   isClaudeContextOverflowMessage,
 } from "@paperclipai/adapter-utils";
 import {
@@ -59,8 +60,54 @@ export const CLAUDE_QUOTA_EXHAUSTED_ERROR_CODE = "claude_quota_exhausted";
 // (AUR-4055 -> AUR-4192 -> AUR-4531 each patched one copy and missed another).
 const CLAUDE_QUOTA_EXHAUSTION_RE = new RegExp(`(?:${CLAUDE_QUOTA_EXHAUSTION_SOURCE})`, "i");
 
+/**
+ * AUR-4524: anchored form of the quota wording, mirroring `isClaudeContextOverflowMessage`
+ * (AUR-4557). The phrase must OPEN the (wrapper-stripped) payload and be followed by
+ * end-of-string or punctuation, so a genuine CLI quota message ("You've hit your weekly
+ * limit · resets Aug 1") still matches, but the same words merely QUOTED mid-report by an
+ * agent ("...the run failed; I noticed it logged 'You've hit your weekly limit' before
+ * dying...") do not. This is the AUR-4524 defect: `parsed.result` is the agent's OWN final
+ * text on a `subtype=success` result, and an unanchored substring test over it let quoting
+ * the wording self-inflict the classification (and, since AUR-4192 widened the regex, a
+ * real quota pause parked at a reset time the agent only mentioned). A leading
+ * "you're"/"you've" is part of the genuine wording itself (see the production specimens
+ * above), not prose to reject.
+ */
+const CLAUDE_QUOTA_EXHAUSTION_ANCHORED_RE = new RegExp(
+  `^(?:you(?:'re|'ve)\\s+)?(?:${CLAUDE_QUOTA_EXHAUSTION_SOURCE})(?=\\s*(?:$|[-\u2013\u2014:.,;!?\u00b7]))`,
+  "i",
+);
+
+function stripClaudeFailureWrapper(value: string): string {
+  return value.trim().replace(CLAUDE_FAILURE_WRAPPER_RE, "").trim();
+}
+
+/** Anchored quota-wording test for text the model CAN author. See the regex doc above. */
+function isClaudeQuotaExhaustionMessage(value: string | null | undefined): boolean {
+  if (!value) return false;
+  const payload = stripClaudeFailureWrapper(value);
+  if (!payload) return false;
+  return CLAUDE_QUOTA_EXHAUSTION_ANCHORED_RE.test(payload);
+}
+
+// AUR-4524: quota-free core, safe to test UNANCHORED against text the model can author
+// (parsed.result/errorMessage) -- see isClaudeTransientUpstreamError. Quota wording is
+// deliberately excluded here: once the quota check above has correctly rejected
+// contaminated prose for not anchoring the payload, this regex must not re-catch the same
+// wording as generic transient via a bare substring match.
+const CLAUDE_TRANSIENT_UPSTREAM_CORE_SOURCE =
+  "rate[-\\s]?limit(?:ed)?|rate_limit_error|too\\s+many\\s+requests|\\b429\\b|overloaded(?:_error)?|server\\s+overloaded|service\\s+unavailable|\\b503\\b|\\b529\\b|high\\s+demand|try\\s+again\\s+later|temporarily\\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception";
+const CLAUDE_TRANSIENT_UPSTREAM_CORE_RE = new RegExp(
+  `(?:${CLAUDE_TRANSIENT_UPSTREAM_CORE_SOURCE})`,
+  "i",
+);
+
+// Full form (core + quota wording). Only safe on text the model cannot author (trusted
+// `parsed.errors[]`), or on the raw stdout/stderr fallback used when there is no parsed
+// terminal result to trust at all (see buildClaudeRawHaystack) -- retained for that path
+// and for the legacy combined haystack `extractClaudeRetryNotBefore` reads.
 const CLAUDE_TRANSIENT_UPSTREAM_RE = new RegExp(
-  `(?:rate[-\\s]?limit(?:ed)?|rate_limit_error|too\\s+many\\s+requests|\\b429\\b|overloaded(?:_error)?|server\\s+overloaded|service\\s+unavailable|\\b503\\b|\\b529\\b|high\\s+demand|try\\s+again\\s+later|temporarily\\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|${CLAUDE_QUOTA_EXHAUSTION_SOURCE})`,
+  `(?:${CLAUDE_TRANSIENT_UPSTREAM_CORE_SOURCE}|${CLAUDE_QUOTA_EXHAUSTION_SOURCE})`,
   "i",
 );
 
@@ -294,6 +341,25 @@ function buildClaudePrimaryHaystack(input: ClaudeFailureFields): string {
     parsed ? asString(parsed.result, "") : "",
     ...(parsed ? extractClaudeErrorMessages(parsed) : []),
   ]);
+}
+
+/**
+ * AUR-4524: the trusted/contaminable split from `isClaudeContextOverflowError` (AUR-4557),
+ * applied to the quota/transient classifiers. `parsed.errors[].message` is a structured API
+ * error object the model cannot author, so it stays safe for unanchored substring matching.
+ * `errorMessage` and `parsed.result` CAN be the model's own final report on a
+ * `subtype=success` result -- callers that need to test this text against wording the model
+ * might legitimately discuss (quota phrasing) must anchor it; callers testing wording the
+ * model has no reason to discuss (429/503/529/overloaded) may still use it unanchored.
+ */
+function buildClaudeTrustedHaystack(input: ClaudeFailureFields): string {
+  const parsed = input.parsed ?? null;
+  return normalizeHaystack(parsed ? extractClaudeErrorMessages(parsed) : []);
+}
+
+function claudeContaminableTexts(input: ClaudeFailureFields): string[] {
+  const parsed = input.parsed ?? null;
+  return [input.errorMessage ?? "", parsed ? asString(parsed.result, "") : ""];
 }
 
 /**
@@ -737,6 +803,11 @@ export interface ClaudeQuotaExhaustion {
  *
  * The prose fallback deliberately reads the PRIMARY haystack only -- never raw
  * stdout/stderr. That is the whole defect: raw stdout is the resumed transcript.
+ *
+ * AUR-4524: within the primary haystack, `parsed.errors[]` is trusted and substring
+ * matched, but `errorMessage`/`parsed.result` can be the model's own final report -- an
+ * agent that merely quotes the wording while describing a run must not self-inflict a
+ * quota wall, so that half is anchored (see `isClaudeQuotaExhaustionMessage`).
  */
 export function detectClaudeQuotaExhaustion(
   input: ClaudeFailureFields,
@@ -753,10 +824,27 @@ export function detectClaudeQuotaExhaustion(
     };
   }
 
-  const primary = buildClaudePrimaryHaystack(input);
-  if (!primary || !CLAUDE_QUOTA_EXHAUSTION_RE.test(primary)) return null;
+  const parsed = input.parsed ?? null;
+  const trusted = parsed ? extractClaudeErrorMessages(parsed) : [];
+  const trustedSource = trusted.find((text) => CLAUDE_QUOTA_EXHAUSTION_RE.test(text)) ?? null;
 
-  const match = primary.match(CLAUDE_EXTRA_USAGE_RESET_RE);
+  const contaminableSource =
+    claudeContaminableTexts(input)
+      .map((text) => stripClaudeFailureWrapper(text))
+      .find((text) => text && CLAUDE_QUOTA_EXHAUSTION_ANCHORED_RE.test(text)) ?? null;
+
+  const sourceText = trustedSource ?? contaminableSource;
+  if (!sourceText) return null;
+
+  // AUR-4524 fix: the reset clock time can sit in either confirmed text -- a structured
+  // `errors[]` message rarely carries it, but the accompanying prose (already anchor-
+  // checked above, so not blind contamination) usually does. Search both confirmed texts
+  // rather than only the one that happened to win quota confirmation, or a genuine failure
+  // whose reset time lives in the other text loses its `resetAt` (regression caught by the
+  // "out of extra usage" test: structured `errors[]` confirmed the wall, but the reset
+  // clock only appeared in the anchored `parsed.result` prose alongside it).
+  const resetSearchText = [trustedSource, contaminableSource].filter(Boolean).join(" ");
+  const match = resetSearchText.match(CLAUDE_EXTRA_USAGE_RESET_RE);
   const resetAt = match ? parseClaudeResetClockTime(match[1] ?? "", now, match[2]) : null;
   return {
     resetAt,
@@ -934,8 +1022,21 @@ export function isClaudeTransientUpstreamError(input: {
   // unchanged; the distinction lives in the error CODE and the structured metadata.
   if (detectClaudeQuotaExhaustion(input)) return false;
 
-  const primary = buildClaudePrimaryHaystack(input);
-  if (primary && CLAUDE_TRANSIENT_UPSTREAM_RE.test(primary)) return true;
+  // AUR-4524: same trusted/contaminable split as the quota check above. Trusted text
+  // (`parsed.errors[]`) cannot be model prose, so it keeps matching the full wording list
+  // (redundant with the quota check, which already returned above for a trusted quota hit,
+  // but harmless). The contaminable half (`errorMessage`/`parsed.result`) must use the
+  // quota-free core regex -- otherwise quota wording the check above just (correctly)
+  // rejected for not anchoring the payload would re-enter here as generic transient via an
+  // unanchored substring match, reclassifying the same contaminated prose under a
+  // different error code instead of excluding it.
+  const trustedPrimary = buildClaudeTrustedHaystack(input);
+  if (trustedPrimary && CLAUDE_TRANSIENT_UPSTREAM_RE.test(trustedPrimary)) return true;
+
+  const contaminablePrimary = normalizeHaystack(claudeContaminableTexts(input));
+  if (contaminablePrimary && CLAUDE_TRANSIENT_UPSTREAM_CORE_RE.test(contaminablePrimary)) {
+    return true;
+  }
 
   // AUR-4144: only reach for raw stdout/stderr when there is NO parsed terminal result to
   // trust. When `parsed` exists, the CLI told us why it failed, and the resumed transcript

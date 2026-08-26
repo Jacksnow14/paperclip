@@ -881,3 +881,68 @@ describe("isClaudeContextOverflowError prose contamination (AUR-4557)", () => {
     ).toBe(true);
   });
 });
+
+// AUR-4524: same trusted/contaminable split as AUR-4557, applied to the quota/transient
+// classifiers. Live evidence: run 6b320661-e093-400c-9a76-b2c83297cd7a (2026-07-29T11:27:03Z)
+// -- an agent's OWN status report on a subtype=success result quoted the quota wording
+// verbatim while describing an unrelated run, and an unanchored substring test over
+// `parsed.result` self-inflicted a `claude_transient_upstream` classification (and, post
+// AUR-4192's widened regex, a real quota pause parked at a reset time the agent only
+// mentioned).
+describe("quota/transient prose contamination (AUR-4524)", () => {
+  // FIRE case: the exact defect. The wording is quoted mid-sentence in the model's own
+  // final report, not authored by the CLI as an actual failure.
+  it("does NOT classify quota or transient when parsed.result merely quotes the wording", () => {
+    const prose =
+      "Heartbeat summary: the prior run failed after logging \"You've hit your weekly " +
+      "limit · resets Aug 5, 11am (UTC)\" before dying; I have not changed anything.";
+    const input = {
+      parsed: { is_error: false, subtype: "success", result: prose },
+      stdout: "",
+      stderr: "",
+      errorMessage: null,
+    };
+    expect(isClaudeQuotaExhaustedError(input)).toBe(false);
+    expect(isClaudeTransientUpstreamError(input)).toBe(false);
+    expect(extractClaudeRetryNotBefore(input)).toBeNull();
+  });
+
+  // Same contamination via the errorMessage/describeClaudeFailure wrapper shape.
+  it("does NOT classify quota when errorMessage wraps a quoted-wording status report", () => {
+    const prose =
+      "Noted the CLI printed \"You've hit your session limit · resets 4pm (UTC)\" on the " +
+      "last attempt; retrying now.";
+    const input = {
+      parsed: { is_error: false, subtype: "success", result: prose },
+      errorMessage: `Claude run failed: subtype=success: ${prose}`,
+    };
+    expect(isClaudeQuotaExhaustedError(input)).toBe(false);
+    expect(isClaudeTransientUpstreamError(input)).toBe(false);
+  });
+
+  // PASS control: the same wording, genuinely CLI-authored (no parsed terminal result to
+  // trust, exactly the shape `detectClaudeLoginRequired`/raw-fallback callers see), must
+  // still classify as a quota wall with a live reset time -- the anchor must not blanket
+  // suppress the real thing.
+  it("still classifies a genuine CLI-authored occurrence in errorMessage", () => {
+    const input = {
+      errorMessage: "You've hit your weekly limit · resets Aug 5, 11am (UTC)",
+    };
+    expect(isClaudeQuotaExhaustedError(input)).toBe(true);
+    expect(isClaudeTransientUpstreamError(input)).toBe(false);
+    const now = new Date("2026-07-29T11:27:03.000Z");
+    expect(extractClaudeRetryNotBefore(input, now)?.toISOString()).toBe(
+      "2026-08-05T11:00:00.000Z",
+    );
+  });
+
+  // PASS control: same wording surfacing on raw stderr with no parsed result at all --
+  // the AUR-4144 raw-fallback path -- must also still classify as retryable transient.
+  it("still classifies a genuine CLI-authored occurrence on raw stderr", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        stderr: "You've hit your weekly limit · resets Aug 5, 11am (UTC)",
+      }),
+    ).toBe(true);
+  });
+});

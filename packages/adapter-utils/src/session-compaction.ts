@@ -112,8 +112,12 @@ const CLAUDE_CONTEXT_OVERFLOW_ANCHORED_RE = new RegExp(
  * `describeClaudeFailure` wraps the detail as `Claude run failed: subtype=<x>: <detail>`,
  * and the no-parse path wraps stderr as `Claude exited with code <n>: <detail>`. Strip
  * either wrapper so the anchored test sees the payload itself.
+ *
+ * Exported (AUR-4524) so other anchored-message classifiers in this fleet (the quota/
+ * transient classifiers in claude-local's parse.ts) can strip the same wrapper instead of
+ * hand-rolling a second copy that could drift from this one.
  */
-const CLAUDE_FAILURE_WRAPPER_RE =
+export const CLAUDE_FAILURE_WRAPPER_RE =
   /^(?:claude\s+run\s+failed(?::\s*subtype=[^:\s]*)?|claude\s+exited\s+with\s+code\s+-?\d+):\s*/i;
 
 /**

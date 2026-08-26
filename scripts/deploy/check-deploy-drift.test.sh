@@ -131,7 +131,11 @@ seed_log() {
 }
 
 run_check() {
-  PAPERCLIP_HEALTH_URL="file://$HEALTH" \
+  PAPERCLIP_HEALTH_URL="${TEST_HEALTH_URL:-file://$HEALTH}" \
+  PAPERCLIP_HEALTH_PROBE_TIMEOUT_SEC="${TEST_PROBE_TIMEOUT:-1}" \
+  PAPERCLIP_HEALTH_PROBE_RETRIES="${TEST_PROBE_RETRIES:-2}" \
+  PAPERCLIP_HEALTH_PROBE_BACKOFF_SEC="${TEST_PROBE_BACKOFF:-0}" \
+  PAPERCLIP_DRIFT_LAST_KNOWN_RUNNING_FILE="${TEST_LAST_KNOWN_FILE:-$TMP/last-known-running}" \
   PAPERCLIP_DEPLOY_REMOTE="$REMOTE_REPO" \
   PAPERCLIP_DEPLOY_APP_ROOT="$APP" \
   PAPERCLIP_DRIFT_LOG="$LOG" \
@@ -997,6 +1001,92 @@ if [[ "$rc" == "0" && "$(alerts)" == "0" ]] && ! grep -q "timer=" <<<"$out"; the
   ok "empty timer list disables the axis entirely"
 else
   fail "empty timer list disables the axis entirely" "rc=$rc alerts=$(alerts) out=$out"
+fi
+
+# --- AUR-5093: probe timeout vs refusal grading -----------------------------
+# The bug: a single 10s curl budget read a genuinely healthy prod as
+# unreachable ~25% of the time under load, and a bare timeout used to be
+# indistinguishable from a genuine refusal — both landed on the same
+# outage-shaped "untracked-or-unreachable:unreachable" reason with
+# running=none. These cases prove the split: a timeout (curl exit 28) grades
+# as status=UNKNOWN reason=health-slow with running=unknown, never escalates,
+# and carries the last known running sha/age forward; a genuine refusal (curl
+# exit 7, nothing listening) is UNCHANGED — still status=DRIFT
+# reason=untracked-or-unreachable:unreachable, running=none.
+
+hang_pid=""
+start_hang_server() { # $1=port — accepts connections and never responds
+  local port=$1
+  python3 -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', $port))
+s.listen(5)
+conns = []
+while True:
+    conn, _ = s.accept()
+    conns.append(conn)  # keep the ref alive: never respond, never close
+" &
+  hang_pid=$!
+  for _ in $(seq 1 30); do
+    (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && { exec 3>&-; return 0; }
+    sleep 0.1
+  done
+  echo "FATAL: hang server on port $port never came up" >&2; exit 1
+}
+stop_hang_server() {
+  [[ -n "$hang_pid" ]] && kill "$hang_pid" 2>/dev/null
+  wait "$hang_pid" 2>/dev/null || true
+  hang_pid=""
+}
+
+HANG_PORT=$(( 24000 + RANDOM % 5000 ))
+
+# 47a. A converged tick over the real (fast) health fixture seeds the
+#      last-known-running file from a genuine success, not a hand-written one.
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"; clear_ad_state
+rm -f "$TMP/last-known-running"
+out=$(run_check); rc=$?
+if [[ "$rc" == "0" && -s "$TMP/last-known-running" ]] && grep -q "^$MASTER_SHA " "$TMP/last-known-running"; then
+  ok "47a: a converged tick seeds the last-known-running file"
+else
+  fail "47a: a converged tick seeds the last-known-running file" "rc=$rc file=$(cat "$TMP/last-known-running" 2>/dev/null)"
+fi
+
+# 47b. The health endpoint now times out (server accepts but never responds).
+#      Must NOT read as an outage: status=UNKNOWN reason=health-slow,
+#      running=unknown (never none), and it must not page.
+start_hang_server "$HANG_PORT"
+reset
+out=$(TEST_HEALTH_URL="http://127.0.0.1:$HANG_PORT/api/health" run_check); rc=$?
+stop_hang_server
+if grep -q "status=UNKNOWN reason=health-slow" <<<"$out" && grep -q "running=unknown" <<<"$out"; then
+  ok "47b: a timed-out probe grades UNKNOWN/health-slow, running=unknown — not an outage"
+else
+  fail "47b: a timed-out probe grades UNKNOWN/health-slow, running=unknown — not an outage" "rc=$rc out=$out"
+fi
+if [[ "$rc" == "0" && "$(alerts)" == "0" ]]; then
+  ok "47c: health-slow never escalates (unclassified reason, same posture as remote-unreachable)"
+else
+  fail "47c: health-slow never escalates (unclassified reason, same posture as remote-unreachable)" "rc=$rc alerts=$(alerts)"
+fi
+if grep -qE "last_known=${MASTER_SHA:0:12} last_known_age_s=[0-9]+" <<<"$out"; then
+  ok "47d: last known running sha/age carried forward instead of running=none"
+else
+  fail "47d: last known running sha/age carried forward instead of running=none" "out=$out"
+fi
+
+# 48. Genuine refusal (nothing listening on the port — curl exit 7) is
+#     UNCHANGED: still status=DRIFT reason=untracked-or-unreachable:unreachable,
+#     running=none — the timeout grading above must not soften a real outage.
+REFUSED_PORT=$(( 29000 + RANDOM % 5000 ))
+reset; set_activated "$MASTER_SHA"
+out=$(TEST_HEALTH_URL="http://127.0.0.1:$REFUSED_PORT/api/health" run_check); rc=$?
+if grep -q "status=DRIFT reason=untracked-or-unreachable:unreachable" <<<"$out" && grep -q "running=none" <<<"$out"; then
+  ok "48: a genuinely refused connection still reports unreachable, running=none (unchanged)"
+else
+  fail "48: a genuinely refused connection still reports unreachable, running=none (unchanged)" "rc=$rc out=$out"
 fi
 
 echo

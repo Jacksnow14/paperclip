@@ -91,6 +91,14 @@ QUIESCE_INTERVAL=${PAPERCLIP_DEPLOY_QUIESCE_INTERVAL_SEC:-30}
 QUIESCE_DEADLINE=${PAPERCLIP_DEPLOY_QUIESCE_DEADLINE_SEC:-1800}
 HEALTH_TIMEOUT=${PAPERCLIP_DEPLOY_HEALTH_TIMEOUT_SEC:-120}
 HEALTH_POLL=${PAPERCLIP_DEPLOY_HEALTH_POLL_SEC:-3}
+# AUR-5093: a single 10s curl budget read a genuinely healthy server as
+# unreachable under load ~25% of the time. Raised to 30s, and the single-shot
+# probe (Stage 2 below) retries a few times before concluding unreachable.
+# health_gate() above/below is UNCHANGED — it already retries within its own
+# HEALTH_TIMEOUT budget and that path is fine.
+HEALTH_PROBE_TIMEOUT_SEC=${PAPERCLIP_HEALTH_PROBE_TIMEOUT_SEC:-30}
+HEALTH_PROBE_RETRIES=${PAPERCLIP_HEALTH_PROBE_RETRIES:-3}
+HEALTH_PROBE_BACKOFF_SEC=${PAPERCLIP_HEALTH_PROBE_BACKOFF_SEC:-2}
 MAX_BUILD_FAILURES=${PAPERCLIP_DEPLOY_MAX_BUILD_FAILURES:-3}
 # ${VAR-default} (not :-) so tests can set SUDO= to run unprivileged on
 # user-owned scratch roots.
@@ -205,7 +213,7 @@ read_activated_sha() {
 probe_health() {
   local body
   H_STATUS=none H_SHA=none
-  body=$(curl -sf -m 10 -H "Accept: application/json" "$HEALTH_URL" 2>/dev/null || true)
+  body=$(curl -sf -m "$HEALTH_PROBE_TIMEOUT_SEC" -H "Accept: application/json" "$HEALTH_URL" 2>/dev/null || true)
   [[ -n "$body" ]] || return 1
   read -r H_STATUS H_SHA < <(printf '%s' "$body" | python3 -c '
 import json, sys
@@ -245,6 +253,21 @@ health_gate() { # $1=intended sha
     sleep "$HEALTH_POLL"
   done
   return 1
+}
+
+# Retries a single-shot probe_health() call up to HEALTH_PROBE_RETRIES times
+# with a short backoff before concluding unreachable (AUR-5093): one slow
+# response must not read as "production is down". Only used at Stage 2's
+# single-shot call site below — health_gate() above already has its own
+# retry loop and is unaffected by this.
+probe_health_with_retry() {
+  local attempt=1
+  while true; do
+    probe_health && return 0
+    (( attempt >= HEALTH_PROBE_RETRIES )) && return 1
+    sleep "$HEALTH_PROBE_BACKOFF_SEC"
+    attempt=$(( attempt + 1 ))
+  done
 }
 
 # Atomic repoint of current, same pattern as build-release.sh --activate.
@@ -474,7 +497,7 @@ else
 fi
 
 # --- Stage 2: make it live -------------------------------------------------------
-if ! probe_health; then
+if ! probe_health_with_retry; then
   PHASE=health-unreachable ARMED_SHA=$activated_sha NOTE="cannot determine running sha via $HEALTH_URL"
   write_state
   log "stage 2: $NOTE — the drift detector (AUR-3937) still owns ALERTING; this tick also attempts a same-sha self-heal restart (see try_health_self_heal)"

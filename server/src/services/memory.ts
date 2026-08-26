@@ -743,11 +743,23 @@ function mapExtractionJob(row: ExtractionJobRow): MemoryExtractionJob {
   };
 }
 
-function isUniqueViolation(error: unknown, constraintName: string): boolean {
+function matchesUniqueViolation(error: unknown, constraintName: string): boolean {
   if (typeof error !== "object" || error === null) return false;
   const err = error as { code?: string; constraint?: string; constraint_name?: string };
   const constraint = err.constraint ?? err.constraint_name;
   return err.code === "23505" && constraint === constraintName;
+}
+
+/**
+ * drizzle-orm's postgres-js driver throws a DrizzleQueryError wrapping the
+ * real PostgresError (with `.code`/`.constraint_name`) in `.cause` rather
+ * than exposing those fields on the thrown error itself — check both shapes
+ * so this works against the raw driver error, not just a pre-unwrapped one.
+ */
+function isUniqueViolation(error: unknown, constraintName: string): boolean {
+  if (matchesUniqueViolation(error, constraintName)) return true;
+  const cause = error instanceof Error ? error.cause : undefined;
+  return matchesUniqueViolation(cause, constraintName);
 }
 
 function buildRecordVisibilityConditions(

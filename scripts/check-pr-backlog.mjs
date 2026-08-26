@@ -91,6 +91,12 @@ const STARVATION_PATTERN = /quota|usage limit|session limit/i;
 
 export const DEFAULT_REPOS = ['Jacksnow14/paperclip', 'Jacksnow14/Auranode'];
 
+// AUR-6213: filed review issues must not flood the active queue (AUR-5826 —
+// the board did a manual backlog/label cleanup after 10-20/week of these
+// landed straight into todo/high). They file as backlog + platform label and
+// drain through the weekly platform-drip routine (max 8/week) instead.
+export const PLATFORM_LABEL_ID = '83062a2e-aec5-4de2-9541-02d05641c246';
+
 // Every state row written before (repo, pr) keying came from a sweep of the
 // then-hardcoded single default repo.
 const LEGACY_STATE_REPO = 'Jacksnow14/paperclip';
@@ -356,6 +362,22 @@ export function issueBody(pr, repo, hasTrunkCiScript = true) {
     'If you cancel this issue without landing or closing the PR, the next sweep',
     'will re-file it — cancelling is not a way to make a PR disappear.',
   ].join('\n');
+}
+
+/**
+ * Pure: the create-issue request body for a filed review issue. Files as
+ * `backlog` + the `platform` label (AUR-6213) so the weekly platform-drip
+ * routine — not the dispatcher — controls how many enter the active queue.
+ */
+export function buildIssueCreatePayload(f, hasTrunkCiScript) {
+  return {
+    title: issueTitle(f, f.repo),
+    description: issueBody(f, f.repo, hasTrunkCiScript),
+    priority: 'high',
+    status: 'backlog',
+    labelIds: [PLATFORM_LABEL_ID],
+    assigneeAgentId: f.reviewerId,
+  };
 }
 
 function parseArgs(argv) {
@@ -627,12 +649,12 @@ async function main() {
   }
 
   for (const f of assigned) {
-    const created = await api(args, 'POST', `/api/companies/${companyId}/issues`, {
-      title: issueTitle(f, f.repo),
-      description: issueBody(f, f.repo, hasTrunkCiScript(f.repo)),
-      priority: 'high',
-      assigneeAgentId: f.reviewerId,
-    });
+    const created = await api(
+      args,
+      'POST',
+      `/api/companies/${companyId}/issues`,
+      buildIssueCreatePayload(f, hasTrunkCiScript(f.repo)),
+    );
     // 201 is not proof — read the row back before recording the dispatch.
     await api(args, 'GET', `/api/issues/${created.id}`);
     const key = stateKey(f.repo, f.number);

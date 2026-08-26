@@ -5828,38 +5828,71 @@ export function issueService(db: Db) {
     },
 
     wasAgentMentionedInThread: async (companyId: string, issueId: string, agentId: string): Promise<boolean> => {
-      const issueRow = await db.select({ description: issues.description })
+      const issueRow = await db.select({
+        description: issues.description,
+        createdByAgentId: issues.createdByAgentId,
+        createdAt: issues.createdAt,
+      })
         .from(issues)
         .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
         .then((rows) => rows[0] ?? null);
       if (!issueRow) return false;
 
-      const commentRows = await db.select({ body: issueComments.body })
+      const commentRows = await db.select({
+        body: issueComments.body,
+        authorAgentId: issueComments.authorAgentId,
+        createdAt: issueComments.createdAt,
+      })
         .from(issueComments)
-        .where(and(eq(issueComments.issueId, issueId), eq(issueComments.companyId, companyId)));
+        .where(and(eq(issueComments.issueId, issueId), eq(issueComments.companyId, companyId)))
+        .orderBy(issueComments.createdAt);
 
-      const allBodies = [issueRow.description ?? "", ...commentRows.map(r => r.body)];
-      const combinedText = allBodies.join("\n");
+      // The mention grant is consumable: once the actor has replied, only
+      // mentions posted after that reply can still grant it. Mentions the
+      // actor authored themselves never count, regardless of timing.
+      const actorCommentTimestamps = commentRows
+        .filter((c) => c.authorAgentId === agentId)
+        .map((c) => c.createdAt.getTime());
+      const actorLastCommentAt = actorCommentTimestamps.length
+        ? Math.max(...actorCommentTimestamps)
+        : null;
 
-      const explicitIds = extractAgentMentionIds(combinedText);
-      if (explicitIds.includes(agentId)) return true;
+      const candidates: Array<{ text: string; authorAgentId: string | null; postedAt: Date }> = [
+        { text: issueRow.description ?? "", authorAgentId: issueRow.createdByAgentId, postedAt: issueRow.createdAt },
+        ...commentRows.map((c) => ({ text: c.body, authorAgentId: c.authorAgentId, postedAt: c.createdAt })),
+      ];
 
+      let agentRow: { name: string } | null | undefined;
       const re = /\B@([^\s@,!?.]+)/g;
-      const tokens = new Set<string>();
-      let m: RegExpExecArray | null;
-      while ((m = re.exec(combinedText)) !== null) {
-        const normalized = normalizeAgentMentionToken(m[1]);
-        if (normalized) tokens.add(normalized.toLowerCase());
+
+      for (const candidate of candidates) {
+        if (candidate.authorAgentId === agentId) continue;
+        if (actorLastCommentAt !== null && candidate.postedAt.getTime() <= actorLastCommentAt) continue;
+
+        const explicitIds = extractAgentMentionIds(candidate.text);
+        if (explicitIds.includes(agentId)) return true;
+
+        const tokens = new Set<string>();
+        let m: RegExpExecArray | null;
+        re.lastIndex = 0;
+        while ((m = re.exec(candidate.text)) !== null) {
+          const normalized = normalizeAgentMentionToken(m[1]);
+          if (normalized) tokens.add(normalized.toLowerCase());
+        }
+        if (tokens.size === 0) continue;
+
+        if (agentRow === undefined) {
+          agentRow = await db.select({ name: agents.name })
+            .from(agents)
+            .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)))
+            .then((rows) => rows[0] ?? null);
+        }
+        if (!agentRow) return false;
+
+        if (tokens.has(agentRow.name.toLowerCase())) return true;
       }
-      if (tokens.size === 0) return false;
 
-      const agentRow = await db.select({ name: agents.name })
-        .from(agents)
-        .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)))
-        .then((rows) => rows[0] ?? null);
-      if (!agentRow) return false;
-
-      return tokens.has(agentRow.name.toLowerCase());
+      return false;
     },
 
     wasAgentPriorParticipantInThread: async (companyId: string, issueId: string, agentId: string): Promise<boolean> => {

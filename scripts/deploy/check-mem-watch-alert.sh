@@ -71,6 +71,7 @@ SWAP_FREE_MIN_MB=${PAPERCLIP_MEM_WATCH_SWAP_FREE_MIN_MB:-2000}
 MEM_AVAIL_MIN_MB=${PAPERCLIP_MEM_WATCH_MEM_AVAIL_MIN_MB:-1500}
 
 now_epoch=$(date -u +%s)
+now_iso=$(date -u -d "@${now_epoch}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -135,7 +136,23 @@ write_pending() {
 }
 
 clear_pending() {
-  rm -f "$PENDING" "$FALLBACK_PENDING" 2>/dev/null || true
+  # AUR-6214: rm needs write on the CONTAINING directory (to unlink the dentry);
+  # on the live host /var/log is root:syslog and this service's user is not in
+  # that group, so rm -f fails -- silently, since callers never checked its
+  # exit status. That left every "successfully cleared" pending record with
+  # its original stale first_ts/attempts sitting on disk forever: read_pending
+  # found the exact same record again on the next tick and re-delivered it
+  # every 5 minutes for 3+ hours (2026-08-26). Truncating in place needs only
+  # write on the FILE itself, which every caller already proved it has (it's
+  # how write_pending/write_success_state succeed) -- and read_pending's `-s`
+  # check already treats a zero-byte file as "no pending", so a truncate
+  # converges exactly like a real removal without needing directory access.
+  local f
+  for f in "$PENDING" "$FALLBACK_PENDING"; do
+    [[ -e "$f" ]] || continue
+    rm -f "$f" 2>/dev/null && continue
+    : > "$f" 2>/dev/null || echo "paperclip-mem-watch-alert: WARNING could not clear pending record $f (no directory or file write access)" >&2
+  done
 }
 
 is_integrity() {
@@ -181,7 +198,13 @@ process_pending() {
   if (( rc == 0 )); then
     echo "paperclip-mem-watch-alert: pending breach ($pending_reasons at $pending_first_ts) delivered on retry $attempt_no" >&2
     clear_pending
-    write_success_state "$pending_first_ts"
+    # AUR-6214: stamp the wall-clock ts this retry actually delivered at, not
+    # pending_first_ts (the stale ts of the original breach row, possibly
+    # hours/days old). The row-ts half of STATE exists only to dedupe an
+    # exact-same-row re-read; pairing a stale row_ts with a fresh now_epoch
+    # (confirmed live: state read "2026-08-25T16:04:09Z\t<today's epoch>")
+    # is an internally inconsistent record even though it's low-impact today.
+    write_success_state "$now_iso"
     return 0
   fi
   pending_attempts=$attempt_no

@@ -56,6 +56,7 @@ const {
   isColdOutreachOwnSend,
   isShopifyInformationalNotification,
   isSelfOriginatedAuditCopy,
+  classifyTicketingAutoresponder,
 } = await import("../services/gmail-intake.js");
 
 // Minimal Drizzle-like db mock that supports select/insert chaining.
@@ -528,7 +529,7 @@ describe("cross-thread sender+subject dedupe (AUR-2674)", () => {
     expect(result.skipped).toBe(1);
   });
 
-  it("does NOT skip auto-reply when there is no historical match (first occurrence)", async () => {
+  it("files a pre-closed audit issue (not a live todo) for an auto-reply with no historical match — AUR-4480", async () => {
     const msg = makeMessageWithHeaders("ar-new", "thread-ar-new", "First ack", [
       { name: "Auto-Submitted", value: "auto-replied" },
     ]);
@@ -541,14 +542,22 @@ describe("cross-thread sender+subject dedupe (AUR-2674)", () => {
     mockAddComment.mockResolvedValue({});
 
     // call 1 dedup → empty; call 2 thread → empty; call 3 sender+subj → empty (no history)
-    // call 4 agent → agent
-    const db = buildCountingDb({ 4: [{ id: "agent-1" }] });
+    // No agent lookup: the pre-closed audit path never assigns anyone.
+    const db = buildCountingDb({});
 
     const svc = createGmailIntakeService(db);
     const result = await svc.processMailbox(COMPANY_ID, "board");
 
     expect(mockIssueCreate).toHaveBeenCalledTimes(1);
-    expect(result.created).toBe(1);
+    const createArgs = mockIssueCreate.mock.calls[0][1] as Record<string, unknown>;
+    expect(createArgs.status).toBe("done");
+    expect(createArgs.priority).toBe("low");
+    expect(createArgs.title).toMatch(/^\[auto-ack\]/);
+    expect(createArgs.assigneeAgentId).toBeUndefined();
+    // Not a live todo issue: it never counts toward `created`, matching how the
+    // DMARC/marketing/etc. suppression paths above count toward `skipped`.
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
   });
 
   it("stores normalized subject in the intake record (strips Re: prefix)", async () => {
@@ -717,6 +726,254 @@ describe("DMARC aggregate-report suppression (AUR-4466)", () => {
     expect(isDmarcAggregateReport("jane@example.com", "Your weekly report domain ideas")).toBe(false);
     expect(isDmarcAggregateReport("jane@example.com", "Report Domain: d.com is down")).toBe(false);
     expect(isDmarcAggregateReport("jane@example.com", "Re: Report Domain: d.com Submitter: z")).toBe(false);
+  });
+});
+
+describe("ticketing autoresponder suppression (AUR-4480)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function makeTicketMessage(
+    id: string,
+    threadId: string,
+    subject: string,
+    extraHeaders: Array<{ name: string; value: string }> = [],
+  ) {
+    const msg = makeMessage(id, threadId, subject);
+    msg.payload.headers.push(...extraHeaders);
+    return msg;
+  }
+
+  function buildCountingDb(rowsByCall: Record<number, unknown[]>) {
+    let selectCallCount = 0;
+    return {
+      select: vi.fn(() => {
+        selectCallCount++;
+        const rows = rowsByCall[selectCallCount] ?? [];
+        return {
+          from: vi.fn().mockReturnThis(),
+          leftJoin: vi.fn().mockReturnThis(),
+          where: vi.fn().mockReturnThis(),
+          orderBy: vi.fn().mockReturnThis(),
+          limit: vi.fn().mockResolvedValue(rows),
+        };
+      }),
+      insert: vi.fn(() => ({ values: vi.fn().mockResolvedValue(undefined) })),
+    } as unknown as Db;
+  }
+
+  it("files a pre-closed audit issue for X-Auto-Response-Suppress (no historical match)", async () => {
+    const msg = makeTicketMessage("xars-1", "thread-xars-1", "Great Support Request (6189923) Received", [
+      { name: "X-Auto-Response-Suppress", value: "All" },
+    ]);
+    mockListMessages.mockResolvedValue({ messages: [{ id: "xars-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([]);
+    mockIssueCreate.mockResolvedValue({ id: "should-be-closed" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildCountingDb({});
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockIssueCreate).toHaveBeenCalledTimes(1);
+    const createArgs = mockIssueCreate.mock.calls[0][1] as Record<string, unknown>;
+    expect(createArgs.status).toBe("done");
+    expect(createArgs.priority).toBe("low");
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+  });
+
+  it("files a pre-closed audit issue for Precedence: auto_reply (no historical match)", async () => {
+    const msg = makeTicketMessage("prec-1", "thread-prec-1", "Ticket update", [
+      { name: "Precedence", value: "auto_reply" },
+    ]);
+    mockListMessages.mockResolvedValue({ messages: [{ id: "prec-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([]);
+    mockIssueCreate.mockResolvedValue({ id: "x" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildCountingDb({});
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockIssueCreate).toHaveBeenCalledTimes(1);
+    expect(result.skipped).toBe(1);
+    expect(result.created).toBe(0);
+  });
+
+  it("files a pre-closed audit issue for a Zendesk-shaped Message-Id (no matching headers or subject)", async () => {
+    const msg = makeTicketMessage("zd-1", "thread-zd-1", "Re: your question", [
+      { name: "Message-Id", value: "<VL0LY5LW1DZ_6a494117ddb8f_48785c6e915c54_sprut@zendesk.com>" },
+    ]);
+    mockListMessages.mockResolvedValue({ messages: [{ id: "zd-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([]);
+    mockIssueCreate.mockResolvedValue({ id: "x" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildCountingDb({});
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockIssueCreate).toHaveBeenCalledTimes(1);
+    expect(result.skipped).toBe(1);
+  });
+
+  it("files a pre-closed audit issue for subject-pattern fallback (no headers at all)", async () => {
+    const msg = makeTicketMessage("subj-1", "thread-subj-1", "Great Support Request (6189923) Received");
+    mockListMessages.mockResolvedValue({ messages: [{ id: "subj-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([]);
+    mockIssueCreate.mockResolvedValue({ id: "x" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildCountingDb({});
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockIssueCreate).toHaveBeenCalledTimes(1);
+    expect(result.skipped).toBe(1);
+  });
+
+  it("still folds into an OPEN existing conversation issue instead of filing a new audit issue", async () => {
+    const msg = makeTicketMessage("open-1", "thread-open-1", "Ticket #4821 was solved");
+    mockListMessages.mockResolvedValue({ messages: [{ id: "open-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([]);
+    mockAddComment.mockResolvedValue({});
+
+    // call 1 dedup → empty; call 2 thread → empty; call 3 sender+subj → open match
+    const db = buildCountingDb({ 3: [{ issueId: "open-conv-issue", issueStatus: "todo" }] });
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockIssueCreate).not.toHaveBeenCalled();
+    expect(mockAddComment).toHaveBeenCalledOnce();
+    expect(result.updated).toBe(1);
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(0);
+  });
+
+  it("folds repeat ticket receipts with DIFFERENT ticket numbers into one audit issue, not N issues (AUR-4480 root cause)", async () => {
+    const msgs = [
+      makeTicketMessage("tk1", "thread-tk1", "Great Support Request (6189923) Received"),
+      makeTicketMessage("tk2", "thread-tk2", "Great Support Request (6208185) Received"),
+    ];
+    msgs[0].payload.headers[0].value = "helpdesk@example.zendesk.com";
+    msgs[1].payload.headers[0].value = "helpdesk@example.zendesk.com";
+
+    mockListMessages.mockResolvedValue({ messages: [{ id: "tk1" }, { id: "tk2" }] });
+    mockGetMessage.mockResolvedValueOnce(msgs[0]).mockResolvedValueOnce(msgs[1]);
+    mockListLabels.mockResolvedValue([]);
+    mockIssueCreate.mockResolvedValue({ id: "audit-issue-1" });
+    mockAddComment.mockResolvedValue({});
+
+    // tk1: call1 dedup→empty, call2 thread→empty, call3 sender+subj→empty
+    //      (no history at all -> files ONE pre-closed audit issue)
+    // tk2: call4 dedup→empty, call5 thread→empty, call6 sender+subj→ticket-number
+    //      -stripped key matches tk1's now-closed audit issue -> skip, no 2nd issue
+    const db = buildCountingDb({
+      6: [{ issueId: "audit-issue-1", issueStatus: "done" }],
+    });
+
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "board");
+
+    expect(mockIssueCreate).toHaveBeenCalledTimes(1);
+    expect(result.skipped).toBe(2);
+    expect(result.created).toBe(0);
+  });
+
+  it("classifier: signal precedence order and rule reporting", () => {
+    expect(
+      classifyTicketingAutoresponder({
+        autoSubmitted: "auto-replied",
+        xAutoResponseSuppress: "",
+        precedence: "",
+        messageId: "",
+        subject: "anything",
+      }),
+    ).toEqual({ matched: true, rule: "auto-submitted-header" });
+
+    expect(
+      classifyTicketingAutoresponder({
+        autoSubmitted: "",
+        xAutoResponseSuppress: "All",
+        precedence: "",
+        messageId: "",
+        subject: "anything",
+      }),
+    ).toEqual({ matched: true, rule: "x-auto-response-suppress-header" });
+
+    expect(
+      classifyTicketingAutoresponder({
+        autoSubmitted: "",
+        xAutoResponseSuppress: "",
+        precedence: "bulk",
+        messageId: "",
+        subject: "anything",
+      }),
+    ).toEqual({ matched: true, rule: "precedence-header" });
+
+    expect(
+      classifyTicketingAutoresponder({
+        autoSubmitted: "",
+        xAutoResponseSuppress: "",
+        precedence: "",
+        messageId: "<abc_sprut@zendesk.com>",
+        subject: "anything",
+      }),
+    ).toEqual({ matched: true, rule: "zendesk-message-id" });
+
+    expect(
+      classifyTicketingAutoresponder({
+        autoSubmitted: "",
+        xAutoResponseSuppress: "",
+        precedence: "",
+        messageId: "",
+        subject: "Your ticket 4821 was solved",
+      }),
+    ).toEqual({ matched: true, rule: "subject-pattern" });
+
+    expect(
+      classifyTicketingAutoresponder({
+        autoSubmitted: "",
+        xAutoResponseSuppress: "",
+        precedence: "",
+        messageId: "",
+        subject: "Let's talk about your ticket needs",
+      }),
+    ).toEqual({ matched: false, rule: null });
+  });
+
+  it("classifier: bracketed ticket-number subject matches, but a genuine reply merely mentioning a ticket number does not", () => {
+    // Autoresponder-shaped: literal brackets around "Ticket #N" — matches.
+    expect(
+      classifyTicketingAutoresponder({
+        autoSubmitted: "",
+        xAutoResponseSuppress: "",
+        precedence: "",
+        messageId: "",
+        subject: "[Ticket #4821] Update on your request",
+      }),
+    ).toEqual({ matched: true, rule: "subject-pattern" });
+
+    // A genuine human reply quoting their own ticket number, with no auto
+    // headers and no brackets, must NOT be classified as an autoresponder —
+    // this is the exact case where a real reply would otherwise be silently
+    // filed as a pre-closed, unassigned audit issue nobody triages.
+    expect(
+      classifyTicketingAutoresponder({
+        autoSubmitted: "",
+        xAutoResponseSuppress: "",
+        precedence: "",
+        messageId: "",
+        subject: "Re: Ticket #4821, can we hop on a call this week?",
+      }),
+    ).toEqual({ matched: false, rule: null });
   });
 });
 

@@ -183,6 +183,79 @@ export function isSelfOriginatedAuditCopy(from: string, mailbox: GmailAlias): bo
   return false;
 }
 
+// Helpdesk/ticketing autoresponders — "ticket received", "ticket solved" —
+// are not actionable correspondence (AUR-4480). A single prospect thread on a
+// Zendesk-backed helpdesk minted 10 separate Paperclip issues in 5 weeks, one
+// per receipt, and the resulting noise produced a wrong strategic read on the
+// relationship (the tracker looked "live" off nothing but robot acks). Prefer
+// structural header signals over subject text — they are what the ticketing
+// platform itself sets and cannot be varied by prospect-side wording, same
+// reasoning as isDmarcAggregateReport/isMarketingEmail above. Subject regex is
+// a fallback only, for helpdesks that don't set the RFC 3834 headers.
+//
+// Signal order (most to least reliable), matching the ticket's spec verbatim:
+//   1. Auto-Submitted: auto-replied | auto-generated (RFC 3834)
+//   2. X-Auto-Response-Suppress present (Microsoft/Exchange convention)
+//   3. Precedence: bulk | auto_reply
+//   4. Zendesk-shaped Message-Id (e.g. ..._sprut@zendesk.com)
+//   5. Subject-regex fallback ("Request (N) Received:", "ticket N was solved")
+// The matched rule is returned (not just a boolean) so misclassification stays
+// auditable from the intake log line rather than a bare yes/no.
+export type TicketingAutoresponderRule =
+  | "auto-submitted-header"
+  | "x-auto-response-suppress-header"
+  | "precedence-header"
+  | "zendesk-message-id"
+  | "subject-pattern";
+
+export interface TicketingAutoresponderMatch {
+  matched: boolean;
+  rule: TicketingAutoresponderRule | null;
+}
+
+const ZENDESK_MESSAGE_ID_RE = /@[a-z0-9.-]*zendesk\.com>?\s*$/i;
+
+// Covers "Great Support Request (6189923) Received", "[Ticket #4821] ...",
+// and "Your ticket 4821 was solved" — the two subject shapes named in the
+// ticket, plus the common bracketed-ticket-number variant. This is the
+// last-resort fallback (only reached when no header signal fired at all),
+// which is exactly the case where a genuine human reply would land, so the
+// bracketed pattern below requires literal brackets — an unbracketed "ticket
+// #4821" anywhere in a subject is common in real correspondence quoting a
+// ticket number and must not match.
+const TICKETING_AUTORESPONDER_SUBJECT_PATTERNS: RegExp[] = [
+  /\brequest\s*\(?#?\d+\)?\s+received\b/i,
+  /\bticket\s*#?\d+\s+was\s+solved\b/i,
+  /\[\s*ticket\s*#?\d+\s*\]/i,
+];
+
+export function classifyTicketingAutoresponder(input: {
+  autoSubmitted: string;
+  xAutoResponseSuppress: string;
+  precedence: string;
+  messageId: string;
+  subject: string;
+}): TicketingAutoresponderMatch {
+  const autoSubmitted = input.autoSubmitted.trim().toLowerCase();
+  if (autoSubmitted === "auto-replied" || autoSubmitted === "auto-generated") {
+    return { matched: true, rule: "auto-submitted-header" };
+  }
+  if (input.xAutoResponseSuppress.trim().length > 0) {
+    return { matched: true, rule: "x-auto-response-suppress-header" };
+  }
+  const precedence = input.precedence.trim().toLowerCase();
+  if (precedence === "bulk" || precedence === "auto_reply") {
+    return { matched: true, rule: "precedence-header" };
+  }
+  if (ZENDESK_MESSAGE_ID_RE.test(input.messageId.trim())) {
+    return { matched: true, rule: "zendesk-message-id" };
+  }
+  if (TICKETING_AUTORESPONDER_SUBJECT_PATTERNS.some((re) => re.test(input.subject))) {
+    return { matched: true, rule: "subject-pattern" };
+  }
+  return { matched: false, rule: null };
+}
+
 // Gmail label names applied by the intake pipeline.
 export const INTAKE_LABELS = {
   TRIAGED: "paperclip/triaged",
@@ -209,6 +282,9 @@ interface ParsedMessage {
   labelIds: string[];
   // Raw List-Unsubscribe header value, "" when absent. See isMarketingEmail (AUR-5831).
   listUnsubscribe: string;
+  // Ticketing-autoresponder classification result (AUR-4480). See
+  // classifyTicketingAutoresponder for the signal precedence order.
+  ticketingAutoresponder: TicketingAutoresponderMatch;
 }
 
 function extractHeader(
@@ -313,13 +389,25 @@ function parseMessage(
   const bodyText = msg.payload ? extractTextBody(msg.payload) : "";
   const bodySnippet = (bodyText || msg.snippet || "").slice(0, SNIPPET_MAX_CHARS);
 
-  const autoSubmitted = extractHeader(headers, "auto-submitted").toLowerCase();
-  const precedence = extractHeader(headers, "precedence").toLowerCase();
+  const autoSubmittedRaw = extractHeader(headers, "auto-submitted");
+  const autoSubmitted = autoSubmittedRaw.toLowerCase();
+  const precedenceRaw = extractHeader(headers, "precedence");
+  const precedence = precedenceRaw.toLowerCase();
   const isAutoReply =
     autoSubmitted === "auto-replied" ||
     autoSubmitted === "auto-generated" ||
     precedence === "bulk";
   const listUnsubscribe = sanitizeHeaderValue(extractHeader(headers, "list-unsubscribe"));
+  const xAutoResponseSuppress = sanitizeHeaderValue(extractHeader(headers, "x-auto-response-suppress"));
+  const rawMessageId = extractHeader(headers, "message-id");
+
+  const ticketingAutoresponder = classifyTicketingAutoresponder({
+    autoSubmitted: autoSubmittedRaw,
+    xAutoResponseSuppress,
+    precedence: precedenceRaw,
+    messageId: rawMessageId,
+    subject,
+  });
 
   return {
     from,
@@ -331,20 +419,43 @@ function parseMessage(
     isAutoReply,
     labelIds: msg.labelIds ?? [],
     listUnsubscribe,
+    ticketingAutoresponder,
   };
+}
+
+// Strip ticket-number tokens ("(6189923)", "#4821", or a bare 3+ digit run)
+// so repeat receipts from the same helpdesk thread — each carrying a distinct
+// ticket number in the subject — normalize to the same dedupe key (AUR-4480).
+// Without this, "Great Support Request (6189923) Received" and "...(6208185)
+// Received" never fold via the AUR-2674 sender+subject dedupe, because each
+// ticket number makes the subject look unique.
+function stripTicketNumberTokens(subject: string): string {
+  return subject
+    .replace(/\(\s*#?\d+\s*\)/g, " ")
+    .replace(/#\d+/g, " ")
+    .replace(/\b\d{3,}\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 // Strip leading Re:/Fwd:/Fw: prefixes (repeatedly), collapse whitespace, lowercase.
 // The result is stored in gmail_intake_records.subject and used as the dedupe key
 // for the sender+subject cross-thread flood-prevention lookup (AUR-2674).
-function normalizeSubject(subject: string): string {
+// `stripTicketNumbers` additionally strips ticket-number tokens — see
+// stripTicketNumberTokens — and is set only for ticketing-autoresponder-
+// classified mail (AUR-4480); other callers keep the original behavior.
+function normalizeSubject(subject: string, opts: { stripTicketNumbers?: boolean } = {}): string {
   let s = subject;
   let prev = "";
   while (s !== prev) {
     prev = s;
     s = s.replace(/^(?:re|fwd|fw)\s*:\s*/i, "");
   }
-  return s.replace(/\s+/g, " ").trim().toLowerCase();
+  s = s.replace(/\s+/g, " ").trim().toLowerCase();
+  if (opts.stripTicketNumbers) {
+    s = stripTicketNumberTokens(s);
+  }
+  return s;
 }
 
 // Row shape for gmail_intake_records, shared by the issue-linked insert and
@@ -362,7 +473,9 @@ function buildIntakeRecordValues(
     gmailMessageId: parsed.gmailMessageId,
     issueId,
     sender: parsed.from.slice(0, 512),
-    subject: normalizeSubject(parsed.subject).slice(0, 512),
+    subject: normalizeSubject(parsed.subject, {
+      stripTicketNumbers: parsed.ticketingAutoresponder.matched,
+    }).slice(0, 512),
     snippet: parsed.bodySnippet.slice(0, 512),
     receivedAt: parsed.dateMs ? new Date(parsed.dateMs) : null,
   };
@@ -619,7 +732,9 @@ export function createGmailIntakeService(db: Db) {
           // different Gmail threads. We normalize the subject (strip Re:/Fwd:, lowercase)
           // so "Re: Notification" and "Notification" match. We left-join with issues to
           // distinguish open vs closed matches within a 14-day recency window.
-          const normalizedSubj = normalizeSubject(parsed.subject).slice(0, 512);
+          const normalizedSubj = normalizeSubject(parsed.subject, {
+            stripTicketNumbers: parsed.ticketingAutoresponder.matched,
+          }).slice(0, 512);
           const cutoff = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
 
           const senderSubjRecord = await db
@@ -653,10 +768,51 @@ export function createGmailIntakeService(db: Db) {
             });
             issueId = senderSubjIssueId!;
             updated++;
-          } else if (senderSubjIssueId !== null && isClosed && parsed.isAutoReply) {
-            // Auto-reply against a historically closed issue: skip creating a new issue.
-            // issueId stays null; the bottom insert records the intake to prevent
-            // reprocessing without linking to any issue.
+          } else if (
+            senderSubjIssueId !== null &&
+            isClosed &&
+            (parsed.isAutoReply || parsed.ticketingAutoresponder.matched)
+          ) {
+            // Auto-reply/ticketing-autoresponder against a historically closed
+            // issue (including a prior pre-closed audit issue filed by the branch
+            // below — AUR-4480): skip creating another issue. issueId stays null;
+            // the bottom insert records the intake to prevent reprocessing without
+            // linking to any issue.
+            skipped++;
+          } else if (parsed.ticketingAutoresponder.matched) {
+            // Helpdesk/ticketing autoresponder (AUR-4480) with NO historical match
+            // at all — genuinely first contact. Unlike DMARC/marketing noise, a
+            // ticket receipt is still evidence of a real correspondence thread, so
+            // file it as an audit-trail issue with the ticket subject/number
+            // preserved, but pre-closed so it never sits in `todo` waiting for a
+            // triage heartbeat. Later receipts for the same ticket-number-stripped
+            // subject bucket hit the branch above instead of duplicating this.
+            const issueTitle = buildIssueTitle(mailbox, parsed.subject, parsed.from);
+            const issueDescription = buildIssueDescription(mailbox, parsed);
+
+            const issue = await isvc.create(companyId, {
+              title: `[auto-ack] ${issueTitle}`.slice(0, 255),
+              description: issueDescription,
+              status: "done",
+              priority: "low",
+              originKind: "inbound_email",
+            });
+            issueId = issue.id;
+
+            await isvc.addComment(issueId, buildReferenceCommentBody(mailbox), {}, {
+              authorType: "system",
+              metadata: buildGmailReferenceMetadata(mailbox, parsed, { includeSubject: true }),
+            });
+            logger.info(
+              {
+                mailbox,
+                messageId: parsed.gmailMessageId,
+                from: parsed.from,
+                subject: parsed.subject,
+                rule: parsed.ticketingAutoresponder.rule,
+              },
+              "gmail-intake: filed ticketing autoresponder pre-closed (no open conversation to fold into)",
+            );
             skipped++;
           } else {
             // No match or closed match without auto-reply header — create a new issue.

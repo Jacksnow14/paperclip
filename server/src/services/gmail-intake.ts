@@ -201,12 +201,27 @@ export function isSelfOriginatedAuditCopy(from: string, mailbox: GmailAlias): bo
 // so it fails condition 1 and is never suppressed.
 function extractAllAddresses(headerValue: string): string[] {
   if (!headerValue.trim()) return [];
-  const angleMatches = [...headerValue.matchAll(/<([^>]+)>/g)].map((m) => m[1].trim().toLowerCase());
-  if (angleMatches.length > 0) return angleMatches;
-  return headerValue
-    .split(",")
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
+  // A header can mix formats per-recipient, e.g.
+  // `"TCR List" <coffee@x.com>, alex@tryauranode.com` — one address bracketed,
+  // the next bare. Treating "any bracket present" as "every address is
+  // bracketed" (the previous approach) silently dropped the bare address
+  // entirely, which could misclassify a message genuinely addressed to us as
+  // a Bcc list blast. Pull bracketed addresses out first, then treat what's
+  // left of each comma-separated segment as a bare address if it looks like
+  // one — this still can't parse a quoted display name containing a comma,
+  // same limitation the naive split already had.
+  const addresses: string[] = [];
+  const withoutBracketed = headerValue.replace(/<([^>]+)>/g, (_, addr: string) => {
+    addresses.push(addr.trim().toLowerCase());
+    return "";
+  });
+  for (const part of withoutBracketed.split(",")) {
+    const trimmed = part.trim().replace(/^"|"$/g, "").trim();
+    if (/^[^\s@]+@[^\s@]+$/.test(trimmed)) {
+      addresses.push(trimmed.toLowerCase());
+    }
+  }
+  return addresses;
 }
 
 function extractAddressDomain(address: string): string {

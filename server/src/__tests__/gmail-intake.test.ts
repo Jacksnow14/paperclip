@@ -2050,6 +2050,20 @@ describe("sender-Bcc list blast suppression (AUR-6234)", () => {
         "board@tryauranode.com",
       ),
     ).toBe(false);
+    // Mixed-format To header: one address bracketed (the sender's own,
+    // self-addressed for the blast case), the other bare — a very ordinary
+    // shape for a To with multiple recipients. Previously the bracket
+    // extraction was all-or-nothing per header, so the bare address
+    // (alex@tryauranode.com) was silently dropped entirely, making this
+    // read as "we're not a visible recipient" and misclassify a message
+    // genuinely addressed to us as a Bcc list blast.
+    expect(
+      isSenderBccListBlast(
+        "coffee@temeculacoffeeroasters.com",
+        '"TCR List" <coffee@temeculacoffeeroasters.com>, alex@tryauranode.com',
+        "",
+      ),
+    ).toBe(false);
   });
 
   it("classifier: negative — a genuine Bcc to us on mail addressed to a third party is not a list blast (scope guard)", () => {

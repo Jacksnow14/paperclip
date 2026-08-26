@@ -342,16 +342,6 @@ export function IssueRecoveryActionCard({
   const sourceRunId = readEvidenceRunId(action, "sourceRunId") ?? readEvidenceRunId(action, "latestRunId");
   const correctiveRunId = readEvidenceRunId(action, "correctiveRunId");
   const showAttempt = action.attemptCount > 1 && action.maxAttempts !== null;
-  const showTimeoutInline = (() => {
-    if (!action.timeoutAt) return false;
-    try {
-      const date = action.timeoutAt instanceof Date ? action.timeoutAt : new Date(action.timeoutAt);
-      const diffMs = date.getTime() - Date.now();
-      return diffMs > 0 && diffMs < 60 * 60 * 1000;
-    } catch {
-      return false;
-    }
-  })();
   const updatedAtLabel = formatTimeShort(action.updatedAt);
 
   const ariaState = ({
@@ -458,11 +448,6 @@ export function IssueRecoveryActionCard({
             {showAttempt ? (
               <span className="rounded-md border border-border/50 bg-background/60 px-1.5 py-0.5 text-[11px] text-muted-foreground">
                 attempt {action.attemptCount} of {action.maxAttempts}
-              </span>
-            ) : null}
-            {showTimeoutInline ? (
-              <span className="rounded-md border border-border/50 bg-background/60 px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                Times out {formatTimeShort(action.timeoutAt) ?? "soon"}
               </span>
             ) : null}
           </span>

@@ -53,6 +53,7 @@ import {
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { assertAgentLaneAdmissible } from "./agent-lane-admission.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import { memoryService } from "./memory.js";
@@ -3212,12 +3213,17 @@ export function issueService(db: Db) {
     });
   }
 
-  async function assertAssignableAgent(companyId: string, agentId: string) {
+  async function assertAssignableAgent(
+    companyId: string,
+    agentId: string,
+    options: { allowStaleLane?: boolean } = {},
+  ) {
     const assignee = await db
       .select({
         id: agents.id,
         companyId: agents.companyId,
         status: agents.status,
+        lastHeartbeatAt: agents.lastHeartbeatAt,
       })
       .from(agents)
       .where(eq(agents.id, agentId))
@@ -3233,6 +3239,7 @@ export function issueService(db: Db) {
     if (assignee.status === "terminated") {
       throw conflict("Cannot assign work to terminated agents");
     }
+    assertAgentLaneAdmissible(assignee, { allowStaleLane: options.allowStaleLane });
   }
 
   async function isTreeHoldInteractionCheckoutAllowed(
@@ -4338,7 +4345,9 @@ export function issueService(db: Db) {
         throw unprocessable("Issue can only have one assignee");
       }
       if (data.assigneeAgentId) {
-        await assertAssignableAgent(companyId, data.assigneeAgentId);
+        await assertAssignableAgent(companyId, data.assigneeAgentId, {
+          allowStaleLane: data.status === "blocked",
+        });
       }
       if (data.assigneeUserId) {
         await assertAssignableUser(companyId, data.assigneeUserId);
@@ -4694,7 +4703,9 @@ export function issueService(db: Db) {
         }
       }
       if (issueData.assigneeAgentId) {
-        await assertAssignableAgent(existing.companyId, issueData.assigneeAgentId);
+        await assertAssignableAgent(existing.companyId, issueData.assigneeAgentId, {
+          allowStaleLane: nextStatus === "blocked",
+        });
       }
       if (issueData.assigneeUserId) {
         await assertAssignableUser(existing.companyId, issueData.assigneeUserId);

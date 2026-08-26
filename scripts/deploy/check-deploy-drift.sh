@@ -151,6 +151,18 @@
 set -uo pipefail
 
 HEALTH_URL=${PAPERCLIP_HEALTH_URL:-http://127.0.0.1:3100/api/health}
+# AUR-5093: a single 10s curl budget read a genuinely healthy server as
+# unreachable ~25% of the time under load, and a bare timeout used to read
+# identically to a genuine refusal (outage-shaped DRIFT, running=none). Raised
+# the budget, added a short retry before giving up, and — below — a timeout
+# (curl exit 28) is now graded separately from a refusal/DNS failure (any
+# other curl exit): it reports status=UNKNOWN reason=health-slow, never an
+# outage-shaped reason, and carries forward the last known running sha/age
+# instead of claiming running=none.
+HEALTH_PROBE_TIMEOUT_SEC=${PAPERCLIP_HEALTH_PROBE_TIMEOUT_SEC:-30}
+HEALTH_PROBE_RETRIES=${PAPERCLIP_HEALTH_PROBE_RETRIES:-3}
+HEALTH_PROBE_BACKOFF_SEC=${PAPERCLIP_HEALTH_PROBE_BACKOFF_SEC:-2}
+LAST_KNOWN_RUNNING_FILE=${PAPERCLIP_DRIFT_LAST_KNOWN_RUNNING_FILE:-/var/log/paperclip-deploy-drift.last-known-running}
 REMOTE=${PAPERCLIP_DEPLOY_REMOTE:-https://github.com/Jacksnow14/paperclip.git}
 APP_ROOT=${PAPERCLIP_DEPLOY_APP_ROOT:-/opt/paperclip/app}
 DRIFT_LOG=${PAPERCLIP_DRIFT_LOG:-/var/log/paperclip-deploy-drift.log}
@@ -211,16 +223,41 @@ SYSTEMCTL_BIN=${PAPERCLIP_DRIFT_SYSTEMCTL:-systemctl}
 
 ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-health=$(curl -sf -m 10 -H "Accept: application/json" "$HEALTH_URL" 2>/dev/null || true)
+health="" curl_rc=0
+for attempt in $(seq 1 "$HEALTH_PROBE_RETRIES"); do
+  health=$(curl -sf -m "$HEALTH_PROBE_TIMEOUT_SEC" -H "Accept: application/json" "$HEALTH_URL" 2>/dev/null)
+  curl_rc=$?
+  [[ -n "$health" ]] && break
+  (( attempt < HEALTH_PROBE_RETRIES )) && sleep "$HEALTH_PROBE_BACKOFF_SEC"
+done
+
 if [[ -n "$health" ]]; then
   read -r running_source running_sha < <(printf '%s' "$health" | python3 -c '
 import json, sys
 b = (json.load(sys.stdin).get("build") or {})
 print(b.get("source") or "absent", b.get("sha") or "none")
 ' 2>/dev/null || echo "unparseable none")
+  if [[ "$running_source" == "release" && "$running_sha" != "none" ]]; then
+    printf '%s %s\n' "$running_sha" "$(date -u +%s)" > "$LAST_KNOWN_RUNNING_FILE" 2>/dev/null || true
+  fi
+elif [[ "$curl_rc" -eq 28 ]]; then
+  # Timed out after retries — the server may well be healthy (AUR-5093).
+  # This is NOT a refusal/DNS failure: grade it separately below and never
+  # claim running=none for it.
+  running_source=timeout
+  running_sha=unknown
 else
   running_source=unreachable
   running_sha=none
+fi
+
+last_known_sha=- last_known_age_s=-
+if [[ "$running_source" == "timeout" && -r "$LAST_KNOWN_RUNNING_FILE" ]]; then
+  read -r lk_sha lk_ts < "$LAST_KNOWN_RUNNING_FILE" 2>/dev/null || true
+  if [[ -n "${lk_sha:-}" && -n "${lk_ts:-}" ]]; then
+    last_known_sha=$lk_sha
+    last_known_age_s=$(( $(date -u +%s) - lk_ts ))
+  fi
 fi
 
 activated_sha=$(python3 -c "import json; print(json.load(open('$APP_ROOT/current/build-info.json'))['sha'])" 2>/dev/null || echo "none")
@@ -249,7 +286,12 @@ fi
 
 status=ok
 reason=-
-if [[ "$running_source" != "release" ]]; then
+if [[ "$running_source" == "timeout" ]]; then
+  # AUR-5093: a slow health response is not an outage. Unclassified in
+  # run_drift_gate() below (same posture as remote-unreachable) — it never
+  # escalates on its own.
+  status=UNKNOWN reason=health-slow
+elif [[ "$running_source" != "release" ]]; then
   status=DRIFT reason=untracked-or-unreachable:$running_source
 elif [[ "$running_sha" != "$activated_sha" ]]; then
   # Armed but not live. What the daemon CLAIMS decides the grade: a fresh
@@ -334,7 +376,12 @@ if [[ "$status" == "ok" ]]; then
   fi
 fi
 
-line="$ts running=${running_sha:0:12} activated=${activated_sha:0:12} master=${master_sha:0:12} status=$status reason=$reason auto=$ad_phase$merge_debt_fields"
+health_slow_fields=""
+if [[ "$running_source" == "timeout" ]]; then
+  health_slow_fields=" last_known=${last_known_sha:0:12} last_known_age_s=$last_known_age_s"
+fi
+
+line="$ts running=${running_sha:0:12} activated=${activated_sha:0:12} master=${master_sha:0:12} status=$status reason=$reason auto=$ad_phase$merge_debt_fields$health_slow_fields"
 echo "$line"
 echo "$line" >> "$DRIFT_LOG" 2>/dev/null || true
 

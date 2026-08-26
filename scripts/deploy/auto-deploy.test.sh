@@ -181,6 +181,9 @@ run_tick() { # extra env as KEY=VAL args
     PAPERCLIP_DEPLOY_HEALTH_TIMEOUT_SEC=6 \
     PAPERCLIP_DEPLOY_HEALTH_POLL_SEC=1 \
     PAPERCLIP_AUTO_HEALTH_RESTART_ENABLED=0 \
+    PAPERCLIP_HEALTH_PROBE_TIMEOUT_SEC=2 \
+    PAPERCLIP_HEALTH_PROBE_RETRIES=3 \
+    PAPERCLIP_HEALTH_PROBE_BACKOFF_SEC=0.2 \
     "$@" \
     bash "$AUTODEPLOY" >> "$TMP/tick.out" 2>&1
 }
@@ -725,6 +728,41 @@ fi
 set_master "$SHA_G"; point_current "$SHA_G"; set_counts 0 0
 systemctl --user restart "$UNIT"
 wait_sha "$SHA_G" 10 || echo "WARNING: scratch unit did not return to $G12 after K" >&2
+
+# ================================================================================
+# L. AUR-5093: the Stage 2 single-shot probe (probe_health_with_retry) must
+#    retry a few times, with backoff, before concluding unreachable — one
+#    slow/refused attempt must not immediately read as "production is down".
+#    Differential timing check against a genuinely-down unit: RETRIES=1 (no
+#    retry) vs the default RETRIES=3/BACKOFF=0.2s must show the retrying tick
+#    taking measurably longer for the identical down-unit fixture.
+systemctl --user stop "$UNIT" 2>/dev/null; systemctl --user reset-failed "$UNIT" 2>/dev/null
+rm -f "$HUS" "$HRL"; : > "$ALERTS"
+t0=$(date +%s%N)
+run_tick PAPERCLIP_HEALTH_PROBE_RETRIES=1
+t1=$(date +%s%N)
+no_retry_ms=$(( (t1 - t0) / 1000000 ))
+phase_no_retry=$(state_get phase)
+
+rm -f "$HUS" "$HRL"; : > "$ALERTS"
+t0=$(date +%s%N)
+run_tick
+t1=$(date +%s%N)
+retry_ms=$(( (t1 - t0) / 1000000 ))
+phase_retry=$(state_get phase)
+
+if [[ "$phase_no_retry" == "health-unreachable" && "$phase_retry" == "health-unreachable" ]] \
+   && (( retry_ms > no_retry_ms + 250 )); then
+  ok "L: single-shot probe retries before concluding unreachable (retry tick ${retry_ms}ms vs no-retry ${no_retry_ms}ms)"
+else
+  fail "L: single-shot probe retries before concluding unreachable (retry tick ${retry_ms}ms vs no-retry ${no_retry_ms}ms)" \
+    "phase_no_retry=$phase_no_retry phase_retry=$phase_retry"
+fi
+
+# restore a clean baseline (this is now the last section in the suite).
+set_master "$SHA_G"; point_current "$SHA_G"; set_counts 0 0
+systemctl --user restart "$UNIT"
+wait_sha "$SHA_G" 10 || echo "WARNING: scratch unit did not return to $G12 after L" >&2
 
 echo
 if [[ "$FAILURES" -eq 0 ]]; then

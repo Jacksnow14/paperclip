@@ -16,6 +16,9 @@ const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'sgi-loop-h-experim
 const COMPANY_ID = 'co-test';
 const TASK_ID = 'issue-test';
 const AGENT = 'agent-under-test';
+// AUR-6215: mirrors PLATFORM_LABEL_ID exported by sgi-loop-h-experiment-watchdog.mjs.
+// Not imported because this test execs the script as a subprocess.
+const PLATFORM_LABEL_ID = '83062a2e-aec5-4de2-9541-02d05641c246';
 
 const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString();
 
@@ -99,6 +102,10 @@ test('negative control: a prompt_edit hypothesis asks for a gate run, never nags
     assert.match(stub.calls.issues[0].title, /prompt-edit gate/);
     assert.equal(stub.calls.issues[0].assigneeAgentId, AGENT);
     assert.match(stub.calls.issues[0].description, /prompt-edit-gate\.mjs/);
+    // AUR-6215: gate-run issues are self-improvement work, never critical —
+    // must file as backlog + platform label, not the default todo.
+    assert.equal(stub.calls.issues[0].status, 'backlog');
+    assert.deepEqual(stub.calls.issues[0].labelIds, [PLATFORM_LABEL_ID]);
     const patched = stub.calls.patches.find((p) => p.id === 'rec-exp-prompt');
     assert.equal(patched.body.metadata.status, 'needs_gate');
     assert.equal(patched.body.metadata.gate_issue_id, 'new-issue');

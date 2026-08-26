@@ -8,6 +8,8 @@ import {
   canonicalizeAgentKey,
   orderByWorkTime,
   workDateMs,
+  buildSelfEditIssuePayload,
+  PLATFORM_LABEL_ID,
 } from './sgi-loop-c-streak-detection.mjs';
 
 const REF_DATE = new Date('2026-07-26T00:00:00Z');
@@ -462,4 +464,38 @@ test('an exact uuid match (any case) resolves directly, not via prefix', () => {
   const result = canonicalizeAgentKey('371A1B08-0286-4A12-A516-F587F42DF5EB', LIVE_AGENTS);
   assert.equal(result.resolved, '371a1b08-0286-4a12-a516-f587f42df5eb');
   assert.equal(result.method, 'exact');
+});
+
+// ---------------------------------------------------------------------------
+// AUR-6215: self-edit issues are self-improvement work, never critical, so
+// they must file as backlog + platform label, not the default todo.
+// ---------------------------------------------------------------------------
+
+test('self-edit issue payload is created as backlog with the platform label, not todo', () => {
+  const payload = buildSelfEditIssuePayload({
+    title: 'Prompt self-edit required — agent-1 / bug',
+    description: 'desc',
+    assigneeAgentId: 'agent-1',
+    projectId: 'proj-1',
+    parentId: 'parent-1',
+  });
+  assert.equal(payload.status, 'backlog');
+  assert.deepEqual(payload.labelIds, [PLATFORM_LABEL_ID]);
+  assert.notEqual(payload.status, 'todo');
+  assert.equal(payload.priority, 'high');
+  assert.equal(payload.assigneeAgentId, 'agent-1');
+  assert.equal(payload.projectId, 'proj-1');
+  assert.equal(payload.parentId, 'parent-1');
+});
+
+test('self-edit issue payload omits parentId when not given, rather than sending undefined', () => {
+  const payload = buildSelfEditIssuePayload({
+    title: 'Prompt self-edit required — agent-1 / bug',
+    description: 'desc',
+    assigneeAgentId: 'agent-1',
+    projectId: 'proj-1',
+  });
+  assert.equal(payload.status, 'backlog');
+  assert.deepEqual(payload.labelIds, [PLATFORM_LABEL_ID]);
+  assert.ok(!('parentId' in payload));
 });

@@ -183,6 +183,58 @@ export function isSelfOriginatedAuditCopy(from: string, mailbox: GmailAlias): bo
   return false;
 }
 
+// Sender-Bcc list blasts are not correspondence (AUR-6234). A partner
+// broadcast (e.g. coffee@temeculacoffeeroasters.com's Zoom invite to its
+// mailing list) reaches our mailbox only via Bcc/Delivered-To, with no
+// List-Unsubscribe/Auto-Submitted/Precedence header for isMarketingEmail or
+// classifyTicketingAutoresponder to catch — it is a plain Gmail Bcc blast
+// from a human Workspace account, a different class entirely. The
+// discriminator is structural, requiring BOTH:
+//   1. Our own tryauranode.com mailbox appears in neither To nor Cc — we were
+//      never a visible recipient, only reached via Bcc/Delivered-To.
+//   2. Every To address resolves to the sender's own address or own domain —
+//      the actual list-blast signature (the sender addressed the message to
+//      themselves, then Bcc'd their list).
+// Condition 2 is what keeps this narrow: condition 1 alone would suppress any
+// legitimate individual Bcc to us. A genuine reply is always addressed to us
+// directly (see the Will replies in the issue, both `To: alex@tryauranode.com`),
+// so it fails condition 1 and is never suppressed.
+function extractAllAddresses(headerValue: string): string[] {
+  if (!headerValue.trim()) return [];
+  const angleMatches = [...headerValue.matchAll(/<([^>]+)>/g)].map((m) => m[1].trim().toLowerCase());
+  if (angleMatches.length > 0) return angleMatches;
+  return headerValue
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function extractAddressDomain(address: string): string {
+  const at = address.lastIndexOf("@");
+  return at === -1 ? "" : address.slice(at + 1);
+}
+
+function isOwnMailboxAddress(address: string): boolean {
+  return GMAIL_SUPPORTED_ALIASES.some((alias) => address === `${alias}@${OWNED_MAILBOX_DOMAIN}`);
+}
+
+export function isSenderBccListBlast(from: string, to: string, cc: string): boolean {
+  const senderAddress = extractSenderAddress(from).trim().toLowerCase();
+  const senderDomain = extractAddressDomain(senderAddress);
+  if (!senderAddress || !senderDomain) return false;
+
+  const toAddresses = extractAllAddresses(to);
+  const ccAddresses = extractAllAddresses(cc);
+  if (toAddresses.length === 0) return false;
+
+  const weAreVisibleRecipient = [...toAddresses, ...ccAddresses].some(isOwnMailboxAddress);
+  if (weAreVisibleRecipient) return false;
+
+  return toAddresses.every(
+    (addr) => addr === senderAddress || extractAddressDomain(addr) === senderDomain,
+  );
+}
+
 // Helpdesk/ticketing autoresponders — "ticket received", "ticket solved" —
 // are not actionable correspondence (AUR-4480). A single prospect thread on a
 // Zendesk-backed helpdesk minted 10 separate Paperclip issues in 5 weeks, one
@@ -268,6 +320,9 @@ const SNIPPET_MAX_CHARS = 500;
 
 interface ParsedMessage {
   from: string;
+  // Raw To/Cc header values, "" when absent. See isSenderBccListBlast (AUR-6234).
+  to: string;
+  cc: string;
   subject: string;
   dateMs: number | null;
   bodySnippet: string;
@@ -382,6 +437,8 @@ function parseMessage(
   // repairUtf8Mojibake reverses double-Latin-1 encoding that the Gmail API sometimes produces for
   // non-ASCII header values (LAR-570).
   const from = repairUtf8Mojibake(sanitizeHeaderValue(extractHeader(headers, "from")));
+  const to = repairUtf8Mojibake(sanitizeHeaderValue(extractHeader(headers, "to")));
+  const cc = repairUtf8Mojibake(sanitizeHeaderValue(extractHeader(headers, "cc")));
   const subject = repairUtf8Mojibake(sanitizeHeaderValue(extractHeader(headers, "subject"))) || "(no subject)";
   const dateStr = extractHeader(headers, "date");
   const dateMs = dateStr ? new Date(dateStr).getTime() : null;
@@ -411,6 +468,8 @@ function parseMessage(
 
   return {
     from,
+    to,
+    cc,
     subject,
     dateMs,
     bodySnippet,
@@ -690,6 +749,25 @@ export function createGmailIntakeService(db: Db) {
           logger.info(
             { mailbox, messageId: parsed.gmailMessageId, from: parsed.from, subject: parsed.subject },
             "gmail-intake: suppressed Shopify informational notification (no issue)",
+          );
+          skipped++;
+          continue;
+        }
+
+        // Sender-Bcc list blasts are not actionable correspondence
+        // (AUR-6234). Record the intake so the message is not refetched on
+        // every poll, mint no issue, and leave the mail untouched — same
+        // suppress-in-place treatment as the cases above. The message stays
+        // in the mailbox as case-file evidence (e.g. TCR's manufacturing-
+        // license footer, load-bearing on AUR-673/AUR-2156); only the
+        // issue-minting + agent wake stops.
+        if (isSenderBccListBlast(parsed.from, parsed.to, parsed.cc)) {
+          await db.insert(gmailIntakeRecords).values(
+            buildIntakeRecordValues(companyId, mailbox, parsed, null),
+          );
+          logger.info(
+            { mailbox, messageId: parsed.gmailMessageId, from: parsed.from, to: parsed.to, subject: parsed.subject },
+            "gmail-intake: suppressed sender-Bcc list blast (no issue)",
           );
           skipped++;
           continue;

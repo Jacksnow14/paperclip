@@ -217,11 +217,16 @@ const ZENDESK_MESSAGE_ID_RE = /@[a-z0-9.-]*zendesk\.com>?\s*$/i;
 
 // Covers "Great Support Request (6189923) Received", "[Ticket #4821] ...",
 // and "Your ticket 4821 was solved" — the two subject shapes named in the
-// ticket, plus the common bracketed-ticket-number variant.
+// ticket, plus the common bracketed-ticket-number variant. This is the
+// last-resort fallback (only reached when no header signal fired at all),
+// which is exactly the case where a genuine human reply would land, so the
+// bracketed pattern below requires literal brackets — an unbracketed "ticket
+// #4821" anywhere in a subject is common in real correspondence quoting a
+// ticket number and must not match.
 const TICKETING_AUTORESPONDER_SUBJECT_PATTERNS: RegExp[] = [
   /\brequest\s*\(?#?\d+\)?\s+received\b/i,
   /\bticket\s*#?\d+\s+was\s+solved\b/i,
-  /\[?ticket\s*#\d+\]?/i,
+  /\[\s*ticket\s*#?\d+\s*\]/i,
 ];
 
 export function classifyTicketingAutoresponder(input: {

@@ -948,6 +948,33 @@ describe("ticketing autoresponder suppression (AUR-4480)", () => {
       }),
     ).toEqual({ matched: false, rule: null });
   });
+
+  it("classifier: bracketed ticket-number subject matches, but a genuine reply merely mentioning a ticket number does not", () => {
+    // Autoresponder-shaped: literal brackets around "Ticket #N" — matches.
+    expect(
+      classifyTicketingAutoresponder({
+        autoSubmitted: "",
+        xAutoResponseSuppress: "",
+        precedence: "",
+        messageId: "",
+        subject: "[Ticket #4821] Update on your request",
+      }),
+    ).toEqual({ matched: true, rule: "subject-pattern" });
+
+    // A genuine human reply quoting their own ticket number, with no auto
+    // headers and no brackets, must NOT be classified as an autoresponder —
+    // this is the exact case where a real reply would otherwise be silently
+    // filed as a pre-closed, unassigned audit issue nobody triages.
+    expect(
+      classifyTicketingAutoresponder({
+        autoSubmitted: "",
+        xAutoResponseSuppress: "",
+        precedence: "",
+        messageId: "",
+        subject: "Re: Ticket #4821, can we hop on a call this week?",
+      }),
+    ).toEqual({ matched: false, rule: null });
+  });
 });
 
 describe("marketing/promotional email suppression (AUR-5831)", () => {

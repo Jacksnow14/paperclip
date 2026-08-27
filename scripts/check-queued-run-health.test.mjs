@@ -142,7 +142,7 @@ test('main() requests the heartbeat-runs census with status=queued (AUR-6285: av
   const runsUrl = requestedUrls.find((u) => u.includes('/heartbeat-runs'));
   assert.ok(runsUrl, `expected a heartbeat-runs request, got: ${requestedUrls.join(', ')}`);
   assert.ok(runsUrl.includes('status=queued'), `expected status=queued filter, got: ${runsUrl}`);
-  assert.ok(!runsUrl.includes('limit='), 'the census read must stay unbounded aside from the status filter');
+  assert.ok(runsUrl.includes('limit=500'), `expected limit=500 cap to prevent OOM on large queued-run sets, got: ${runsUrl}`);
 });
 
 test('flagTitle/FLAG_REGEX round-trip for both incident kinds', () => {

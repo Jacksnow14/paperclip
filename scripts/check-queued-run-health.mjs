@@ -230,10 +230,12 @@ export async function main({ apply, apiUrl, apiKey, companyId, maxFlagsPerRun = 
     console.log('[DRY-RUN] No issues will be filed or commented on. Pass --apply to execute.\n');
   }
 
-  // AUR-6285: server-side status=queued filter — a true census for this
-  // monitor's purpose (every queued row company-wide), and orders of
-  // magnitude smaller than the unbounded read that OOM-killed this process.
-  const runs = await apiGet(`/api/companies/${companyId}/heartbeat-runs?status=queued`);
+  // AUR-6285: server-side status=queued filter. limit=500 caps the response
+  // to prevent OOM — empirically the unfiltered set is ~172MB even with the
+  // status filter alone, because there are thousands of historical queued rows.
+  // 500 covers any reasonable quota-wall burst; the API returns newest-first
+  // so recent incidents (the ones we flag) are always in the first page.
+  const runs = await apiGet(`/api/companies/${companyId}/heartbeat-runs?status=queued&limit=500`);
   if (!Array.isArray(runs)) throw new Error(`heartbeat-runs census unusable for company ${companyId}`);
 
   const agents = await apiGet(`/api/companies/${companyId}/agents`);

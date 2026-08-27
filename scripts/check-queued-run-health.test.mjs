@@ -7,6 +7,7 @@ import {
   STALE_QUEUED_THRESHOLD_MS,
   FLAG_REGEX,
   flagTitle,
+  main,
 } from './check-queued-run-health.mjs';
 
 const NOW = new Date('2026-08-27T09:12:00.000Z');
@@ -110,6 +111,38 @@ test('does NOT flag a wakeup request that already finished', () => {
     { agentId: 'a1', now: NOW },
   );
   assert.deepEqual(flagged, []);
+});
+
+test('main() requests the heartbeat-runs census with status=queued (AUR-6285: avoids the unbounded-read OOM)', async () => {
+  const requestedUrls = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url) => {
+    requestedUrls.push(String(url));
+    if (String(url).includes('/heartbeat-runs')) {
+      return { ok: true, json: async () => [] };
+    }
+    if (String(url).includes('/wakeup-requests')) {
+      return { ok: true, json: async () => [] };
+    }
+    if (String(url).includes('/agents')) {
+      return { ok: true, json: async () => [] };
+    }
+    if (String(url).includes('/issues?')) {
+      return { ok: true, json: async () => [] };
+    }
+    return { ok: true, json: async () => ({}) };
+  };
+  try {
+    const code = await main({ apply: false, apiUrl: 'https://api.test', apiKey: 'k', companyId: 'c1' });
+    assert.equal(code, 0);
+  } finally {
+    global.fetch = originalFetch;
+  }
+
+  const runsUrl = requestedUrls.find((u) => u.includes('/heartbeat-runs'));
+  assert.ok(runsUrl, `expected a heartbeat-runs request, got: ${requestedUrls.join(', ')}`);
+  assert.ok(runsUrl.includes('status=queued'), `expected status=queued filter, got: ${runsUrl}`);
+  assert.ok(!runsUrl.includes('limit='), 'the census read must stay unbounded aside from the status filter');
 });
 
 test('flagTitle/FLAG_REGEX round-trip for both incident kinds', () => {

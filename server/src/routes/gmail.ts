@@ -5,13 +5,14 @@ import type { Db } from "@paperclipai/db";
 import { approvals, gmailIntakeRecords, gmailOutboundRecords } from "@paperclipai/db";
 import { validate } from "../middleware/validate.js";
 import { assertCompanyAccess } from "./authz.js";
-import { badRequest, forbidden, unprocessable } from "../errors.js";
+import { badRequest, conflict, forbidden, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import {
   createGmailService,
   decodeGmailMessageBody,
   isSupportedGmailAlias,
   GMAIL_SUPPORTED_ALIASES,
+  GmailRecentSendBlockedError,
   type GmailSendGuardContext,
 } from "../services/gmail.js";
 import { GmailOutboundBlockedError, type GmailOutboundDecision } from "../services/gmail-outbound-guard.js";
@@ -55,6 +56,8 @@ const sendMessageBodySchema = z
     // role mailbox, mirroring allowSelfAddressed. Requires outboundJustification.
     outboundKind: z.literal("vendor_inquiry").optional(),
     outboundJustification: z.string().optional(),
+    // AUR-6347: see replyBodySchema — same per-send cadence-guard opt-out.
+    acknowledgeRecentSend: z.boolean().optional(),
   })
   .refine((v) => !v.outboundKind || (v.outboundJustification ?? "").trim().length >= 20, {
     message: "outboundJustification (>=20 chars) is required when outboundKind is set",
@@ -84,6 +87,10 @@ const replyBodySchema = z
     // AUR-5891: see sendMessageBodySchema.
     outboundKind: z.literal("vendor_inquiry").optional(),
     outboundJustification: z.string().optional(),
+    // AUR-6347: explicit override for the per-recipient send-cadence guard
+    // (a soft 409 block on repeat sends to the same address within
+    // RECENT_SEND_CADENCE_WINDOW_MS) — same shape as allowSelfAddressed.
+    acknowledgeRecentSend: z.boolean().optional(),
   })
   .refine((v) => Boolean(v.replyToMessageId || v.threadId), {
     message: "replyToMessageId or threadId is required",
@@ -343,6 +350,13 @@ export function gmailRoutes(db: Db) {
           fileProspectSuppressedIncident(db, companyId, req, mailbox, { to: body.to }, err.verdict);
           throw forbidden(err.message);
         }
+        // AUR-6347: a repeat send to the same recipient inside the cadence
+        // window is a soft block — 409 so the fix is "re-read the thread and
+        // either confirm with acknowledgeRecentSend, or don't send", not a
+        // policy escalation like the gated-content/prospect-suppression cases.
+        if (err instanceof GmailRecentSendBlockedError) {
+          throw conflict(err.message, { address: err.address, recentSends: err.recentSends });
+        }
         throw err;
       }
     },
@@ -393,6 +407,10 @@ export function gmailRoutes(db: Db) {
             err.verdict,
           );
           throw forbidden(err.message);
+        }
+        // AUR-6347: see the .../messages handler above.
+        if (err instanceof GmailRecentSendBlockedError) {
+          throw conflict(err.message, { address: err.address, recentSends: err.recentSends });
         }
         throw err;
       }

@@ -35,7 +35,20 @@
  *     (GET /api/agents/{id}/runs), not its status field. Among healthy
  *     lanes, PRs are distributed least-loaded-first by queued run count, so
  *     one lane never again absorbs the whole backlog. Fails loud (exit 2) if
- *     zero lanes are healthy — never files unassigned issues.
+ *     zero lanes are healthy — there is no reviewer to eventually pick up an
+ *     unassigned issue's re-triage either, so this case still aborts rather
+ *     than filing unassigned.
+ *   - Credential-permission fallback (AUR-6335): a *healthy* lane was picked
+ *     but the identity this script runs under structurally lacks
+ *     `tasks:assign` (a shared cron credential, not this agent's own — see
+ *     AUR-6054), so the assigned POST 403s. That is a permission gap, not a
+ *     capacity gap: `api()` retries the same body unassigned instead of
+ *     FATAL-aborting the whole run, so backlog after the first 403 still
+ *     gets filed. Every other FATAL path (repo enumeration failure, zero
+ *     healthy lanes, an uncaught exception) also fires a SEV2 alert via
+ *     --alert-cmd, which does not touch the Paperclip API at all — so a
+ *     dead fire is no longer silent even when the underlying capability
+ *     that broke is the one this script itself needs to report through.
  *   - Author exclusion (AUR-5370): every PR here is authored by the same
  *     GitHub machine account, so GitHub author metadata can't discriminate.
  *     The AUR-NNNN token in the PR title is looked up; that issue's
@@ -449,6 +462,21 @@ function hasTrunkCiScript(repo) {
   return trunkCiScriptCache.get(repo);
 }
 
+/**
+ * Best-effort out-of-band alert for a FATAL condition. Deliberately does not
+ * touch the Paperclip API — this is the path that must still work when the
+ * reason we're alerting IS a broken Paperclip credential (AUR-6335: 26
+ * consecutive dead fires logged to a file nobody watches, zero alerts).
+ * Swallows its own failure; a broken alert must never mask the real FATAL.
+ */
+function alertFatal(args, message) {
+  try {
+    execFileSync(args.alertCmd, ['SEV2', message]);
+  } catch (err) {
+    console.error(`FATAL-alert via ${args.alertCmd} failed: ${err.message}`);
+  }
+}
+
 function loadState(stateDir) {
   const f = join(stateDir, 'state.json');
   if (!existsSync(f)) return migrateState({ prs: {} });
@@ -473,14 +501,30 @@ export async function api(args, method, path, body) {
     },
     body: body ? JSON.stringify(body) : undefined,
   });
-  if (!res.ok) {
-    // Response body is the server's stated reason (e.g. "Missing permission:
-    // tasks:assign") — without it a 403/400 leaves the next responder to
-    // re-derive the cause from scratch.
-    const detail = await res.text().catch(() => '');
-    throw new Error(`${method} ${path} → ${res.status}${detail ? `: ${detail}` : ''}`);
+  if (res.ok) return res.json();
+
+  // Response body is the server's stated reason (e.g. "Missing permission:
+  // tasks:assign") — without it a 403/400 leaves the next responder to
+  // re-derive the cause from scratch.
+  const detail = await res.text().catch(() => '');
+
+  // AUR-6335: some credentials this script runs under (a shared cron
+  // service-principal key, not this agent's own) structurally lack
+  // `tasks:assign`, so a POST that carries `assigneeAgentId` 403s every
+  // time. Retrying the same body forever fails the same way, and letting
+  // it propagate FATAL-aborts the whole run, silently dropping the rest of
+  // the backlog too (AUR-6335 root cause: 26 consecutive dead fires).
+  // Match the accepted company pattern (AUR-6054/check-unattributed-trigger-
+  // disarms.mjs): file the issue UNASSIGNED instead of throwing. Only this
+  // specific 403 is swallowed — any other status, or a 403 for a different
+  // reason, still throws.
+  if (method === 'POST' && res.status === 403 && body && typeof body === 'object' && 'assigneeAgentId' in body && /tasks:assign/i.test(detail)) {
+    const { assigneeAgentId, ...unassignedBody } = body;
+    console.log(`FILED UNASSIGNED (403 on assigneeAgentId — see AUR-6335/AUR-6054): ${detail}`);
+    return api(args, method, path, unassignedBody);
   }
-  return res.json();
+
+  throw new Error(`${method} ${path} → ${res.status}${detail ? `: ${detail}` : ''}`);
 }
 
 /** Best-effort: fetch statuses for every filedIssueId that might need re-file verification. */
@@ -551,6 +595,7 @@ async function main() {
   const companyId = process.env.PAPERCLIP_COMPANY_ID;
   if (!args.dryRun && (!apiKey || !companyId)) {
     console.error('FATAL: PAPERCLIP_API_KEY / PAPERCLIP_COMPANY_ID not set — cannot dispatch.');
+    alertFatal(args, 'pr-backlog-dispatch FATAL: PAPERCLIP_API_KEY / PAPERCLIP_COMPANY_ID not set — cannot dispatch.');
     process.exit(2);
   }
   const haveCreds = Boolean(apiKey && companyId);
@@ -570,7 +615,9 @@ async function main() {
       }));
     } catch (err) {
       // Loud, but per-repo: one dead repo must not hide the other's backlog.
-      console.error(`FATAL: repo=${repo} could not list open PRs: ${err.message}`);
+      const msg = `pr-backlog-dispatch FATAL: repo=${repo} could not list open PRs: ${err.message}`;
+      console.error(msg);
+      alertFatal(args, msg);
       enumerationFailures += 1;
       continue;
     }
@@ -637,7 +684,9 @@ async function main() {
   if (kept.length > 0) {
     const lanes = await resolveHealthyLanes(args, companyId);
     if (lanes.length === 0) {
-      console.error(`FATAL: zero healthy reviewer lanes among [${args.reviewers.join(', ')}].`);
+      const msg = `pr-backlog-dispatch FATAL: zero healthy reviewer lanes among [${args.reviewers.join(', ')}] — ${kept.length} PR(s) undispatched.`;
+      console.error(msg);
+      alertFatal(args, msg);
       process.exit(2);
     }
     const withExclusions = [];
@@ -715,6 +764,9 @@ if (process.argv[1]) {
 if (invokedDirectly) {
   main().catch((err) => {
     console.error(`FATAL: ${err.message}`);
+    // parseArgs() may not have run (or may itself be the thing that threw),
+    // so fall back to its own default rather than assuming `args` exists.
+    alertFatal({ alertCmd: '/home/ievgen/bot/telegram-alert.sh' }, `pr-backlog-dispatch FATAL (uncaught): ${err.message}`);
     process.exit(2);
   });
 }

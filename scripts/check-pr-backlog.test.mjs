@@ -552,6 +552,67 @@ test('api() throws a plain status line when the body is empty', async () => {
   }
 });
 
+test('api() retries unassigned on a 403 tasks:assign error and returns the retry result (AUR-6335)', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const body = init.body ? JSON.parse(init.body) : undefined;
+    calls.push({ method: init.method, body });
+    if (body && Object.prototype.hasOwnProperty.call(body, 'assigneeAgentId')) {
+      return new Response('{"error":"Missing permission: tasks:assign"}', { status: 403 });
+    }
+    return new Response(JSON.stringify({ id: 'unassigned1' }), { status: 201 });
+  };
+  try {
+    const result = await api(
+      { apiBase: 'http://example.invalid' },
+      'POST',
+      '/api/companies/x/issues',
+      { title: 't', assigneeAgentId: 'agent-1' },
+    );
+    assert.deepEqual(result, { id: 'unassigned1' });
+    assert.equal(calls.length, 2);
+    assert.ok('assigneeAgentId' in calls[0].body);
+    assert.ok(!('assigneeAgentId' in calls[1].body));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('api() still throws on a 403 for a reason other than tasks:assign', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response('{"error":"Missing permission: something:else"}', { status: 403 });
+  try {
+    await assert.rejects(
+      () =>
+        api({ apiBase: 'http://example.invalid' }, 'POST', '/api/companies/x/issues', {
+          title: 't',
+          assigneeAgentId: 'agent-1',
+        }),
+      (err) => {
+        assert.match(err.message, /POST \/api\/companies\/x\/issues → 403/);
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('api() still throws a 403 tasks:assign error on a body without assigneeAgentId', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response('{"error":"Missing permission: tasks:assign"}', { status: 403 });
+  try {
+    await assert.rejects(() =>
+      api({ apiBase: 'http://example.invalid' }, 'PATCH', '/api/issues/x', { status: 'done' }),
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('applyFileCap keeps everything when under the cap', () => {
   const items = [{ number: 1, title: 't', createdAt: '2026-08-01T00:00:00Z' }];
   const { kept, dropped } = applyFileCap(items, 6);

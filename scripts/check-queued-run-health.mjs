@@ -20,8 +20,12 @@
  * one.
  *
  * Two independent scans, since only runs have a company-wide census endpoint:
- *   1. Company-wide `GET /api/companies/{id}/heartbeat-runs` (unbounded —
- *      only a limit-less read is a true census, see check-parked-agents.mjs)
+ *   1. Company-wide `GET /api/companies/{id}/heartbeat-runs?status=queued`
+ *      (AUR-6285: a status-filtered read is the true census for this
+ *      monitor's purpose — the unbounded read returned 172MB of mostly
+ *      terminal succeeded/failed rows on this company and OOM-killed the
+ *      process before it ever reached the scan/classify step; the queued
+ *      subset the monitor actually needs is orders of magnitude smaller)
  *      → runs with status=queued, age > threshold, zero token usage.
  *   2. Per-agent `GET /api/agents/{id}/wakeup-requests?limit=20` (no
  *      company-wide equivalent exists — confirmed by reading
@@ -226,8 +230,10 @@ export async function main({ apply, apiUrl, apiKey, companyId, maxFlagsPerRun = 
     console.log('[DRY-RUN] No issues will be filed or commented on. Pass --apply to execute.\n');
   }
 
-  // No `limit`: only a limit-less read is a true census.
-  const runs = await apiGet(`/api/companies/${companyId}/heartbeat-runs`);
+  // AUR-6285: server-side status=queued filter — a true census for this
+  // monitor's purpose (every queued row company-wide), and orders of
+  // magnitude smaller than the unbounded read that OOM-killed this process.
+  const runs = await apiGet(`/api/companies/${companyId}/heartbeat-runs?status=queued`);
   if (!Array.isArray(runs)) throw new Error(`heartbeat-runs census unusable for company ${companyId}`);
 
   const agents = await apiGet(`/api/companies/${companyId}/agents`);

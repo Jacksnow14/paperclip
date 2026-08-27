@@ -15,9 +15,11 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import {
   DEFAULT_REPOS,
+  PLATFORM_LABEL_ID,
   api,
   applyFileCap,
   assessLaneHealth,
+  buildIssueCreatePayload,
   decideActions,
   distributeReviewers,
   escalationMessage,
@@ -203,6 +205,32 @@ test('issue title is per-repo-per-PR-per-sha (the idempotency key)', () => {
     issueTitle({ number: 7, sha7: 'abc1234' }, 'Jacksnow14/paperclip'),
     'pr-review/paperclip#7@abc1234: review, correct and land',
   );
+});
+
+// ---------------------------------------------------------------------------
+// AUR-6213: filed review issues must not flood the active queue (AUR-5826 —
+// 10-20/week landed straight into todo/high, draining agent limits on
+// platform work instead of revenue work). File as backlog + platform label
+// so the weekly platform-drip routine (max 8/week) controls admission.
+// ---------------------------------------------------------------------------
+
+test('filed review issues are created as backlog with the platform label, not todo', () => {
+  const payload = buildIssueCreatePayload(
+    { number: 7, sha7: 'abc1234', title: 't', repo: 'Jacksnow14/paperclip', reviewerId: 'agent-1' },
+    true,
+  );
+  assert.equal(payload.status, 'backlog');
+  assert.deepEqual(payload.labelIds, [PLATFORM_LABEL_ID]);
+  assert.notEqual(payload.status, 'todo');
+});
+
+test('filed review issue payload still carries title, description, priority and assignee', () => {
+  const f = { number: 7, sha7: 'abc1234', title: 't', repo: 'Jacksnow14/paperclip', reviewerId: 'agent-1' };
+  const payload = buildIssueCreatePayload(f, true);
+  assert.equal(payload.title, issueTitle(f, f.repo));
+  assert.equal(payload.description, issueBody(f, f.repo, true));
+  assert.equal(payload.priority, 'high');
+  assert.equal(payload.assigneeAgentId, 'agent-1');
 });
 
 test('issue body forbids founder code review and demands loop closure', () => {

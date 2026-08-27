@@ -51,7 +51,6 @@ import {
 import {
   RECOVERY_ORIGIN_KINDS,
   buildIssueGraphLivenessLeafKey,
-  isStrandedIssueRecoveryOriginKind,
   parseIssueGraphLivenessIncidentKey,
 } from "./origins.js";
 import {
@@ -395,10 +394,6 @@ function unwrapDatabaseConflictError(error: unknown) {
 
 function isAgentInvokable(agent: typeof agents.$inferSelect | null | undefined) {
   return Boolean(agent && !["paused", "terminated", "pending_approval"].includes(agent.status));
-}
-
-function isStrandedIssueRecoveryIssue(issue: Pick<typeof issues.$inferSelect, "originKind">) {
-  return isStrandedIssueRecoveryOriginKind(issue.originKind);
 }
 
 function isUnsuccessfulTerminalIssueRun(latestRun: LatestIssueRun) {
@@ -1201,17 +1196,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       );
   }
 
-  function isUniqueStrandedIssueRecoveryConflict(error: unknown) {
-    const maybe = unwrapDatabaseConflictError(error);
-    if (!maybe) return false;
-    return maybe.code === "23505" &&
-      (
-        maybe.constraint === "issues_active_stranded_issue_recovery_uq" ||
-        maybe.constraint_name === "issues_active_stranded_issue_recovery_uq" ||
-        typeof maybe.message === "string" && maybe.message.includes("issues_active_stranded_issue_recovery_uq")
-      );
-  }
-
   async function ensureSourceIssueBlockedByStaleEvaluation(input: {
     sourceIssue: typeof issues.$inferSelect | null;
     evaluationIssue: { id: string; identifier: string | null };
@@ -1560,49 +1544,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return row;
   }
 
-  async function findOpenStrandedIssueRecoveryIssue(companyId: string, sourceIssueId: string) {
-    return db
-      .select()
-      .from(issues)
-      .where(
-        and(
-          eq(issues.companyId, companyId),
-          eq(issues.originKind, STRANDED_ISSUE_RECOVERY_ORIGIN_KIND),
-          eq(issues.originId, sourceIssueId),
-          isNull(issues.hiddenAt),
-          notInArray(issues.status, ["done", "cancelled"]),
-        ),
-      )
-      .orderBy(desc(issues.createdAt))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-  }
-
   function isStrandedIssueRecoveryIssue(issue: typeof issues.$inferSelect) {
     return issue.originKind === STRANDED_ISSUE_RECOVERY_ORIGIN_KIND;
-  }
-
-  async function buildNestedStrandedRecoveryLine(issue: typeof issues.$inferSelect, prefix: string) {
-    const sourceIssueId = readNonEmptyString(issue.originId);
-    const sourceIssue = sourceIssueId
-      ? await db
-        .select({ id: issues.id, identifier: issues.identifier })
-        .from(issues)
-        .where(and(eq(issues.companyId, issue.companyId), eq(issues.id, sourceIssueId)))
-        .then((rows) => rows[0] ?? null)
-      : null;
-    const sourceLine = sourceIssue
-      ? `- Original source issue: ${issueUiLink(sourceIssue, prefix)}`
-      : sourceIssueId
-        ? `- Original source issue: \`${sourceIssueId}\``
-        : "- Original source issue: unknown";
-
-    return [
-      "",
-      "- Nested recovery: suppressed because this issue is already a `stranded_issue_recovery` issue.",
-      sourceLine,
-      "- Next action: the assigned recovery owner or board operator should fix the runtime/adapter problem, resolve or reassign the original source issue, then mark this recovery issue done or cancelled.",
-    ].join("\n");
   }
 
   async function resolveStrandedIssueRecoveryOwnerAgentId(issue: typeof issues.$inferSelect) {
@@ -1639,164 +1582,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     return null;
-  }
-
-  function buildStrandedIssueRecoveryDescription(input: {
-    issue: typeof issues.$inferSelect;
-    latestRun: LatestIssueRun;
-    previousStatus: "todo" | "in_progress";
-    prefix: string;
-    recoveryCause?: StrandedRecoveryCause;
-    successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
-    sourceAssignee?: Pick<typeof agents.$inferSelect, "id" | "name"> | null;
-  }) {
-    const sourceIssue = issueUiLink({ identifier: input.issue.identifier, id: input.issue.id }, input.prefix);
-    const runLink = input.latestRun
-      ? `[\`${input.latestRun.id}\`](/${input.prefix}/agents/${input.latestRun.agentId}/runs/${input.latestRun.id})`
-      : "none";
-    if (input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON) {
-      const sourceRunId = input.successfulRunHandoffEvidence?.sourceRunId;
-      const sourceRunLink = sourceRunId && input.latestRun
-        ? `[\`${sourceRunId}\`](/${input.prefix}/agents/${input.latestRun.agentId}/runs/${sourceRunId})`
-        : "unknown";
-      const missingDisposition = input.successfulRunHandoffEvidence?.missingDisposition ?? "clear_next_step";
-      return [
-        "Paperclip exhausted the bounded corrective handoff for a successful run that still has no valid issue disposition.",
-        "",
-        "This is not a runtime/adapter crash report. The source run succeeded; the remaining problem is the missing `done`, `in_review`, `blocked`, delegated follow-up, or explicit continuation path.",
-        "",
-        "## Safe Evidence",
-        "",
-        `- Source issue: ${sourceIssue}`,
-        `- Source run: ${sourceRunLink}`,
-        `- Corrective handoff run: ${runLink}`,
-        `- Source assignee: ${agentUiLink(input.sourceAssignee ?? null, input.prefix)}`,
-        `- Latest issue status: \`${input.issue.status}\``,
-        `- Latest handoff run status: \`${input.latestRun?.status ?? "unknown"}\``,
-        `- Normalized cause: \`${SUCCESSFUL_RUN_MISSING_STATE_REASON}\``,
-        `- Missing disposition: \`${missingDisposition}\``,
-        "- Suggested manager action: choose and record a valid issue disposition without copying transcript content.",
-        "",
-        "## Required Action",
-        "",
-        "- Inspect the source issue and run metadata, not raw transcript excerpts.",
-        "- Choose a valid issue disposition: `done`/`cancelled`, `in_review` with an owner, `blocked` with first-class blockers, delegated follow-up work, or an explicit continuation path.",
-        "- When the source issue has a clear owner and disposition, mark this recovery issue done.",
-      ].join("\n");
-    }
-
-    const retryReason = readNonEmptyString(parseObject(input.latestRun?.contextSnapshot)?.retryReason) ?? "unknown";
-    const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
-
-    return [
-      "Paperclip exhausted automatic recovery for an assigned issue and created this explicit recovery task.",
-      "",
-      "## Source",
-      "",
-      `- Source issue: ${sourceIssue}`,
-      `- Previous source status: \`${input.previousStatus}\``,
-      `- Latest retry run: ${runLink}`,
-      `- Latest retry status: \`${input.latestRun?.status ?? "unknown"}\``,
-      `- Detected invariant: \`stranded_assigned_issue\``,
-      `- Retry reason: \`${retryReason}\``,
-      failureSummary ? `- Failure: ${failureSummary.trim()}` : "- Failure: none recorded",
-      "",
-      "## Ownership",
-      "",
-      "- Selected owner: the first invokable manager/creator/executive candidate with budget available.",
-      "",
-      "## Required Action",
-      "",
-      "- Inspect the latest run and source issue state.",
-      "- Fix the runtime/adapter problem, reassign the source issue, or convert the source issue into a clear manual-review state.",
-      "- When the source issue has a live execution path or has been intentionally resolved, mark this recovery issue done.",
-    ].join("\n");
-  }
-
-  async function ensureStrandedIssueRecoveryIssue(input: {
-    issue: typeof issues.$inferSelect;
-    latestRun: LatestIssueRun;
-    previousStatus: "todo" | "in_progress";
-    recoveryCause?: StrandedRecoveryCause;
-    successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
-  }) {
-    if (isStrandedIssueRecoveryIssue(input.issue)) return null;
-
-    const existing = await findOpenStrandedIssueRecoveryIssue(input.issue.companyId, input.issue.id);
-    if (existing) return existing;
-
-    const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
-    if (!ownerAgentId) return null;
-
-    const prefix = await getCompanyIssuePrefix(input.issue.companyId);
-    const sourceAssignee = input.issue.assigneeAgentId ? await getAgent(input.issue.assigneeAgentId) : null;
-    const recoveryCause = input.recoveryCause ?? "stranded_assigned_issue";
-    let recovery: Awaited<ReturnType<typeof issuesSvc.create>>;
-    try {
-      recovery = await issuesSvc.create(input.issue.companyId, {
-        title: recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
-          ? `Recover missing next step ${input.issue.identifier ?? input.issue.title}`
-          : `Recover stalled issue ${input.issue.identifier ?? input.issue.title}`,
-        description: buildStrandedIssueRecoveryDescription({
-          issue: input.issue,
-          latestRun: input.latestRun,
-          previousStatus: input.previousStatus,
-          prefix,
-          recoveryCause,
-          successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
-          sourceAssignee,
-        }),
-        status: "todo",
-        priority: input.issue.priority,
-        parentId: input.issue.id,
-        projectId: input.issue.projectId,
-        goalId: input.issue.goalId,
-        assigneeAgentId: ownerAgentId,
-        assigneeAdapterOverrides: recoveryAssigneeAdapterOverrides(),
-        originKind: STRANDED_ISSUE_RECOVERY_ORIGIN_KIND,
-        originId: input.issue.id,
-        originRunId: input.latestRun?.id ?? null,
-        originFingerprint: [
-          STRANDED_ISSUE_RECOVERY_ORIGIN_KIND,
-          input.issue.companyId,
-          input.issue.id,
-          recoveryCause,
-          input.latestRun?.id ?? "no-run",
-        ].join(":"),
-        billingCode: input.issue.billingCode,
-        inheritExecutionWorkspaceFromIssueId: input.issue.id,
-      });
-    } catch (error) {
-      if (!isUniqueStrandedIssueRecoveryConflict(error)) throw error;
-      const raced = await findOpenStrandedIssueRecoveryIssue(input.issue.companyId, input.issue.id);
-      if (!raced) throw error;
-      return raced;
-    }
-
-    await deps.enqueueWakeup(ownerAgentId, {
-      source: "assignment",
-      triggerDetail: "system",
-      reason: "issue_assigned",
-      payload: withRecoveryModelProfileHint({
-        issueId: recovery.id,
-        sourceIssueId: input.issue.id,
-        strandedRunId: input.latestRun?.id ?? null,
-        recoveryCause,
-      }),
-      requestedByActorType: "system",
-      requestedByActorId: null,
-      contextSnapshot: withRecoveryModelProfileHint({
-        issueId: recovery.id,
-        taskId: recovery.id,
-        wakeReason: "issue_assigned",
-        source: STRANDED_ISSUE_RECOVERY_ORIGIN_KIND,
-        sourceIssueId: input.issue.id,
-        strandedRunId: input.latestRun?.id ?? null,
-        recoveryCause,
-      }),
-    });
-
-    return recovery;
   }
 
   function strandedRecoveryActionKind(cause: StrandedRecoveryCause) {
@@ -1945,12 +1730,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     previousStatus: "todo" | "in_progress";
     latestRun: LatestIssueRun;
     prefix: string;
+    recoveryAction: Awaited<ReturnType<typeof recoveryActionsSvc.upsertSourceScoped>>;
+    recoveryOwner: typeof agents.$inferSelect | null;
+    nextStatus: "todo" | "blocked";
+    keepDispatchable: boolean;
+    effectiveMaxAttempts: number;
+    attemptsExhausted: boolean;
   }) {
     const runLink = input.latestRun
       ? runUiLink({ id: input.latestRun.id, agentId: input.latestRun.agentId }, input.prefix)
       : "none";
     const retryReason = readNonEmptyString(parseObject(input.latestRun?.contextSnapshot)?.retryReason) ?? "none";
     const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
+    const attemptSummaryLine = `- Attempt: ${input.recoveryAction.attemptCount} of ${input.effectiveMaxAttempts}${input.attemptsExhausted ? " (exhausted)" : ""}.`;
+    const ownershipLine = input.recoveryAction.ownerAgentId
+      ? `- Recovery owner: ${agentUiLink(input.recoveryOwner, input.prefix)}`
+      : "- Recovery owner: board escalation, because Paperclip could not find an invokable manager, creator, or executive owner with budget available.";
 
     return [
       "Paperclip stopped automatic stranded-work recovery for this recovery issue.",
@@ -1963,7 +1758,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       failureSummary ? `- Failure: ${failureSummary.trim()}` : "- Failure: none recorded",
       "- Guard: recovery issues do not create nested `stranded_issue_recovery` issues.",
       "",
-      "Next action: the current recovery owner should inspect the failed run evidence, restore a live execution path or record the manual resolution, and keep this recovery issue in an explicit actionable state instead of parking it in `blocked`.",
+      `- Recovery action: \`${input.recoveryAction.id}\` (attempt ${input.recoveryAction.attemptCount})`,
+      attemptSummaryLine,
+      ownershipLine,
+      `- Issue status: \`${input.nextStatus}\`${input.keepDispatchable
+        ? " — left dispatchable and reassigned to the recovery owner, because nothing is actually blocking it. Retries are spaced by a 24h cooldown."
+        : ""}`,
+      "",
+      "Next action: the recovery owner should inspect the failed run evidence and restore a live execution path or record the manual resolution on the source issue.",
     ].join("\n");
   }
 
@@ -1986,23 +1788,77 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       return null;
     }
 
-    // AUR-4712: `blocked` now requires a first-class edge, and this reconciler doesn't
-    // attach one. Send the issue back to `todo` so it stays dispatchable instead of
-    // failing the new write-path guard.
-    const updated = await issuesSvc.update(input.issue.id, { status: "todo" });
+    // AUR-6178: mirror escalateStrandedAssignedIssue's (path 1) recovery-action cooldown
+    // instead of unconditionally re-escalating on every reconciler tick. `stranded_issue_recovery`
+    // issues never call ensureSourceScopedStrandedRecoveryAction/ensureStrandedIssueRecoveryIssue
+    // to mint a NEW issue here — this path only ever reassigns/reconciles the SAME recovery
+    // issue in place. Never add a call here that creates another `stranded_issue_recovery`
+    // issue; that would defeat the whole point of the in-place path and recurse.
+    const existingAction = await recoveryActionsSvc.getActiveForIssue(
+      input.issue.companyId,
+      input.issue.id,
+    );
+    if (
+      existingAction &&
+      existingAction.kind !== "issue_graph_liveness" &&
+      existingAction.lastAttemptAt &&
+      new Date(existingAction.lastAttemptAt) > recoveryActionDormancyCutoff()
+    ) {
+      return null;
+    }
+
+    const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
+      issue: input.issue,
+      previousStatus: input.previousStatus,
+      latestRun: input.latestRun,
+    });
+    const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+
+    // AUR-4712 / AUR-6178: `blocked` requires a first-class edge — only write it when real
+    // unresolved blockers exist. Otherwise keep the issue dispatchable and reassigned to the
+    // recovery owner; the 24h cooldown above (not the status write) is the loop-breaker.
+    const attemptsExhausted = recoveryAction.attemptCount >
+      (recoveryAction.maxAttempts ?? MAX_DISPATCHABLE_STRANDED_RECOVERY_ATTEMPTS);
+    const keepDispatchable = blockerIds.length === 0 &&
+      Boolean(recoveryAction.ownerAgentId) &&
+      !attemptsExhausted;
+    const nextStatus = keepDispatchable ? "todo" as const : "blocked" as const;
+
+    const updated = await issuesSvc.update(input.issue.id, {
+      status: nextStatus,
+      // Only reconcile blocker edges when actually blocking — passing an empty list would
+      // delete every `blocks` relation, including edges to already-resolved blockers.
+      ...(keepDispatchable ? {} : { blockedByIssueIds: blockerIds }),
+      assigneeAgentId: recoveryAction.ownerAgentId ?? input.issue.assigneeAgentId,
+    });
     if (!updated) return null;
 
     const prefix = await getCompanyIssuePrefix(input.issue.companyId);
-    await issuesSvc.addComment(
-      input.issue.id,
-      buildRecoveryIssueInPlaceEscalationComment({
-        issue: input.issue,
-        previousStatus: input.previousStatus,
-        latestRun: input.latestRun,
-        prefix,
-      }),
-      {},
-    );
+    const recoveryOwner = recoveryAction.ownerAgentId ? await getAgent(recoveryAction.ownerAgentId) : null;
+    const effectiveMaxAttempts = recoveryAction.maxAttempts ?? MAX_DISPATCHABLE_STRANDED_RECOVERY_ATTEMPTS;
+
+    // AUR-6178: gate the escalation comment on the first attempt only. Unlike path 1 (which
+    // posts on every attempt per AUR-4719 #2), this path's cooldown already keeps attempts
+    // to roughly one per 24h, and a recovery issue's own thread doesn't need a repeat notice
+    // every time the cooldown lapses and the same failure re-fires.
+    if (recoveryAction.attemptCount === 1) {
+      await issuesSvc.addComment(
+        input.issue.id,
+        buildRecoveryIssueInPlaceEscalationComment({
+          issue: input.issue,
+          previousStatus: input.previousStatus,
+          latestRun: input.latestRun,
+          prefix,
+          recoveryAction,
+          recoveryOwner,
+          nextStatus,
+          keepDispatchable,
+          effectiveMaxAttempts,
+          attemptsExhausted,
+        }),
+        {},
+      );
+    }
 
     await logActivity(db, {
       companyId: input.issue.companyId,
@@ -2015,7 +1871,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       entityId: input.issue.id,
       details: {
         identifier: input.issue.identifier,
-        status: "todo",
+        status: nextStatus,
+        keptDispatchable: keepDispatchable,
+        recoveryAttemptCount: recoveryAction.attemptCount,
         previousStatus: input.previousStatus,
         source: "recovery.reconcile_stranded_recovery_issue",
         latestRunId: input.latestRun?.id ?? null,
@@ -2023,7 +1881,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         latestRunErrorCode: input.latestRun?.errorCode ?? null,
         originKind: input.issue.originKind,
         originId: input.issue.originId,
+        recoveryActionId: recoveryAction.id,
+        recoveryOwnerAgentId: recoveryAction.ownerAgentId,
+        blockerIssueIds: blockerIds,
       },
+    });
+
+    await enqueueSourceScopedStrandedRecoveryWake({
+      action: recoveryAction,
+      issue: input.issue,
+      latestRun: input.latestRun,
+      recoveryCause: "stranded_assigned_issue",
     });
 
     return updated;

@@ -611,8 +611,25 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       },
     });
 
-    const actionRows = await db.select().from(issueRecoveryActions);
-    expect(actionRows).toHaveLength(0);
+    // AUR-6178: escalateStrandedAssignedIssue redirects a stranded_issue_recovery-origin
+    // issue into escalateStrandedRecoveryIssueInPlace, which now anchors a source-scoped
+    // recovery action on the recovery issue itself (mirroring path 1) instead of the old
+    // unconditional `status: "todo"` write with no action row. It still never mints a NEW
+    // nested recovery issue — only reconciles this same one in place.
+    const actionRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, recoveryIssueId));
+    expect(actionRows).toHaveLength(1);
+    expect(actionRows[0]).toMatchObject({
+      companyId,
+      sourceIssueId: recoveryIssueId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      attemptCount: 1,
+    });
     const recoveryIssues = await db
       .select()
       .from(issues)

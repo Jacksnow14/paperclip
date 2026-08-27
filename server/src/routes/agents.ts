@@ -3216,7 +3216,11 @@ export function agentRoutes(
 
     const limitParam = req.query.limit as string | undefined;
     const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10) || 50)) : 50;
-    const runs = await heartbeat.list(agent.companyId, id, limit);
+    const statusParam = req.query.status as string | undefined;
+    const status = statusParam
+      ? statusParam.split(",").map((s) => s.trim()).filter((s) => s.length > 0)
+      : undefined;
+    const runs = await heartbeat.list(agent.companyId, id, limit, status);
     res.json(redactCurrentUserValue(runs, await getCurrentUserRedactionOptions()));
   });
 
@@ -3420,7 +3424,11 @@ export function agentRoutes(
     const agentId = req.query.agentId as string | undefined;
     const limitParam = req.query.limit as string | undefined;
     const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10) || 200)) : undefined;
-    const runs = await heartbeat.list(companyId, agentId, limit);
+    const statusParam = req.query.status as string | undefined;
+    const status = statusParam
+      ? statusParam.split(",").map((s) => s.trim()).filter((s) => s.length > 0)
+      : undefined;
+    const runs = await heartbeat.list(companyId, agentId, limit, status);
     res.json(runs);
   });
 

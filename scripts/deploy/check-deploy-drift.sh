@@ -148,6 +148,27 @@
 #               timer's own 30-min OnUnitActiveSec, floored at 90 min so a
 #               faster-cadence timer added later still gets a sane grace
 #               window instead of paging on a single missed tick.
+#
+# SCRIPT-DRIFT AXIS (AUR-6177, follow-up to AUR-4692/AUR-5648): unit-drift
+# above watches installed systemd artifacts, but paperclip-mem-watch.sh,
+# paperclip-mem-watch-alert.sh, and paperclip-oom-guard.sh are standalone
+# shell scripts under /usr/local/sbin that those units invoke — deliberately
+# independent of the app release pipeline, so unit-drift's own byte-compare
+# never touches them. AUR-4692 found paperclip-mem-watch-alert.sh itself
+# stale against its repo canonical source with no detector anywhere watching
+# it, and paperclip-oom-guard.sh had no repo canonical source to diff against
+# at all. This axis diffs each watched /usr/local/sbin script
+# against the ACTIVE release's own copy of its repo canonical source under
+# $APP_ROOT/current/<source-relative-path> — never origin/master, same
+# "a release that hasn't activated a script edit yet is not drift" posture
+# as unit-drift — isolated in its own log/state file pair per script.
+#
+#   script-debt (script-behind:<label>, script-missing:<label>)
+#               A watched /usr/local/sbin script's sha256 differs from (or is
+#               absent versus) the active release's own copy of its repo
+#               canonical source. Same debt character as unit-debt: a script
+#               edit can legitimately lag a merge by hours until someone
+#               re-runs the relevant install-*.sh. Threshold: 24h.
 set -uo pipefail
 
 HEALTH_URL=${PAPERCLIP_HEALTH_URL:-http://127.0.0.1:3100/api/health}
@@ -220,6 +241,17 @@ TIMERS=${PAPERCLIP_DRIFT_TIMERS-}
 TIMER_LIVENESS_THRESHOLD_SEC=${PAPERCLIP_DRIFT_TIMER_THRESHOLD_SEC:-5400}
 TIMER_ISSUE_URL=${PAPERCLIP_DRIFT_TIMER_ISSUE_URL:-https://paperclip/AUR/issues/AUR-5885}
 SYSTEMCTL_BIN=${PAPERCLIP_DRIFT_SYSTEMCTL:-systemctl}
+# script-drift axis (AUR-6177): `label:source-relative-path:installed-path`,
+# one entry per line. DELIBERATELY EMPTY by default — opt-in via
+# PAPERCLIP_DRIFT_SCRIPTS, same reasoning as CHECKOUTS/UNITS/TIMERS above.
+# source-relative-path is relative to the REPO ROOT (unlike unit-drift's
+# fixed scripts/deploy/systemd/ prefix, these scripts live in several
+# different repo directories) in the ACTIVE release, compared against
+# $APP_ROOT/current/<source-relative-path> — never origin/master. Labels are
+# used as log/state filename suffixes, so keep them filename-safe.
+SCRIPTS=${PAPERCLIP_DRIFT_SCRIPTS-}
+SCRIPT_DEBT_THRESHOLD_SEC=${PAPERCLIP_DRIFT_SCRIPT_DEBT_THRESHOLD_SEC:-86400}
+SCRIPT_ISSUE_URL=${PAPERCLIP_DRIFT_SCRIPT_ISSUE_URL:-https://paperclip/AUR/issues/AUR-6177}
 
 ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -408,6 +440,7 @@ run_drift_gate() {
   CHECKOUT_ISSUE_URL="$CHECKOUT_ISSUE_URL" CONTEXT="$gate_context" \
   UNIT_DEBT_THRESHOLD_SEC="$UNIT_DEBT_THRESHOLD_SEC" UNIT_ISSUE_URL="$UNIT_ISSUE_URL" \
   TIMER_LIVENESS_THRESHOLD_SEC="$TIMER_LIVENESS_THRESHOLD_SEC" TIMER_ISSUE_URL="$TIMER_ISSUE_URL" \
+  SCRIPT_DEBT_THRESHOLD_SEC="$SCRIPT_DEBT_THRESHOLD_SEC" SCRIPT_ISSUE_URL="$SCRIPT_ISSUE_URL" \
   ALERT_COOLDOWN_SEC="$ALERT_COOLDOWN_SEC" RUNNING_SHA="${running_sha:0:12}" \
   MASTER_SHA="${master_sha:0:12}" ISSUE_URL="$ISSUE_URL" \
   python3 -c '
@@ -440,6 +473,11 @@ elif reason.startswith("timer-disabled:") or reason.startswith("timer-service-fa
     # AUR-5885: a dead timer/service is the same "automation silently dead"
     # class as provenance/dark-armed, not fleet-internal debt telemetry.
     klass, threshold = "timer-liveness", int(os.environ["TIMER_LIVENESS_THRESHOLD_SEC"])
+elif reason.startswith("script-behind:") or reason.startswith("script-missing:"):
+    # AUR-6177: same debt character as unit-debt — a /usr/local/sbin script
+    # edit can legitimately lag a merge by hours until someone re-runs the
+    # relevant install-*.sh.
+    klass, threshold = "script-debt", int(os.environ["SCRIPT_DEBT_THRESHOLD_SEC"])
 else:
     print("QUIET\tunclassified-reason:%s" % reason); raise SystemExit(0)
 
@@ -570,6 +608,16 @@ elif reason.startswith("timer-disabled:") or reason.startswith("timer-service-fa
         % (hours, klass, reason, os.environ.get("CONTEXT", ""),
            os.environ["TIMER_ISSUE_URL"], note)
     )
+elif reason.startswith("script-behind:") or reason.startswith("script-missing:"):
+    # Same rationale as unit-behind: the running server can be fully
+    # converged while a standalone /usr/local/sbin monitor script is a stale
+    # or hand-edited copy of what the active release repo canonical source
+    # ships (AUR-6177).
+    text = (
+        "Paperclip script drift sustained %dh (%s): %s. %s %s%s"
+        % (hours, klass, reason, os.environ.get("CONTEXT", ""),
+           os.environ["SCRIPT_ISSUE_URL"], note)
+    )
 else:
     text = (
         "Paperclip deploy drift sustained %dh (%s): %s.%s "
@@ -582,7 +630,7 @@ else:
 # other klass keeps paging at SEV2. unit-debt (AUR-5648) is the same
 # character of debt — a merged-but-not-yet-installed unit edit is not
 # something the founder can act on directly — so it joins the INFO group.
-severity = "INFO" if klass in ("deploy-debt", "checkout-debt", "unit-debt") else "SEV2"
+severity = "INFO" if klass in ("deploy-debt", "checkout-debt", "unit-debt", "script-debt") else "SEV2"
 print("ALERT\t%s\t%s" % (severity, text))
 ' 2>/dev/null || printf 'QUIET\tescalation-gate-failed'
   )
@@ -741,6 +789,56 @@ while IFS=: read -r un_label un_src un_installed un_level; do
       "Unit $un_label ($un_level) at $un_installed does not match the active release's $un_release_src."
   fi
 done <<< "$UNITS"
+
+# --- script-drift axis (AUR-6177) -------------------------------------------
+# Standalone /usr/local/sbin monitor scripts (paperclip-mem-watch.sh,
+# paperclip-mem-watch-alert.sh, paperclip-oom-guard.sh) run independent of the
+# app release pipeline by design, so unit-drift's own installer-artifact
+# compare never touches them — AUR-4692 found paperclip-mem-watch-alert.sh
+# itself stale with no detector watching it. Each manifest line names a
+# repo-relative source path (not a fixed prefix like unit-drift, since these
+# scripts live in several different repo directories) and is diffed against
+# the ACTIVE release's own copy under $APP_ROOT/current/ — never
+# origin/master — isolated in its own log/state file pair exactly like the
+# unit-drift axis above. Missing-at-installed-path is a real MISSING status,
+# not a skip: every manifest line names a definitive expected location.
+while IFS=: read -r sd_label sd_src sd_installed; do
+  [[ -n "$sd_label" ]] || continue
+
+  sd_release_src="$APP_ROOT/current/$sd_src"
+
+  if [[ ! -e "$sd_release_src" ]]; then
+    # The active release does not carry this source file at all — nothing to
+    # diff against. This is a manifest/release mismatch, not provable drift
+    # of the installed script, so it is reported (not silently skipped) and
+    # left out of the DRIFT verdict — same posture as an unreachable checkout.
+    echo "script drift: $sd_label active release copy $sd_release_src not found, skipping" >&2
+    continue
+  fi
+
+  if [[ ! -e "$sd_installed" ]]; then
+    sd_status=DRIFT sd_reason="script-missing:${sd_label}"
+    overall_drift=1
+  elif cmp -s "$sd_installed" "$sd_release_src" 2>/dev/null; then
+    sd_status=ok sd_reason=-
+  else
+    sd_status=DRIFT sd_reason="script-behind:${sd_label}"
+    overall_drift=1
+  fi
+
+  sd_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  sd_line="$sd_ts script=$sd_label installed=$sd_installed status=$sd_status reason=$sd_reason"
+  echo "$sd_line"
+  sd_log="${DRIFT_LOG}.script-${sd_label}"
+  sd_state="${ALERT_STATE}.script-${sd_label}"
+  echo "$sd_line" >> "$sd_log" 2>/dev/null || true
+
+  if [[ "$sd_status" == "DRIFT" ]]; then
+    echo "paperclip script drift: $sd_label ($sd_installed) does not match the active release's $sd_release_src" >&2
+    run_drift_gate "$sd_log" "$sd_state" "$sd_reason" \
+      "Script $sd_label at $sd_installed does not match the active release's $sd_release_src."
+  fi
+done <<< "$SCRIPTS"
 
 # --- timer-liveness axis (AUR-5885) -----------------------------------------
 # No existing axis asks systemd directly whether a watched timer/service pair

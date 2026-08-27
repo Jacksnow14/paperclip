@@ -171,9 +171,9 @@ sudo -n -l    # -> (ALL : ALL) ALL, no password
 
 | Mitigation | Unit / file | Purpose |
 | --- | --- | --- |
-| `paperclip-oom-guard.timer` | `/etc/systemd/system/paperclip-oom-guard.{service,timer}`, script `/usr/local/sbin/paperclip-oom-guard.sh` | Every 30s, sets `oom_score_adj`: `-900` Postgres, `-800` control-plane main pid, `+600` `claude` agent children — biases kernel kill selection toward a sacrificial agent child |
+| `paperclip-oom-guard.timer` | `/etc/systemd/system/paperclip-oom-guard.{service,timer}`, script `/usr/local/sbin/paperclip-oom-guard.sh` (canonical source: `scripts/paperclip-oom-guard.sh` in this repo — see §4c) | Every 30s, sets `oom_score_adj`: `-900` Postgres, `-800` control-plane main pid, `+600` `claude` agent children — biases kernel kill selection toward a sacrificial agent child |
 | `paperclip-mem-watch.timer` | `/etc/systemd/system/paperclip-mem-watch.{service,timer}`, script `/usr/local/sbin/paperclip-mem-watch.sh` (canonical source: `scripts/paperclip-mem-watch.sh` in this repo — see §4a) | Every 5min, appends a CSV row to `/var/log/paperclip-mem-watch.log` (§1) so a "sustained window under real load" is a log lookup, not journalctl forensics |
-| `paperclip-mem-watch-alert.timer` | `/etc/systemd/system/paperclip-mem-watch-alert.{service,timer}`, script `/usr/local/sbin/paperclip-mem-watch-alert.sh` (canonical source: `scripts/deploy/check-mem-watch-alert.sh` on the unmerged `aur-4025-mem-watch-alert` branch — see §4b) | Every 5min, reads the sampler's last row and pages the founder (SEV2, 30min cooldown) when `oom_5min>0`, `swap_free_mb<2000`, or `mem_avail_mb<1500` — the breach-triggered wake AUR-3924 originally lacked |
+| `paperclip-mem-watch-alert.timer` | `/etc/systemd/system/paperclip-mem-watch-alert.{service,timer}`, script `/usr/local/sbin/paperclip-mem-watch-alert.sh` (canonical source: `scripts/deploy/check-mem-watch-alert.sh` in this repo, merged to `master` via #111/#225/#310 — see §4b) | Every 5min, reads the sampler's last row and pages the founder (SEV2, 30min cooldown) when `oom_5min>0`, `swap_free_mb<2000`, or `mem_avail_mb<1500` — the breach-triggered wake AUR-3924 originally lacked |
 | `OOMPolicy=continue` | `~/.config/systemd/user/paperclip.service.d/oom-policy.conf` | A `claude` child getting OOM-killed no longer stops the whole `paperclip.service` unit and orphans every other run on it |
 | `OOMScoreAdjust=-900`, `OOMPolicy=continue` | built into `paperclip-db.service` | Postgres is the last thing the kernel should pick, independent of the guard timer |
 
@@ -244,14 +244,19 @@ app release — both scripts live in `/usr/local/sbin`, installed by
 respectively, by design (see the header comments in both scripts): a monitor that depends on the
 app release pipeline can't be trusted to alert on that pipeline breaking.
 
-**Provenance note, worth recording precisely:** the deployed units and scripts on this box are
-**byte-identical** to `scripts/deploy/{paperclip-mem-watch.sh,check-mem-watch-alert.sh,systemd/*}`
-on two branches — `aur-4086-mem-watch-consumers` (sampler install script + systemd units) and
-`aur-4025-mem-watch-alert` (alert script + systemd units) — confirmed by direct `diff` against
-`/usr/local/sbin` and `/etc/systemd/system` on 2026-07-30. **Neither branch is merged to
-`origin/master`.** The supervision path described here is real and running, but its source is
-not yet on the branch this runbook lives on; that gap belongs to whoever merges AUR-4025/AUR-4086,
-not to this issue.
+**Provenance note, worth recording precisely:** as of 2026-07-30 this section read the deployed
+units and scripts on this box as byte-identical to two then-unmerged branches
+(`aur-4086-mem-watch-consumers`, `aur-4025-mem-watch-alert`). That gap is closed (AUR-6177,
+2026-08-26): the same content is merged to `origin/master` via PR #111 (AUR-4025, breach-triggered
+wake), PR #225 (AUR-4489, owed-page-on-refused-delivery fix), and PR #310 (AUR-4086, `SPLIT_SAFE_MAX_COL`
+freeze lift) — confirmed via `git merge-base --is-ancestor` for all three merge-commit shas against
+`origin/master`, and `git show origin/master:scripts/deploy/check-mem-watch-alert.sh` returning the
+live alert script's content. The `aur-4025-mem-watch-alert` local branch was a stale, unreferenced
+pre-merge rework (its own tip commit is not an ancestor of `origin/master` — the content landed
+through a different, rebased commit) with no remote-tracking copy and no worktree checkout; it has
+been deleted. `aur-4086-mem-watch-consumers` remains, tracked by `remotes/origin/aur-4086-mem-watch-consumers`
+and out of scope here. The supervision path described in this section is real, running, and now
+traceable to a canonical source on this repo's default branch.
 
 **Staleness self-alarm: no — this is the gap.** Read `paperclip-mem-watch-alert.sh` end to end:
 it parses the *last row's field values* against the three breach thresholds
@@ -280,6 +285,39 @@ self-alarm" under time pressure; the answer, as of 2026-07-30, is no.
 zero malformed rows (`REFUSING malformed row` count in the service journal: 0), max gap between
 consecutive samples over the last 300 rows: 5.3 minutes — the sampler has not gone stale in its
 observed lifetime; the gap above is about what happens if it ever does.
+
+### 4c. Canonical source and sync path for `paperclip-oom-guard.sh` (AUR-6177)
+
+Until AUR-6177, the live copy at `/usr/local/sbin/paperclip-oom-guard.sh` had **no repo canonical
+source at all** — unlike the mem-watch sampler (§4a) and alerter (§4b), a hotfix applied directly
+on the host had nothing to diff against and nothing would ever flag it as drift. The canonical
+source is now `scripts/paperclip-oom-guard.sh` in this repo, copied byte-identical from the live
+script (verified via `sha256sum` against the deployed copy at commit time).
+
+To change the guard: edit the repo copy, ship via PR, then deploy with
+
+```bash
+sudo install -m 0755 scripts/paperclip-oom-guard.sh /usr/local/sbin/paperclip-oom-guard.sh
+```
+
+No separate `install-*.sh` wrapper exists for this script, matching the sampler's own bare-`install`
+deploy path in §4a. Ongoing drift between the repo copy and the live script is now caught
+automatically by the script-drift axis in `scripts/deploy/check-deploy-drift.sh` (§4d — AUR-6177),
+the same mechanism §4a's regression harness note above hints at for the sampler, generalized to
+all three `/usr/local/sbin/paperclip-*.sh` scripts rather than relying on a per-script hand-rolled
+check.
+
+### 4d. Automatic drift detection across all three `/usr/local/sbin` scripts (AUR-6177)
+
+`scripts/deploy/check-deploy-drift.sh` runs on a schedule (same cadence as its other axes —
+checkout-drift, unit-drift, timer-liveness) and, when armed via `PAPERCLIP_DRIFT_SCRIPTS`, diffs
+each of `paperclip-mem-watch.sh`, `paperclip-mem-watch-alert.sh`, and `paperclip-oom-guard.sh`
+against its repo canonical source under the **active release's** `$APP_ROOT/current/`, never
+`origin/master` directly — a merged fix that hasn't been re-deployed yet is not drift. A mismatch
+sustained past a threshold (default 24h) fires the same graded INFO-severity gate as unit-drift
+and checkout-drift; a script missing from its expected installed path fires immediately. See the
+axis's own header comment in `check-deploy-drift.sh` for the full reasoning, and
+`scripts/deploy/systemd/paperclip-deploy-drift.service.d/40-scripts.conf` for the live manifest.
 
 ---
 

@@ -149,6 +149,7 @@ run_check() {
   PAPERCLIP_DRIFT_CHECKOUT_REFRESH="${PAPERCLIP_DRIFT_CHECKOUT_REFRESH-}" \
   PAPERCLIP_DRIFT_UNITS="${PAPERCLIP_DRIFT_UNITS-}" \
   PAPERCLIP_DRIFT_TIMERS="${PAPERCLIP_DRIFT_TIMERS-}" \
+  PAPERCLIP_DRIFT_SCRIPTS="${PAPERCLIP_DRIFT_SCRIPTS-}" \
   PAPERCLIP_DRIFT_SYSTEMCTL="${PAPERCLIP_DRIFT_SYSTEMCTL-}" \
   PAPERCLIP_DRIFT_TIMER_THRESHOLD_SEC="${PAPERCLIP_DRIFT_TIMER_THRESHOLD_SEC-}" \
   FAKE_SYSTEMCTL_DIR="${FAKE_SYSTEMCTL_DIR-}" \
@@ -1087,6 +1088,113 @@ if grep -q "status=DRIFT reason=untracked-or-unreachable:unreachable" <<<"$out" 
   ok "48: a genuinely refused connection still reports unreachable, running=none (unchanged)"
 else
   fail "48: a genuinely refused connection still reports unreachable, running=none (unchanged)" "rc=$rc out=$out"
+fi
+
+# --- script-drift axis (AUR-6177, follow-up to AUR-4692/AUR-5648) ----------
+# Standalone /usr/local/sbin monitor scripts run independent of the app
+# release pipeline, so unit-drift's own installer-artifact compare never
+# touches them — AUR-4692 found paperclip-mem-watch-alert.sh itself stale
+# with no detector watching it, and paperclip-oom-guard.sh had no repo
+# canonical source at all. These cases mirror the unit-drift axis cases
+# above (34-39): FIRE on a genuinely stale/missing installed script, PASS on
+# a current one, and confirm the axis is opt-in.
+
+SCRIPT_SRC_REL="scripts/paperclip-fixture-guard.sh"
+SCRIPT_REL_DIR="$APP/current/scripts"
+mkdir -p "$SCRIPT_REL_DIR"
+printf 'release copy content\n' > "$APP/current/$SCRIPT_SRC_REL"
+SCRIPT_INSTALLED="$TMP/installed-fixture-guard.sh"
+SD_LOG="$LOG.script-fixture"
+SD_STATE="$STATE.script-fixture"
+
+run_check_script() {
+  PAPERCLIP_DRIFT_SCRIPTS="fixture:$SCRIPT_SRC_REL:$SCRIPT_INSTALLED" run_check
+}
+
+# 47. PASS: installed copy byte-identical to the active release's own copy
+#     reports ok and pages no one.
+printf 'release copy content\n' > "$SCRIPT_INSTALLED"
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"; clear_ad_state
+rm -f "$SD_LOG" "$SD_STATE"
+out=$(run_check_script); rc=$?
+if [[ "$rc" == "0" && "$(alerts)" == "0" ]] && grep -q "script=fixture .*status=ok" <<<"$out"; then
+  ok "script content matching the active release reports ok and exits 0"
+else
+  fail "script content matching the active release reports ok and exits 0" "rc=$rc alerts=$(alerts) out=$out"
+fi
+
+# 48. FIRE (below threshold): installed copy diverges from the active
+#     release's copy. Seeded at 3h — below the 24h script-debt threshold, so
+#     it drifts (nonzero exit) but does not yet page.
+printf 'HAND-EDITED content, never reinstalled\n' > "$SCRIPT_INSTALLED"
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+: > "$SD_LOG"; : > "$SD_STATE"
+now=$(date -u +%s)
+stamp=$(date -u -d "@$(( now - 3 * 3600 ))" +%Y-%m-%dT%H:%M:%SZ)
+printf '%s script=fixture installed=%s status=DRIFT reason=script-behind:fixture\n' \
+  "$stamp" "$SCRIPT_INSTALLED" >> "$SD_LOG"
+out=$(run_check_script); rc=$?
+if [[ "$rc" == "1" && "$(alerts)" == "0" ]] && grep -q "reason=script-behind:fixture" <<<"$out"; then
+  ok "script content behind the active release for 3h drifts but does not page"
+else
+  fail "script content behind the active release for 3h drifts but does not page" "rc=$rc alerts=$(alerts) out=$out"
+fi
+
+# 49. FIRE (sustained past threshold): left behind for 30h, it pages, naming
+#     the script, at INFO severity (AUR-5355 posture: same fleet-internal
+#     debt character as unit-debt/checkout-debt, not a founder-actionable
+#     page).
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+: > "$SD_LOG"; : > "$SD_STATE"
+stamp=$(date -u -d "@$(( now - 30 * 3600 ))" +%Y-%m-%dT%H:%M:%SZ)
+printf '%s script=fixture installed=%s status=DRIFT reason=script-behind:fixture\n' \
+  "$stamp" "$SCRIPT_INSTALLED" >> "$SD_LOG"
+out=$(run_check_script); rc=$?
+if [[ "$(alerts)" == "1" ]] && grep -q "script-behind:fixture" "$SINK"; then
+  ok "script content behind the active release for 30h pages, naming the script"
+else
+  fail "script content behind the active release for 30h pages, naming the script" "rc=$rc alerts=$(alerts) sink=$(cat "$SINK" 2>/dev/null) out=$out"
+fi
+if grep -q "^INFO .*script-behind:fixture" "$SINK" && ! grep -q "^SEV2 " "$SINK"; then
+  ok "script-debt (script-behind) escalates at INFO, not SEV2"
+else
+  fail "script-debt (script-behind) escalates at INFO, not SEV2" "sink=$(cat "$SINK" 2>/dev/null)"
+fi
+
+# 50. FIRE (missing): the installed script is absent entirely — a real
+#     MISSING status, not a skip, since the manifest names a definitive
+#     expected location.
+rm -f "$SCRIPT_INSTALLED"
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+: > "$SD_LOG"; : > "$SD_STATE"
+out=$(run_check_script); rc=$?
+if [[ "$rc" == "1" ]] && grep -q "script=fixture .*status=DRIFT reason=script-missing:fixture" <<<"$out"; then
+  ok "missing installed script reports script-missing, not a skip"
+else
+  fail "missing installed script reports script-missing, not a skip" "rc=$rc out=$out"
+fi
+
+# 51. A manifest line whose active-release source copy does not exist is
+#     reported and skipped (not alarmed) — nothing to prove drift against,
+#     same posture as an unreachable checkout (case 24) / missing unit
+#     source (case 38).
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+out=$(PAPERCLIP_DRIFT_SCRIPTS="ghost:scripts/does-not-exist.sh:$TMP/whatever" run_check); rc=$?
+if [[ "$rc" == "0" && "$(alerts)" == "0" ]] && grep -q "active release copy .*does-not-exist.sh not found, skipping" <<<"$out"; then
+  ok "missing active-release source copy is skipped, not alarmed"
+else
+  fail "missing active-release source copy is skipped, not alarmed" "rc=$rc alerts=$(alerts) out=$out"
+fi
+
+# 52. Feature off by default: no PAPERCLIP_DRIFT_SCRIPTS, no script lines,
+#     exit still 0 on a converged deploy — opt-in for the same reason as
+#     PAPERCLIP_DRIFT_CHECKOUTS/UNITS/TIMERS (cases 25/39/46).
+reset; set_health_release "$MASTER_SHA"; set_activated "$MASTER_SHA"
+out=$(run_check); rc=$?
+if [[ "$rc" == "0" && "$(alerts)" == "0" ]] && ! grep -q "script=" <<<"$out"; then
+  ok "empty script list disables the axis entirely"
+else
+  fail "empty script list disables the axis entirely" "rc=$rc alerts=$(alerts) out=$out"
 fi
 
 echo

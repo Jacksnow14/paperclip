@@ -278,6 +278,11 @@ async function findRecentSendsToAddress(
       sentAtRaw instanceof Date ? sentAtRaw : typeof sentAtRaw === "string" ? new Date(sentAtRaw) : null;
     const gmailMessageId = typeof row.gmailMessageId === "string" ? row.gmailMessageId : null;
     if (!sentAt || Number.isNaN(sentAt.getTime()) || !gmailMessageId) continue;
+    // Re-check the window in JS as well as in SQL. The block decision must not
+    // depend on the WHERE clause having been honoured: a row that has aged out
+    // is not a cadence collision, and re-asserting that here is what makes the
+    // aged-out case a genuine passing control rather than an untested branch.
+    if (sentAt.getTime() < cutoff.getTime()) continue;
     matches.push({
       gmailMessageId,
       gmailThreadId: typeof row.gmailThreadId === "string" ? row.gmailThreadId : "",

@@ -218,7 +218,7 @@ describe("agent wakeup-requests and runs routes", () => {
     const res = await request(createApp()).get("/api/agents/11111111-1111-4111-8111-111111111111/runs?limit=5");
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(mockHeartbeatService.list).toHaveBeenCalledWith("company-1", AGENT_ID, 5);
+    expect(mockHeartbeatService.list).toHaveBeenCalledWith("company-1", AGENT_ID, 5, undefined);
     expect(res.body).toHaveLength(1);
     expect(res.body[0]).toMatchObject({ id: "run-1", status: "succeeded" });
   });
@@ -227,9 +227,9 @@ describe("agent wakeup-requests and runs routes", () => {
     mockHeartbeatService.list.mockResolvedValue([]);
 
     await request(createApp()).get("/api/agents/11111111-1111-4111-8111-111111111111/runs?limit=99999");
-    expect(mockHeartbeatService.list).toHaveBeenLastCalledWith("company-1", AGENT_ID, 1000);
+    expect(mockHeartbeatService.list).toHaveBeenLastCalledWith("company-1", AGENT_ID, 1000, undefined);
 
     await request(createApp()).get("/api/agents/11111111-1111-4111-8111-111111111111/runs");
-    expect(mockHeartbeatService.list).toHaveBeenLastCalledWith("company-1", AGENT_ID, 50);
+    expect(mockHeartbeatService.list).toHaveBeenLastCalledWith("company-1", AGENT_ID, 50, undefined);
   });
 });

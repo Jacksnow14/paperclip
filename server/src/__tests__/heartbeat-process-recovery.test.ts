@@ -1155,8 +1155,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .select()
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.agentId, agentId));
-    expect(runs).toHaveLength(1);
-    expect(runs[0]?.status).toBe("failed");
+    // AUR-6178: the repaired in-place path now anchors a recovery action and
+    // enqueues a wake for its owner, same as path 1 — that wake mints a second
+    // (queued) run alongside the original failed run.
+    expect(runs).toHaveLength(2);
+    const originalRun = runs.find((row) => row.id === runId);
+    expect(originalRun?.status).toBe("failed");
 
     const recoveryIssue = await waitForValue(async () =>
       db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => {
@@ -2770,7 +2774,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   it("returns an already stranded recovery issue to todo without creating a recovery child", async () => {
-    const { companyId, issueId } = await seedStrandedIssueFixture({
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "todo",
       runStatus: "failed",
       retryReason: "assignment_recovery",
@@ -2838,12 +2842,106 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       );
     expect(blockerRelations).toHaveLength(0);
 
+    const action = await strandedRecoveryActionFor(companyId, issueId);
+    expect(action).toMatchObject({
+      status: "active",
+      attemptCount: 1,
+      ownerAgentId: agentId,
+    });
+
+    expect(recoveryIssues[0]?.assigneeAgentId).toBe(agentId);
+
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(1);
     expect(comments[0]?.body).toContain("stopped automatic stranded-work recovery");
     expect(comments[0]?.body).toContain("recovery issues do not create nested `stranded_issue_recovery` issues");
     expect(comments[0]?.body).toContain(`Recovery issue: [${recoveryIssues[0]?.identifier}]`);
     expect(comments[0]?.body).toContain("Next action:");
+  });
+
+  it("converges to a bounded number of comments/attempts when a stranded recovery issue stays a candidate (AUR-6178)", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "failed",
+      retryReason: "assignment_recovery",
+    });
+    const sourceIssueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      title: "Original source issue",
+      status: "blocked",
+      priority: "medium",
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+    });
+    await db
+      .update(issues)
+      .set({
+        title: "Recover stalled issue from previous adapter failure",
+        parentId: sourceIssueId,
+        originKind: "stranded_issue_recovery",
+        originId: sourceIssueId,
+        originRunId: sourceRunId,
+        originFingerprint: [
+          "stranded_issue_recovery",
+          companyId,
+          sourceIssueId,
+          sourceRunId,
+        ].join(":"),
+      })
+      .where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+
+    const TICKS = 5;
+    const escalatedPerTick: number[] = [];
+    const statusPerTick: string[] = [];
+    for (let i = 0; i < TICKS; i += 1) {
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      escalatedPerTick.push(result.escalated);
+      const current = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      statusPerTick.push(current?.status ?? "unknown");
+    }
+
+    // Only the first tick actually escalates; the 24h recovery-action cooldown
+    // makes every subsequent tick a no-op (skipped, not re-escalated).
+    expect(escalatedPerTick).toEqual([1, 0, 0, 0, 0]);
+    expect(statusPerTick).toEqual(Array(TICKS).fill("todo"));
+
+    const action = await strandedRecoveryActionFor(companyId, issueId);
+    expect(action).toMatchObject({
+      status: "active",
+      attemptCount: 1,
+      ownerAgentId: agentId,
+    });
+
+    const blockerRelations = await db
+      .select()
+      .from(issueRelations)
+      .where(
+        and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.relatedIssueId, issueId),
+          eq(issueRelations.type, "blocks"),
+        ),
+      );
+    expect(blockerRelations).toHaveLength(0);
+
+    const recoveryIssues = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
+    expect(recoveryIssues).toHaveLength(1);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
   });
 
   it("assigns open unassigned blockers back to their creator agent", async () => {
@@ -3712,8 +3810,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(nestedRecoveries).toHaveLength(0);
 
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
-    expect(runs).toHaveLength(1);
-    expect(runs[0]?.id).toBe(runId);
+    // AUR-6178: the repaired in-place path anchors a recovery action and enqueues
+    // a wake for its owner, same as path 1 — that wake mints a second (queued) run
+    // alongside the original failed run.
+    expect(runs).toHaveLength(2);
+    expect(runs.some((row) => row.id === runId)).toBe(true);
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(1);
@@ -3789,11 +3890,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       })
       .where(eq(issues.id, issueId));
 
+    // AUR-6178: the repaired in-place path gates re-escalation on the same 24h
+    // recovery-action cooldown path 1 uses, so a second failure that lands while
+    // the action is still warm is a no-op (skipped), not a second escalation.
     const secondResult = await heartbeat.reconcileStrandedAssignedIssues();
     expect(secondResult.dispatchRequeued).toBe(0);
     expect(secondResult.continuationRequeued).toBe(0);
-    expect(secondResult.escalated).toBe(1);
-    expect(secondResult.issueIds).toEqual([issueId]);
+    expect(secondResult.escalated).toBe(0);
+    expect(secondResult.issueIds).toEqual([]);
 
     const recoveryIssuesForSource = await db
       .select()
@@ -3809,8 +3913,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await expect(sourceBlockerIssueIds(companyId, sourceIssueId)).resolves.toEqual([issueId]);
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
-    expect(comments).toHaveLength(2);
-    expect(comments[1]?.body).toContain("Latest retry failure details were withheld from the issue thread");
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("Latest retry failure details were withheld from the issue thread");
+
+    const action = await strandedRecoveryActionFor(companyId, issueId);
+    expect(action).toMatchObject({ status: "active", attemptCount: 1, ownerAgentId: agentId });
   });
 
   it("does not escalate paused-tree recovery when the automatic continuation retry was cancelled by the hold", async () => {

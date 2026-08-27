@@ -56,6 +56,7 @@ const {
   isColdOutreachOwnSend,
   isShopifyInformationalNotification,
   isSelfOriginatedAuditCopy,
+  isSenderBccListBlast,
   classifyTicketingAutoresponder,
 } = await import("../services/gmail-intake.js");
 
@@ -1974,5 +1975,186 @@ describe("thread lookup excludes null-issueId rows (AUR-5491)", () => {
     );
     expect(result.updated).toBe(1);
     expect(result.created).toBe(0);
+  });
+});
+
+describe("sender-Bcc list blast suppression (AUR-6234)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function makeBccBlastMessage(
+    id: string,
+    threadId: string,
+    from: string,
+    to: string,
+    cc: string,
+    subject: string,
+  ) {
+    const msg = makeMessage(id, threadId, subject);
+    msg.payload.headers[0].value = from;
+    msg.payload.headers.push({ name: "To", value: to });
+    if (cc) msg.payload.headers.push({ name: "Cc", value: cc });
+    return msg;
+  }
+
+  it("classifier: matches a sender addressed to their own address/domain with no owned mailbox in To/Cc", () => {
+    // 1a03ede846de4b44 (2026-08-26) — self-addressed To, us reached only via Bcc.
+    expect(
+      isSenderBccListBlast(
+        "coffee@temeculacoffeeroasters.com",
+        "coffee@temeculacoffeeroasters.com",
+        "",
+      ),
+    ).toBe(true);
+    // 1a0159f938686444 (2026-08-18) — display-name variant.
+    expect(
+      isSenderBccListBlast(
+        "Temecula Coffee (TCR) <coffee@temeculacoffeeroasters.com>",
+        '"Temecula Coffee (TCR)" <coffee@temeculacoffeeroasters.com>',
+        "",
+      ),
+    ).toBe(true);
+    // Own-domain variant (a different address at the same sending domain).
+    expect(
+      isSenderBccListBlast(
+        "list@temeculacoffeeroasters.com",
+        "announcements@temeculacoffeeroasters.com",
+        "",
+      ),
+    ).toBe(true);
+  });
+
+  it("classifier: negative — genuine replies addressed directly to us must never be suppressed", () => {
+    // 1a025086ce0094b3 (2026-08-21).
+    expect(
+      isSenderBccListBlast(
+        "coffee@temeculacoffeeroasters.com",
+        '"Alex - Auranode" <alex@tryauranode.com>',
+        "",
+      ),
+    ).toBe(false);
+    // 1a035824c1c3c819 (2026-08-24).
+    expect(
+      isSenderBccListBlast(
+        "coffee@temeculacoffeeroasters.com",
+        "alex@tryauranode.com",
+        "",
+      ),
+    ).toBe(false);
+    // Owned mailbox present only on Cc still counts as visible.
+    expect(
+      isSenderBccListBlast(
+        "coffee@temeculacoffeeroasters.com",
+        "coffee@temeculacoffeeroasters.com",
+        "board@tryauranode.com",
+      ),
+    ).toBe(false);
+    // Mixed-format To header: one address bracketed (the sender's own,
+    // self-addressed for the blast case), the other bare — a very ordinary
+    // shape for a To with multiple recipients. Previously the bracket
+    // extraction was all-or-nothing per header, so the bare address
+    // (alex@tryauranode.com) was silently dropped entirely, making this
+    // read as "we're not a visible recipient" and misclassify a message
+    // genuinely addressed to us as a Bcc list blast.
+    expect(
+      isSenderBccListBlast(
+        "coffee@temeculacoffeeroasters.com",
+        '"TCR List" <coffee@temeculacoffeeroasters.com>, alex@tryauranode.com',
+        "",
+      ),
+    ).toBe(false);
+  });
+
+  it("classifier: negative — a genuine Bcc to us on mail addressed to a third party is not a list blast (scope guard)", () => {
+    // Condition 1 holds (we're not in To/Cc) but condition 2 fails — the To
+    // address is neither the sender nor the sender's own domain, so this is
+    // an ordinary individual Bcc, not a self-addressed broadcast. Must not
+    // be suppressed by a "no address of ours anywhere" heuristic.
+    expect(
+      isSenderBccListBlast(
+        "coffee@temeculacoffeeroasters.com",
+        "someone-else@example.com",
+        "",
+      ),
+    ).toBe(false);
+  });
+
+  it("classifier: negative — a multi-recipient To where one address is not the sender's own is not suppressed", () => {
+    expect(
+      isSenderBccListBlast(
+        "coffee@temeculacoffeeroasters.com",
+        "coffee@temeculacoffeeroasters.com, someone-else@example.com",
+        "",
+      ),
+    ).toBe(false);
+  });
+
+  it("classifier: negative — empty To or unparseable sender never suppress", () => {
+    expect(isSenderBccListBlast("coffee@temeculacoffeeroasters.com", "", "")).toBe(false);
+    expect(isSenderBccListBlast("not-an-address", "coffee@temeculacoffeeroasters.com", "")).toBe(
+      false,
+    );
+  });
+
+  it("skips issue creation for the TCR partner Bcc broadcast (AUR-4357/AUR-6232 shape)", async () => {
+    const msg = makeBccBlastMessage(
+      "tcr-blast-1",
+      "thread-tcr-blast-1",
+      "Temecula Coffee (TCR) <coffee@temeculacoffeeroasters.com>",
+      '"Temecula Coffee (TCR)" <coffee@temeculacoffeeroasters.com>',
+      "",
+      "You're invited: partner Zoom call",
+    );
+    mockListMessages.mockResolvedValue({ messages: [{ id: "tcr-blast-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([{ id: "lbl-t", name: "paperclip/triaged" }]);
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "should-not-exist" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "alex");
+
+    expect(mockIssueCreate).not.toHaveBeenCalled();
+    expect(mockAddComment).not.toHaveBeenCalled();
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(result.processed).toBe(1);
+
+    // Retained as case-file evidence: intake record written (issueId null),
+    // mail itself untouched — no triaged label applied.
+    const insertValues = (db as ReturnType<typeof buildDbMock>)._insertChain.values.mock
+      .calls[0][0] as Record<string, unknown>;
+    expect(insertValues.gmailMessageId).toBe("tcr-blast-1");
+    expect(insertValues.issueId).toBeNull();
+    expect(mockModifyMessageLabels).not.toHaveBeenCalled();
+  });
+
+  it("still mints an issue for a genuine Will reply addressed to alex@ (negative control, must not regress AUR-6052/AUR-6129/AUR-6130 correspondence)", async () => {
+    const msg = makeBccBlastMessage(
+      "tcr-real-reply-1",
+      "thread-tcr-real-reply-1",
+      "Will <coffee@temeculacoffeeroasters.com>",
+      "alex@tryauranode.com",
+      "",
+      "Re: FDA label wording",
+    );
+    mockListMessages.mockResolvedValue({ messages: [{ id: "tcr-real-reply-1" }] });
+    mockGetMessage.mockResolvedValue(msg);
+    mockListLabels.mockResolvedValue([]);
+    mockCreateLabel.mockResolvedValue({ id: "lbl-x" });
+    mockModifyMessageLabels.mockResolvedValue({});
+    mockIssueCreate.mockResolvedValue({ id: "issue-tcr-real-reply-1" });
+    mockAddComment.mockResolvedValue({});
+
+    const db = buildDbMock({ selectRows: [] });
+    const svc = createGmailIntakeService(db);
+    const result = await svc.processMailbox(COMPANY_ID, "alex");
+
+    expect(mockIssueCreate).toHaveBeenCalledOnce();
+    expect(result.created).toBe(1);
+    expect(result.skipped).toBe(0);
   });
 });

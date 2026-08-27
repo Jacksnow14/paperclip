@@ -1,4 +1,5 @@
 import { google } from "googleapis";
+import { and, eq, gte } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { gmailOutboundRecords } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
@@ -13,6 +14,15 @@ import {
 import { loadServiceAccountKey } from "./google-service-account.js";
 
 const DOMAIN = "tryauranode.com";
+
+// AUR-6347: per-counterparty send-cadence window. Two different agent runs,
+// on two different issues, each unaware of the other, sent 3 emails to the
+// same real supplier inside 6 minutes — a question and its answer crossed by
+// ten seconds. Row-level issue checkout does not prevent this: it protects
+// the tracker row, not the human on the other end. Company-wide, not scoped
+// to a mailbox/issue/thread, because that scoping gap is exactly what let
+// the incident happen.
+export const RECENT_SEND_CADENCE_WINDOW_MS = 20 * 60 * 1000;
 export const GMAIL_SUPPORTED_ALIASES = ["board", "alex"] as const;
 export type GmailAlias = (typeof GMAIL_SUPPORTED_ALIASES)[number];
 
@@ -206,6 +216,77 @@ function isApprovalScopedToSend(
   return true;
 }
 
+// AUR-6347.
+export interface RecentOutboundSend {
+  gmailMessageId: string;
+  gmailThreadId: string;
+  sentAt: Date;
+}
+
+export class GmailRecentSendBlockedError extends Error {
+  readonly address: string;
+  readonly recentSends: RecentOutboundSend[];
+  constructor(address: string, recentSends: RecentOutboundSend[], windowMs: number) {
+    const windowMin = Math.round(windowMs / 60_000);
+    const recent = recentSends
+      .map((s) => `${s.gmailMessageId} (thread ${s.gmailThreadId || "unknown"}) at ${s.sentAt.toISOString()}`)
+      .join("; ");
+    super(
+      `BLOCKED: we already sent to ${address} within the last ${windowMin} minutes ` +
+        `(AUR-6347 cadence guardrail). Recent message(s): ${recent}. ` +
+        `Re-read the thread and confirm this send is still correct, then re-send with ` +
+        `acknowledgeRecentSend:true to proceed.`,
+    );
+    this.name = "GmailRecentSendBlockedError";
+    this.address = address;
+    this.recentSends = recentSends;
+  }
+}
+
+// AUR-6347: looks at prior outbound (recorded by the sendMessage() chokepoint
+// tracking write, see AUR-1796) to the same recipient ADDRESS across the
+// whole company — not scoped to a mailbox, issue, or thread — within the
+// cadence window. Defensive against malformed/foreign rows (a test double or
+// a future schema change) by skipping anything that doesn't parse cleanly
+// rather than throwing, since a query failure here must never itself block a
+// send — only a genuine matching row does.
+async function findRecentSendsToAddress(
+  db: Db,
+  companyId: string,
+  address: string,
+  windowMs: number,
+): Promise<RecentOutboundSend[]> {
+  const cutoff = new Date(Date.now() - windowMs);
+  let rows: unknown[];
+  try {
+    rows = await db
+      .select()
+      .from(gmailOutboundRecords)
+      .where(and(eq(gmailOutboundRecords.companyId, companyId), gte(gmailOutboundRecords.sentAt, cutoff)));
+  } catch (err) {
+    logger.error({ err, companyId, address }, "gmail-guard: failed to query cadence records (AUR-6347)");
+    return [];
+  }
+  const matches: RecentOutboundSend[] = [];
+  for (const raw of rows ?? []) {
+    if (!raw || typeof raw !== "object") continue;
+    const row = raw as Record<string, unknown>;
+    const recipientRaw = typeof row.recipient === "string" ? row.recipient : undefined;
+    if (!extractEmailAddresses(recipientRaw).includes(address)) continue;
+    const sentAtRaw = row.sentAt;
+    const sentAt =
+      sentAtRaw instanceof Date ? sentAtRaw : typeof sentAtRaw === "string" ? new Date(sentAtRaw) : null;
+    const gmailMessageId = typeof row.gmailMessageId === "string" ? row.gmailMessageId : null;
+    if (!sentAt || Number.isNaN(sentAt.getTime()) || !gmailMessageId) continue;
+    matches.push({
+      gmailMessageId,
+      gmailThreadId: typeof row.gmailThreadId === "string" ? row.gmailThreadId : "",
+      sentAt,
+    });
+  }
+  return matches.sort((a, b) => b.sentAt.getTime() - a.sentAt.getTime());
+}
+
 export interface GmailAttachmentInput {
   filename: string;
   mimeType: string;
@@ -268,6 +349,14 @@ export interface GmailSendOptions {
   outboundKind?: "vendor_inquiry";
   /** AUR-5891: why this role mailbox is the correct address for this send (>=20 chars). */
   outboundJustification?: string;
+  /**
+   * AUR-6347: explicit acknowledgement that we've already sent to this
+   * recipient within RECENT_SEND_CADENCE_WINDOW_MS and the caller has
+   * re-read the thread and confirmed this send is still correct. Without it,
+   * a repeat send to the same address inside the window is soft-blocked
+   * (GmailRecentSendBlockedError) naming the prior message(s).
+   */
+  acknowledgeRecentSend?: boolean;
 }
 
 export interface GmailReplyOptions {
@@ -299,6 +388,8 @@ export interface GmailReplyOptions {
   outboundKind?: "vendor_inquiry";
   /** AUR-5891: see GmailSendOptions.outboundJustification. */
   outboundJustification?: string;
+  /** AUR-6347: see GmailSendOptions.acknowledgeRecentSend. */
+  acknowledgeRecentSend?: boolean;
 }
 
 export interface GmailListOptions {
@@ -764,6 +855,34 @@ export function createGmailService(db?: Db) {
       }
     }
 
+    // AUR-6347: per-counterparty send-cadence check. Scoped to the recipient
+    // ADDRESS, not the issue/thread/mailbox — the incident this guards
+    // against was two DIFFERENT agent runs, on two different issues, neither
+    // aware of the other, both emailing the same human within minutes. Own-
+    // domain recipients are exempt (never a counterparty); a recipient with
+    // suppression/machine-only evidence never reaches this point — it was
+    // already hard-blocked above by the AUR-5734 guard. This is a soft block:
+    // acknowledgeRecentSend:true (a deliberate, per-send opt-out, same shape
+    // as allowSelfAddressed/outboundKind) proceeds past it.
+    if (db && tracking?.companyId && !opts.acknowledgeRecentSend) {
+      const toAddresses = extractEmailAddresses(opts.to).filter((addr) => !isOwnDomain(addr));
+      for (const address of toAddresses) {
+        const recent = await findRecentSendsToAddress(
+          db,
+          tracking.companyId,
+          address,
+          RECENT_SEND_CADENCE_WINDOW_MS,
+        );
+        if (recent.length > 0) {
+          logger.warn(
+            { alias, to: opts.to, address, recentSends: recent },
+            "gmail-guard: BLOCKED repeat send inside cadence window (AUR-6347)",
+          );
+          throw new GmailRecentSendBlockedError(address, recent, RECENT_SEND_CADENCE_WINDOW_MS);
+        }
+      }
+    }
+
     const gmail = buildGmailClient(alias);
     const from = resolveMailboxEmail(alias);
     const requestBody: { raw: string; threadId?: string } = { raw: "" };
@@ -925,6 +1044,8 @@ export function createGmailService(db?: Db) {
         // the declared-intent role-mailbox opt-out.
         outboundKind: opts.outboundKind,
         outboundJustification: opts.outboundJustification,
+        // AUR-6347: see GmailSendOptions.acknowledgeRecentSend.
+        acknowledgeRecentSend: opts.acknowledgeRecentSend,
       },
       guard,
       tracking,

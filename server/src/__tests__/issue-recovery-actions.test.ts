@@ -638,6 +638,79 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(recoveryIssues[0]?.status).toBe("todo");
   });
 
+  // AUR-6391: `hasActiveExecutionPath` gates `reconcileStrandedAssignedIssues` — it must
+  // recognize a future, still-scheduled issue monitor as a live path (the arm-to-fire
+  // window materializes no row in any of the tables the other three checks query), while
+  // still flagging the cases the monitor firer (`tickDueIssueMonitors`) would itself
+  // refuse to fire as genuinely stranded. A guard is only proven by one passing and one
+  // failing case per source of falseness (artifact-provenance doctrine).
+  describe("hasActiveExecutionPath monitor liveness", () => {
+    async function seedMonitorIssue(overrides: Record<string, unknown> = {}) {
+      const { companyId, coderId, sourceIssueId } = await seedCompany();
+      if (Object.keys(overrides).length > 0) {
+        await db
+          .update(issues)
+          .set(overrides)
+          .where(eq(issues.id, sourceIssueId));
+      }
+      return { companyId, coderId, sourceIssueId };
+    }
+
+    const now = new Date("2026-08-28T00:00:00.000Z");
+    const future = new Date("2026-09-01T00:30:00.000Z");
+    const past = new Date("2026-08-27T00:00:00.000Z");
+    const scheduledExecutionState = { monitor: { status: "scheduled" } };
+
+    it("PASS: returns true for a future, scheduled monitor on an in_progress agent-assigned issue", async () => {
+      const { companyId, sourceIssueId } = await seedMonitorIssue({
+        monitorNextCheckAt: future,
+        executionState: scheduledExecutionState,
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+      expect(await recovery.hasActiveExecutionPath(companyId, sourceIssueId, now)).toBe(true);
+    });
+
+    it("FIRE: returns false for an overdue monitor that never fired", async () => {
+      const { companyId, sourceIssueId } = await seedMonitorIssue({
+        monitorNextCheckAt: past,
+        executionState: scheduledExecutionState,
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+      expect(await recovery.hasActiveExecutionPath(companyId, sourceIssueId, now)).toBe(false);
+    });
+
+    it("FIRE: returns false when no monitor is scheduled at all", async () => {
+      const { companyId, sourceIssueId } = await seedMonitorIssue();
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+      expect(await recovery.hasActiveExecutionPath(companyId, sourceIssueId, now)).toBe(false);
+    });
+
+    it("FIRE: returns false for a future monitor on a todo issue (the firer would refuse it)", async () => {
+      const { companyId, sourceIssueId } = await seedMonitorIssue({
+        status: "todo",
+        monitorNextCheckAt: future,
+        executionState: scheduledExecutionState,
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+      expect(await recovery.hasActiveExecutionPath(companyId, sourceIssueId, now)).toBe(false);
+    });
+
+    it("FIRE: returns false for a future monitor on a user-assigned issue (the firer would refuse it)", async () => {
+      const { companyId, sourceIssueId } = await seedMonitorIssue({
+        assigneeUserId: "user-1",
+        monitorNextCheckAt: future,
+        executionState: scheduledExecutionState,
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) });
+
+      expect(await recovery.hasActiveExecutionPath(companyId, sourceIssueId, now)).toBe(false);
+    });
+  });
+
   it("exposes active recovery actions on the issue read API", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     const recoveryActionSvc = issueRecoveryActionService(db);

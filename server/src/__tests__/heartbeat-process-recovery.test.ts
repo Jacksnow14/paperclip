@@ -4357,6 +4357,70 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  // AUR-6391: reproduces the AUR-6348 shape end to end through the actual sweep entry
+  // point — an in_progress, agent-assigned issue whose latest continuation run failed
+  // must still be escalated to `stranded_assigned_issue` when its monitor is overdue or
+  // absent, but must be skipped while a future monitor is armed and scheduled.
+  describe("AUR-6391 hasActiveExecutionPath via scheduled issue monitor", () => {
+    it("FIRE: still escalates when the monitor is overdue (never fired)", async () => {
+      const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "failed",
+        retryReason: "issue_continuation_needed",
+      });
+      await db
+        .update(issues)
+        .set({
+          monitorNextCheckAt: new Date("2026-03-01T00:00:00.000Z"),
+          executionState: { monitor: { status: "scheduled" } },
+        })
+        .where(eq(issues.id, issueId));
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.escalated).toBe(1);
+      expect(result.issueIds).toEqual([issueId]);
+      await expectSourceScopedStrandedRecoveryAction({
+        companyId,
+        agentId,
+        issueId,
+        runId,
+        previousStatus: "in_progress",
+        retryReason: "issue_continuation_needed",
+      });
+    });
+
+    it("PASS: skips escalation while a future monitor is scheduled (AUR-6348 shape)", async () => {
+      const { companyId, issueId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "failed",
+        retryReason: "issue_continuation_needed",
+      });
+      await db
+        .update(issues)
+        .set({
+          monitorNextCheckAt: new Date(Date.now() + 4 * 24 * 60 * 60 * 1000),
+          executionState: { monitor: { status: "scheduled" } },
+        })
+        .where(eq(issues.id, issueId));
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.escalated).toBe(0);
+      expect(result.skipped).toBe(1);
+      expect(result.issueIds).toEqual([]);
+
+      const actions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+      expect(actions).toHaveLength(0);
+
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      expect(issue?.status).toBe("in_progress");
+    });
+  });
+
   // AUR-5102 (P1): the unclaimability gauntlet must run on the periodic sweep,
   // not only at admission — with the global cap saturated 100% of the time,
   // admission never ran it and stale queued runs sat until operator trims.

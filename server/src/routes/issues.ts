@@ -3440,7 +3440,23 @@ export function issueRoutes(
         updateFields.assigneeAgentId !== undefined
           ? updateFields.assigneeAgentId
           : existing.assigneeAgentId;
-      if (effectiveAssigneeAgentId === req.actor.agentId && explicitAssigneeUserId === undefined) {
+      // AUR-6429: a scheduled issue monitor is itself a review path
+      // (assertAgentInReviewReviewPath below accepts it) — don't force a
+      // reassignment the caller doesn't need just because they stayed
+      // self-assigned. Without this, a monitor-parked issue could never
+      // reach in_review via a plain self-PATCH: this auto-route guard ran
+      // first and unconditionally 422'd before the monitor check downstream
+      // was ever reached.
+      const selfAssignedReviewHasScheduledMonitor = hasScheduledMonitor({
+        existingMonitorNextCheckAt: existing.monitorNextCheckAt ?? null,
+        patchMonitorNextCheckAt: updateFields.monitorNextCheckAt,
+        executionPolicy: updateFields.executionPolicy,
+      });
+      if (
+        effectiveAssigneeAgentId === req.actor.agentId &&
+        explicitAssigneeUserId === undefined &&
+        !selfAssignedReviewHasScheduledMonitor
+      ) {
         // AUR-5985: an explicit assigneeAgentId in the same request is about to
         // be discarded by the auto-route below — remember that so the response
         // can say so instead of silently returning 200 with a different assignee.

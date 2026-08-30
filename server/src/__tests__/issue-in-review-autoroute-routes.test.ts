@@ -380,6 +380,75 @@ describe("in_review auto-route guard", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  it("AUR-6429: allows self-assigned agent in_review transition when a scheduled monitor is present (createdByAgentId exists, no createdByUserId)", async () => {
+    const issueWithAgentCreatorAndMonitor = {
+      ...BASE_ISSUE,
+      createdByUserId: null,
+      createdByAgentId: "other-creator-agent",
+      executionPolicy: {
+        monitor: {
+          status: "scheduled",
+          scheduledBy: "assignee",
+          nextCheckAt: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString(),
+          maxAttempts: 4,
+        },
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(issueWithAgentCreatorAndMonitor);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issueWithAgentCreatorAndMonitor,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    // If the guard incorrectly fired, this would 422 (no manager fallback is even consulted here).
+    mockAgentService.getById.mockResolvedValue({ id: "agent-1", reportsTo: "manager-agent-1" });
+
+    const res = await request(await createAgentApp())
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(200);
+    const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(patch.status).toBe("in_review");
+    // Self-assignment must be preserved -- no forced reassignment to the manager or creator.
+    expect(patch.assigneeAgentId).toBeUndefined();
+    expect(patch.assigneeUserId).toBeUndefined();
+    expect(mockAgentService.getById).not.toHaveBeenCalled();
+  });
+
+  it("AUR-5832: no-creator issue with a scheduled monitor is exempted from the guard (no manager fallback consulted)", async () => {
+    const creatorlessIssueWithMonitor = {
+      ...BASE_ISSUE,
+      createdByUserId: null,
+      createdByAgentId: null,
+      executionPolicy: {
+        monitor: {
+          status: "scheduled",
+          scheduledBy: "assignee",
+          nextCheckAt: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString(),
+          maxAttempts: 4,
+        },
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(creatorlessIssueWithMonitor);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...creatorlessIssueWithMonitor,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createAgentApp())
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(200);
+    const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(patch.status).toBe("in_review");
+    expect(patch.assigneeAgentId).toBeUndefined();
+    expect(patch.assigneeUserId).toBeUndefined();
+    expect(mockAgentService.getById).not.toHaveBeenCalled();
+  });
+
   it("AUR-5985: comment-only PATCH on an already-in_review creator-less issue with a scheduled assignee monitor keeps the assignment (no bounce to manager)", async () => {
     const creatorlessInReviewIssue = {
       ...BASE_ISSUE,

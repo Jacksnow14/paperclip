@@ -16,6 +16,7 @@ import { execFileSync } from 'node:child_process';
 import {
   DEFAULT_REPOS,
   PLATFORM_LABEL_ID,
+  StaleLaneError,
   api,
   applyFileCap,
   assessLaneHealth,
@@ -24,10 +25,13 @@ import {
   distributeReviewers,
   escalationMessage,
   extractAurToken,
+  fileOneItem,
+  isLaneHeartbeatStale,
   isStarvedRun,
   issueBody,
   issueTitle,
   migrateState,
+  pickFallbackLane,
   pickReviewer,
   refileCapMessage,
   stateKey,
@@ -459,6 +463,175 @@ test('assessLaneHealth counts queued runs for load-based distribution', () => {
     { status: 'succeeded', usageJson: { inputTokens: 1, outputTokens: 1 } },
   ];
   assert.equal(assessLaneHealth(runs).queuedCount, 2);
+});
+
+// ---------------------------------------------------------------------------
+// AUR-6430: the precheck must predict the server's stale-lane 409, and a
+// 409 that still slips through mid-run must degrade gracefully, not FATAL.
+// ---------------------------------------------------------------------------
+
+test('isLaneHeartbeatStale: exact reproduction of the AUR-6430 log evidence (FIRING case)', () => {
+  // lastHeartbeatAt 2026-08-29T13:37:14.463Z, run at 2026-08-30T18:13:02Z —
+  // heartbeatAgeMs 102949262 in the server's own 409 body, > 86400000 threshold.
+  const nowMs = Date.parse('2026-08-30T18:13:02.000Z');
+  const instance = { lastHeartbeatAt: '2026-08-29T13:37:14.463Z' };
+  assert.equal(isLaneHeartbeatStale(instance, nowMs), true);
+});
+
+test('isLaneHeartbeatStale: a lane inside the 24h threshold stays healthy (PASSING case)', () => {
+  const nowMs = Date.parse('2026-08-30T18:13:02.000Z');
+  const instance = { lastHeartbeatAt: '2026-08-30T10:00:00.000Z' };
+  assert.equal(isLaneHeartbeatStale(instance, nowMs), false);
+});
+
+test('isLaneHeartbeatStale: null lastHeartbeatAt is never stale (agents that never heartbeat)', () => {
+  const nowMs = Date.parse('2026-08-30T18:13:02.000Z');
+  assert.equal(isLaneHeartbeatStale({ lastHeartbeatAt: null }, nowMs), false);
+  assert.equal(isLaneHeartbeatStale({}, nowMs), false);
+});
+
+test('pickFallbackLane picks the least-loaded lane not already proven stale', () => {
+  const lanes = [
+    { id: 'a', name: 'A', queuedCount: 3 },
+    { id: 'b', name: 'B', queuedCount: 1 },
+    { id: 'c', name: 'C', queuedCount: 0 },
+  ];
+  assert.equal(pickFallbackLane(lanes, new Set(['c'])).id, 'b');
+});
+
+test('pickFallbackLane returns null when every lane has been excluded', () => {
+  const lanes = [{ id: 'a', name: 'A', queuedCount: 0 }];
+  assert.equal(pickFallbackLane(lanes, new Set(['a'])), null);
+});
+
+test('api() throws StaleLaneError on a stale-lane 409, carrying the offending agentId (AUR-6430)', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        error: 'Cannot assign work to a stale agent lane',
+        details: { agentId: 'agent-max', agentStatus: 'idle', heartbeatAgeMs: 102949262 },
+      }),
+      { status: 409 },
+    );
+  try {
+    await assert.rejects(
+      () =>
+        api({ apiBase: 'http://example.invalid' }, 'POST', '/api/companies/x/issues', {
+          title: 't',
+          assigneeAgentId: 'agent-max',
+        }),
+      (err) => {
+        assert.ok(err instanceof StaleLaneError);
+        assert.equal(err.agentId, 'agent-max');
+        assert.match(err.message, /409/);
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('api() still throws a plain Error on a 409 unrelated to stale lanes', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response('{"error":"some other conflict"}', { status: 409 });
+  try {
+    await assert.rejects(
+      () =>
+        api({ apiBase: 'http://example.invalid' }, 'POST', '/api/companies/x/issues', {
+          title: 't',
+          assigneeAgentId: 'agent-max',
+        }),
+      (err) => {
+        assert.equal(err instanceof StaleLaneError, false);
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('fileOneItem retries on a stale-lane 409 and succeeds on the fallback lane (AUR-6430)', async () => {
+  const originalFetch = globalThis.fetch;
+  const posts = [];
+  globalThis.fetch = async (url, init = {}) => {
+    if (init.method === 'POST') {
+      const body = JSON.parse(init.body);
+      posts.push(body.assigneeAgentId);
+      if (body.assigneeAgentId === 'agent-max') {
+        return new Response(
+          JSON.stringify({
+            error: 'Cannot assign work to a stale agent lane',
+            details: { agentId: 'agent-max' },
+          }),
+          { status: 409 },
+        );
+      }
+      return new Response(JSON.stringify({ id: 'issue-1', identifier: 'AUR-1' }), { status: 201 });
+    }
+    return new Response(JSON.stringify({ id: 'issue-1', status: 'backlog' }), { status: 200 });
+  };
+  try {
+    const lanes = [
+      { id: 'agent-max', name: 'Claude Code Max', queuedCount: 0 },
+      { id: 'agent-fast', name: 'Claude Code Fast', queuedCount: 1 },
+    ];
+    const staleLaneIds = new Set();
+    const item = {
+      repo: 'Jacksnow14/paperclip',
+      number: 42,
+      sha7: 'abc1234',
+      title: 'fix(AUR-9999): thing',
+      reviewerId: 'agent-max',
+      reviewerName: 'Claude Code Max',
+      refileCount: 0,
+    };
+    const result = await fileOneItem({ apiBase: 'http://example.invalid' }, 'company-1', item, lanes, staleLaneIds);
+    assert.deepEqual(posts, ['agent-max', 'agent-fast']);
+    assert.ok(result);
+    assert.equal(result.created.id, 'issue-1');
+    assert.equal(result.candidate.reviewerId, 'agent-fast');
+    assert.equal(result.candidate.reviewerName, 'Claude Code Fast');
+    assert.ok(staleLaneIds.has('agent-max'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('fileOneItem skips (not FATAL) once the fallback pool is exhausted (AUR-6430)', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    if (init.method === 'POST') {
+      return new Response(
+        JSON.stringify({
+          error: 'Cannot assign work to a stale agent lane',
+          details: { agentId: 'agent-max' },
+        }),
+        { status: 409 },
+      );
+    }
+    return new Response('{}', { status: 200 });
+  };
+  try {
+    const lanes = [{ id: 'agent-max', name: 'Claude Code Max', queuedCount: 0 }];
+    const staleLaneIds = new Set();
+    const item = {
+      repo: 'Jacksnow14/paperclip',
+      number: 42,
+      sha7: 'abc1234',
+      title: 'fix(AUR-9999): thing',
+      reviewerId: 'agent-max',
+      reviewerName: 'Claude Code Max',
+      refileCount: 0,
+    };
+    const result = await fileOneItem({ apiBase: 'http://example.invalid' }, 'company-1', item, lanes, staleLaneIds);
+    assert.equal(result, null);
+    assert.ok(staleLaneIds.has('agent-max'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('distributeReviewers spreads items least-loaded-first across N healthy lanes', () => {

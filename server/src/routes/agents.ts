@@ -53,6 +53,7 @@ import {
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
 import { laneBreakerForDb } from "../services/lane-breaker.js";
+import { isAgentLaneStale } from "../services/agent-lane-admission.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectAgentAdapterWorkspaceCommandPaths,
@@ -3238,6 +3239,31 @@ export function agentRoutes(
     source: HeartbeatSource | undefined;
     skippedResponse: (agent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>) => unknown | Promise<unknown>;
   };
+
+  /**
+   * AUR-6492: an agent with zero live/queued runs whose heartbeat has gone
+   * stale (>24h, see `isAgentLaneStale`) can never wake itself again — the
+   * only invocation paths are /wakeup and /heartbeat/invoke, both otherwise
+   * gated to self. This admits exactly one additional caller: the target's
+   * *direct* manager (`targetAgent.reportsTo === ` the caller's own agent
+   * id), and only while the target's lane is actually stale — it must not
+   * become a general "wake my reports" capability, and it must not walk the
+   * transitive chain of command.
+   */
+  const isAgentActorAdmittedToWakeup = async (
+    req: Request,
+    targetAgent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
+  ): Promise<boolean> => {
+    if (req.actor.type !== "agent") return false;
+    const actorAgentId = req.actor.agentId;
+    if (actorAgentId === targetAgent.id) return true;
+    if (!actorAgentId) return false;
+    if (targetAgent.reportsTo !== actorAgentId) return false;
+    if (!isAgentLaneStale(targetAgent)) return false;
+    const actorAgent = await svc.getById(actorAgentId);
+    return actorAgent != null && targetAgent.reportsTo === actorAgent.id;
+  };
+
   const handleWakeupRoute = async (
     req: Request,
     res: Response,
@@ -3252,7 +3278,7 @@ export function agentRoutes(
     assertCompanyAccess(req, agent.companyId);
 
     if (req.actor.type === "agent") {
-      if (req.actor.agentId !== id) {
+      if (req.actor.agentId !== id && !(await isAgentActorAdmittedToWakeup(req, agent))) {
         res.status(403).json({ error: "Agent can only invoke itself" });
         return;
       }
@@ -3272,6 +3298,7 @@ export function agentRoutes(
         triggeredBy: req.actor.type,
         actorId: req.actor.type === "agent" ? req.actor.agentId : req.actor.userId,
         forceFreshSession: req.body.forceFreshSession === true,
+        ...(req.actor.type === "agent" && req.actor.agentId !== id ? { recoveryWake: true } : {}),
       },
     });
 
@@ -3320,7 +3347,7 @@ export function agentRoutes(
     assertCompanyAccess(req, agent.companyId);
 
     if (req.actor.type === "agent") {
-      if (req.actor.agentId !== id) {
+      if (req.actor.agentId !== id && !(await isAgentActorAdmittedToWakeup(req, agent))) {
         res.status(403).json({ error: "Agent can only invoke itself" });
         return;
       }
@@ -3341,6 +3368,9 @@ export function agentRoutes(
     };
     if (body.forceFreshSession === true) {
       contextSnapshot.forceFreshSession = true;
+    }
+    if (req.actor.type === "agent" && req.actor.agentId !== id) {
+      contextSnapshot.recoveryWake = true;
     }
     const wakeOpts: Parameters<typeof heartbeat.wakeup>[1] = {
       source: "on_demand",

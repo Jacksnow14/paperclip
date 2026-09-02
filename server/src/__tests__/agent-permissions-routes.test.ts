@@ -72,6 +72,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   resetRuntimeSession: vi.fn(),
   getRun: vi.fn(),
   cancelRun: vi.fn(),
+  wakeup: vi.fn(),
 }));
 
 const mockIssueApprovalService = vi.hoisted(() => ({
@@ -314,6 +315,7 @@ describe.sequential("agent permission routes", () => {
     mockHeartbeatService.resetRuntimeSession.mockReset();
     mockHeartbeatService.getRun.mockReset();
     mockHeartbeatService.cancelRun.mockReset();
+    mockHeartbeatService.wakeup.mockReset();
     mockIssueApprovalService.linkManyForApproval.mockReset();
     mockIssueService.list.mockReset();
     mockSecretService.normalizeAdapterConfigForPersistence.mockReset();
@@ -521,6 +523,165 @@ describe.sequential("agent permission routes", () => {
       .send({}));
 
     expect(res.status).toBe(403);
+  });
+
+  describe("manager-can-wake-own-stale-report recovery path (AUR-6492)", () => {
+    const managerId = "33333333-3333-4333-8333-333333333333";
+    const staleReportId = "44444444-4444-4444-8444-444444444444";
+    const outsideAgentId = "55555555-5555-4555-8555-555555555555";
+    const grandManagerId = "66666666-6666-4666-8666-666666666666";
+    const staleHeartbeat = new Date("2020-01-01T00:00:00.000Z");
+    const recentHeartbeat = new Date(Date.now() - 60 * 60 * 1000);
+
+    function agentRow(overrides: Partial<typeof baseAgent>) {
+      return { ...baseAgent, ...overrides };
+    }
+
+    function mockGetByIdMap(rows: Record<string, typeof baseAgent | null>) {
+      mockAgentService.getById.mockImplementation(async (id: string) =>
+        Object.prototype.hasOwnProperty.call(rows, id) ? rows[id] : null,
+      );
+    }
+
+    it("lets a direct manager wake a stale report", async () => {
+      const staleReport = agentRow({ id: staleReportId, reportsTo: managerId, lastHeartbeatAt: staleHeartbeat });
+      const manager = agentRow({ id: managerId, reportsTo: null });
+      mockGetByIdMap({ [staleReportId]: staleReport, [managerId]: manager });
+      mockHeartbeatService.wakeup.mockResolvedValue({ id: "run-recovery-1", status: "queued" });
+
+      const app = await createApp({
+        type: "agent",
+        agentId: managerId,
+        companyId,
+        source: "agent_key",
+        runId: "run-manager",
+      });
+
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${staleReportId}/wakeup`)
+        .send({}));
+
+      expect(res.status).toBe(202);
+      expect(res.body).toEqual({ id: "run-recovery-1", status: "queued" });
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        staleReportId,
+        expect.objectContaining({
+          contextSnapshot: expect.objectContaining({ recoveryWake: true }),
+        }),
+      );
+    });
+
+    it("still blocks a direct manager when the report is not yet stale", async () => {
+      const notStaleReport = agentRow({ id: staleReportId, reportsTo: managerId, lastHeartbeatAt: recentHeartbeat });
+      const manager = agentRow({ id: managerId, reportsTo: null });
+      mockGetByIdMap({ [staleReportId]: notStaleReport, [managerId]: manager });
+
+      const app = await createApp({
+        type: "agent",
+        agentId: managerId,
+        companyId,
+        source: "agent_key",
+        runId: "run-manager",
+      });
+
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${staleReportId}/wakeup`)
+        .send({}));
+
+      expect(res.status).toBe(403);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("blocks an agent that is not the target's direct manager, even if stale", async () => {
+      const staleReport = agentRow({ id: staleReportId, reportsTo: managerId, lastHeartbeatAt: staleHeartbeat });
+      const manager = agentRow({ id: managerId, reportsTo: null });
+      mockGetByIdMap({ [staleReportId]: staleReport, [managerId]: manager });
+
+      const app = await createApp({
+        type: "agent",
+        agentId: outsideAgentId,
+        companyId,
+        source: "agent_key",
+        runId: "run-outside",
+      });
+
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${staleReportId}/wakeup`)
+        .send({}));
+
+      expect(res.status).toBe(403);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("does not admit a transitive chain-of-command manager, only a direct report relationship", async () => {
+      // grandManagerId -> managerId -> staleReportId (grandManager manages the manager, not the report)
+      const staleReport = agentRow({ id: staleReportId, reportsTo: managerId, lastHeartbeatAt: staleHeartbeat });
+      const manager = agentRow({ id: managerId, reportsTo: grandManagerId });
+      const grandManager = agentRow({ id: grandManagerId, reportsTo: null });
+      mockGetByIdMap({
+        [staleReportId]: staleReport,
+        [managerId]: manager,
+        [grandManagerId]: grandManager,
+      });
+
+      const app = await createApp({
+        type: "agent",
+        agentId: grandManagerId,
+        companyId,
+        source: "agent_key",
+        runId: "run-grandmanager",
+      });
+
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${staleReportId}/wakeup`)
+        .send({}));
+
+      expect(res.status).toBe(403);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it("legacy heartbeat/invoke: lets a direct manager wake a stale report", async () => {
+      const staleReport = agentRow({ id: staleReportId, reportsTo: managerId, lastHeartbeatAt: staleHeartbeat });
+      const manager = agentRow({ id: managerId, reportsTo: null });
+      mockGetByIdMap({ [staleReportId]: staleReport, [managerId]: manager });
+      mockHeartbeatService.wakeup.mockResolvedValue({ id: "run-recovery-2", status: "queued" });
+
+      const app = await createApp({
+        type: "agent",
+        agentId: managerId,
+        companyId,
+        source: "agent_key",
+        runId: "run-manager",
+      });
+
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${staleReportId}/heartbeat/invoke`)
+        .send({}));
+
+      expect(res.status).toBe(202);
+      expect(res.body).toEqual({ id: "run-recovery-2", status: "queued" });
+    });
+
+    it("legacy heartbeat/invoke: blocks an agent that is not the target's direct manager", async () => {
+      const staleReport = agentRow({ id: staleReportId, reportsTo: managerId, lastHeartbeatAt: staleHeartbeat });
+      const manager = agentRow({ id: managerId, reportsTo: null });
+      mockGetByIdMap({ [staleReportId]: staleReport, [managerId]: manager });
+
+      const app = await createApp({
+        type: "agent",
+        agentId: outsideAgentId,
+        companyId,
+        source: "agent_key",
+        runId: "run-outside",
+      });
+
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .post(`/api/agents/${staleReportId}/heartbeat/invoke`)
+        .send({}));
+
+      expect(res.status).toBe(403);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
   });
 
   it("blocks agent-authenticated self-updates that set host-executed workspace commands", async () => {

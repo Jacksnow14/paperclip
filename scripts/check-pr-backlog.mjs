@@ -49,6 +49,15 @@
  *     --alert-cmd, which does not touch the Paperclip API at all — so a
  *     dead fire is no longer silent even when the underlying capability
  *     that broke is the one this script itself needs to report through.
+ *   - Stale-lane degrade (AUR-6430): the lane-health precheck now also drops
+ *     a lane whose `lastHeartbeatAt` exceeds the same 24h threshold the
+ *     create-issue endpoint enforces server-side (previously it only read
+ *     run history, so it could report a >24h-idle lane "healthy" right
+ *     before the server rejected it). As defense-in-depth for the remaining
+ *     race — a heartbeat can still lapse between the precheck and the POST —
+ *     a stale-lane 409 no longer FATAL-aborts the run either: the filing
+ *     loop retries once on a different healthy lane, and only skips (leaving
+ *     it to re-file next sweep) if every lane is exhausted.
  *   - Author exclusion (AUR-5370): every PR here is authored by the same
  *     GitHub machine account, so GitHub author metadata can't discriminate.
  *     The AUR-NNNN token in the PR title is looked up; that issue's
@@ -101,6 +110,14 @@ const ESCALATION_INTERVAL_MS = 24 * HOUR_MS;
 const REFILE_CAP = 3;
 const DEFAULT_REVIEWERS = ['Claude Code Max', 'Claude Code Fast'];
 const STARVATION_PATTERN = /quota|usage limit|session limit/i;
+
+// AUR-6430: must mirror server/src/services/agent-lane-admission.ts's
+// STALE_LANE_HEARTBEAT_THRESHOLD_MS — that is the threshold the create-issue
+// endpoint actually enforces (409 "Cannot assign work to a stale agent
+// lane"). The run-history-based health check below (assessLaneHealth) never
+// read lastHeartbeatAt, so it could report a lane "healthy" the server
+// considered stale.
+const STALE_LANE_HEARTBEAT_THRESHOLD_MS = 24 * HOUR_MS;
 
 export const DEFAULT_REPOS = ['Jacksnow14/paperclip', 'Jacksnow14/Auranode'];
 
@@ -228,6 +245,31 @@ export function assessLaneHealth(runs) {
   const mostRecent = list[0];
   const healthy = !mostRecent || !isStarvedRun(mostRecent);
   return { healthy, queuedCount };
+}
+
+/**
+ * Pure: mirrors isAgentLaneStale in server/src/services/agent-lane-admission.ts
+ * so the precheck actually predicts the 409 the create-issue endpoint
+ * enforces (AUR-6430). A null/missing lastHeartbeatAt is NOT stale — that is
+ * the legitimate signature of an agent that never heartbeats at all.
+ */
+export function isLaneHeartbeatStale(instance, nowMs) {
+  const raw = instance?.lastHeartbeatAt;
+  if (!raw) return false;
+  const heartbeatMs = Date.parse(raw);
+  if (Number.isNaN(heartbeatMs)) return false;
+  return nowMs - heartbeatMs > STALE_LANE_HEARTBEAT_THRESHOLD_MS;
+}
+
+/**
+ * Pure: least-loaded healthy lane not already proven stale this run — the
+ * fallback pool for a stale-lane 409 caught mid-filing (AUR-6430). Returns
+ * null when every healthy lane has been exhausted.
+ */
+export function pickFallbackLane(lanes, excludeIds) {
+  const pool = lanes.filter((l) => !excludeIds.has(l.id));
+  if (pool.length === 0) return null;
+  return [...pool].sort((a, b) => (a.queuedCount ?? 0) - (b.queuedCount ?? 0))[0];
 }
 
 /** Pure: pick the reviewer agent instance for a lane name. running > idle; never error/terminated. */
@@ -492,6 +534,22 @@ function saveState(stateDir, state) {
   writeFileSync(join(stateDir, 'state.json'), `${JSON.stringify(state, null, 2)}\n`);
 }
 
+/**
+ * Thrown by api() for the specific 409 the create-issue endpoint returns
+ * when the chosen lane's heartbeat has gone stale (AUR-6430). Typed so the
+ * filing loop can fall back to a different healthy lane instead of letting
+ * it propagate to the top-level handler and FATAL-abort the whole run — the
+ * server-side race this covers: a heartbeat can lapse in the seconds between
+ * resolveHealthyLanes()'s own read and this POST.
+ */
+export class StaleLaneError extends Error {
+  constructor(message, agentId) {
+    super(message);
+    this.name = 'StaleLaneError';
+    this.agentId = agentId;
+  }
+}
+
 export async function api(args, method, path, body) {
   const res = await fetch(`${args.apiBase}${path}`, {
     method,
@@ -522,6 +580,15 @@ export async function api(args, method, path, body) {
     const { assigneeAgentId, ...unassignedBody } = body;
     console.log(`FILED UNASSIGNED (403 on assigneeAgentId — see AUR-6335/AUR-6054): ${detail}`);
     return api(args, method, path, unassignedBody);
+  }
+
+  // AUR-6430: the create-issue endpoint 409s when the target lane's
+  // heartbeat is stale (server/src/services/agent-lane-admission.ts). This
+  // is a typed, expected-to-happen condition — throw StaleLaneError instead
+  // of a plain Error so the filing loop can retry on a different lane
+  // instead of the whole run FATAL-aborting.
+  if (method === 'POST' && res.status === 409 && body && typeof body === 'object' && 'assigneeAgentId' in body && /stale agent lane/i.test(detail)) {
+    throw new StaleLaneError(`${method} ${path} → 409: ${detail}`, body.assigneeAgentId);
   }
 
   throw new Error(`${method} ${path} → ${res.status}${detail ? `: ${detail}` : ''}`);
@@ -561,7 +628,7 @@ async function resolveAuthorExclusion(args, title) {
   }
 }
 
-async function resolveHealthyLanes(args, companyId) {
+async function resolveHealthyLanes(args, companyId, nowMs) {
   const agents = await api(args, 'GET', `/api/companies/${companyId}/agents`);
   const list = Array.isArray(agents) ? agents : agents.agents ?? [];
   const lanes = [];
@@ -569,6 +636,14 @@ async function resolveHealthyLanes(args, companyId) {
     const instance = pickReviewer(list, name);
     if (!instance) {
       console.error(`lane "${name}": no usable agent instance — dropped.`);
+      continue;
+    }
+    if (isLaneHeartbeatStale(instance, nowMs)) {
+      const ageHours = Math.round((nowMs - Date.parse(instance.lastHeartbeatAt)) / HOUR_MS);
+      console.error(
+        `lane "${name}": STALE HEARTBEAT (idle ${ageHours}h, > ${STALE_LANE_HEARTBEAT_THRESHOLD_MS / HOUR_MS}h ` +
+          'threshold the server enforces) — dropped.',
+      );
       continue;
     }
     let runs = [];
@@ -587,6 +662,59 @@ async function resolveHealthyLanes(args, companyId) {
     lanes.push({ id: instance.id, name, queuedCount: health.queuedCount });
   }
   return lanes;
+}
+
+/**
+ * Files one review issue, degrading gracefully instead of propagating
+ * (AUR-6430): the per-item filing loop previously had no try/catch, so any
+ * thrown error — including a stale-lane 409 the precheck didn't anticipate —
+ * FATAL-aborted the whole run, dropping every remaining unfiled item across
+ * both repos. A StaleLaneError retries once on a different healthy lane; any
+ * other failure (or an exhausted fallback pool) is logged and this item is
+ * skipped. Returns `{ created, candidate }` on success, or null — the caller
+ * does not record state for a null result, so the PR is simply re-attempted
+ * on the next sweep rather than lost.
+ */
+export async function fileOneItem(args, companyId, item, lanes, staleLaneIds) {
+  let candidate = item;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const created = await api(
+        args,
+        'POST',
+        `/api/companies/${companyId}/issues`,
+        buildIssueCreatePayload(candidate, hasTrunkCiScript(candidate.repo)),
+      );
+      // 201 is not proof — read the row back before recording the dispatch.
+      await api(args, 'GET', `/api/issues/${created.id}`);
+      return { created, candidate };
+    } catch (err) {
+      if (err instanceof StaleLaneError && attempt === 0) {
+        staleLaneIds.add(err.agentId);
+        const fallback = pickFallbackLane(lanes, staleLaneIds);
+        if (!fallback) {
+          console.error(
+            `SKIP: repo=${candidate.repo}#${candidate.number}@${candidate.sha7} — lane ` +
+              `"${candidate.reviewerName}" went stale (409) and no other healthy lane is left; ` +
+              'will re-file on the next sweep.',
+          );
+          return null;
+        }
+        console.error(
+          `lane "${candidate.reviewerName}" went stale (409) mid-run — retrying ` +
+            `repo=${candidate.repo}#${candidate.number} on lane "${fallback.name}" instead.`,
+        );
+        candidate = { ...candidate, reviewerId: fallback.id, reviewerName: fallback.name };
+        continue;
+      }
+      console.error(
+        `SKIP: repo=${candidate.repo}#${candidate.number}@${candidate.sha7} — filing failed: ` +
+          `${err.message}; will re-file on the next sweep.`,
+      );
+      return null;
+    }
+  }
+  return null;
 }
 
 async function main() {
@@ -681,8 +809,9 @@ async function main() {
   }
 
   let assigned = [];
+  let lanes = [];
   if (kept.length > 0) {
-    const lanes = await resolveHealthyLanes(args, companyId);
+    lanes = await resolveHealthyLanes(args, companyId, Date.now());
     if (lanes.length === 0) {
       const msg = `pr-backlog-dispatch FATAL: zero healthy reviewer lanes among [${args.reviewers.join(', ')}] — ${kept.length} PR(s) undispatched.`;
       console.error(msg);
@@ -697,27 +826,23 @@ async function main() {
     assigned = distributeReviewers(withExclusions, lanes);
   }
 
+  const staleLaneIds = new Set();
   for (const f of assigned) {
-    const created = await api(
-      args,
-      'POST',
-      `/api/companies/${companyId}/issues`,
-      buildIssueCreatePayload(f, hasTrunkCiScript(f.repo)),
-    );
-    // 201 is not proof — read the row back before recording the dispatch.
-    await api(args, 'GET', `/api/issues/${created.id}`);
-    const key = stateKey(f.repo, f.number);
+    const result = await fileOneItem(args, companyId, f, lanes, staleLaneIds);
+    if (!result) continue;
+    const { created, candidate } = result;
+    const key = stateKey(candidate.repo, candidate.number);
     state.prs[key] = {
       ...(state.prs[key] ?? {}),
-      filedSha: f.sha7,
+      filedSha: candidate.sha7,
       filedAt: new Date().toISOString(),
       filedIssueId: created.id,
       issue: created.identifier ?? created.id,
-      refileCount: f.refileCount ?? 0,
+      refileCount: candidate.refileCount ?? 0,
     };
     saveState(args.stateDir, state);
     console.log(
-      `filed ${created.identifier ?? created.id} for ${f.repo}#${f.number}@${f.sha7} -> ${f.reviewerName}`,
+      `filed ${created.identifier ?? created.id} for ${candidate.repo}#${candidate.number}@${candidate.sha7} -> ${candidate.reviewerName}`,
     );
   }
 

@@ -224,6 +224,42 @@ function fileBlockedSendIncident(
 // Fire-and-forget: file a high-priority incident when the AUR-5734 second-sink
 // guard refuses a recipient, so it surfaces as "a human contact is needed
 // instead" rather than a swallowed 403.
+// AUR-6330: the refusal text above tells the assignee to go find a different
+// human, which is the right advice for a cold-prospecting mistake and the
+// WRONG advice for a buyer-side inquiry where the role inbox is the only
+// channel the counterparty publishes. AUR-5891 already built the escape hatch
+// for that case (`outboundKind: "vendor_inquiry"` + `outboundJustification`),
+// but nothing in the filed issue said so, so the assignee cannot find it from
+// the issue alone: AUR-6330 was a `high` issue filed against a licensing
+// enquiry to Swiss Water's published `info@`, the only contact address on
+// their own Roaster Partners page.
+//
+// Name the hatch only for `role/system mailbox:` — it is the only refusal
+// AUR-5891 downgrades. `suppression` (bounce/machine-only evidence) and
+// `denylisted recipient:` stay hard-blocked regardless of declared intent, so
+// advertising the flag there would be advertising a bypass that does not
+// exist.
+export function remediationHint(verdict: ProspectSuppressionVerdict): string {
+  const isRoleMailbox =
+    verdict.source === "non-prospect" && (verdict.reason ?? "").startsWith("role/system mailbox:");
+  if (!isRoleMailbox) return "";
+  return (
+    `\n\n### If this is a buyer-side inquiry, not cold outreach\n\n` +
+    `A role mailbox is routinely the ONLY address a company publishes for licensing, ` +
+    `procurement, or vendor questions. If that is what this send is, it is not a mistake ` +
+    `and you do not need a different contact — re-send with the AUR-5891 declared-intent ` +
+    `opt-out:\n\n` +
+    "```json\n" +
+    `{ "to": "${verdict.address}", "subject": "...", "body": "...",\n` +
+    `  "outboundKind": "vendor_inquiry",\n` +
+    `  "outboundJustification": "why this role mailbox is the correct route (>=20 chars)" }\n` +
+    "```\n\n" +
+    `That downgrades THIS refusal to a logged warning. It does not bypass bounce or ` +
+    `machine-only suppression, and it is not a licence for cold outreach: if you are ` +
+    `prospecting, the original advice stands — find a verified human instead.`
+  );
+}
+
 function fileProspectSuppressedIncident(
   db: Db,
   companyId: string,
@@ -249,7 +285,8 @@ function fileProspectSuppressedIncident(
           `**Source:** ${verdict.source}\n` +
           `**Evidence:** ${verdict.reason}\n\n` +
           `The account is not disqualified — only this automated route into it. ` +
-          `Find a different, verified human contact at this account instead of resending to this address.`,
+          `Find a different, verified human contact at this account instead of resending to this address.` +
+          remediationHint(verdict),
         priority: "high",
         status: "todo",
         assigneeAgentId: callerAgentId,

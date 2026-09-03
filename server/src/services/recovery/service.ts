@@ -35,6 +35,7 @@ import { logActivity } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { issueRecoveryActionService, recoveryActionDormancyCutoff } from "../issue-recovery-actions.js";
+import { issueAllowsMonitor } from "../issue-execution-policy.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { issueService } from "../issues.js";
 import { NON_ATTRIBUTABLE_PROVIDER_ERROR_CODES, PROCESS_LOST_ERROR_CODE } from "../productivity-review.js";
@@ -550,8 +551,36 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows[0] ?? null);
   }
 
-  async function hasActiveExecutionPath(companyId: string, issueId: string) {
-    const [run, deferredWake, ownedActiveRoutine] = await Promise.all([
+  // AUR-6391: an issue with a future, still-scheduled issue monitor never materialises a
+  // row in any of the three tables below for the entire arm→fire window (a monitor wake
+  // only becomes an `agentWakeupRequests` row once `tickDueIssueMonitors` fires it), so
+  // without this it reads as stranded even though it holds the platform's most explicit
+  // live path. Mirror `issueAllowsMonitor` (the exact predicate `tickDueIssueMonitors`
+  // gates on) instead of restating it, so this check and the firer cannot drift apart —
+  // a monitor the firer would refuse to fire (wrong status, user-assigned, overdue) must
+  // still read as stranded here, which is the whole point of the sweep.
+  async function hasLiveScheduledMonitor(companyId: string, issueId: string, now: Date) {
+    const issue = await db
+      .select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+        executionState: issues.executionState,
+      })
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!issue || !issue.monitorNextCheckAt) return false;
+    if (issue.monitorNextCheckAt <= now) return false;
+    if (!issueAllowsMonitor(issue.status, issue.assigneeAgentId, issue.assigneeUserId)) return false;
+    const monitorStatus = (issue.executionState as { monitor?: { status?: string } } | null)?.monitor?.status ?? null;
+    return monitorStatus === "scheduled";
+  }
+
+  async function hasActiveExecutionPath(companyId: string, issueId: string, now: Date = new Date()) {
+    const [run, deferredWake, ownedActiveRoutine, liveScheduledMonitor] = await Promise.all([
       db
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
@@ -592,9 +621,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         )
         .limit(1)
         .then((rows) => rows[0] ?? null),
+      hasLiveScheduledMonitor(companyId, issueId, now),
     ]);
 
-    return Boolean(run || deferredWake || ownedActiveRoutine);
+    return Boolean(run || deferredWake || ownedActiveRoutine || liveScheduledMonitor);
   }
 
   async function hasQueuedIssueWake(companyId: string, issueId: string) {
@@ -4527,5 +4557,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     reconcileOrphanedRecoveryActions,
     readRecoveryTimerIntervalMs,
     isRecoveryDispatchStillValid,
+    hasActiveExecutionPath,
   };
 }
